@@ -23,7 +23,7 @@ OpenCode-specific runtime behavior. Shared plugin behavior lives in [`Core.md`](
 8. Measure pre-compaction tokens using provider tokens when available, otherwise local counting.
 9. Insert an ignored no-reply progress message.
 10. Fork the source session into an ephemeral compaction session so the summarizer sees the full conversation.
-11. Send the XML summary prompt in the ephemeral session.
+11. Resolve OpenCode's native hidden `compaction` agent for the source workspace, then send the XML summary prompt through Magic Compact's hidden summarizer agent in the ephemeral session using the resolved compaction model and variant.
 12. Parse per-turn summaries.
 13. Delete the ephemeral session in cleanup.
 14. Delete the progress message in cleanup.
@@ -85,7 +85,14 @@ Known issues: We do not check for noops.
 
 - Summaries are generated in an ephemeral session so the prompt and assistant stream stay out of the main session.
 - The ephemeral session is a fork of the source session: the summarizer needs the full conversation in context to summarize assistant turns faithfully.
-- The model and prompt prefix must remain unchanged for cache reuse: the ephemeral request should use the same model, agent-controlled system prompt, and tool set as the source session.
+- Magic Compact registers a hidden `magic-compact-summarizer` subagent with a dedicated faithful per-turn XML summarization prompt.
+- The summarizer treats historical transcript evidence as primary. It may inspect current state when needed, must distinguish current observations from historical claims, and must never continue unfinished work.
+- Before prompting, Magic Compact resolves OpenCode's native hidden `compaction` agent through the public v2 app agents API for the source workspace.
+- The request explicitly uses the Magic Compact summarizer agent while inheriting the native compaction agent's configured model and variant. If the native compaction agent has no model, the request falls back to the captured source session model and variant.
+- A missing or disabled native hidden compaction agent, or an invalid explicit model configuration, aborts compaction rather than selecting another agent.
+- Source session permissions are not copied to the ephemeral session; the custom agent policy remains authoritative.
+- The custom agent allows registered built-in, plugin, MCP, and unknown future tools by default, including shell and bash. It denies OpenCode's `edit` permission, which covers edit, write, and apply-patch operations, and also denies task/subagent, question/interactive, todowrite, plan-enter, plan-exit, and doom-loop interactions.
+- Allowed tools can have side effects. Deleting the temporary session removes its conversation record but does not roll back tool effects on files, processes, services, or external systems.
 - The XML prompt is built from the OpenCode template.
 - The XML prompt includes only the turns being summarized and, when needed, the next user turn as the boundary marker.
 - User text in the prompt excludes synthetic and ignored text and is truncated to the first line or first 300 characters, whichever is shorter.
@@ -110,12 +117,13 @@ Known issues: We do not check for noops.
 - The current session cache is the active cache on success.
 - The backup gets a cache copy before mutation.
 - Compaction and trimming share the same session-local omission sequence.
+- During an ephemeral summary prompt, omission reads for the temporary session are routed to the source session cache. The mapping is installed before the prompt and cleared on success or failure.
 
 ## Omission Retrieval
 
 - The plugin exposes `read_omitted_content` as an OpenCode plugin tool.
 - The tool accepts one argument: `contentId`.
-- The tool receives `context.sessionID` from OpenCode and reads that session's omission cache.
+- The tool receives `context.sessionID` from OpenCode and reads that session's omission cache, except for the temporary source mapping active only during summarization.
 - If no matching cache entry exists, it returns a not-found message.
 
 ## Stats

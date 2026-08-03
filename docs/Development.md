@@ -27,12 +27,12 @@ bun install
   - `src/tui.ts` - TUI plugin wiring.
   - `src/util.ts` - shared local utilities.
   - `src/compact/compact.ts` - main compaction flow.
-  - `src/compact/constants.ts` - compaction constants.
+  - `src/compact/constants.ts` - compaction constants and custom summarizer-agent definition.
   - `src/compact/plan.ts` - turn planning and boundary selection.
   - `src/compact/prune.ts` - tool input/output pruning.
   - `src/compact/session.ts` - session backup and mutation helpers.
   - `src/compact/template.ts` - summarization prompt template helpers.
-  - `src/storage/omission.ts` - omitted content cache persistence.
+  - `src/storage/omission.ts` - omitted content cache persistence and temporary summarization-session lookup routing.
   - `src/storage/stats.ts` - persisted stats storage.
   - `src/storage/store.ts` - shared storage access helpers.
   - `src/stats/constants.ts` - stats constants.

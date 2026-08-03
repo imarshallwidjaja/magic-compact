@@ -2,6 +2,10 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { getV2Client } from "./api";
 import {
+  MAGIC_COMPACT_SUMMARIZER_AGENT,
+  MAGIC_COMPACT_SUMMARIZER_PROMPT,
+} from "./compact/constants";
+import {
   COMPACT_NOOP,
   COMPACT_SUCCESS,
   executeMagicCompact,
@@ -14,10 +18,28 @@ import { handleStatsEvent } from "./stats/events";
 const COMPACT_COMMAND = "magic-compact";
 const TRIM_COMMAND = "magic-trim";
 const STATS_COMMAND = "magic-stats";
+const SUMMARIZER_PERMISSION = {
+  "*": "allow",
+  edit: "deny",
+  task: "deny",
+  question: "deny",
+  todowrite: "deny",
+  plan_enter: "deny",
+  plan_exit: "deny",
+  doom_loop: "deny",
+} as const;
 
 const server: Plugin = async input => {
   return {
     config: async config => {
+      config.agent ??= {};
+      config.agent[MAGIC_COMPACT_SUMMARIZER_AGENT] = {
+        description: "Faithful per-turn XML summarizer for Magic Compact",
+        mode: "subagent",
+        hidden: true,
+        prompt: MAGIC_COMPACT_SUMMARIZER_PROMPT,
+        permission: SUMMARIZER_PERMISSION,
+      };
       config.command ??= {};
       config.command[COMPACT_COMMAND] = {
         template: "",

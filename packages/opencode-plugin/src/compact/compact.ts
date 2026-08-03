@@ -1,6 +1,11 @@
-import type { Session, TextPart } from "@opencode-ai/sdk/v2";
+import type { Agent, Session, TextPart } from "@opencode-ai/sdk/v2";
 import { unwrap, type V2Client } from "../api";
-import { summaryMetadata, summaryPartID } from "./constants";
+import { installTemporaryOmissionSource } from "../storage/omission";
+import {
+  MAGIC_COMPACT_SUMMARIZER_AGENT,
+  summaryMetadata,
+  summaryPartID,
+} from "./constants";
 import { createCompactionPlan, type Turn } from "./plan";
 import { buildCompactionPrompt } from "./template";
 
@@ -50,17 +55,25 @@ async function generateSummariesInEphemeralSession(
       await v2.session.update({
         sessionID: compactionSession.id,
         title: `[TEMP] ${session.title}`,
-        ...(session.permission ? { permission: session.permission } : {}),
       }),
     );
 
-    return await generateSummaries(
-      v2,
+    const settings = await resolveCompactionSettings(v2, session);
+    const clearOmissionSource = installTemporaryOmissionSource(
       compactionSession.id,
-      session,
-      turns,
-      nextTurn,
+      session.id,
     );
+    try {
+      return await generateSummaries(
+        v2,
+        compactionSession.id,
+        settings,
+        turns,
+        nextTurn,
+      );
+    } finally {
+      clearOmissionSource();
+    }
   } finally {
     unwrap(
       await v2.session.delete({
@@ -70,27 +83,74 @@ async function generateSummariesInEphemeralSession(
   }
 }
 
+type CompactionSettings = {
+  model?: { providerID: string; modelID: string };
+  variant?: string;
+};
+
+async function resolveCompactionSettings(
+  v2: V2Client,
+  sourceSession: Session,
+): Promise<CompactionSettings> {
+  const agents = unwrap(
+    await v2.app.agents({
+      directory: sourceSession.directory,
+      ...(sourceSession.workspaceID
+        ? { workspace: sourceSession.workspaceID }
+        : {}),
+    }),
+  );
+  const compactionAgent = agents.find(
+    (agent: Agent) =>
+      agent.name === "compaction"
+      && agent.native === true
+      && agent.hidden === true,
+  );
+  if (!compactionAgent) {
+    throw new Error(
+      "Magic Compact requires the native hidden compaction agent, but it is missing or disabled.",
+    );
+  }
+
+  if (compactionAgent.model) {
+    if (
+      !compactionAgent.model.providerID.trim()
+      || !compactionAgent.model.modelID.trim()
+    ) {
+      throw new Error(
+        "The native compaction agent has an invalid model configuration.",
+      );
+    }
+    return {
+      model: compactionAgent.model,
+      variant: compactionAgent.variant,
+    };
+  }
+
+  return {
+    model: sourceSession.model
+      ? {
+          providerID: sourceSession.model.providerID,
+          modelID: sourceSession.model.id,
+        }
+      : undefined,
+    variant: sourceSession.model?.variant,
+  };
+}
+
 async function generateSummaries(
   v2: V2Client,
   sessionID: string,
-  sourceSession: Session,
+  settings: CompactionSettings,
   turns: Turn[],
   nextTurn: Turn | null,
 ): Promise<string[]> {
-  const variant = sourceSession.model?.variant;
   const response = unwrap(
     await v2.session.prompt({
       sessionID,
-      ...(sourceSession.agent ? { agent: sourceSession.agent } : {}),
-      ...(sourceSession.model
-        ? {
-            model: {
-              providerID: sourceSession.model.providerID,
-              modelID: sourceSession.model.id,
-            },
-          }
-        : {}),
-      ...(variant && variant !== "default" ? { variant } : {}),
+      agent: MAGIC_COMPACT_SUMMARIZER_AGENT,
+      ...(settings.model ? { model: settings.model } : {}),
+      ...(settings.variant ? { variant: settings.variant } : {}),
       parts: [
         {
           type: "text",

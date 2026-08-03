@@ -18,6 +18,7 @@ const OmissionCacheSchema = z.object({
 export type OmissionCache = z.infer<typeof OmissionCacheSchema>;
 
 const CACHE_VERSION = 1;
+const temporaryOmissionSources = new Map<string, string>();
 
 export async function allocateOmission(
   sessionID: string,
@@ -54,12 +55,24 @@ export async function readOmittedContent(
   sessionID: string,
   contentID: string,
 ): Promise<string | null> {
-  const cache = await readCache(sessionID);
+  const sourceSessionID = temporaryOmissionSources.get(sessionID) ?? sessionID;
+  const cache = await readCache(sourceSessionID);
   if (!cache) {
     return null;
   }
 
   return cache.entries[contentID]?.content ?? null;
+}
+
+export function installTemporaryOmissionSource(
+  temporarySessionID: string,
+  sourceSessionID: string,
+): () => void {
+  temporaryOmissionSources.set(temporarySessionID, sourceSessionID);
+
+  return () => {
+    temporaryOmissionSources.delete(temporarySessionID);
+  };
 }
 
 export async function readCache(

@@ -26,7 +26,7 @@ ${buildXmlTemplate(turns, nextTurn)}
 - Output your summary for assistant turns within the <assistant> </assistant> tags
   - You are **only responsible** for summarizing the specific assistant turns specified within the XML structure
   - Do not summarize any other assistant turns not specified in the XML template above.
-- Do not think. Do not call any tools. Output the summary ONLY.
+- Do not think. Tools may be used only when needed to recover missing historical evidence or clarify it through current inspection. Must not continue unfinished work. After any tool use, final output remains only the required XML. Output the summary ONLY.
 - **Follow the template.** Your response should start with the <summary> tag and end with the closing </summary> tag.
 
 ## Summarization Guidelines:

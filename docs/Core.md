@@ -14,6 +14,7 @@ Compress a conversation without flattening it into a single generic recap.
 - The plugin creates a backup before mutating the conversation.
 - User messages are preserved exactly.
 - Older assistant turns are summarized turn-by-turn, not merged into one blob.
+- Historical transcript evidence is authoritative for summaries. Current inspection may clarify that evidence, but summaries distinguish current observations from historical claims and never continue unfinished work.
 - Useful tool calls stay visible; bulky tool I/O is replaced with retrievable omission records.
 - Re-running compaction later preserves earlier summaries and compacts newer turns.
 - `/magic-stats` shows cumulative savings for the current conversation.
