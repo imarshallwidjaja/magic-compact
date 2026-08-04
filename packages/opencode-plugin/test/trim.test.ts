@@ -33,6 +33,46 @@ describe("magic trim", () => {
     ).toEqual(["ast_1", "ast_2"]);
   });
 
+  test("selects the complete session despite native checkpoints", async () => {
+    const marker = message("usr_checkpoint", "user", [
+      {
+        id: "prt_checkpoint",
+        sessionID: "session",
+        messageID: "usr_checkpoint",
+        type: "compaction",
+        auto: true,
+      } as unknown as Part,
+    ]);
+    const summary = message("ast_checkpoint", "assistant", []);
+    summary.info = {
+      ...summary.info,
+      parentID: "usr_checkpoint",
+      summary: true,
+      finish: "stop",
+    } as Message;
+    const messages = [
+      message("usr_before", "user", []),
+      message("ast_before", "assistant", [readTool("tool_before", "before")]),
+      marker,
+      summary,
+      message("usr_after", "user", []),
+      message("ast_after", "assistant", [readTool("tool_after", "after")]),
+    ];
+    const v2 = {
+      session: {
+        messages: async () => ({ data: messages }),
+      },
+    } as unknown as V2Client;
+
+    const plan = await createTrimPlan(v2, "session", 1);
+
+    expect(
+      plan.trimmedTurns.flatMap(turn =>
+        turn.assistants.map(assistant => assistant.info.id),
+      ),
+    ).toEqual(["ast_before", "ast_checkpoint"]);
+  });
+
   test("marks changed tools and skips them on later trims", async () => {
     const tool = completedTool("tool_1", "todowrite", "verbose output");
     const reasoning = {

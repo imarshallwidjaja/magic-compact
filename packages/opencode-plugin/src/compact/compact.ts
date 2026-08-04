@@ -6,41 +6,13 @@ import {
   summaryMetadata,
   summaryPartID,
 } from "./constants";
-import { createCompactionPlan, type Turn } from "./plan";
+import type { CompactionPlan, Turn } from "./plan";
 import { buildCompactionPrompt } from "./template";
 
-export type CompactSessionResult = {
-  summarizedTurns: Turn[];
-  nextTurn: Turn | null;
-};
-
-export async function compactSession(
+export async function generateCompactionSummaries(
   v2: V2Client,
   session: Session,
-  sessionID: string,
-  keepTurns: number,
-): Promise<CompactSessionResult> {
-  const plan = await createCompactionPlan(v2, sessionID, keepTurns);
-  const summaries = await generateSummariesInEphemeralSession(
-    v2,
-    session,
-    plan.summarizedTurns,
-    plan.nextTurn,
-  );
-
-  await injectSummaries(v2, sessionID, plan.summarizedTurns, summaries);
-
-  return {
-    summarizedTurns: plan.summarizedTurns,
-    nextTurn: plan.nextTurn,
-  };
-}
-
-async function generateSummariesInEphemeralSession(
-  v2: V2Client,
-  session: Session,
-  turns: Turn[],
-  nextTurn: Turn | null,
+  plan: CompactionPlan,
 ): Promise<string[]> {
   // Fork the source session so the summarizer sees the full conversation it
   // is asked to summarize. A freshly created session has no history: the
@@ -50,6 +22,8 @@ async function generateSummariesInEphemeralSession(
     await v2.session.fork({ sessionID: session.id }),
   );
 
+  let bodyError: unknown;
+  let summaries: string[] | undefined;
   try {
     unwrap(
       await v2.session.update({
@@ -64,23 +38,44 @@ async function generateSummariesInEphemeralSession(
       session.id,
     );
     try {
-      return await generateSummaries(
+      summaries = await generateSummaries(
         v2,
         compactionSession.id,
         settings,
-        turns,
-        nextTurn,
+        plan.summarizedTurns,
+        plan.nextTurn,
       );
     } finally {
       clearOmissionSource();
     }
-  } finally {
+  } catch (error) {
+    bodyError = error;
+  }
+
+  let deleteError: unknown;
+  try {
     unwrap(
       await v2.session.delete({
         sessionID: compactionSession.id,
       }),
     );
+  } catch (error) {
+    deleteError = error;
   }
+
+  if (bodyError !== undefined && deleteError !== undefined) {
+    throw new AggregateError(
+      [bodyError, deleteError],
+      "Summary generation and ephemeral session cleanup both failed.",
+    );
+  }
+  if (bodyError !== undefined) {
+    throw bodyError;
+  }
+  if (deleteError !== undefined) {
+    throw deleteError;
+  }
+  return summaries!;
 }
 
 type CompactionSettings = {
@@ -211,7 +206,7 @@ function extractSummaryXml(responseText: string): string {
   return responseText.slice(start, end + "</summary>".length);
 }
 
-async function injectSummaries(
+export async function injectSummaries(
   v2: V2Client,
   sessionID: string,
   compactionTurns: Turn[],

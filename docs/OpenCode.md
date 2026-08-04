@@ -14,26 +14,29 @@ OpenCode-specific runtime behavior. Shared plugin behavior lives in [`Core.md`](
 ## Compaction Flow
 
 1. Parse `N`; default is `0`.
-2. Build a per-turn compaction plan for the current session.
+2. Validate native checkpoint artifacts and build one per-turn compaction plan for the current session.
 3. Stop early with a toast if no assistant turns are eligible.
 4. Load the source session and compute the next `compactionCount`.
 5. Fork the session as a backup.
 6. Copy omission and stats caches to the backup.
 7. Rename the backup to `[Backup] ${title} ${timestamp}` and write backup metadata.
 8. Measure pre-compaction tokens using provider tokens when available, otherwise local counting.
-9. Insert an ignored no-reply progress message.
-10. Fork the source session into an ephemeral compaction session so the summarizer sees the full conversation.
-11. Resolve OpenCode's native hidden `compaction` agent for the source workspace, then send the XML summary prompt through Magic Compact's hidden summarizer agent in the ephemeral session using the resolved compaction model and variant.
-12. Parse per-turn summaries.
-13. Delete the ephemeral session in cleanup.
-14. Delete the progress message in cleanup.
-15. Upsert deterministic summary text parts onto the first assistant message in each summarized turn.
-16. Inject the post-compaction boundary notice.
-17. Reload summarized turns, then prune summarized turns.
-18. Update current session metadata with `compactionCount`.
-19. Measure post-compaction tokens.
-20. Update stats and inject an ignored stats notice.
-21. Show a success toast.
+9. Revalidate native checkpoint state against the planning snapshot immediately before creating the progress notice.
+10. Insert an ignored no-reply progress message.
+11. Fork the source session into an ephemeral compaction session so the summarizer sees the full conversation.
+12. Resolve OpenCode's native hidden `compaction` agent for the source workspace, then send the XML summary prompt through Magic Compact's hidden summarizer agent in the ephemeral session using the resolved compaction model and variant.
+13. Parse per-turn summaries.
+14. Delete the ephemeral session in cleanup. Prompt/body failure and ephemeral deletion failure are captured independently: both failures throw an `AggregateError` retaining each cause; a single failure throws that error.
+15. After every ephemeral summary-generation attempt (success or failure of prompt generation or ephemeral deletion), reload native checkpoint state and compare it with the planning snapshot before writing any Magic summaries, boundary, or pruning changes. A fetch, unwrap, or inspection failure leaves checkpoint state unknown and is treated as a checkpoint change. If generation or cleanup also failed, keep `NativeCheckpointChangedError` outermost and retain every failure in its aggregate cause; only confirmed unchanged state permits ordinary backup rollback.
+16. Upsert deterministic summary text parts onto the first assistant message in each summarized turn.
+17. Delete the progress message in cleanup.
+18. Inject the post-compaction boundary notice.
+19. Reload the planned summarized turns by ID.
+20. Preflight the complete prune selection, then prune summarized turns.
+21. Update current session metadata with `compactionCount`.
+22. Measure post-compaction tokens.
+23. Update stats and inject an ignored stats notice.
+24. Show a success toast.
 
 ## Trim Flow (Experimental)
 
@@ -51,7 +54,7 @@ OpenCode-specific runtime behavior. Shared plugin behavior lives in [`Core.md`](
 
 `/magic-trim` does not call an LLM, generate summaries, modify ordinary user or assistant content, insert a compaction boundary, or increment `compactionCount`.
 
-Known issues: We do not check for noops.
+A trim no-op is detected after backup creation and leaves that backup in place.
 
 ## Backup Sessions
 
@@ -60,7 +63,8 @@ Known issues: We do not check for noops.
 - Backup metadata stores `sourceSessionId`, `compactedAt`, and `compactionCount`.
 - The backup receives copies of omission and stats caches before mutation.
 - Trim backups preserve the source session's current `compactionCount`.
-- If compaction or trimming fails after backup creation, the backup is renamed back to the original title, the original session is deleted, and OpenCode selects the backup session.
+- For ordinary compaction or trimming failures after backup creation, the backup is renamed back to the original title and selected before the original session is deleted. If backup selection fails, the original session remains intact.
+- A native checkpoint change detected by the pre-write revalidation is not an ordinary rollback case: the live source and pre-race backup are both preserved, and neither session is selected or deleted.
 
 ## Turn Selection
 
@@ -70,7 +74,13 @@ Known issues: We do not check for noops.
 - Boundary detection runs before ignoring a trailing assistantless turn.
 - A trailing user-only turn does not count against `N`.
 - Only turns with assistant messages are summarized.
-- `N` preserves the most recent assistant turns in the current uncompacted range.
+- A valid completed native checkpoint is a user message with exactly one `compaction` part followed by one successful assistant child whose `parentID` is the marker ID, `summary` is `true`, `finish` is truthy, and `error` is absent.
+- Completed checkpoint intervals must be sequential. An interval may not contain another marker or a foreign native summary; nested and crossed intervals are rejected as ambiguous.
+- The newest valid completed native checkpoint owns an immutable prefix through its summary assistant. Turn construction starts strictly after that summary.
+- Every completed checkpoint candidate's `tail_start_id`, when present, must resolve to a durable message strictly before its marker. The retained tail, marker, summary message, summary text, and summary parts remain untouched.
+- Magic boundaries before the native checkpoint are ignored. The latest Magic boundary in the eligible suffix still controls recompaction.
+- `N` preserves the most recent completed assistant turns in the eligible suffix only.
+- If the suffix has no eligible turns after applying `N`, the command is the existing no-op: no backup, progress notice, summary request, boundary, stats, or mutation is created.
 - For `/magic-trim`, `N` preserves tool I/O in the most recent assistant turns across the complete session.
 - Trim selection does not use compaction boundaries.
 
@@ -80,6 +90,7 @@ Known issues: We do not check for noops.
 - Recompaction starts at the latest boundary marker.
 - The boundary marker is a user text part with `metadata.magicCompact.boundary === true`.
 - Earlier turns before the latest boundary are outside the current compaction range.
+- A later completed native checkpoint advances the immutable floor beyond any older native or Magic boundary.
 
 ## Summarization
 
@@ -139,6 +150,7 @@ Known issues: We do not check for noops.
 ## Pruning
 
 - Pruning applies only to summarized turns after summary insertion and boundary injection.
+- Before the first prune mutation, the full selection is rejected if it contains a native `compaction` part or native summary assistant.
 - Synthetic user text parts are deleted unless they are preserved OpenCode wrappers or reminders.
 - Summarized assistant messages keep summary parts and tool parts.
 - Other assistant parts are deleted.
@@ -163,7 +175,9 @@ Known issues: We do not check for noops.
 ## Error Handling
 
 - Any LLM, XML, SDK, cache, stats, token counting, or pruning failure aborts the attempt.
-- Cleanup deletes the ephemeral session and progress message when they exist.
-- If a backup exists, it is promoted back.
+- Compaction parts on non-user messages, multiple compaction parts, multiple successful summaries for one marker, orphan summaries, overlapping checkpoint intervals, dangling or forward `tail_start_id` values on any completed candidate, and active incomplete or errored markers fail clearly before backup or mutation. An older incomplete marker is ignored only when it is wholly before the marker of a later valid completed checkpoint.
+- The ordered native checkpoint artifact snapshot is deep-cloned during planning and compared structurally immediately before the progress notice and again after every ephemeral summary-generation attempt, including when prompt generation or ephemeral session deletion fails, and still before any Magic summary, boundary, or pruning writes. A new, changed, malformed, or incomplete checkpoint aborts those writes and does not replace the live source with the pre-race backup. Revalidation fetch, unwrap, and inspection failures receive the same preserve-both treatment because unchanged state was not confirmed.
+- Cleanup deletes the ephemeral session and progress message when they exist. `NativeCheckpointChangedError` remains the outer error for preserve-both failures, with structural or fetch causes and generation, ephemeral-cleanup, and progress-cleanup failures retained in an aggregate cause. Non-race operation and cleanup failures are also retained together but remain ordinary rollback cases. Cleanup-only failure still surfaces and follows ordinary rollback.
+- Other failures promote an existing backup by renaming and selecting it before deleting the source.
 - A failure toast is shown.
 - The command hook throws so OpenCode does not continue sending the slash command to the LLM.

@@ -1,6 +1,9 @@
 import type { Session } from "@opencode-ai/sdk/v2";
 import { unwrap, type V2Client } from "./api";
-import { compactSession } from "./compact/compact";
+import {
+  generateCompactionSummaries,
+  injectSummaries,
+} from "./compact/compact";
 import {
   applyBackup,
   createBackup,
@@ -11,9 +14,13 @@ import {
   injectCompactStatsNotice,
   recordPruningStats,
   reloadTurns,
+  revalidateNativeCheckpoint,
   updateCompactionMetadata,
 } from "./compact/session";
-import { createCompactionPlan } from "./compact/plan";
+import {
+  createCompactionPlan,
+  NativeCheckpointChangedError,
+} from "./compact/plan";
 import { pruneSummarizedTurns } from "./compact/prune";
 import { countSessionTokens, getProviderTokens } from "./stats/tokenize";
 
@@ -58,25 +65,66 @@ export async function executeMagicCompact(
       (await getProviderTokens(v2, sessionID))
       ?? (await countSessionTokens(v2, sessionID));
 
+    await revalidateNativeCheckpoint(v2, sessionID, sourcePlan);
+
     const progressMessageID = await injectProgressNotice(v2, sessionID);
-    let compacted;
+    let operationError: unknown;
     try {
-      // Compact current session
-      compacted = await compactSession(v2, sourceSession, sessionID, keepTurns);
-    } finally {
+      let summaries: string[] | undefined;
+      let generationError: unknown;
+      try {
+        summaries = await generateCompactionSummaries(
+          v2,
+          sourceSession,
+          sourcePlan,
+        );
+      } catch (error) {
+        generationError = error;
+      }
+
+      let revalidationError: unknown;
+      try {
+        await revalidateNativeCheckpoint(v2, sessionID, sourcePlan);
+      } catch (error) {
+        revalidationError = error;
+      }
+
+      if (revalidationError !== undefined) {
+        throw generationError === undefined
+          ? revalidationError
+          : combineErrors(revalidationError, generationError);
+      }
+      if (generationError !== undefined) {
+        throw generationError;
+      }
+
+      await injectSummaries(
+        v2,
+        sessionID,
+        sourcePlan.summarizedTurns,
+        summaries!,
+      );
+    } catch (error) {
+      operationError = error;
+    }
+    try {
       await deleteProgressNotice(v2, sessionID, progressMessageID);
+    } catch (cleanupError) {
+      operationError =
+        operationError === undefined
+          ? cleanupError
+          : combineErrors(operationError, cleanupError);
+    }
+    if (operationError !== undefined) {
+      throw operationError;
     }
 
     // Mark the new compaction boundary for future recompactions
     // Message placed outside of summarization range so unaffected by pruning
-    await injectPostCompactionNotice(v2, sessionID, compacted.nextTurn);
+    await injectPostCompactionNotice(v2, sessionID, sourcePlan.nextTurn);
 
     // Prune messages & tool calls
-    const summarizedTurns = await reloadTurns(
-      v2,
-      sessionID,
-      compacted.summarizedTurns,
-    );
+    const summarizedTurns = await reloadTurns(v2, sessionID, sourcePlan);
     await pruneSummarizedTurns({ v2, sessionID }, summarizedTurns);
 
     await updateCompactionMetadata(v2, sourceSession, currentCompactionCount);
@@ -99,13 +147,17 @@ export async function executeMagicCompact(
 
     await v2.tui.showToast({
       title: "Magic Compact",
-      message: `Compacted ${compacted.summarizedTurns.length} assistant turn(s).`,
+      message: `Compacted ${sourcePlan.summarizedTurns.length} assistant turn(s).`,
       variant: "info",
       duration: 5000,
     });
     return true;
   } catch (error) {
-    if (sourceSession && backupSession) {
+    if (
+      !(error instanceof NativeCheckpointChangedError)
+      && sourceSession
+      && backupSession
+    ) {
       await applyBackup(v2, sourceSession, backupSession);
     }
 
@@ -117,4 +169,26 @@ export async function executeMagicCompact(
     });
     throw error;
   }
+}
+
+function combineErrors(primary: unknown, secondary: unknown): Error {
+  if (primary instanceof NativeCheckpointChangedError) {
+    const causes =
+      primary.cause instanceof AggregateError
+        ? [...primary.cause.errors, secondary]
+        : primary.cause === undefined
+          ? [secondary]
+          : [primary.cause, secondary];
+    return new NativeCheckpointChangedError(
+      new AggregateError(
+        causes,
+        "Native checkpoint state changed while another operation also failed.",
+      ),
+    );
+  }
+
+  return new AggregateError(
+    [primary, secondary],
+    "Magic Compact operation and cleanup both failed.",
+  );
 }

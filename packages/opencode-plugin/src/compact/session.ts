@@ -5,7 +5,13 @@ import {
   POST_COMPACTION_NOTICE,
   boundaryPartID,
 } from "./constants";
-import type { MessageWithParts, Turn } from "./plan";
+import {
+  assertNativeCheckpointUnchanged,
+  NativeCheckpointChangedError,
+  type CompactionPlan,
+  type MessageWithParts,
+  type Turn,
+} from "./plan";
 import { copyCache } from "../storage/omission";
 import type { ConversationStats } from "../storage/stats";
 import { copyStats, writeStats } from "../storage/stats";
@@ -55,13 +61,15 @@ export async function applyBackup(
     }),
   );
   unwrap(
+    await v2.tui.selectSession({
+      sessionID: backupSession.id,
+    }),
+  );
+  unwrap(
     await v2.session.delete({
       sessionID: originalSession.id,
     }),
   );
-  await v2.tui.selectSession({
-    sessionID: backupSession.id,
-  });
 }
 
 export async function injectProgressNotice(
@@ -275,7 +283,7 @@ export async function injectTrimStatsNotice(
 export async function reloadTurns(
   v2: V2Client,
   sessionID: string,
-  turns: Turn[],
+  plan: CompactionPlan,
 ): Promise<Turn[]> {
   const messages: MessageWithParts[] = unwrap(
     await v2.session.messages({
@@ -286,7 +294,7 @@ export async function reloadTurns(
     messages.map(message => [message.info.id, message]),
   );
 
-  return turns.map(turn => ({
+  return plan.summarizedTurns.map(turn => ({
     user: turn.user.map(message =>
       requireMessage(messageByID, message.info.id),
     ),
@@ -294,6 +302,26 @@ export async function reloadTurns(
       requireMessage(messageByID, message.info.id),
     ),
   }));
+}
+
+export async function revalidateNativeCheckpoint(
+  v2: V2Client,
+  sessionID: string,
+  plan: CompactionPlan,
+): Promise<void> {
+  try {
+    const messages: MessageWithParts[] = unwrap(
+      await v2.session.messages({
+        sessionID,
+      }),
+    );
+    assertNativeCheckpointUnchanged(messages, plan);
+  } catch (error) {
+    if (error instanceof NativeCheckpointChangedError) {
+      throw error;
+    }
+    throw new NativeCheckpointChangedError(error);
+  }
 }
 
 function requireMessage(

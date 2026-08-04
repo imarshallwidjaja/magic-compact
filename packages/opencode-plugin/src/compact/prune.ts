@@ -20,6 +20,7 @@ export async function pruneSummarizedTurns(
   context: PruneContext,
   turns: Turn[],
 ): Promise<void> {
+  assertNoNativeArtifacts(turns);
   for (const turn of turns) {
     for (const user of turn.user) {
       await pruneUserParts(context, user);
@@ -27,6 +28,22 @@ export async function pruneSummarizedTurns(
 
     for (const assistant of turn.assistants) {
       await pruneAssistantParts(context, assistant);
+    }
+  }
+}
+
+function assertNoNativeArtifacts(turns: Turn[]): void {
+  for (const turn of turns) {
+    const messages = [...turn.user, ...turn.assistants];
+    if (
+      messages.some(message =>
+        message.parts.some(part => part.type === "compaction"),
+      )
+      || turn.assistants.some(message => message.info.summary === true)
+    ) {
+      throw new Error(
+        "Refusing to prune a turn containing a native compaction artifact.",
+      );
     }
   }
 }

@@ -68,3 +68,5 @@ bun install
 
 - The project uses Bun workspaces.
 - For the user-facing plugin install flow, see the main `README.md`.
+- The native-checkpoint cases in `packages/opencode-plugin/test/compact.test.ts` are maintenance canaries for user `compaction` parts with optional `tail_start_id`, and assistant `parentID`, `summary`, `finish`, and `error` fields. Check those fields against OpenCode's compaction implementation whenever OpenCode or `@opencode-ai/sdk` is upgraded.
+- Native checkpoint race detection uses structural revalidation immediately before the progress notice and again immediately after ephemeral summary generation, before Magic source writes. There is no journal or lock, so unsupported concurrent source mutation after the post-summary revalidation is not protected.
