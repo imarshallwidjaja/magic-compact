@@ -99,7 +99,7 @@ Run `/magic-stats` to show cumulative token savings for the current conversation
 
 Magic Compact registers a `read_omitted_content` tool that the agent can call to retrieve any tool input or output that was pruned during compaction or trimming.
 
-Each omission notice in the conversation includes a Content ID (e.g. `omitted-001`). The agent uses that ID to fetch the original content when it needs stale information that cannot be reproduced via a new tool call.
+Each omission notice in the conversation includes a Content ID. OpenCode uses integrity-protected IDs such as `2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA`; Claude Code currently uses IDs such as `a1b2c3d4e5f6:omitted-001`. The agent uses that ID to fetch the original content when it needs stale information that cannot be reproduced via a new tool call. OpenCode preserves historical v1 bare entries during migration and backup copying, but cannot retrieve them because they have no cryptographic binding. Unavailable or integrity-invalid entries fail closed instead of returning guessed bytes.
 
 ### Claude Code
 
@@ -161,7 +161,7 @@ Magic Compact Offers:
 
 - Simplicity — One command, zero configuration.
 - Lossless quality — Turn-by-turn flow stays intact. All user commands are preserved. All past tool calls are preserved.
-- Maximum token savings — The entire conversation is summarized with one request. Long tool calls are aggressively pruned.
+- Maximum token savings — OpenCode batches up to eight ordinary turns per summary request and renders high-risk turns deterministically from source records without a model request. Long tool calls are aggressively pruned.
 - No cache churn — Compaction happens once and is cache friendly, whereas DCP may invalidate entire conversations multiple times within one request.
 - Zero assistant overhead — No prompt injections asking the assistant to compact. Your assistant stay focused on its task.
 

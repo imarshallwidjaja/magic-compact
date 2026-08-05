@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { randomUUID } from "node:crypto";
+import { rm } from "node:fs/promises";
 import type { Message, Part, ToolPart } from "@opencode-ai/sdk/v2";
 import type { V2Client } from "../src/api";
 import {
@@ -7,6 +9,7 @@ import {
   type Turn,
 } from "../src/compact/plan";
 import { trimToolParts } from "../src/compact/prune";
+import { cachePath } from "../src/storage/omission";
 
 describe("magic trim", () => {
   test("preserves the requested assistant-turn tail", async () => {
@@ -109,6 +112,28 @@ describe("magic trim", () => {
       await trimToolParts({ v2, sessionID: "session" }, [selectedTurn]),
     ).toBe(0);
     expect(updates).toBe(1);
+  });
+
+  test("writes strict session-qualified omission IDs", async () => {
+    const tool = readTool("tool_strict_id", "\u20ac");
+    const sessionID = `ses_trim_${randomUUID().replaceAll("-", "")}`;
+    const v2 = {
+      part: { update: async () => ({ data: tool }) },
+    } as unknown as V2Client;
+
+    try {
+      await trimToolParts({ v2, sessionID }, [turn(tool)]);
+
+      expect(tool.state.status).toBe("completed");
+      if (tool.state.status !== "completed")
+        throw new Error("Expected completion");
+      expect(tool.state.output).toContain(
+        `Content ID: ${sessionID.slice(-12)}:omitted-`,
+      );
+      expect(tool.state.output).toContain("Output Length: 3 bytes");
+    } finally {
+      await rm(cachePath(sessionID), { force: true });
+    }
   });
 });
 

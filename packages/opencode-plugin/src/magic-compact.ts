@@ -3,6 +3,7 @@ import { unwrap, type V2Client } from "./api";
 import {
   generateCompactionSummaries,
   injectSummaries,
+  prepareHighRiskSummaries,
 } from "./compact/compact";
 import {
   applyBackup,
@@ -34,17 +35,20 @@ export async function executeMagicCompact(
 ): Promise<boolean> {
   let backupSession: Session | null = null;
   let sourceSession: Session | null = null;
+  let compactedTurnCount: number;
 
   try {
     // Check if there's anything to compact
     const sourcePlan = await createCompactionPlan(v2, sessionID, keepTurns);
     if (sourcePlan.summarizedTurns.length === 0) {
-      await v2.tui.showToast({
-        title: "Magic Compact",
-        message: COMPACT_NOOP,
-        variant: "info",
-        duration: 5000,
-      });
+      unwrap(
+        await v2.tui.showToast({
+          title: "Magic Compact",
+          message: COMPACT_NOOP,
+          variant: "info",
+          duration: 5000,
+        }),
+      );
       return false;
     }
 
@@ -67,6 +71,8 @@ export async function executeMagicCompact(
 
     await revalidateNativeCheckpoint(v2, sessionID, sourcePlan);
 
+    const highRiskSummaries = prepareHighRiskSummaries(sourcePlan);
+
     const progressMessageID = await injectProgressNotice(v2, sessionID);
     let operationError: unknown;
     try {
@@ -77,6 +83,7 @@ export async function executeMagicCompact(
           v2,
           sourceSession,
           sourcePlan,
+          highRiskSummaries,
         );
       } catch (error) {
         generationError = error;
@@ -144,31 +151,45 @@ export async function executeMagicCompact(
       stats,
       sourceSession.model?.id ?? null,
     );
-
-    await v2.tui.showToast({
-      title: "Magic Compact",
-      message: `Compacted ${sourcePlan.summarizedTurns.length} assistant turn(s).`,
-      variant: "info",
-      duration: 5000,
-    });
-    return true;
+    compactedTurnCount = sourcePlan.summarizedTurns.length;
   } catch (error) {
+    let failure = error;
     if (
       !(error instanceof NativeCheckpointChangedError)
       && sourceSession
       && backupSession
     ) {
-      await applyBackup(v2, sourceSession, backupSession);
+      try {
+        await applyBackup(v2, sourceSession, backupSession);
+      } catch (rollbackError) {
+        failure = combineErrors(failure, rollbackError);
+      }
     }
 
-    await v2.tui.showToast({
-      title: "Magic Compact Failed",
-      message: String(error),
-      variant: "error",
-      duration: 8000,
-    });
-    throw error;
+    try {
+      unwrap(
+        await v2.tui.showToast({
+          title: "Magic Compact Failed",
+          message: String(error),
+          variant: "error",
+          duration: 8000,
+        }),
+      );
+    } catch (notificationError) {
+      failure = combineErrors(failure, notificationError);
+    }
+    throw failure;
   }
+
+  unwrap(
+    await v2.tui.showToast({
+      title: "Magic Compact",
+      message: `Compacted ${compactedTurnCount} assistant turn(s).`,
+      variant: "info",
+      duration: 5000,
+    }),
+  );
+  return true;
 }
 
 function combineErrors(primary: unknown, secondary: unknown): Error {
@@ -189,6 +210,6 @@ function combineErrors(primary: unknown, secondary: unknown): Error {
 
   return new AggregateError(
     [primary, secondary],
-    "Magic Compact operation and cleanup both failed.",
+    "Magic Compact operation and a secondary recovery or notification operation both failed.",
   );
 }

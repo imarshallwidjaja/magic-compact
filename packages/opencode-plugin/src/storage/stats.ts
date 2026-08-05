@@ -1,3 +1,4 @@
+import { rm } from "node:fs/promises";
 import { z } from "zod";
 import { pluginStorageDirectory, readJSONFile, writeJSONFile } from "./store";
 
@@ -58,6 +59,10 @@ export async function copyStats(
 
   await writeStats(targetSessionID, stats);
   return stats;
+}
+
+export async function deleteStats(sessionID: string): Promise<void> {
+  await rm(statsPath(sessionID), { force: true });
 }
 
 function statsPath(sessionID: string): string {

@@ -21,6 +21,8 @@ export type CompactionPlan = {
 
 type NativeArtifact = { info: Message; parts: Part[] };
 
+export type NativeCheckpointSnapshot = NativeArtifact[];
+
 export class NativeCheckpointChangedError extends Error {
   constructor(cause?: unknown) {
     const detail = cause instanceof Error ? ` ${cause.message}` : "";
@@ -29,6 +31,22 @@ export class NativeCheckpointChangedError extends Error {
       { cause },
     );
     this.name = "NativeCheckpointChangedError";
+  }
+}
+
+export class EphemeralCheckpointChangedError extends Error {
+  constructor(cause?: unknown) {
+    const artifactCause =
+      cause instanceof NativeCheckpointChangedError
+        ? (cause.cause ?? new Error(cause.message))
+        : cause;
+    super(
+      artifactCause instanceof Error
+        ? artifactCause.message
+        : "OpenCode native compaction checkpoint changed in an ephemeral Magic Compact session.",
+      { cause: artifactCause },
+    );
+    this.name = "EphemeralCheckpointChangedError";
   }
 }
 
@@ -124,13 +142,27 @@ export function assertNativeCheckpointUnchanged(
   messages: MessageWithParts[],
   plan: CompactionPlan,
 ): void {
+  assertNativeCheckpointSnapshotUnchanged(messages, plan.nativeArtifacts);
+}
+
+export function captureNativeCheckpointSnapshot(
+  messages: MessageWithParts[],
+): NativeCheckpointSnapshot {
   let current: ReturnType<typeof inspectNativeCheckpoints>;
   try {
     current = inspectNativeCheckpoints(messages);
   } catch (error) {
     throw new NativeCheckpointChangedError(error);
   }
-  if (!isDeepStrictEqual(current.artifacts, plan.nativeArtifacts)) {
+  return current.artifacts;
+}
+
+export function assertNativeCheckpointSnapshotUnchanged(
+  messages: MessageWithParts[],
+  snapshot: NativeCheckpointSnapshot,
+): void {
+  const current = captureNativeCheckpointSnapshot(messages);
+  if (!isDeepStrictEqual(current, snapshot)) {
     throw new NativeCheckpointChangedError();
   }
 }
@@ -186,20 +218,19 @@ function inspectNativeCheckpoints(messages: MessageWithParts[]): {
     }
   }
 
+  const childrenByMarkerID = new Map(
+    markers.map(marker => [
+      marker.message.info.id,
+      summaries.filter(
+        summary => summary.message.info.parentID === marker.message.info.id,
+      ),
+    ]),
+  );
   const candidates = markers.flatMap(marker => {
-    const matches = summaries.filter(
-      summary =>
-        summary.message.info.parentID === marker.message.info.id
-        && summary.index > marker.index
-        && Boolean(summary.message.info.finish)
-        && !summary.message.info.error,
-    );
-    if (matches.length > 1) {
-      throw new Error(
-        `Native compaction marker ${marker.message.info.id} has multiple completed summaries.`,
-      );
-    }
-    if (matches.length === 0) return [];
+    const children = childrenByMarkerID.get(marker.message.info.id)!;
+    if (children.length !== 1) return [];
+    const summary = children[0]!;
+    if (!summary.message.info.finish || summary.message.info.error) return [];
 
     const tailStartID = readTailStartID(marker.part);
     if (tailStartID) {
@@ -210,7 +241,7 @@ function inspectNativeCheckpoints(messages: MessageWithParts[]): {
         );
       }
     }
-    return [{ marker, summary: matches[0]! }];
+    return [{ marker, summary }];
   });
 
   for (const candidate of candidates) {
@@ -241,15 +272,28 @@ function inspectNativeCheckpoints(messages: MessageWithParts[]): {
     const completed = candidates.some(
       candidate => candidate.marker.message.info.id === marker.message.info.id,
     );
+    const children = childrenByMarkerID.get(marker.message.info.id)!;
     const whollyBeforeSelected =
       selected
       && marker.index < selected.marker.index
-      && summaries
-        .filter(
-          summary => summary.message.info.parentID === marker.message.info.id,
-        )
-        .every(summary => summary.index < selected.marker.index);
+      && children.every(summary => summary.index < selected.marker.index);
     if (completed || whollyBeforeSelected) continue;
+    if (
+      children.length > 1
+      && children.some(
+        summary => summary.message.info.finish && !summary.message.info.error,
+      )
+    ) {
+      const detail =
+        children.filter(
+          summary => summary.message.info.finish && !summary.message.info.error,
+        ).length > 1
+          ? ", including multiple completed summaries"
+          : "";
+      throw new Error(
+        `Native compaction marker ${marker.message.info.id} has ambiguous summary children${detail}.`,
+      );
+    }
     throw new Error(
       `Native compaction marker ${marker.message.info.id} is incomplete or errored.`,
     );

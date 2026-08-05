@@ -12,9 +12,9 @@ import {
   type MessageWithParts,
   type Turn,
 } from "./plan";
-import { copyCache } from "../storage/omission";
+import { copyCache, deleteCache } from "../storage/omission";
 import type { ConversationStats } from "../storage/stats";
-import { copyStats, writeStats } from "../storage/stats";
+import { copyStats, deleteStats, writeStats } from "../storage/stats";
 import {
   STATS_METADATA,
   statsMessage,
@@ -36,17 +36,51 @@ export async function createBackup(
     await v2.session.fork({ sessionID: sourceSession.id }),
   );
 
-  await copyCache(sourceSession.id, backupSession.id);
-  await copyStats(sourceSession.id, backupSession.id);
-  await updateForkMetadata(
-    v2,
-    sourceSession,
-    sourceSession.id,
-    backupSession.id,
-    compactionCount,
-  );
-
-  return backupSession;
+  try {
+    await copyCache(sourceSession.id, backupSession.id);
+    await copyStats(sourceSession.id, backupSession.id);
+    await updateForkMetadata(
+      v2,
+      sourceSession,
+      sourceSession.id,
+      backupSession.id,
+      compactionCount,
+    );
+    return backupSession;
+  } catch (initializationError) {
+    const cleanupErrors: unknown[] = [];
+    try {
+      await deleteCache(backupSession.id);
+    } catch (cleanupError) {
+      cleanupErrors.push(
+        new Error("Failed to delete partial backup omission cache.", {
+          cause: cleanupError,
+        }),
+      );
+    }
+    try {
+      await deleteStats(backupSession.id);
+    } catch (cleanupError) {
+      cleanupErrors.push(
+        new Error("Failed to delete partial backup stats cache.", {
+          cause: cleanupError,
+        }),
+      );
+    }
+    try {
+      unwrap(await v2.session.delete({ sessionID: backupSession.id }));
+    } catch (cleanupError) {
+      cleanupErrors.push(cleanupError);
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [initializationError, ...cleanupErrors],
+        "Backup initialization and partial-backup cleanup failed.",
+        { cause: initializationError },
+      );
+    }
+    throw initializationError;
+  }
 }
 
 export async function applyBackup(

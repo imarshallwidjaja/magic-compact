@@ -189,7 +189,7 @@ async function applyInputOmissions(
       input["content"] = "[Omitted]";
       return inputOmissionNotice(
         "File write contents omitted due to a compaction operation. If necessary, reread file to see current contents.",
-        content.length,
+        Buffer.byteLength(content),
         contentID,
       );
     }
@@ -202,7 +202,7 @@ async function applyInputOmissions(
       input["patchText"] = "[Omitted]";
       return inputOmissionNotice(
         "Patch text omitted due to compaction operation. If necessary, reread files to see current contents.",
-        content.length,
+        Buffer.byteLength(content),
         contentID,
       );
     }
@@ -216,7 +216,7 @@ async function applyInputOmissions(
         `${content.slice(0, 512)}\n[REST OF COMMAND TRUNCATED]`;
       return inputOmissionNotice(
         "Bash command truncated due to compaction operation.",
-        content.length,
+        Buffer.byteLength(content),
         contentID,
       );
     }
@@ -234,7 +234,7 @@ async function applyInputOmissions(
       input["newString"] = "[Omitted]";
       return inputOmissionNotice(
         "File edit oldString and newString omitted due to compaction operation. If necessary, reread file to see current contents.",
-        combined.length,
+        Buffer.byteLength(combined),
         contentID,
       );
     }
@@ -274,7 +274,7 @@ async function applyOutputOmissions(
     });
     part.state.output = outputOmissionNotice(
       "Stale read contents omitted due to compaction operation. If necessary, reread to see current contents.",
-      output.length,
+      Buffer.byteLength(output),
       contentID,
     );
     return;
@@ -287,7 +287,7 @@ async function applyOutputOmissions(
       });
       part.state.output = outputOmissionNotice(
         "Task output omitted due to a compaction operation. If necessary, reread output via read_omitted_content tool.",
-        output.length,
+        Buffer.byteLength(output),
         contentID,
       );
     }
@@ -303,7 +303,7 @@ async function applyOutputOmissions(
   });
   part.state.output = outputOmissionNotice(
     DEFAULT_OUTPUT_DESCRIPTION,
-    output.length,
+    Buffer.byteLength(output),
     contentID,
   );
 }

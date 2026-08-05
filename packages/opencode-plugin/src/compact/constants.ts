@@ -42,7 +42,7 @@ export function outputOmissionNotice(
   return `<tool-output-omission-notice>
 ${description}
 
-Output Length: ${length} characters
+Output Length: ${length} bytes
 Content ID: ${contentID}
 </tool-output-omission-notice>`;
 }
@@ -55,7 +55,7 @@ export function inputOmissionNotice(
   return `<tool-input-omission-notice>
 ${description}
 
-Omitted Length: ${length} characters
+Omitted Length: ${length} bytes
 Content ID: ${contentID}
 </tool-input-omission-notice>`;
 }

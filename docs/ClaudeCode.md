@@ -146,8 +146,6 @@ This differs from OpenCode's synthetic user boundary notice.
 - The session suffix is included because Claude Code MCP tool calls do not provide session IDs.
 - Retrieval resolves the cache file by matching the suffix against `{sessionId}.json`.
 
-This differs from OpenCode, where omission IDs are session-local sequential IDs and the tool receives `context.sessionID`.
-
 ## Omission Retrieval
 
 - The plugin registers a local MCP server through `.mcp.json`.
@@ -187,4 +185,5 @@ The MCP server is a minimal stdio-based server implemented using `@modelcontextp
 - Claude Code uses a native `system` compact boundary instead of a synthetic user boundary part.
 - Claude Code stores summary markers on transcript rows instead of OpenCode text part metadata.
 - Claude Code omission IDs include a session suffix because MCP tool calls do not provide the current session ID.
+- Claude Code uses v1 sequential omission IDs and positional summaries; OpenCode uses v2 omission digests bound to exact IDs and content, ID-keyed standard summaries, and model-free deterministic high-risk summaries.
 - Claude Code omission retrieval is exposed through a plugin MCP server instead of an OpenCode plugin tool surface.

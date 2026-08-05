@@ -12,7 +12,7 @@ import {
 } from "./magic-compact";
 import { STATS_SUCCESS, executeMagicStats } from "./magic-stats";
 import { TRIM_NOOP, TRIM_SUCCESS, executeMagicTrim } from "./magic-trim";
-import { readOmittedContent } from "./storage/omission";
+import { omissionReadDiagnostic, readOmittedContent } from "./storage/omission";
 import { handleStatsEvent } from "./stats/events";
 
 const COMPACT_COMMAND = "magic-compact";
@@ -108,17 +108,23 @@ const server: Plugin = async input => {
         args: {
           contentId: tool.schema
             .string()
-            .describe("Omitted content ID. E.g.: omitted-001."),
+            .describe(
+              "Omitted content ID. E.g.: 2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA.",
+            ),
         },
         async execute(args, context) {
-          const content = await readOmittedContent(
-            context.sessionID,
-            args.contentId,
-          );
-          return (
-            content
-            ?? `No omitted content found for Content ID: ${args.contentId}`
-          );
+          try {
+            const content = await readOmittedContent(
+              context.sessionID,
+              args.contentId,
+            );
+            return (
+              content
+              ?? `Omitted content unavailable for Content ID ${args.contentId}: no authorized current-session cache entry exists.`
+            );
+          } catch (error) {
+            return omissionReadDiagnostic(args.contentId, error);
+          }
         },
       }),
     },

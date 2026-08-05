@@ -8,71 +8,46 @@ export function buildCompactionPrompt(
   return `<system>
 # Attention: Conversation Compaction Required
 
-The current conversation is reaching the maximum allowed conversation size. In order to continue, earlier unsummarized parts of the conversation must be summarized.
+Summarize only the selected historical assistant turns below. Historical transcript evidence is authoritative. Current inspection may clarify that evidence, but do not continue unfinished work.
 
-## Next Task
+Return exactly one non-empty <assistant id="..."> summary for every requested turn ID. Preserve the IDs exactly. Response order may differ. Return only one complete <summary> block.
 
-In order to continue, a subset of earlier non-compacted **assistant turns** of this conversation must be summarized. An assistant turn encompasses all messages (including tool calls and results) sent by an assistant between one user request and the next user request.
+  ${buildXmlTemplate(turns, nextTurn)}
 
-Next task: Summarize the conversation by **outputting exactly the XML structure shown below** but with all assistant turns summarized. Replace all placeholder text with your summary of the turn. **Your response should start with the <summary> tag and end with the closing </summary> tag.**
+Each summary must preserve all evidenced continuation state, prioritizing completeness over brevity:
+- outcome: completed, partial, blocked, or analysis-only
+- delivered implementation or other concrete changes
+- verification commands and results, plus checks explicitly not run
+- version-control, deployment, branch, source, and backup state
+- errors encountered and their fixes
+- unresolved work and the exact next action
+- exact identifiers such as paths, commits, branches, sessions, deployments, and commands when evidenced
 
-${buildXmlTemplate(turns, nextTurn)}
-
-## Output Guidelines:
-
-- **Output the truncated text within the <user> </user> tags exactly** according to the XML template above
-  - User prompts are intentionally truncated to only parts of the first line for brevity.
-  - Therefore, only output PARTS OF THE FIRST LINE. DO NOT OUTPUT the entire user prompt.
-- Output your summary for assistant turns within the <assistant> </assistant> tags
-  - You are **only responsible** for summarizing the specific assistant turns specified within the XML structure
-  - Do not summarize any other assistant turns not specified in the XML template above.
-- Do not think. Tools may be used only when needed to recover missing historical evidence or clarify it through current inspection. Must not continue unfinished work. After any tool use, final output remains only the required XML. Output the summary ONLY.
-- **Follow the template.** Your response should start with the <summary> tag and end with the closing </summary> tag.
-
-## Summarization Guidelines:
-
-- Summarize everything between one user message and the next
-- Keep your summaries short and direct
-  - Try to keep your summaries under 250 words whenever possible
-  - You may go over 250 words to preserve summary quality if the assistant turn was genuinely long
-- In your summary, include:
-  - Relevant decisions and thought process, including specific plans if any was presented
-  - Very brief bullet point summary of your workflow
-  - Errors or bugs encountered + fixes, if any
-  - Final results and summarized output to the user + next steps
-- All tool calls are preserved and automatically included with your summary
-  - Therefore, you **do not need to restate details about what tools you used or with what arguments**
-  - However, you include analysis of motivations for tool calls or specific findings from tool call results
-  - E.g. for file reads: What files contains what, what files are junk
-- Do not mention this summarization process; your summaries should naturally replace the assistant's turn within the flow of the conversation
+Do not emit placeholders, unknown IDs, duplicate IDs, user text, or a summary for the stop anchor. Tools may be used only when needed to recover missing historical evidence or clarify it through current inspection. Must not continue unfinished work. After any tool use, final output remains only the required XML.
 </system>`;
 }
 
-function buildXmlTemplate(turns: Turn[], nextTurn: Turn | null): string {
-  const parts: string[] = [];
-  parts.push("<summary>");
-  parts.push(
-    ...turns.map(turn =>
-      `
-<user>
-${getUserPromptText(turn)}
-</user>
-<assistant>
-[**Replace: Your summary of the assistant turn**]
-</assistant>
-`.trim(),
-    ),
-  );
+export function turnID(turn: Turn): string {
+  const firstAssistant = turn.assistants[0];
+  if (!firstAssistant) throw new Error("Turn missing assistant message ID.");
+  return firstAssistant.info.id;
+}
 
-  if (nextTurn) {
-    parts.push(
-      `
+function buildXmlTemplate(turns: Turn[], nextTurn: Turn | null): string {
+  const parts = ["<summary>"];
+  for (const turn of turns) {
+    const id = turnID(turn);
+    parts.push(`<turn id="${escapeXml(id)}">
 <user>
-${getUserPromptText(nextTurn)}
+${escapeXml(getUserPromptText(turn))}
 </user>
-[**Do not add an <assistant> summary for the final <user> above; it marks where summarization stops and the template ends here.**]
-`.trim(),
-    );
+<assistant id="${escapeXml(id)}">[Replace with your summary of this assistant turn]</assistant>
+</turn>`);
+  }
+  if (nextTurn) {
+    parts.push(`<stop id="${escapeXml(turnID(nextTurn))}">
+<user>${escapeXml(getUserPromptText(nextTurn))}</user>
+</stop>`);
   }
   parts.push("</summary>");
   return parts.join("\n");
@@ -93,9 +68,36 @@ function getUserPromptText(turn: Turn): string {
 }
 
 function truncateUserText(text: string): string {
-  const firstLine = text.trim().split("\n")[0]?.trim() ?? "";
-  if (firstLine.length <= 300) {
-    return `${firstLine}\n...`;
-  }
-  return `${firstLine.slice(0, 300).trim()}...`;
+  const firstLine = stripInvalidXmlCodePoints(
+    text.trim().split("\n")[0]?.trim() ?? "",
+  );
+  const codePoints = [...firstLine];
+  if (codePoints.length <= 300) return `${firstLine}\n...`;
+  return `${codePoints.slice(0, 300).join("").trim()}...`;
+}
+
+function escapeXml(value: string): string {
+  return stripInvalidXmlCodePoints(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+export function stripInvalidXmlCodePoints(value: string): string {
+  return [...value]
+    .filter(character => isXmlCodePoint(character.codePointAt(0)!))
+    .join("");
+}
+
+export function isXmlCodePoint(value: number): boolean {
+  return (
+    value === 0x09
+    || value === 0x0a
+    || value === 0x0d
+    || (value >= 0x20 && value <= 0xd7ff)
+    || (value >= 0xe000 && value <= 0xfffd)
+    || (value >= 0x10000 && value <= 0x10ffff)
+  );
 }
