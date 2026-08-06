@@ -43,6 +43,7 @@ bun install
   - `test/omission.test.ts` - omission cache migration, integrity, legacy quarantine, backup, and concurrency tests.
   - `test/compact.test.ts` - compaction planning, standard summary protocol, deterministic high-risk rendering, batching, checkpoint, and recovery tests.
   - `test/trim.test.ts` - trim planning, metadata idempotency, and omission-format integration tests.
+  - `test/tokenize.test.ts` - provider and local token-accounting tests.
 - `packages/claude-code-plugin` - Claude Code plugin implementation for the port.
   - `src/command.ts` - Claude Code slash command entrypoint.
   - `src/compact.ts` - Claude Code compaction flow.
