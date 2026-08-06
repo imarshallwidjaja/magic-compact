@@ -44,23 +44,11 @@ bun install
   - `test/compact.test.ts` - compaction planning, standard summary protocol, deterministic high-risk rendering, batching, checkpoint, and recovery tests.
   - `test/trim.test.ts` - trim planning, metadata idempotency, and omission-format integration tests.
   - `test/tokenize.test.ts` - provider and local token-accounting tests.
-- `packages/claude-code-plugin` - Claude Code plugin implementation for the port.
-  - `src/command.ts` - Claude Code slash command entrypoint.
-  - `src/compact.ts` - Claude Code compaction flow.
-  - `src/hook.ts` - Claude Code hook integration.
-  - `src/index.ts` - package export surface.
-  - `src/mcp.ts` - MCP integration helpers.
-  - `src/omission.ts` - omitted content handling.
-  - `src/prune.ts` - transcript pruning helpers.
-  - `src/transcript.ts` - transcript parsing and formatting.
-- `packages/common` - shared utilities for cross-package code.
-  - `src/index.ts` - shared export surface.
 
 ### `docs/`
 
 - `docs/Development.md` - contributor setup and repository map.
 - `docs/OpenCode.md` - OpenCode runtime behavior specification.
-- `docs/ClaudeCode.md` - Claude Code runtime behavior specification.
 
 ## Common Commands
 

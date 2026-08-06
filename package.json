@@ -11,14 +11,11 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "prepare": "git config core.hooksPath .githooks",
-    "release-opencode": "sh scripts/release-opencode.sh",
-    "release-claude": "sh scripts/release-claude.sh"
+    "release-opencode": "sh scripts/release-opencode.sh"
   },
   "keywords": [
     "opencode",
     "opencode-plugin",
-    "claude-code",
-    "claude",
     "codex",
     "openai",
     "gemini",

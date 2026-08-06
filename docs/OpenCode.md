@@ -1,6 +1,6 @@
 # OpenCode Behavior Specification
 
-OpenCode-specific runtime behavior. Shared plugin behavior lives in [`Core.md`](Core.md).
+OpenCode-specific runtime behavior. Core behavior and safety guarantees live in [`Core.md`](Core.md).
 
 ## Commands
 

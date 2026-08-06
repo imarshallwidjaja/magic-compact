@@ -1,6 +1,6 @@
 # Project
 
-Magic Compact is a lossless context compression plugin for OpenCode and Claude Code. See `README.md` for the user-facing overview, features, installation, source map, and pruning rules.
+Magic Compact is a lossless context compression plugin for OpenCode. See `README.md` for the user-facing overview, features, installation, source map, and pruning rules.
 
 This file is the development reference for agents working on this repo.
 
@@ -11,9 +11,8 @@ This file is the development reference for agents working on this repo.
 Agents MUST read these files before working on platform behavior, and MUST update them whenever behavior changes:
 
 - `docs/Development.md` — setup, repository layout, and maintenance commands.
-- `docs/Core.md` — shared, platform-independent behavior and safety guarantees.
-- `docs/OpenCode.md` — **Read if working on OpenCode plugin**: OpenCode runtime behavior specification.
-- `docs/ClaudeCode.md` — **Read if working on Claude Code plugin**: Claude Code runtime behavior specification.
+- `docs/Core.md` — core behavior and safety guarantees.
+- `docs/OpenCode.md` — OpenCode runtime behavior specification.
 
 ---
 
@@ -24,8 +23,8 @@ Magic Compact performs per-turn conversation compaction while preserving the con
 ### Runtime Surfaces
 
 - `/magic-compact [N]` slash command.
-- `/magic-trim [N]` slash command (OpenCode exclusive).
-- `/magic-stats` slash command (OpenCode exclusive).
+- `/magic-trim [N]` slash command.
+- `/magic-stats` slash command.
 - `read_omitted_content` tool.
 
 ### Goals

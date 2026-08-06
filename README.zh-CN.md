@@ -4,7 +4,7 @@
 
 (注：AI翻译)
 
-OpenCode 和 Claude Code 的无损上下文压缩。
+OpenCode 的无损上下文压缩。
 
 <p align="center">
   <img src=".github/assets/preview.png" alt="Magic Compact Preview" />
@@ -37,21 +37,6 @@ Magic Compact 不会把整段会话折叠成一个通用摘要,而是用高保�
 
 ## 安装
 
-Magic Compact 在 Claude Code 上运行完美,但 OpenCode 会有更多功能 + 一等支持,因为 OpenCode 向插件暴露了更多功能。
-
-### Claude Code
-
-从此仓库的第一方插件市场安装:
-
-```shell
-/plugin marketplace add aerovato/magic-compact
-/plugin install claude-magic-compact@magic-compact
-```
-
-安装后,如果 Claude Code 已打开,请运行 `/reload-plugins`。
-
-### OpenCode
-
 从 CLI 安装:
 
 ```bash
@@ -79,7 +64,7 @@ NPM_CONFIG_MIN_RELEASE_AGE=0 opencode plugin magic-compact --global
 - `/magic-compact` — 摘要所有旧的助手回合。
 - `/magic-compact 3` — 保留最近 3 个助手回合,其余摘要。
 
-### `/magic-trim`(OpenCode 专属) (实验性)
+### `/magic-trim` (实验性)
 
 运行 `/magic-trim [N]` 可应用相同的工具 I/O 修剪规则,但不会摘要或删除普通用户与助手内容。
 
@@ -93,7 +78,7 @@ NPM_CONFIG_MIN_RELEASE_AGE=0 opencode plugin magic-compact --global
 - `/magic-trim` — 修剪整个会话中符合条件的工具 I/O。
 - `/magic-trim 3` — 保留最近 3 个助手回合中的工具 I/O。
 
-### `/magic-stats`(OpenCode 专属)
+### `/magic-stats`
 
 运行 `/magic-stats` 显示当前对话累计的 token 节省:修剪的 token、节省的缓存 token、估算节省的金额,以及其他统计信息。
 
@@ -101,21 +86,11 @@ NPM_CONFIG_MIN_RELEASE_AGE=0 opencode plugin magic-compact --global
 
 Magic Compact 注册了一个 `read_omitted_content` 工具,助手可以调用它来检索压缩或修剪期间被省略的任何工具输入或输出。
 
-对话中的每个省略提示都包含一个 Content ID。OpenCode 使用带完整性保护的 ID,例如 `2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA`;Claude Code 目前使用例如 `a1b2c3d4e5f6:omitted-001` 的 ID。助手在需要无法通过新工具调用重现的旧信息时,会使用该 ID 获取原始内容。OpenCode 在迁移和备份复制期间会保留历史 v1 裸条目,但因缺少密码学绑定而无法检索它们。不可用或完整性校验失败的条目会失败关闭,而不是返回猜测的字节。
-
-### Claude Code
-
-Claude Code 向插件暴露的能力不如 OpenCode 多。因此,在 Claude Code 上使用 Magic Compact 时存在一些差异:
-
-- Magic Compact 会创建一个压缩后的目标会话,而不是原地压缩。
-  - Claude Code 不允许我们修改当前会话的消息记录
-- 压缩后,Claude Code 会提示你运行 `/resume <new-session-id>` 进入压缩后的会话
-  - 只需复制并粘贴该命令并运行
-- `/magic-stats` 在 Claude Code 上未实现
+对话中的每个省略提示都包含一个带完整性保护的 Content ID,例如 `2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA`。助手在需要无法通过新工具调用重现的旧信息时,会使用该 ID 获取原始内容。OpenCode 在迁移和备份复制期间会保留历史 v1 裸条目,但因缺少密码学绑定而无法检索它们。不可用或完整性校验失败的条目会失败关闭,而不是返回猜测的字节。
 
 ## 修剪规则
 
-执行 `/magic-compact` 时,修剪仅适用于被摘要的回合。在 OpenCode 上,`/magic-trim [N]` 仅对保留尾部之外的回合应用工具 I/O 规则。
+执行 `/magic-compact` 时,修剪仅适用于被摘要的回合。`/magic-trim [N]` 仅对保留尾部之外的回合应用工具 I/O 规则。
 
 保留:
 
@@ -134,22 +109,12 @@ Claude Code 向插件暴露的能力不如 OpenCode 多。因此,在 Claude Code
 
 默认情况下,超过 128 个单词或 1024 个字符的已完成工具输出会被省略。少数工具有特殊处理。
 
-#### OpenCode
-
 - `read` — 输出总是被省略(陈旧的文件内容可重新加载)
 - `write` / `edit` / `apply_patch` — 大文件内容被省略
 - `bash` — 超过 1024 个字符的命令会被截断
 - `task` — 输出在更高的阈值(512 单词 / 4096 字符)以上被省略
 - `question` — 输入和输出保留
 - `todowrite` / `skill` — 输出被丢弃且不缓存(冗余或可重新加载)
-
-#### Claude Code
-
-- `Read` / `NotebookEdit` — 输出总是被省略(文件文本、notebook JSON、图片、PDF 可重新加载)
-- `Bash.command` — 超过 512 个字符的命令被截断;完整命令以省略 ID 缓存
-- `Agent` / `TaskOutput` — 输出在更高的阈值(512 单词 / 4096 字符)以上被省略
-- `AskUserQuestion` — 输入和输出保留(捕获明确的用户决策)
-- `Skill` — 输出被丢弃且不缓存(可通过重新调用 skill 重新加载)
 
 待处理、运行中和出错的工具调用总是原样保留。
 

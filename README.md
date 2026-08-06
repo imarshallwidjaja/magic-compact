@@ -2,7 +2,7 @@
 
 English | [中文](./README.zh-CN.md)
 
-Lossless context compression for OpenCode and Claude Code.
+Lossless context compression for OpenCode.
 
 <p align="center">
   <img src=".github/assets/preview.png" alt="Magic Compact Preview" />
@@ -10,7 +10,7 @@ Lossless context compression for OpenCode and Claude Code.
 
 ## Why
 
-OpenCode and Claude Code's built-in compaction replaces an entire conversation with one summary blob. The user messages, the assistant's reasoning, tool calls, design decisions, and workflow are all flattened into a generic template (Goal, Progress, Key Decisions...). The agent wakes up with amnesia, forced to reconstruct its working state from an abstraction that captured a fraction of what mattered.
+OpenCode's built-in compaction replaces an entire conversation with one summary blob. The user messages, the assistant's reasoning, tool calls, design decisions, and workflow are all flattened into a generic template (Goal, Progress, Key Decisions...). The agent wakes up with amnesia, forced to reconstruct its working state from an abstraction that captured a fraction of what mattered.
 
 Magic Compact takes a different approach: preserve the conversation skeleton, condense each old assistant turn into its own summary, prune bulky tool I/O, and keep everything retrievable. The agent retains its memory of what it did, why, and what comes next.
 
@@ -34,21 +34,6 @@ The assistant's thought process, decisions, and actions remain in context along 
 - Trim without summarizing — OpenCode can prune historical tool I/O with `/magic-trim` while preserving assistant responses.
 
 ## Installation
-
-Magic Compact works flawlessly on Claude Code, but OpenCode will have more features + first class support as OpenCode exposes more functionality to plugins.
-
-### Claude Code
-
-Install from this repository's first-party plugin marketplace:
-
-```shell
-/plugin marketplace add aerovato/magic-compact
-/plugin install claude-magic-compact@magic-compact
-```
-
-After installation, run `/reload-plugins` if Claude Code is already open.
-
-### OpenCode
 
 Install from the CLI:
 
@@ -77,7 +62,7 @@ Examples:
 - `/magic-compact` — summarize all old assistant turns.
 - `/magic-compact 3` — keep the 3 most recent assistant turns, summarize the rest.
 
-### `/magic-trim` (OpenCode Exclusive) (Experimental)
+### `/magic-trim` (Experimental)
 
 Run `/magic-trim [N]` to apply the same tool I/O pruning rules without summarizing or deleting ordinary user and assistant content.
 
@@ -91,7 +76,7 @@ Examples:
 - `/magic-trim` — trim eligible tool I/O throughout the session.
 - `/magic-trim 3` — preserve tool I/O in the 3 most recent assistant turns.
 
-### `/magic-stats` (OpenCode Exclusive)
+### `/magic-stats`
 
 Run `/magic-stats` to show cumulative token savings for the current conversation: tokens pruned, cached tokens saved, estimated money saved, among other statistics.
 
@@ -99,21 +84,11 @@ Run `/magic-stats` to show cumulative token savings for the current conversation
 
 Magic Compact registers a `read_omitted_content` tool that the agent can call to retrieve any tool input or output that was pruned during compaction or trimming.
 
-Each omission notice in the conversation includes a Content ID. OpenCode uses integrity-protected IDs such as `2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA`; Claude Code currently uses IDs such as `a1b2c3d4e5f6:omitted-001`. The agent uses that ID to fetch the original content when it needs stale information that cannot be reproduced via a new tool call. OpenCode preserves historical v1 bare entries during migration and backup copying, but cannot retrieve them because they have no cryptographic binding. Unavailable or integrity-invalid entries fail closed instead of returning guessed bytes.
-
-### Claude Code
-
-Claude Code does not expose as much capability to plugins vs OpenCode. Therefore, certain differences are present when using Magic Compact for Claude Code:
-
-- Magic Compact will create a compacted destintaion sesion instead of compacting in place.
-  - Claude Code does not allow us to modify the current session's message transcript
-- After compaction, Claude Code will tell you to run `/resume <new-session-id>` to enter the compacted session
-  - Simply copy and paste that command and run it
-- `/magic-stats` is not implemented for Claude Code
+Each omission notice in the conversation includes an integrity-protected Content ID such as `2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA`. The agent uses that ID to fetch the original content when it needs stale information that cannot be reproduced via a new tool call. OpenCode preserves historical v1 bare entries during migration and backup copying, but cannot retrieve them because they have no cryptographic binding. Unavailable or integrity-invalid entries fail closed instead of returning guessed bytes.
 
 ## Pruning Rules
 
-During `/magic-compact`, pruning applies only to summarized turns. On OpenCode, `/magic-trim [N]` applies only the tool I/O rules to turns outside the preserved tail.
+During `/magic-compact`, pruning applies only to summarized turns. `/magic-trim [N]` applies only the tool I/O rules to turns outside the preserved tail.
 
 Kept:
 
@@ -132,22 +107,12 @@ Removed or condensed:
 
 Completed tool outputs over 128 words or 1024 characters are omitted by default. A few tools have special handling.
 
-#### OpenCode
-
 - `read` — output always omitted (stale file contents are reloadable)
 - `write` / `edit` / `apply_patch` — large file content omitted
 - `bash` — commands over 1024 characters are truncated
 - `task` — output omitted above a higher threshold (512 words / 4096 characters)
 - `question` — input and output preserved
 - `todowrite` / `skill` — output discarded without caching (redundant or reloadable)
-
-#### Claude Code
-
-- `Read` / `NotebookEdit` — output always omitted (file text, notebook JSON, images, PDFs are reloadable)
-- `Bash.command` — commands over 512 characters truncated; full command cached with an omission ID
-- `Agent` / `TaskOutput` — output omitted above a higher threshold (512 words / 4096 characters)
-- `AskUserQuestion` — input and output preserved (captures explicit user decisions)
-- `Skill` — output discarded without caching (reloadable by re-invoking the skill)
 
 Pending, running, and errored tool calls are always preserved as-is.
 
