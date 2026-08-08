@@ -1,7 +1,5 @@
 # Magic Compact
 
-English | [中文](./README.zh-CN.md)
-
 Lossless context compression for OpenCode.
 
 <p align="center">
