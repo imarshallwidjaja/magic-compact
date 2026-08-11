@@ -16,12 +16,37 @@ import {
   type NativeCheckpointSnapshot,
   type Turn,
 } from "./plan";
-import { buildCompactionPrompt, isXmlCodePoint, turnID } from "./template";
+import { buildCompactionPrompt, turnID } from "./template";
 
 export const HIGH_RISK_SERIALIZED_BYTES = 153_600;
 export const HIGH_RISK_MESSAGE_COUNT = 20;
 export const HIGH_RISK_TOOL_COUNT = 32;
 export const MAX_SUMMARY_BATCH_TURNS = 8;
+const MAX_SUMMARY_ATTEMPTS = 2;
+
+type SummaryContractCategory =
+  | "provider-structured-output"
+  | "missing-structured-output"
+  | "invalid-output-shape"
+  | "unknown-id"
+  | "missing-id"
+  | "invalid-summary-type"
+  | "empty-summary"
+  | "placeholder-summary";
+
+class SummaryContractError extends Error {
+  constructor(
+    readonly category: SummaryContractCategory,
+    readonly batch: number,
+    readonly batchCount: number,
+    readonly attempt: number,
+  ) {
+    super(
+      `Summary contract failure (category=${category}, batch=${batch}/${batchCount}, attempt=${attempt}/${MAX_SUMMARY_ATTEMPTS}).`,
+    );
+    this.name = "SummaryContractError";
+  }
+}
 
 type CompactionSettings = {
   model?: { providerID: string; modelID: string };
@@ -44,8 +69,11 @@ export async function generateCompactionSummaries(
   const getSettings = async () =>
     (settings ??= await resolveCompactionSettings(v2, session));
   const summaries: string[] = [];
+  const batches = createSummaryBatches(plan);
+  const batchCount = batches.filter(batch => !batch.highRisk).length;
+  let batchNumber = 0;
 
-  for (const batch of createSummaryBatches(plan)) {
+  for (const batch of batches) {
     if (batch.highRisk) {
       const turn = batch.turns[0]!;
       const summary = highRiskSummaries.get(turn);
@@ -55,14 +83,28 @@ export async function generateCompactionSummaries(
       summaries.push(summary);
       continue;
     }
-    const selected = await runEphemeralPrompt(
-      v2,
-      session,
-      getSettings,
-      buildCompactionPrompt(batch.turns, batch.nextTurn),
-      batch.turns,
-    );
-    summaries.push(...selected);
+    batchNumber += 1;
+    for (let attempt = 1; attempt <= MAX_SUMMARY_ATTEMPTS; attempt += 1) {
+      try {
+        const selected = await runEphemeralPrompt(
+          v2,
+          session,
+          getSettings,
+          buildCompactionPrompt(batch.turns, batch.nextTurn),
+          batch.turns,
+          { batch: batchNumber, batchCount, attempt },
+        );
+        summaries.push(...selected);
+        break;
+      } catch (error) {
+        if (
+          !(error instanceof SummaryContractError)
+          || attempt === MAX_SUMMARY_ATTEMPTS
+        ) {
+          throw error;
+        }
+      }
+    }
   }
 
   return summaries;
@@ -121,6 +163,7 @@ async function runEphemeralPrompt(
   getSettings: () => Promise<CompactionSettings>,
   promptText: string,
   turns: Turn[],
+  diagnostic: { batch: number; batchCount: number; attempt: number },
 ): Promise<string[]> {
   const ephemeral = unwrap(
     await v2.session.fork({ sessionID: sourceSession.id }),
@@ -159,11 +202,15 @@ async function runEphemeralPrompt(
           agent: MAGIC_COMPACT_SUMMARIZER_AGENT,
           ...(settings.model ? { model: settings.model } : {}),
           ...(settings.variant ? { variant: settings.variant } : {}),
+          format: buildSummaryFormat(turns),
           parts: [{ type: "text", text: promptText }],
         }),
       );
     } catch (error) {
       promptError = error;
+    }
+    if (promptError === undefined && body?.info.error) {
+      promptError = summaryResponseError(body.info.error.name, diagnostic);
     }
 
     let artifactError: unknown;
@@ -182,11 +229,7 @@ async function runEphemeralPrompt(
     }
     if (promptError !== undefined) throw promptError;
 
-    const textResponse = body!.parts
-      .filter((part): part is TextPart => part.type === "text")
-      .map(part => part.text)
-      .join("\n");
-    result = parseSummaries(textResponse, turns);
+    result = validateSummaries(body!.info.structured, turns, diagnostic);
   } catch (error) {
     operationError = error;
   } finally {
@@ -252,110 +295,95 @@ async function resolveCompactionSettings(
   };
 }
 
-function parseSummaries(responseText: string, turns: Turn[]): string[] {
-  const document = responseText;
-  const rootOpen = "<summary>";
-  const rootClose = "</summary>";
-  const assistantOpen = '<assistant id="';
-  const assistantClose = "</assistant>";
-  let cursor = 0;
-  const skipWhitespace = () => {
-    while (
-      document[cursor] === " "
-      || document[cursor] === "\t"
-      || document[cursor] === "\n"
-      || document[cursor] === "\r"
-    ) {
-      cursor += 1;
-    }
+function buildSummaryFormat(turns: Turn[]) {
+  const expected = turns.map(turnID);
+  return {
+    type: "json_schema" as const,
+    retryCount: 0,
+    schema: {
+      type: "object",
+      properties: Object.fromEntries(
+        expected.map(id => [id, { type: "string" }]),
+      ),
+      required: expected,
+      additionalProperties: false,
+    },
   };
-  skipWhitespace();
-  if (!document.startsWith(rootOpen, cursor)) {
-    throw new Error(
-      "Summary response must contain exactly one <summary> root.",
-    );
+}
+
+function summaryResponseError(
+  name: string,
+  diagnostic: { batch: number; batchCount: number; attempt: number },
+): Error {
+  if (name === "StructuredOutputError") {
+    return contractError("provider-structured-output", diagnostic);
   }
+  return new Error(`Summary provider failed (${name}).`);
+}
 
-  cursor += rootOpen.length;
-  const parsed: Array<{ id: string; summary: string }> = [];
-  while (true) {
-    skipWhitespace();
-    if (document.startsWith(rootClose, cursor)) {
-      cursor += rootClose.length;
-      break;
-    }
-    if (!document.startsWith(assistantOpen, cursor)) {
-      throw new Error(
-        "Summary response contains text or an unsupported element inside <summary>.",
-      );
-    }
-
-    cursor += assistantOpen.length;
-    const idEnd = document.indexOf('"', cursor);
-    if (idEnd === -1 || document[idEnd + 1] !== ">") {
-      throw new Error(
-        "Summary response contains a malformed assistant ID or attributes.",
-      );
-    }
-    const id = document.slice(cursor, idEnd);
-    cursor = idEnd + 2;
-
-    const close = document.indexOf(assistantClose, cursor);
-    const nested = document.indexOf("<", cursor);
-    if (close === -1 || (nested !== -1 && nested < close)) {
-      throw new Error(
-        "Summary response contains a nested, unexpected, or unclosed assistant element.",
-      );
-    }
-    const summary = decodeXmlText(document.slice(cursor, close)).trim();
-    parsed.push({ id, summary });
-    cursor = close + assistantClose.length;
+function validateSummaries(
+  output: unknown,
+  turns: Turn[],
+  diagnostic: { batch: number; batchCount: number; attempt: number },
+): string[] {
+  if (output === undefined) {
+    throw contractError("missing-structured-output", diagnostic);
   }
-  skipWhitespace();
-  if (cursor !== document.length) {
-    throw new Error(
-      "Summary response contains text or elements outside its root.",
-    );
+  if (output === null || typeof output !== "object" || Array.isArray(output)) {
+    throw contractError("invalid-output-shape", diagnostic);
   }
 
   const expected = turns.map(turnID);
   const expectedSet = new Set(expected);
-  const byID = new Map<string, string>();
-  for (const { id, summary } of parsed) {
-    if (!/^[A-Za-z0-9_-]+$/.test(id)) {
-      throw new Error(`Summary response contains malformed turn ID: ${id}`);
+  const byID = output as Record<string, unknown>;
+  if (Object.keys(byID).some(id => !expectedSet.has(id))) {
+    throw contractError("unknown-id", diagnostic);
+  }
+  if (expected.some(id => !Object.prototype.hasOwnProperty.call(byID, id))) {
+    throw contractError("missing-id", diagnostic);
+  }
+
+  return expected.map(id => {
+    const value = byID[id];
+    if (typeof value !== "string") {
+      throw contractError("invalid-summary-type", diagnostic);
     }
-    if (!expectedSet.has(id)) throw new Error(`Unknown summary turn ID: ${id}`);
-    if (byID.has(id)) throw new Error(`Duplicate summary turn ID: ${id}`);
-    if (!summary) throw new Error(`Empty summary for turn ID: ${id}`);
+    const summary = value.trim();
+    if (!summary) throw contractError("empty-summary", diagnostic);
     if (isNonSubstantiveMarker(summary)) {
-      throw new Error(`Placeholder summary for turn ID: ${id}`);
+      throw contractError("placeholder-summary", diagnostic);
     }
-    byID.set(id, summary);
-  }
-  const missing = expected.filter(id => !byID.has(id));
-  if (missing.length > 0) {
-    throw new Error(`Missing summaries for turn IDs: ${missing.join(", ")}`);
-  }
-  return expected.map(id => byID.get(id)!);
+    return summary;
+  });
+}
+
+function contractError(
+  category: SummaryContractCategory,
+  diagnostic: { batch: number; batchCount: number; attempt: number },
+): SummaryContractError {
+  return new SummaryContractError(
+    category,
+    diagnostic.batch,
+    diagnostic.batchCount,
+    diagnostic.attempt,
+  );
 }
 
 function isNonSubstantiveMarker(value: string): boolean {
-  const normalized = value.trim();
   if (
-    /replace with (?:your )?summary/i.test(normalized)
+    /replace with (?:your )?summary/i.test(value)
     || /^(?:preserve(?:d)?|name|describe)\b[^\n]*\bevidenc(?:e|ed)\b[^\n]*[.!]?$/i.test(
-      normalized,
+      value,
     )
     || /^(?:yes|done|complete|completed|none(?: evidenced)?|n\/a|not applicable|unknown|todo|tbd)\.?$/i.test(
-      normalized,
+      value,
     )
-    || /^[A-Za-z][A-Za-z0-9_-]*[.!?]?$/.test(normalized)
-    || /^(?:-+|\.+)$/.test(normalized)
+    || /^[A-Za-z][A-Za-z0-9_-]*[.!?]?$/.test(value)
+    || /^(?:-+|\.+)$/.test(value)
   ) {
     return true;
   }
-  for (const match of normalized.matchAll(/\[([^\]\r\n]*)\]/g)) {
+  for (const match of value.matchAll(/\[([^\]\r\n]*)\]/g)) {
     if (isTemplateBracketBody(match[1] ?? "")) return true;
   }
   return false;
@@ -369,57 +397,6 @@ function isTemplateBracketBody(body: string): boolean {
     || /\b(?:TODO|TBD)\b/i.test(text)
     || /\b(?:replace|placeholder)\b/i.test(text)
   );
-}
-
-function decodeXmlText(value: string): string {
-  if (value.includes("]]>")) {
-    throw new Error("Summary response contains an invalid XML text delimiter.");
-  }
-  let decoded = "";
-  let cursor = 0;
-  while (cursor < value.length) {
-    const ampersand = value.indexOf("&", cursor);
-    if (ampersand === -1) {
-      decoded += value.slice(cursor);
-      break;
-    }
-    decoded += value.slice(cursor, ampersand);
-    const semicolon = value.indexOf(";", ampersand + 1);
-    if (semicolon === -1) {
-      throw new Error("Summary response contains a malformed XML entity.");
-    }
-    const entity = value.slice(ampersand + 1, semicolon);
-    const named = {
-      amp: "&",
-      lt: "<",
-      gt: ">",
-      quot: '"',
-      apos: "'",
-    }[entity];
-    if (named !== undefined) {
-      decoded += named;
-    } else {
-      const numeric = entity.startsWith("#x")
-        ? Number.parseInt(entity.slice(2), 16)
-        : entity.startsWith("#")
-          ? Number.parseInt(entity.slice(1), 10)
-          : Number.NaN;
-      const validNumericSyntax = entity.startsWith("#x")
-        ? /^#x[0-9A-Fa-f]+$/.test(entity)
-        : /^#[0-9]+$/.test(entity);
-      if (!validNumericSyntax || !isXmlCodePoint(numeric)) {
-        throw new Error("Summary response contains a malformed XML entity.");
-      }
-      decoded += String.fromCodePoint(numeric);
-    }
-    cursor = semicolon + 1;
-  }
-  for (const character of decoded) {
-    if (!isXmlCodePoint(character.codePointAt(0)!)) {
-      throw new Error("Summary response contains an invalid XML character.");
-    }
-  }
-  return decoded;
 }
 
 function combinePromptErrors(primary: unknown, secondary: unknown): Error {

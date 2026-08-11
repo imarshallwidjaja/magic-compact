@@ -65,7 +65,8 @@ describe("magic compact", () => {
     await hooks.config?.(config);
 
     expect(config.agent?.["magic-compact-summarizer"]).toMatchObject({
-      description: "Faithful per-turn XML summarizer for Magic Compact",
+      description:
+        "Faithful per-turn structured-output summarizer for Magic Compact",
       mode: "subagent",
       hidden: true,
     });
@@ -86,7 +87,7 @@ describe("magic compact", () => {
       "Never continue unfinished work",
     );
     expect(config.agent?.["magic-compact-summarizer"]?.prompt).toContain(
-      "Follow the Magic Compact XML request exactly",
+      "Follow the Magic Compact structured-output request exactly",
     );
   });
 
@@ -132,6 +133,16 @@ describe("magic compact", () => {
         modelID: "compaction-model",
       },
       variant: "precise",
+    });
+    expect(requests.prompts[0]?.format).toEqual({
+      type: "json_schema",
+      retryCount: 0,
+      schema: {
+        type: "object",
+        properties: { assistant: { type: "string" } },
+        required: ["assistant"],
+        additionalProperties: false,
+      },
     });
   });
 
@@ -220,21 +231,22 @@ describe("magic compact", () => {
     expect(await readOmittedContent("ephemeral", contentID)).toBeNull();
   });
 
-  test("preserves the XML prompt and parser behavior", async () => {
+  test("requests exact JSON-schema output while preserving summarizer constraints", async () => {
     const requests = await runCompaction(session("source"));
     const prompt = requests.prompts[0]?.parts as Array<{ text: string }>;
     const promptText = prompt[0]?.text ?? "";
 
-    expect(promptText).toContain(
-      '<summary>\n<turn id="assistant">\n<user>\nRequest\n...\n</user>\n<assistant id="assistant">',
-    );
+    expect(promptText).toContain('"assistantTurnID": "assistant"');
+    expect(promptText).toContain('"userPreview": "Request\\n..."');
+    expect(promptText).toContain('"stopAnchor": null');
+    expect(promptText).not.toContain("<summary>");
     expect(promptText).not.toContain("Do not call any tools");
     expect(promptText).toContain(
       "Tools may be used only when needed to recover missing historical evidence or clarify it through current inspection",
     );
     expect(promptText).toContain("Must not continue unfinished work");
     expect(promptText).toContain(
-      "After any tool use, final output remains only the required XML",
+      "After any tool use, submit the final summaries through the required StructuredOutput tool",
     );
     expect(requests.partUpdates[0]).toMatchObject({
       part: {
@@ -249,14 +261,14 @@ describe("magic compact", () => {
       ...completedTurn("first", "One"),
       ...completedTurn("second", "Two"),
     ];
-    const response = `<summary>
-<assistant id="second-assistant">Second result.</assistant>
-<assistant id="first-assistant">First result.</assistant>
-</summary>`;
-
     const requests = await runCompaction(session("source"), {
       messages,
-      promptResponses: [response],
+      structuredResponses: [
+        {
+          "second-assistant": "Second result.",
+          "first-assistant": "First result.",
+        },
+      ],
     });
 
     expect(
@@ -264,65 +276,173 @@ describe("magic compact", () => {
     ).toEqual(["First result.", "Second result."]);
   });
 
-  test("decodes standard XML entities into installed summary text", async () => {
+  test("round-trips structured technical summary text without escaping", async () => {
+    const technical =
+      'Compared <left> & <right>, ran `bun test "packages/unit suite.test.ts"`, updated C:\\work\\app and /workspace/app/[slug]/page.tsx, then returned \ud83d\ude80.';
     const requests = await runCompaction(session("source"), {
-      promptResponses: [
-        '\n\t<summary><assistant id="assistant">Rock &amp; Roll &lt;done&gt; &quot;yes&quot; &apos;ok&apos; &#x1F680;</assistant></summary>\r\n',
-      ],
+      structuredResponses: [{ assistant: technical }],
     });
 
-    expect((requests.partUpdates[0]!.part as TextPart).text).toBe(
-      `Rock & Roll <done> "yes" 'ok' \ud83d\ude80`,
-    );
+    expect((requests.partUpdates[0]!.part as TextPart).text).toBe(technical);
   });
 
-  test("rejects malformed IDs and non-document summary XML before source writes", async () => {
-    const invalid = [
-      "<summary></summary>",
-      '<summary><assistant id="assistant">one</assistant><assistant id="assistant">two</assistant></summary>',
-      '<summary><assistant id="unknown">one</assistant></summary>',
-      '<summary><assistant id="assistant"> </assistant></summary>',
-      '<summary><assistant id="assistant">[Replace with summary]</assistant></summary>',
-      '<summary><assistant id="assistant">Replace with your summary...</assistant></summary>',
-      '<summary><assistant id="assistant">[TODO]</assistant></summary>',
-      '<summary><assistant id="assistant">[TBD]</assistant></summary>',
-      '<summary><assistant id="assistant">[TODO: add evidence]</assistant></summary>',
-      '<summary><assistant id="assistant">[placeholder for outcome]</assistant></summary>',
-      '<summary><assistant id="assistant">Details [Replace with summary] remain.</assistant></summary>',
-      '<summary><assistant id="assistant">TODO</assistant></summary>',
-      '<summary><assistant id="assistant">TBD</assistant></summary>',
-      '<summary><assistant id="assistant">unknown</assistant></summary>',
-      '<summary><assistant id="assistant">N/A</assistant></summary>',
-      '<summary><assistant id="assistant">yes</assistant></summary>',
-      '<summary><assistant id="assistant">none</assistant></summary>',
-      '<summary><assistant id="assistant">Done.</assistant></summary>',
-      '<summary><assistant id="assistant">Implemented</assistant></summary>',
-      '<summary><assistant id="bad id">one</assistant></summary>',
-      'text before<summary><assistant id="assistant">one</assistant></summary>',
-      '<summary><assistant id="assistant">one</assistant></summary>text after',
-      '<summary><assistant id="assistant"><nested>one</nested></assistant></summary>',
-      '<summary><assistant id="assistant" extra="no">one</assistant></summary>',
-      '<summary><!-- no --><assistant id="assistant">one</assistant></summary>',
-      '<summary><![CDATA[no]]><assistant id="assistant">one</assistant></summary>',
-      '<summary><?no?><assistant id="assistant">one</assistant></summary>',
-      '<summary><assistant id="assistant">bad &unknown;</assistant></summary>',
-      '<summary><assistant id="assistant">bad &amp</assistant></summary>',
-      '\u00a0<summary><assistant id="assistant">one</assistant></summary>',
-      '<summary><assistant id="assistant">bad ]]> text</assistant></summary>',
-      '<summary><assistant id="assistant">unclosed</summary>',
+  test("rejects invalid structured summary contracts before source writes", async () => {
+    const invalid: Array<{
+      output: unknown;
+      category:
+        | "missing-structured-output"
+        | "invalid-output-shape"
+        | "invalid-summary-type"
+        | "missing-id"
+        | "unknown-id"
+        | "empty-summary"
+        | "placeholder-summary";
+    }> = [
+      { output: undefined, category: "missing-structured-output" },
+      { output: null, category: "invalid-output-shape" },
+      { output: [], category: "invalid-output-shape" },
+      { output: { assistant: 42 }, category: "invalid-summary-type" },
+      { output: {}, category: "missing-id" },
+      {
+        output: { unknown: "Unexpected private summary content." },
+        category: "unknown-id",
+      },
+      {
+        output: {
+          assistant: "Completed the requested work.",
+          unknown: "Unexpected private summary content.",
+        },
+        category: "unknown-id",
+      },
+      { output: { assistant: " " }, category: "empty-summary" },
+      ...[
+        "[Replace with summary]",
+        "Replace with your summary...",
+        "[TODO]",
+        "[TBD]",
+        "[TODO: add evidence]",
+        "[placeholder for outcome]",
+        "Details [Replace with summary] remain.",
+        "TODO",
+        "TBD",
+        "unknown",
+        "N/A",
+        "yes",
+        "none",
+        "Done.",
+        "Implemented",
+      ].map(output => ({
+        output: { assistant: output },
+        category: "placeholder-summary" as const,
+      })),
     ];
 
-    for (const response of invalid) {
+    for (const { output, category } of invalid) {
       const partUpdates: Record<string, unknown>[] = [];
-      await expect(
-        runCompaction(session("source"), {
+      let error: unknown;
+      try {
+        await runCompaction(session("source"), {
           messages: compactableMessages(),
-          promptResponses: [response],
+          structuredResponses: [output, output],
           partUpdates,
-        }),
-      ).rejects.toThrow();
+        });
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).toMatchObject({
+        name: "SummaryContractError",
+        category,
+        batch: 1,
+        batchCount: 1,
+        attempt: 2,
+      });
+      expect(String(error)).toContain(
+        `category=${category}, batch=1/1, attempt=2/2`,
+      );
+      expect(String(error)).not.toContain("private summary content");
       expect(partUpdates).toEqual([]);
     }
+  });
+
+  test("does not retry a contract failure when ephemeral cleanup fails", async () => {
+    const lifecycle: string[] = [];
+    let error: unknown;
+
+    try {
+      await runCompaction(session("source"), {
+        structuredResponses: [{ assistant: "[TODO]" }],
+        deleteError: new Error("ephemeral cleanup failed"),
+        deleteErrorAt: 1,
+        lifecycle,
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(AggregateError);
+    expect(nestedErrorMessages(error)).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("category=placeholder-summary"),
+        "ephemeral cleanup failed",
+      ]),
+    );
+    expect(lifecycle.filter(event => event === "prompt")).toHaveLength(1);
+    expect(lifecycle.filter(event => event === "fork")).toHaveLength(1);
+    expect(lifecycle.filter(event => event === "delete")).toHaveLength(1);
+  });
+
+  test("does not retry provider or SDK failures", async () => {
+    const providerLifecycle: string[] = [];
+    await expect(
+      runCompaction(session("source"), {
+        promptInfoErrors: [
+          {
+            name: "ProviderAuthError",
+            data: { providerID: "provider", message: "authentication failed" },
+          },
+        ],
+        lifecycle: providerLifecycle,
+      }),
+    ).rejects.toThrow("ProviderAuthError");
+    expect(providerLifecycle.filter(event => event === "prompt")).toHaveLength(
+      1,
+    );
+
+    const sdkLifecycle: string[] = [];
+    await expect(
+      runCompaction(session("source"), {
+        promptError: new Error("prompt transport failed"),
+        lifecycle: sdkLifecycle,
+      }),
+    ).rejects.toThrow("prompt transport failed");
+    expect(sdkLifecycle.filter(event => event === "prompt")).toHaveLength(1);
+  });
+
+  test("retries a provider structured-output failure once in a fresh fork", async () => {
+    const lifecycle: string[] = [];
+    const requests = await runCompaction(session("source"), {
+      promptInfoErrors: [
+        {
+          name: "StructuredOutputError",
+          data: {
+            message: "Model did not produce structured output",
+            retries: 0,
+          },
+        },
+      ],
+      structuredResponses: [undefined, { assistant: "Recovered summary." }],
+      lifecycle,
+    });
+
+    expect(requests.updates.map(update => update.sessionID)).toEqual([
+      "ephemeral",
+      "ephemeral-2",
+    ]);
+    expect(lifecycle.filter(event => event === "prompt")).toHaveLength(2);
+    expect(lifecycle.filter(event => event === "delete")).toHaveLength(2);
+    expect((requests.partUpdates[0]!.part as TextPart).text).toBe(
+      "Recovered summary.",
+    );
   });
 
   test.each([
@@ -337,15 +457,13 @@ describe("magic compact", () => {
   ])("accepts substantive standard summary text: %s", async text => {
     const requests = await runCompaction(session("source"), {
       messages: compactableMessages(),
-      promptResponses: [
-        `<summary><assistant id="assistant">${text}</assistant></summary>`,
-      ],
+      structuredResponses: [{ assistant: text }],
     });
 
     expect((requests.partUpdates[0]!.part as TextPart).text).toBe(text);
   });
 
-  test("XML-escapes user previews", () => {
+  test("serializes user previews as JSON", () => {
     const turn = {
       user: [
         message("user", "user", [
@@ -357,11 +475,11 @@ describe("magic compact", () => {
 
     const prompt = buildCompactionPrompt([turn], null);
 
-    expect(prompt).toContain("&lt;request &amp; &quot;proof&quot;&gt;");
-    expect(prompt).not.toContain('<request & "proof">');
+    expect(prompt).toContain(JSON.stringify('<request & "proof">\n...'));
+    expect(prompt).not.toContain("&lt;request");
   });
 
-  test("truncates user previews by Unicode code point and removes XML-invalid input", () => {
+  test("truncates user previews by Unicode code point and removes provider-invalid input", () => {
     const emojiBoundary = `${"a".repeat(299)}\ud83d\ude80ignored`;
     const invalidXml = "before\u0000\u000b\ud800middle\ud801after";
     const prompt = buildCompactionPrompt(
@@ -388,7 +506,7 @@ describe("magic compact", () => {
 
     expect(prompt).toContain(`${"a".repeat(299)}\ud83d\ude80...`);
     expect(prompt).not.toContain("ignored");
-    expect(prompt).toContain("beforemiddleafter\n...");
+    expect(prompt).toContain("beforemiddleafter\\n...");
     expect(prompt).not.toContain("\u0000");
     expect(prompt).not.toContain("\u000b");
     expect(hasUnpairedSurrogate(prompt)).toBeFalse();
@@ -422,27 +540,64 @@ describe("magic compact", () => {
 
     const requests = await runCompaction(session("source"), { messages });
     const prompts = requests.prompts.map(promptText);
+    const firstBatchIDs = Array.from(
+      { length: MAX_SUMMARY_BATCH_TURNS },
+      (_, index) => `batch-${index}-assistant`,
+    );
+    const finalBatchID = `batch-${MAX_SUMMARY_BATCH_TURNS}-assistant`;
 
     expect(prompts).toHaveLength(2);
-    expect(prompts[0]).toContain('<assistant id="batch-0-assistant">');
-    expect(prompts[0]).toContain(
-      `<assistant id="batch-${MAX_SUMMARY_BATCH_TURNS - 1}-assistant">`,
-    );
-    expect(prompts[0]).not.toContain(
-      `<assistant id="batch-${MAX_SUMMARY_BATCH_TURNS}-assistant">`,
-    );
-    expect(prompts[0]).toContain(
-      `<stop id="batch-${MAX_SUMMARY_BATCH_TURNS}-assistant">`,
-    );
-    expect(prompts[1]).toContain(
-      `<assistant id="batch-${MAX_SUMMARY_BATCH_TURNS}-assistant">`,
-    );
-    expect(prompts[1]).not.toContain("<stop id=");
+    expect(requests.prompts.map(summarySchemaIDs)).toEqual([
+      firstBatchIDs,
+      [finalBatchID],
+    ]);
+    expect(prompts[0]).toContain('"stopAnchor": {');
+    expect(prompts[0]).toContain(`"assistantTurnID": "${finalBatchID}"`);
+    expect(prompts[1]).toContain('"stopAnchor": null');
     expect(requests.agentRequests).toHaveLength(1);
     expect(requests.updates.map(update => update.sessionID)).toEqual([
       "ephemeral",
       "ephemeral-2",
     ]);
+  });
+
+  test("retries only a failed late batch in a fresh ephemeral fork", async () => {
+    const messages = Array.from(
+      { length: MAX_SUMMARY_BATCH_TURNS + 1 },
+      (_, index) => completedTurn(`retry-${index}`, `Request ${index}`),
+    ).flat();
+    const firstBatchIDs = Array.from(
+      { length: MAX_SUMMARY_BATCH_TURNS },
+      (_, index) => `retry-${index}-assistant`,
+    );
+    const lateID = `retry-${MAX_SUMMARY_BATCH_TURNS}-assistant`;
+
+    const requests = await runCompaction(session("source"), {
+      messages,
+      structuredResponses: [
+        structuredOutputForIDs(firstBatchIDs),
+        { [lateID]: "[TODO]" },
+        { [lateID]: "Recovered late batch summary." },
+      ],
+    });
+
+    expect(requests.prompts.map(summarySchemaIDs)).toEqual([
+      firstBatchIDs,
+      [lateID],
+      [lateID],
+    ]);
+    expect(requests.updates.map(update => update.sessionID)).toEqual([
+      "ephemeral",
+      "ephemeral-2",
+      "ephemeral-3",
+    ]);
+    expect(requests.partUpdates.map(update => update.messageID)).toEqual([
+      ...firstBatchIDs,
+      lateID,
+    ]);
+    expect((requests.partUpdates.at(-1)!.part as TextPart).text).toBe(
+      "Recovered late batch summary.",
+    );
   });
 
   test("renders a measured outlier deterministically between standard batches", async () => {
@@ -464,9 +619,9 @@ describe("magic compact", () => {
     ];
     const requests = await runCompaction(session("source"), {
       messages,
-      promptResponses: [
-        summaryResponse("ordinary-before-assistant", "Before summary."),
-        summaryResponse("ordinary-after-assistant", "After summary."),
+      structuredResponses: [
+        { "ordinary-before-assistant": "Before summary." },
+        { "ordinary-after-assistant": "After summary." },
       ],
     });
     const prompts = requests.prompts.map(promptText);
@@ -474,12 +629,12 @@ describe("magic compact", () => {
     expect(prompts).toHaveLength(2);
     expect(requests.updates).toHaveLength(2);
     expect(requests.agentRequests).toHaveLength(1);
-    expect(prompts[0]).toContain('<assistant id="ordinary-before-assistant">');
-    expect(prompts[0]).toContain('<stop id="outlier-assistant-0">');
-    expect(prompts[1]).toContain('<assistant id="ordinary-after-assistant">');
-    expect(prompts.join("\n")).not.toContain(
-      'id="outlier-assistant-0">[Replace',
-    );
+    expect(requests.prompts.map(summarySchemaIDs)).toEqual([
+      ["ordinary-before-assistant"],
+      ["ordinary-after-assistant"],
+    ]);
+    expect(prompts[0]).toContain('"assistantTurnID": "outlier-assistant-0"');
+    expect(prompts.join("\n")).not.toContain("Replace with your summary");
     expect(requests.partUpdates.map(update => update.messageID)).toEqual([
       "ordinary-before-assistant",
       "outlier-assistant-0",
@@ -2487,6 +2642,73 @@ describe("native OpenCode checkpoint coexistence", () => {
     expect(command.sessionDeletes).toEqual(["ephemeral"]);
   });
 
+  test("rolls back without partial compaction writes when a late batch exhausts its retry", async () => {
+    const messages = Array.from(
+      { length: MAX_SUMMARY_BATCH_TURNS + 1 },
+      (_, index) => completedTurn(`exhaust-${index}`, `Request ${index}`),
+    ).flat();
+    addProviderTokens(messages);
+    const firstBatchIDs = Array.from(
+      { length: MAX_SUMMARY_BATCH_TURNS },
+      (_, index) => `exhaust-${index}-assistant`,
+    );
+    const lateID = `exhaust-${MAX_SUMMARY_BATCH_TURNS}-assistant`;
+    const command = createCommandHarness(messages, {
+      summaryOutputs: [
+        structuredOutputForIDs(firstBatchIDs),
+        { [lateID]: "[TODO]" },
+        { [lateID]: "[TODO]" },
+      ],
+    });
+    let error: unknown;
+
+    try {
+      await executeMagicCompact(command.v2, "source", 0);
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toMatchObject({
+      name: "SummaryContractError",
+      category: "placeholder-summary",
+      batch: 2,
+      batchCount: 2,
+      attempt: 2,
+    });
+    expect(
+      command.events.filter(event => event === "summary-prompt"),
+    ).toHaveLength(3);
+    expect(command.partUpdates).toEqual([]);
+    expect(command.partDeletes).toEqual([]);
+    expect(
+      command.sessionUpdates.filter(request => request.sessionID === "source"),
+    ).toEqual([]);
+    // The only source prompt before validation is the temporary progress
+    // notice; rollback cleanup deletes it.
+    expect(command.sourcePrompts).toHaveLength(1);
+    expect(command.sourcePrompts[0]).toMatchObject({
+      noReply: true,
+      parts: [
+        {
+          metadata: { magicCompact: { progress: true } },
+        },
+      ],
+    });
+    expect(command.messageDeletes).toEqual([
+      { sessionID: "source", messageID: "progress" },
+    ]);
+    expect(command.sessionDeletes).toEqual([
+      "ephemeral",
+      "ephemeral-2",
+      "ephemeral-3",
+      "source",
+    ]);
+    expect(command.selectedSessions).toEqual(["backup"]);
+    expect(command.events).not.toContain("summary-update");
+    expect(command.events).not.toContain("boundary-update");
+    expect(String(command.toasts.at(-1)?.message)).not.toContain("[TODO]");
+  });
+
   test("a future completed native checkpoint advances the immutable floor", async () => {
     const messages = nativeCheckpointFixture({ tailStartID: null });
     messages.push(
@@ -3434,10 +3656,11 @@ type RunOptions = {
   promptError?: Error;
   promptErrorAt?: number;
   promptResponseError?: string;
+  promptInfoErrors?: unknown[];
   deleteError?: Error;
   deleteErrorAt?: number;
   messages?: MessageWithParts[];
-  promptResponses?: string[];
+  structuredResponses?: unknown[];
   partUpdates?: Record<string, unknown>[];
   ephemeralMessages?: MessageWithParts[];
   ephemeralMessagesAfterPrompt?: MessageWithParts[];
@@ -3513,12 +3736,20 @@ async function runCompaction(
         if (options.promptResponseError) {
           return { error: options.promptResponseError };
         }
-        const response =
-          options.promptResponses?.[promptCount - 1]
-          ?? responseForPrompt(promptText(request));
+        const infoError = options.promptInfoErrors?.[promptCount - 1];
+        if (infoError !== undefined) {
+          return { data: { info: { error: infoError }, parts: [] } };
+        }
+        const responseIndex = promptCount - 1;
+        const structured =
+          options.structuredResponses
+          && responseIndex in options.structuredResponses
+            ? options.structuredResponses[responseIndex]
+            : structuredOutputForPrompt(request);
         return {
           data: {
-            parts: [textPart("response", "ephemeral", "response", response)],
+            info: { structured },
+            parts: [],
           },
         };
       },
@@ -3572,7 +3803,7 @@ function createCommandHarness(
     summaryPromptError?: Error;
     revalidationMessagesError?: Error;
     activateRaceAtSummaryPrompt?: number;
-    summaryResponses?: string[];
+    summaryOutputs?: unknown[];
     selectBackupError?: Error;
     deleteSourceError?: Error;
     showToastError?: Error;
@@ -3649,12 +3880,15 @@ function createCommandHarness(
           if (options.summaryPromptError) {
             throw options.summaryPromptError;
           }
-          const response =
-            options.summaryResponses?.[summaryPrompts - 1]
-            ?? summaryResponse("suffix-1-assistant", "Suffix summary.");
+          const responseIndex = summaryPrompts - 1;
+          const structured =
+            options.summaryOutputs && responseIndex in options.summaryOutputs
+              ? options.summaryOutputs[responseIndex]
+              : structuredOutputForPrompt(request);
           return {
             data: {
-              parts: [textPart("response", "ephemeral", "response", response)],
+              info: { structured },
+              parts: [],
             },
           };
         }
@@ -4055,8 +4289,26 @@ function labeledSummarySection(
   return value.slice(start, end).trim();
 }
 
-function summaryResponse(id: string, summary: string): string {
-  return `<summary><assistant id="${id}">${summary}</assistant></summary>`;
+function summarySchemaIDs(request: Record<string, unknown>): string[] {
+  const format = request.format as
+    | { schema?: { properties?: Record<string, unknown> } }
+    | undefined;
+  return Object.keys(format?.schema?.properties ?? {});
+}
+
+function structuredOutputForIDs(ids: string[]): Record<string, string> {
+  return Object.fromEntries(
+    ids.map(id => [
+      id,
+      id === "assistant" ? "Completed the request." : `Completed ${id}.`,
+    ]),
+  );
+}
+
+function structuredOutputForPrompt(
+  request: Record<string, unknown>,
+): Record<string, string> {
+  return structuredOutputForIDs(summarySchemaIDs(request));
 }
 
 function commandToolPart(
@@ -4118,22 +4370,6 @@ function pendingCommandToolPart(
       metadata: {},
     },
   } as Part;
-}
-
-function responseForPrompt(prompt: string): string {
-  const ids = [
-    ...new Set(
-      [...prompt.matchAll(/<assistant id="([A-Za-z0-9_-]+)">/g)].map(
-        match => match[1]!,
-      ),
-    ),
-  ];
-  return `<summary>${ids
-    .map(
-      id =>
-        `<assistant id="${id}">${id === "assistant" ? "Completed the request." : `Completed ${id}.`}</assistant>`,
-    )
-    .join("")}</summary>`;
 }
 
 function outlierTurn(): MessageWithParts[] {
