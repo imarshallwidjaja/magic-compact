@@ -35,7 +35,7 @@ const server: Plugin = async input => {
       config.agent ??= {};
       config.agent[MAGIC_COMPACT_SUMMARIZER_AGENT] = {
         description:
-          "Faithful per-turn structured-output summarizer for Magic Compact",
+          "Faithful per-turn plain-JSON summarizer for Magic Compact",
         mode: "subagent",
         hidden: true,
         prompt: MAGIC_COMPACT_SUMMARIZER_PROMPT,

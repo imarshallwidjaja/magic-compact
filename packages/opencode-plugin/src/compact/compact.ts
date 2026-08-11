@@ -25,8 +25,8 @@ export const MAX_SUMMARY_BATCH_TURNS = 8;
 const MAX_SUMMARY_ATTEMPTS = 2;
 
 type SummaryContractCategory =
-  | "provider-structured-output"
-  | "missing-structured-output"
+  | "missing-text-output"
+  | "invalid-json"
   | "invalid-output-shape"
   | "unknown-id"
   | "missing-id"
@@ -202,7 +202,6 @@ async function runEphemeralPrompt(
           agent: MAGIC_COMPACT_SUMMARIZER_AGENT,
           ...(settings.model ? { model: settings.model } : {}),
           ...(settings.variant ? { variant: settings.variant } : {}),
-          format: buildSummaryFormat(turns),
           parts: [{ type: "text", text: promptText }],
         }),
       );
@@ -210,7 +209,9 @@ async function runEphemeralPrompt(
       promptError = error;
     }
     if (promptError === undefined && body?.info.error) {
-      promptError = summaryResponseError(body.info.error.name, diagnostic);
+      promptError = new Error(
+        `Summary provider failed (${body.info.error.name}).`,
+      );
     }
 
     let artifactError: unknown;
@@ -229,7 +230,11 @@ async function runEphemeralPrompt(
     }
     if (promptError !== undefined) throw promptError;
 
-    result = validateSummaries(body!.info.structured, turns, diagnostic);
+    result = validateSummaries(
+      parseSummaryOutput(body!.parts, diagnostic),
+      turns,
+      diagnostic,
+    );
   } catch (error) {
     operationError = error;
   } finally {
@@ -295,30 +300,22 @@ async function resolveCompactionSettings(
   };
 }
 
-function buildSummaryFormat(turns: Turn[]) {
-  const expected = turns.map(turnID);
-  return {
-    type: "json_schema" as const,
-    retryCount: 0,
-    schema: {
-      type: "object",
-      properties: Object.fromEntries(
-        expected.map(id => [id, { type: "string" }]),
-      ),
-      required: expected,
-      additionalProperties: false,
-    },
-  };
-}
-
-function summaryResponseError(
-  name: string,
+function parseSummaryOutput(
+  parts: Array<{ type: string }>,
   diagnostic: { batch: number; batchCount: number; attempt: number },
-): Error {
-  if (name === "StructuredOutputError") {
-    return contractError("provider-structured-output", diagnostic);
+): unknown {
+  const responseText = parts
+    .filter((part): part is TextPart => part.type === "text")
+    .map(part => part.text)
+    .join("");
+  if (!responseText.trim()) {
+    throw contractError("missing-text-output", diagnostic);
   }
-  return new Error(`Summary provider failed (${name}).`);
+  try {
+    return JSON.parse(responseText);
+  } catch {
+    throw contractError("invalid-json", diagnostic);
+  }
 }
 
 function validateSummaries(
@@ -326,9 +323,6 @@ function validateSummaries(
   turns: Turn[],
   diagnostic: { batch: number; batchCount: number; attempt: number },
 ): string[] {
-  if (output === undefined) {
-    throw contractError("missing-structured-output", diagnostic);
-  }
   if (output === null || typeof output !== "object" || Array.isArray(output)) {
     throw contractError("invalid-output-shape", diagnostic);
   }

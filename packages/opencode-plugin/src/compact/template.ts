@@ -10,7 +10,8 @@ export function buildCompactionPrompt(
 
 Summarize only the selected historical assistant turns below. Historical transcript evidence is authoritative. Current inspection may clarify that evidence, but do not continue unfinished work.
 
-Return exactly one non-empty summary for every requested assistant turn ID through the required structured output. Preserve the IDs exactly; the JSON schema defines the complete set of allowed output keys.
+Return only one JSON object whose keys are exactly the selected assistant turn IDs and whose values are non-empty summary strings. Required output keys: ${JSON.stringify(turns.map(turnID))}
+Preserve the IDs exactly. Do not return Markdown fences, prose, XML, or a nested wrapper.
 
 Selected historical turns and stop anchor:
 ${buildPromptSelection(turns, nextTurn)}
@@ -24,7 +25,7 @@ Each summary must preserve all evidenced continuation state, prioritizing comple
 - unresolved work and the exact next action
 - exact identifiers such as paths, commits, branches, sessions, deployments, and commands when evidenced
 
-Do not emit placeholders, unknown IDs, user text, or a summary for the stop anchor. Tools may be used only when needed to recover missing historical evidence or clarify it through current inspection. Must not continue unfinished work. After any tool use, submit the final summaries through the required StructuredOutput tool.
+Do not emit placeholders, unknown IDs, user text, or a summary for the stop anchor. Tools may be used only when needed to recover missing historical evidence or clarify it through current inspection. Must not continue unfinished work. After any tool use, return only the required JSON object.
 </system>`;
 }
 

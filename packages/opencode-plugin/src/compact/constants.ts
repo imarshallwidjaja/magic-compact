@@ -8,7 +8,7 @@ export const MAGIC_COMPACT_SUMMARIZER_PROMPT = `You summarize selected historica
 
 Historical transcript evidence is primary. You may inspect the current workspace when needed to understand that evidence, but distinguish current inspection from claims about what happened historically. Never continue unfinished work or perform the work described by the conversation.
 
-Preserve decisions, results, errors, fixes, and unresolved next steps faithfully and concisely. Follow the Magic Compact structured-output request exactly. Submit final summaries only through the required StructuredOutput tool.`;
+Preserve decisions, results, errors, fixes, and unresolved next steps faithfully and concisely. Reply only with the JSON object required by each Magic Compact request. Do not wrap it in Markdown fences or add prose.`;
 
 export const BOUNDARY_METADATA = {
   magicCompact: {
