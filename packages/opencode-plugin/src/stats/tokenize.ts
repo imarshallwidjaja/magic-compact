@@ -3,7 +3,7 @@ import { encode } from "gpt-tokenizer";
 import { unwrap, type V2Client } from "../api";
 import type { MessageWithParts } from "../compact/plan";
 
-function countGptTokens(text: string): number {
+export function countGptTokens(text: string): number {
   return encode(text).length;
 }
 
@@ -59,33 +59,16 @@ export async function countSessionTokens(
   const messages = unwrap(
     await v2.session.messages({ sessionID }),
   ) as MessageWithParts[];
-  const sessionTokens = messages
-    .map(message => countMessageGptTokens(message))
-    .reduce((sum, count) => sum + count, 0);
-  return sessionTokens + estimateSystemPromptTokens(messages);
+  return countCanonicalContentTokens(messages);
 }
 
-function estimateSystemPromptTokens(messages: MessageWithParts[]): number {
-  const firstAssistant = messages.find(message => {
-    if (message.info.role !== "assistant") {
-      return false;
-    }
-
-    const tokens = message.info.tokens;
-    return tokens.input > 0 || tokens.cache.read > 0 || tokens.cache.write > 0;
-  });
-
-  if (!firstAssistant || firstAssistant.info.role !== "assistant") {
-    return 0;
-  }
-
-  const firstUser = messages.find(message => message.info.role === "user");
-  const firstUserTokens = firstUser ? countMessageGptTokens(firstUser) : 0;
-
-  const tokens = firstAssistant.info.tokens;
-  const firstTokens = tokens.input + tokens.cache.read + tokens.cache.write;
-
-  return Math.max(0, firstTokens - firstUserTokens);
+export function countCanonicalContentTokens(
+  messages: MessageWithParts[],
+): number {
+  return messages.reduce(
+    (sum, message) => sum + countMessageGptTokens(message),
+    0,
+  );
 }
 
 function countMessageGptTokens(message: MessageWithParts): number {

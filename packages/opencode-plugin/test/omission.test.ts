@@ -8,7 +8,6 @@ import {
   allocateOmission,
   cachePath,
   copyCache,
-  installTemporaryOmissionSource,
   omissionReadDiagnostic,
   readCache,
   readOmittedContent,
@@ -274,7 +273,7 @@ describe("OpenCode omission storage", () => {
     expect(await Bun.file(cachePath(target)).text()).toBe(originalTarget);
   });
 
-  test("authorizes only the current cache unless a scoped temporary mapping is installed", async () => {
+  test("authorizes omission reads only through the current session cache", async () => {
     const source = "ses_mapping_source";
     const other = "ses_mapping_other";
     const temporary = "ses_mapping_temporary";
@@ -285,9 +284,6 @@ describe("OpenCode omission storage", () => {
     );
 
     expect(await readOmittedContent(other, contentID)).toBeNull();
-    const clear = installTemporaryOmissionSource(temporary, source);
-    expect(await readOmittedContent(temporary, contentID)).toBe("source bytes");
-    clear();
     expect(await readOmittedContent(temporary, contentID)).toBeNull();
   });
 

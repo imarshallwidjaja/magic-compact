@@ -1,9 +1,11 @@
 import type { TextPart, ToolPart } from "@opencode-ai/sdk/v2";
+import { countGptTokens } from "../stats/tokenize";
 import { isRecord } from "../util";
 import type { Turn } from "./plan";
 import { isXmlCodePoint, stripInvalidXmlCodePoints } from "./template";
 
-export const DETERMINISTIC_HIGH_RISK_SUMMARY_MAX_BYTES = 64 * 1024;
+export const DETERMINISTIC_SUMMARY_MAX_TOKENS = 2_048;
+export const DETERMINISTIC_OPTIONAL_RECORD_MAX_TOKENS = 512;
 
 const MAX_SOURCE_WINDOWS = 12;
 
@@ -19,6 +21,8 @@ type BudgetRecord = {
   full: string;
   compact: string;
   minimum: string;
+  requiredType: string;
+  overflowMinimum: string;
 };
 
 type AssistantRecord = BudgetRecord & {
@@ -29,6 +33,7 @@ type EvidenceRecord = BudgetRecord & {
   verification: boolean;
   vcs: boolean;
   unresolved: boolean;
+  reserved: boolean;
 };
 
 type RecordChoice = "minimum" | "compact" | "full";
@@ -50,6 +55,17 @@ type AssistantSource = {
   text: string;
 };
 
+type AssistantStatusSource = {
+  messageID: string;
+  order: number;
+  status: "error" | "recovered";
+  errorType: string;
+  message: string | null;
+  statusCode: number | null;
+  providerID: string | null;
+  recoveredByMessageID: string | null;
+};
+
 type ToolSource = {
   index: number;
   tool: ToolPart;
@@ -69,25 +85,48 @@ type ToolSource = {
   mutation: boolean;
 };
 
-export class HighRiskEvidenceOverflowError extends Error {
-  constructor(requiredBytes: number) {
-    super(
-      `Required high-risk evidence needs ${requiredBytes} bytes and exceeds the 64 KiB deterministic summary cap.`,
-    );
-    this.name = "HighRiskEvidenceOverflowError";
-  }
+export function renderDeterministicSummary(turn: Turn): string {
+  return renderBoundedTurnEvidence(turn, true);
 }
 
-export function renderDeterministicHighRiskSummary(turn: Turn): string {
+export function renderStandardTurnEvidence(turn: Turn): string {
+  return renderBoundedTurnEvidence(turn, false);
+}
+
+export function requiresDeterministicSummary(turn: Turn): boolean {
+  const assistantSources = collectAssistantSources(turn);
+  return (
+    collectToolSources(turn).some(source => source.unresolved)
+    || buildAssistantStatusRecords(collectAssistantStatusSources(turn)).some(
+      record => record.unresolved,
+    )
+    || buildAssistantEvidenceRecords(assistantSources).some(
+      record => record.unresolved,
+    )
+  );
+}
+
+function renderBoundedTurnEvidence(
+  turn: Turn,
+  deterministicOnly: boolean,
+): string {
   const assistantSources = collectAssistantSources(turn);
   const assistantRecords = buildAssistantRecords(assistantSources);
   const toolSources = collectToolSources(turn);
   const toolRecords = toolSources.map(buildToolRecord);
   const assistantEvidence = buildAssistantEvidenceRecords(assistantSources);
-  const evidenceRecords = [...toolRecords, ...assistantEvidence];
+  const assistantStatuses = buildAssistantStatusRecords(
+    collectAssistantStatusSources(turn),
+  );
+  const evidenceRecords = [
+    ...toolRecords,
+    ...assistantEvidence,
+    ...assistantStatuses,
+  ];
   const unresolved = evidenceRecords.some(record => record.unresolved);
   const hasExecutionOrMutation =
     toolSources.length > 0
+    || assistantStatuses.length > 0
     || assistantSources.some(source =>
       hasAssistantMutationEvidence(source.text),
     );
@@ -105,21 +144,31 @@ export function renderDeterministicHighRiskSummary(turn: Turn): string {
       "Historical assistant text (authoritative)",
       "assistant-text-records",
       assistantRecords,
-      assistantRecords.filter(record => record.required),
+      deterministicOnly
+        ? assistantRecords.filter(record => record.required)
+        : assistantRecords.length > 0
+          ? [assistantRecords.at(-1)!]
+          : [],
       true,
     ),
     createSection(
       "Verification",
       "evidence-records",
       evidenceRecords.filter(record => record.verification),
-      evidenceRecords.filter(record => record.verification),
+      deterministicOnly
+        ? evidenceRecords.filter(
+            record => record.verification && record.unresolved,
+          )
+        : [],
       true,
     ),
     createSection(
       "VCS/Deployment",
       "evidence-records",
       evidenceRecords.filter(record => record.vcs),
-      evidenceRecords.filter(record => record.vcs),
+      deterministicOnly
+        ? evidenceRecords.filter(record => record.vcs && record.unresolved)
+        : [],
       true,
     ),
     createSection(
@@ -133,16 +182,18 @@ export function renderDeterministicHighRiskSummary(turn: Turn): string {
       "Historical terminal evidence (authoritative)",
       "evidence-records",
       evidenceRecords,
-      [],
+      deterministicOnly
+        ? []
+        : evidenceRecords.filter(record => record.reserved),
       false,
     ),
   ];
 
-  reserveRequiredRecords(outcome, sections);
-  fillOptionalRecords(outcome, sections);
-  const summary = renderSummary(outcome, sections);
-  if (Buffer.byteLength(summary) > DETERMINISTIC_HIGH_RISK_SUMMARY_MAX_BYTES) {
-    throw new Error("Deterministic high-risk summary exceeded its byte cap.");
+  const overflow = reserveRequiredRecords(outcome, sections);
+  if (!overflow) fillOptionalRecords(outcome, sections);
+  const summary = overflow ?? renderSummary(outcome, sections);
+  if (countGptTokens(summary) > DETERMINISTIC_SUMMARY_MAX_TOKENS) {
+    throw new Error("Deterministic summary exceeded its local-token cap.");
   }
   return summary;
 }
@@ -163,6 +214,48 @@ function collectAssistantSources(turn: Turn): AssistantSource[] {
     }
   }
   return sources;
+}
+
+function collectAssistantStatusSources(turn: Turn): AssistantStatusSource[] {
+  const sources: AssistantStatusSource[] = [];
+  for (const [messageIndex, message] of turn.assistants.entries()) {
+    if (message.info.role !== "assistant" || !message.info.error) continue;
+    const recoveredBy = turn.assistants
+      .slice(messageIndex + 1)
+      .find(isSuccessfulAssistantMessage);
+    const data: Record<string, unknown> = isRecord(message.info.error.data)
+      ? message.info.error.data
+      : {};
+    sources.push({
+      messageID: sanitizeIdentifier(message.info.id),
+      order: messageIndex,
+      status: recoveredBy ? "recovered" : "error",
+      errorType: sanitizeIdentifier(message.info.error.name),
+      message: typeof data["message"] === "string" ? data["message"] : null,
+      statusCode:
+        typeof data["statusCode"] === "number" ? data["statusCode"] : null,
+      providerID:
+        typeof data["providerID"] === "string" ? data["providerID"] : null,
+      recoveredByMessageID: recoveredBy
+        ? sanitizeIdentifier(recoveredBy.info.id)
+        : null,
+    });
+  }
+  return sources;
+}
+
+function isSuccessfulAssistantMessage(
+  message: Turn["assistants"][number],
+): boolean {
+  if (message.info.role !== "assistant" || message.info.error) return false;
+  if (typeof message.info.finish === "string" && message.info.finish.trim()) {
+    return true;
+  }
+  return message.parts.some(
+    part =>
+      (part.type === "text" && isSubstantiveAssistantText(part))
+      || (part.type === "tool" && part.state.status === "completed"),
+  );
 }
 
 function isSubstantiveAssistantText(part: TextPart): boolean {
@@ -199,6 +292,13 @@ function buildAssistantRecords(sources: AssistantSource[]): AssistantRecord[] {
       full: renderAssistantRecord(source, Number.POSITIVE_INFINITY),
       compact: renderAssistantRecord(source, 2_048),
       minimum: renderAssistantRecord(source, 768),
+      requiredType: "assistant-text",
+      overflowMinimum: serializeRecord({
+        kind: "required-assistant-text",
+        messageID: source.messageID,
+        partID: source.partID,
+        status: "authoritative-final",
+      }),
     };
   });
 }
@@ -369,9 +469,33 @@ function buildToolRecord(source: ToolSource): EvidenceRecord {
     verification: source.verification,
     vcs: source.vcs,
     unresolved: source.unresolved,
+    reserved: false,
     full: renderToolRecord(source, 4_096),
     compact: renderToolRecord(source, 1_536),
     minimum: renderToolRecord(source, 640),
+    requiredType:
+      source.tool.state.status === "error"
+        ? "tool-error"
+        : source.failed
+          ? "tool-failure"
+          : source.notRun
+            ? "tool-not-run"
+            : source.incomplete
+              ? "tool-incomplete"
+              : "tool-unresolved",
+    overflowMinimum: serializeRecord({
+      kind: "required-tool",
+      messageID: sanitizeIdentifier(source.tool.messageID),
+      partID: sanitizeIdentifier(source.tool.id),
+      callID: sanitizeIdentifier(source.tool.callID),
+      tool: sanitizeIdentifier(source.tool.tool),
+      status: source.tool.state.status,
+      polarity: evidencePolarity(
+        source.failed,
+        source.notRun,
+        source.incomplete,
+      ),
+    }),
   };
 }
 
@@ -467,12 +591,79 @@ function buildAssistantEvidenceRecords(
       verification,
       vcs,
       unresolved,
+      reserved: false,
       full: render(2_048),
       compact: render(1_024),
       minimum: render(512),
+      requiredType: `assistant-${polarity}`,
+      overflowMinimum: serializeRecord({
+        kind: "required-assistant-evidence",
+        messageID: source.messageID,
+        partID: source.partID,
+        status: polarity,
+      }),
     });
   }
   return records;
+}
+
+function buildAssistantStatusRecords(
+  sources: AssistantStatusSource[],
+): EvidenceRecord[] {
+  return sources.map(source => {
+    const unresolved = source.status === "error";
+    const render = (maximumBytes: number) =>
+      renderAssistantStatusRecord(source, maximumBytes);
+    return {
+      priority: unresolved ? 0 : 2,
+      order: 2_000_000 + source.order,
+      verification: false,
+      vcs: false,
+      unresolved,
+      reserved: !unresolved,
+      full: render(2_048),
+      compact: render(1_024),
+      minimum: render(512),
+      requiredType: unresolved
+        ? "assistant-message-error"
+        : "assistant-message-recovered",
+      overflowMinimum: serializeRecord({
+        kind: "required-assistant-message-status",
+        messageID: source.messageID,
+        status: source.status,
+        errorType: source.errorType,
+        ...(source.statusCode === null
+          ? {}
+          : { statusCode: source.statusCode }),
+      }),
+    };
+  });
+}
+
+function renderAssistantStatusRecord(
+  source: AssistantStatusSource,
+  maximumBytes: number,
+): string {
+  const base: Record<string, unknown> = {
+    kind: "assistant-message-status",
+    messageID: source.messageID,
+    status: source.status,
+    errorType: source.errorType,
+    categories: [source.status === "error" ? "failure" : "recovered"],
+    polarity: source.status === "error" ? "failed" : "reported",
+  };
+  const fieldBudget = maximumBytes <= 512 ? 128 : 512;
+  if (source.message !== null) {
+    base["message"] = boundedSourceField(source.message, fieldBudget);
+  }
+  if (source.statusCode !== null) base["statusCode"] = source.statusCode;
+  if (source.providerID !== null) {
+    base["providerID"] = boundedExact(source.providerID, 256);
+  }
+  if (source.recoveredByMessageID !== null) {
+    base["recoveredByMessageID"] = source.recoveredByMessageID;
+  }
+  return serializeRecord(base);
 }
 
 function renderAssistantEvidenceRecord(
@@ -522,7 +713,7 @@ function createSection(
 function reserveRequiredRecords(
   outcome: string,
   sections: SummarySection[],
-): void {
+): string | null {
   const required = sections.flatMap((section, sectionIndex) =>
     [...section.required].map(record => ({ section, sectionIndex, record })),
   );
@@ -535,25 +726,59 @@ function reserveRequiredRecords(
   for (const item of required) {
     item.section.choices.set(item.record, "minimum");
   }
-  const requiredBytes = Buffer.byteLength(renderSummary(outcome, sections));
-  if (requiredBytes > DETERMINISTIC_HIGH_RISK_SUMMARY_MAX_BYTES) {
-    throw new HighRiskEvidenceOverflowError(requiredBytes);
+  const requiredTokens = countGptTokens(renderSummary(outcome, sections));
+  if (requiredTokens > DETERMINISTIC_SUMMARY_MAX_TOKENS) {
+    return renderRequiredOverflowCapsule(
+      [...new Set(required.map(item => item.record))].toSorted(
+        (left, right) =>
+          left.priority - right.priority || left.order - right.order,
+      ),
+    );
   }
-  for (const choice of ["compact", "full"] as const) {
-    for (const item of required) {
-      const previous = item.section.choices.get(item.record)!;
-      item.section.choices.set(item.record, choice);
-      if (!summaryFits(outcome, sections)) {
-        item.section.choices.set(item.record, previous);
-      }
+  return null;
+}
+
+function renderRequiredOverflowCapsule(records: BudgetRecord[]): string {
+  const counts = records.reduce<Record<string, number>>((result, record) => {
+    result[record.requiredType] = (result[record.requiredType] ?? 0) + 1;
+    return result;
+  }, {});
+  const render = (included: BudgetRecord[]) =>
+    [
+      "Outcome: partial",
+      "Required deterministic evidence overflow capsule:",
+      `required-record-counts=${serializeRecord(counts)}`,
+      `required-record-total=${records.length}`,
+      "required-records:",
+      ...included.map(record =>
+        record.requiredType === "assistant-text"
+          ? record.minimum
+          : record.overflowMinimum,
+      ),
+      `required-record-overflow=${records.length - included.length}`,
+      "required-record-omitted-disclosure=Per-record details were omitted from this capsule; aggregate required facts remain above. Full error tool I/O remains in active tool parts, and omitted completed tool I/O is retrievable.",
+    ].join("\n");
+  const substantive = records.filter(
+    record => record.requiredType === "assistant-text",
+  );
+  const identifiers = records.filter(
+    record => record.requiredType !== "assistant-text",
+  );
+  const included: BudgetRecord[] = [];
+  for (const record of [...substantive, ...identifiers]) {
+    const candidate = [...included, record];
+    if (countGptTokens(render(candidate)) <= DETERMINISTIC_SUMMARY_MAX_TOKENS) {
+      included.push(record);
     }
   }
+  return render(included);
 }
 
 function fillOptionalRecords(
   outcome: string,
   sections: SummarySection[],
 ): void {
+  const requiredTokens = countGptTokens(renderSummary(outcome, sections));
   const optional = sections.flatMap((section, sectionIndex) =>
     section.records
       .filter(record => !section.required.has(record))
@@ -566,22 +791,32 @@ function fillOptionalRecords(
       || left.sectionIndex - right.sectionIndex,
   );
   for (const item of optional) {
-    item.section.choices.set(item.record, "compact");
-    if (!summaryFits(outcome, sections)) {
+    item.section.choices.set(item.record, "minimum");
+    if (!optionalChoiceFits(outcome, sections, requiredTokens)) {
       item.section.choices.delete(item.record);
       continue;
     }
+    item.section.choices.set(item.record, "compact");
+    if (!optionalChoiceFits(outcome, sections, requiredTokens)) {
+      item.section.choices.set(item.record, "minimum");
+      continue;
+    }
     item.section.choices.set(item.record, "full");
-    if (!summaryFits(outcome, sections)) {
+    if (!optionalChoiceFits(outcome, sections, requiredTokens)) {
       item.section.choices.set(item.record, "compact");
     }
   }
 }
 
-function summaryFits(outcome: string, sections: SummarySection[]): boolean {
+function optionalChoiceFits(
+  outcome: string,
+  sections: SummarySection[],
+  requiredTokens: number,
+): boolean {
+  const tokens = countGptTokens(renderSummary(outcome, sections));
   return (
-    Buffer.byteLength(renderSummary(outcome, sections))
-    <= DETERMINISTIC_HIGH_RISK_SUMMARY_MAX_BYTES
+    tokens <= DETERMINISTIC_SUMMARY_MAX_TOKENS
+    && tokens - requiredTokens <= DETERMINISTIC_OPTIONAL_RECORD_MAX_TOKENS
   );
 }
 
@@ -815,16 +1050,18 @@ const ASSISTANT_NEGATED_UNRESOLVED_PATTERNS = [
   /\bno\s+(?:work|issues?|items?|tasks?|changes?|tests?|checks?)\s+(?:are|is|remain(?:s)?)\s+pending\b/gi,
   /\bno\s+(?:work|issues?|items?|tasks?|changes?|tests?|checks?)\s+remain(?:s)?\s+pending\b/gi,
   /\bimplementation\s+is\s+not\s+incomplete\b/gi,
+  /\bno\s+(?:tests?|checks?)\s+(?:were|was|are|is|have\s+been|has\s+been)?\s*skipped\b/gi,
+  /\b(?:tests?|checks?)\s+(?:are|is|were|was)\s+not\s+(?:failing|failed)\b/gi,
   /\b(?:configuration|config|state|value|files?)\s+remains?\s+unchanged\b/gi,
 ] as const;
 const ASSISTANT_NEGATED_MUTATION_PATTERN =
   /\bno\s+(?:files?\s+)?(?:were\s+|was\s+)?(?:modified|changed|written|edited|patched|updated|created|deleted)\b/gi;
 const ASSISTANT_VERIFICATION_PATTERN =
-  /\b(?:tests?|checks?|commands?|verification|pytest|vitest|jest|mocha|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?)\b[^\n;]{0,120}\b(?:ran|run|executed|pass(?:ed|ing)?|fail(?:ed|ing|ures?)?|errored|succeeded|successful|not[- ]?run|not\s+executed|skipped|could\s+not|couldn't|cannot|can'?t)\b|\b(?:ran|run|executed|pass(?:ed|ing)?|fail(?:ed|ing|ures?)?|not[- ]?run|not\s+executed|skipped)\b[^\n;]{0,80}\b(?:tests?|checks?|commands?|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?)\b|\bno\s+tests?\s+have\s+run\b/i;
+  /\b(?:tests?|checks?|commands?|verification|pytest|vitest|jest|mocha|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?)\b[^\n;]{0,120}\b(?:ran|run|executed|pass(?:ed|ing)?|fail(?:ed|ing|ures?)?|errored|succeeded|successful|not[- ]?run|not\s+executed|skipped|could\s+not|couldn't|cannot|can'?t)\b|\b(?:ran|run|executed|pass(?:ed|ing)?|fail(?:ed|ing|ures?)?|not[- ]?run|not\s+executed|skipped)\b[^\n;]{0,80}\b(?:tests?|checks?|commands?|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?)\b|\bno\s+tests?\s+(?:have\s+run|have\s+been\s+executed)\b|\btests?\s+have\s+not\s+yet\s+run\b/i;
 const ASSISTANT_FAILURE_PATTERN =
   /\b(?:tests?|checks?|commands?|verification|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?|deployment|deploy|push|commit|work|task|implementation)\b[^\n;]{0,120}\b(?:failed|failing|failures?|errored|fatal|timed\s*out|timeout|cancelled|canceled|aborted|killed)\b|\bfailed\s+to\s+(?:run|execute|build|test|check|write|edit|patch|create|delete|deploy|push|commit)\b/i;
 const ASSISTANT_NOT_RUN_PATTERN =
-  /\bno\s+(?:tests?|checks?|commands?)\s+(?:ran|run|executed)\b|\bno\s+tests?\s+have\s+run\b|\b(?:tests?|checks?)\s+were\s+skipped\b|\b(?:tests?|checks?|commands?|verification|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?)\b[^\n;]{0,120}\b(?:was|were)?\s*not\s+(?:run|executed|performed|attempted)\b|\b(?:tests?|checks?|commands?|verification|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?)\b[^\n;]{0,120}\b(?:could\s+not|couldn't|cannot|can'?t)\s+(?:be\s+)?(?:run|performed|executed)\b|\bnot\s+(?:run|executed|performed|attempted)\b[^\n;]{0,80}\b(?:tests?|checks?|commands?|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?)\b|\b(?:could\s+not|couldn't|cannot|can'?t)\s+(?:run|perform|execute)\b[^\n;]{0,80}\b(?:tests?|checks?|commands?)\b/i;
+  /\bno\s+(?:tests?|checks?|commands?)\s+(?:(?:was|were)\s+)?(?:ran|run|executed|performed)\b|\bno\s+tests?\s+(?:have\s+run|have\s+been\s+executed)\b|\btests?\s+have\s+not\s+yet\s+run\b|\b(?:tests?|checks?)\s+were\s+skipped\b|\b(?:tests?|checks?|commands?|verification|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?)\b[^\n;]{0,120}\b(?:was|were)?\s*not\s+(?:run|executed|performed|attempted)\b|\b(?:tests?|checks?|commands?|verification|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?)\b[^\n;]{0,120}\bnever\s+(?:ran|run|executed|performed|attempted)\b|\b(?:tests?|checks?|commands?|verification|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?)\b[^\n;]{0,120}\b(?:has|have|had)\s+yet\s+to\s+(?:run|perform|execute|be\s+executed|be\s+performed)\b|\b(?:tests?|checks?|commands?|verification|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?)\b[^\n;]{0,120}\b(?:could\s+not|couldn't|cannot|can'?t|unable\s+to)\s+(?:be\s+)?(?:run|performed|executed)\b|\bnot\s+(?:run|executed|performed|attempted)\b[^\n;]{0,80}\b(?:tests?|checks?|commands?|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?)\b|\b(?:could\s+not|couldn't|cannot|can'?t|unable\s+to)\s+(?:run|perform|execute)\b[^\n;]{0,80}\b(?:tests?|checks?|commands?)\b/i;
 const ASSISTANT_INCOMPLETE_PATTERN =
   /\bwork\s+remains?\b|\b(?:TODO|TBD)\b|\b(?:work|tasks?|issues?|implementation|verification|tests?|checks?|commands?|deployment)\b[^\n;]{0,80}\b(?:incomplete|unresolved|blocked|pending|still\s+running)\b|\b(?:incomplete|unresolved|blocked|pending)\b[^\n;]{0,80}\b(?:work|tasks?|issues?|implementation|verification|tests?|checks?|commands?|deployment)\b|\b(?:must\s+still|still\s+needs?|needs?\s+to|next\s+action)\b/i;
 const ASSISTANT_MUTATION_PATTERN =
@@ -848,7 +1085,7 @@ const POSITIVE_FAILURE_COUNT_PATTERN =
 const POSITIVE_RUN_PASS_PATTERN =
   /\b(?:\d+\s+(?:(?:tests?|checks?)\s+)?(?:pass|passed|passing)|(?:all\s+)?tests?\s+passed)\b/i;
 const ZERO_FAILURE_COUNT_PATTERN =
-  /\b(?:0+\s+(?:(?:tests?|checks?)\s+)?(?:fails?|failed|failing|failures?|errors?|skipped)|(?:fails?|failed|failing|failures?|errors?|skipped)\s*[:=]\s*0+|no\s+(?:(?:tests?|checks?)\s+)?(?:failed|failing|failures?|errors?))\b/gi;
+  /\b(?:0+\s+(?:(?:tests?|checks?)\s+)?(?:fails?|failed|failing|failures?|errors?|skipped)|(?:fails?|failed|failing|failures?|errors?|skipped)\s*[:=]\s*0+|no\s+(?:(?:tests?|checks?)\s+)?(?:failed|failing|failures?|errors?)|no\s+(?:tests?|checks?)\s+(?:were|was|are|is|have\s+been|has\s+been)?\s*skipped|(?:tests?|checks?)\s+(?:are|is|were|was)\s+not\s+(?:failing|failed))\b/gi;
 const RESULT_FAILURE_PATTERNS = [
   NONZERO_EXIT_PATTERN,
   POSITIVE_FAILURE_COUNT_PATTERN,
@@ -858,13 +1095,17 @@ const RESULT_FAILURE_PATTERNS = [
   /\b(?:timed\s*out|timeout|cancelled|canceled|aborted|killed|sigterm|sigkill|signal\s+\d+)\b/i,
 ] as const;
 const RESULT_NOT_RUN_PATTERNS = [
-  /\b(?:skipped|not[- ]?run|unrun|not\s+executed)\b/i,
-  /\bno\s+(?:tests?|checks?)\s+(?:ran|run|executed)\b/i,
+  /\b(?:skipped|not[- ]?run|unrun|not\s+executed|never\s+(?:ran|run|executed|performed|attempted)|unable\s+to\s+(?:run|perform|execute)|(?:has|have|had)\s+yet\s+to\s+(?:run|perform|execute))\b/i,
+  /\bno\s+(?:tests?|checks?)\s+(?:(?:was|were)\s+)?(?:ran|run|executed|performed)\b/i,
   /\bno\s+tests?\s+have\s+run\b/i,
+  /\bno\s+tests?\s+have\s+been\s+executed\b/i,
+  /\btests?\s+have\s+not\s+yet\s+run\b/i,
   /\b(?:tests?|checks?)\s+were\s+skipped\b/i,
   /\b(?:tests?|checks?|smoke|commands?)[^\n.;]{0,120}\b(?:was|were)?\s*not\s+(?:run|executed|performed)\b/i,
-  /\b(?:tests?|checks?|smoke|commands?)[^\n.;]{0,120}\b(?:could\s+not|couldn't|cannot|can'?t)\s+be\s+(?:run|performed|executed)\b/i,
-  /\b(?:could\s+not|couldn't|cannot|can'?t)\s+(?:run|perform|execute)\b[^\n.;]{0,80}\b(?:tests?|checks?|commands?)\b/i,
+  /\b(?:tests?|checks?|smoke|commands?)[^\n.;]{0,120}\bnever\s+(?:ran|run|executed|performed|attempted)\b/i,
+  /\b(?:has|have|had)\s+yet\s+to\s+(?:run|perform|execute|be\s+executed|be\s+performed)\b/i,
+  /\b(?:tests?|checks?|smoke|commands?)[^\n.;]{0,120}\b(?:could\s+not|couldn't|cannot|can'?t|unable\s+to)\s+(?:be\s+)?(?:run|performed|executed)\b/i,
+  /\b(?:could\s+not|couldn't|cannot|can'?t|unable\s+to)\s+(?:run|perform|execute)\b[^\n.;]{0,80}\b(?:tests?|checks?|commands?)\b/i,
 ] as const;
 const RESULT_INCOMPLETE_PATTERNS = [
   /\b(?:incomplete|unresolved|blocked|pending)\b/i,
@@ -876,9 +1117,9 @@ const VCS_NOT_RUN_PATTERNS = [
   /\b(?:push|commit|deployment?|deploy)\b[^\n.;]{0,80}\b(?:was\s+)?not\s+(?:run|performed|attempted|completed)\b/i,
 ] as const;
 const SOURCE_EVIDENCE_CUE_PATTERN =
-  /\b(?:pytest|vitest|jest|mocha|tsc|bun\s+(?:run\s+)?(?:test|check|lint|typecheck|build|smoke)|npm\s+(?:run\s+)?(?:test|check|lint|typecheck|build|smoke)|pnpm\s+(?:run\s+)?(?:test|check|lint|typecheck|build|smoke)|yarn\s+(?:run\s+)?(?:test|check|lint|typecheck|build|smoke)|cargo\s+test|go\s+test|tests?|checks?|verification|git\s+[A-Za-z-]+|committed|pushed|push\s+(?:to|origin|upstream|remote)|PR|pull request|deployed|deployment|permission denied|command not found|failed|failing|failure|errors?|not\s+executed|not[- ]?run|unrun|skipped|incomplete|unresolved|blocked|pending|running|timed\s*out|timeout|cancelled|canceled|aborted|killed|SIGTERM|SIGKILL|process\s+exited\s+with\s+code\s+\d+)\b/gi;
+  /\b(?:pytest|vitest|jest|mocha|tsc|bun\s+(?:run\s+)?(?:test|check|lint|typecheck|build|smoke)|npm\s+(?:run\s+)?(?:test|check|lint|typecheck|build|smoke)|pnpm\s+(?:run\s+)?(?:test|check|lint|typecheck|build|smoke)|yarn\s+(?:run\s+)?(?:test|check|lint|typecheck|build|smoke)|cargo\s+test|go\s+test|tests?|checks?|verification|git\s+[A-Za-z-]+|committed|pushed|push\s+(?:to|origin|upstream|remote)|PR|pull request|deployed|deployment|permission denied|command not found|failed|failing|failure|errors?|not\s+executed|not[- ]?run|never\s+(?:ran|run|executed|performed|attempted)|unable\s+to\s+(?:run|perform|execute)|(?:has|have|had)\s+yet\s+to\s+(?:run|perform|execute)|unrun|skipped|incomplete|unresolved|blocked|pending|running|timed\s*out|timeout|cancelled|canceled|aborted|killed|SIGTERM|SIGKILL|process\s+exited\s+with\s+code\s+\d+)\b/gi;
 const EVIDENCE_ANCHOR_PATTERN =
-  /\b(?:permission denied|command not found|no\s+(?:tests?|checks?)\s+(?:ran|run|executed)|not[- ]?run|not\s+(?:pushed|committed|deployed|merged)|unrun|skipped|timed\s*out|timeout|cancelled|canceled|aborted|killed|SIGTERM|SIGKILL|failed|failing|failure|errored|incomplete|unresolved|blocked|pending|running|[1-9]\d*\s+(?:(?:tests?|checks?)\s+)?(?:fails?|failed|failing|failures?|errors?)|(?:process\s+)?exit(?:ed)?(?:\s+with)?\s+(?:code|status)\s*[:=]?\s*\d+|\d+\s+(?:(?:tests?|checks?)\s+)?(?:pass|passed|passing)|working tree\s+(?:clean|dirty)|commit\s+[0-9a-f]{6,40}|push succeeded)\b/gi;
+  /\b(?:permission denied|command not found|no\s+(?:tests?|checks?)\s+(?:(?:was|were)\s+)?(?:ran|run|executed|performed)|not[- ]?run|never\s+(?:ran|run|executed|performed|attempted)|unable\s+to\s+(?:run|perform|execute)|(?:has|have|had)\s+yet\s+to\s+(?:run|perform|execute)|not\s+(?:pushed|committed|deployed|merged)|unrun|skipped|timed\s*out|timeout|cancelled|canceled|aborted|killed|SIGTERM|SIGKILL|failed|failing|failure|errored|incomplete|unresolved|blocked|pending|running|[1-9]\d*\s+(?:(?:tests?|checks?)\s+)?(?:fails?|failed|failing|failures?|errors?)|(?:process\s+)?exit(?:ed)?(?:\s+with)?\s+(?:code|status)\s*[:=]?\s*\d+|\d+\s+(?:(?:tests?|checks?)\s+)?(?:pass|passed|passing)|working tree\s+(?:clean|dirty)|commit\s+[0-9a-f]{6,40}|push succeeded)\b/gi;
 
 function withoutAssistantResolvedNegations(value: string): string {
   return ASSISTANT_NEGATED_UNRESOLVED_PATTERNS.reduce(
@@ -891,6 +1132,7 @@ function hasAssistantVerificationEvidence(value: string): boolean {
   return (
     VERIFICATION_COMMAND_PATTERN.test(value)
     || ASSISTANT_VERIFICATION_PATTERN.test(value)
+    || ASSISTANT_NOT_RUN_PATTERN.test(value)
     || POSITIVE_FAILURE_COUNT_PATTERN.test(value)
     || /\b\d+\s+(?:(?:tests?|checks?)\s+)?(?:pass|passed|passing)\b/i.test(
       value,

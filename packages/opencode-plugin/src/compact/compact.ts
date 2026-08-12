@@ -1,28 +1,32 @@
-import type { Agent, Session, TextPart, ToolPart } from "@opencode-ai/sdk/v2";
+import type {
+  Agent,
+  PermissionRuleset,
+  Session,
+  TextPart,
+} from "@opencode-ai/sdk/v2";
 import { unwrap, type V2Client } from "../api";
-import { installTemporaryOmissionSource } from "../storage/omission";
+import { countGptTokens } from "../stats/tokenize";
 import {
   MAGIC_COMPACT_SUMMARIZER_AGENT,
+  MAX_SUMMARY_OUTPUT_TOKENS,
   summaryMetadata,
   summaryPartID,
 } from "./constants";
-import { renderDeterministicHighRiskSummary } from "./high-risk";
-export { DETERMINISTIC_HIGH_RISK_SUMMARY_MAX_BYTES } from "./high-risk";
 import {
-  assertNativeCheckpointSnapshotUnchanged,
-  captureNativeCheckpointSnapshot,
-  type CompactionPlan,
-  EphemeralCheckpointChangedError,
-  type NativeCheckpointSnapshot,
-  type Turn,
-} from "./plan";
+  renderDeterministicSummary,
+  renderStandardTurnEvidence,
+  requiresDeterministicSummary,
+} from "./high-risk";
+import { type CompactionPlan, type Turn } from "./plan";
 import { buildCompactionPrompt, turnID } from "./template";
 
-export const HIGH_RISK_SERIALIZED_BYTES = 153_600;
-export const HIGH_RISK_MESSAGE_COUNT = 20;
-export const HIGH_RISK_TOOL_COUNT = 32;
-export const MAX_SUMMARY_BATCH_TURNS = 8;
+export const MAX_SUMMARY_INPUT_TOKENS = 24_000;
+export const MAX_CONCURRENT_SUMMARY_REQUESTS = 2;
+export const SUMMARY_REQUEST_TIMEOUT_MS = 90_000;
 const MAX_SUMMARY_ATTEMPTS = 2;
+const SCRATCH_PERMISSION: PermissionRuleset = [
+  { permission: "*", pattern: "*", action: "deny" },
+];
 
 type SummaryContractCategory =
   | "missing-text-output"
@@ -32,7 +36,8 @@ type SummaryContractCategory =
   | "missing-id"
   | "invalid-summary-type"
   | "empty-summary"
-  | "placeholder-summary";
+  | "placeholder-summary"
+  | "response-too-large";
 
 class SummaryContractError extends Error {
   constructor(
@@ -55,109 +60,147 @@ type CompactionSettings = {
 
 type SummaryBatch = {
   turns: Turn[];
-  nextTurn: Turn | null;
-  highRisk: boolean;
+  prompt: string;
 };
 
 export async function generateCompactionSummaries(
   v2: V2Client,
   session: Session,
   plan: CompactionPlan,
-  highRiskSummaries = prepareHighRiskSummaries(plan),
 ): Promise<string[]> {
-  let settings: CompactionSettings | undefined;
+  let settings: Promise<CompactionSettings> | undefined;
   const getSettings = async () =>
-    (settings ??= await resolveCompactionSettings(v2, session));
-  const summaries: string[] = [];
-  const batches = createSummaryBatches(plan);
-  const batchCount = batches.filter(batch => !batch.highRisk).length;
-  let batchNumber = 0;
-
-  for (const batch of batches) {
-    if (batch.highRisk) {
-      const turn = batch.turns[0]!;
-      const summary = highRiskSummaries.get(turn);
-      if (summary === undefined) {
-        throw new Error("Missing prepared deterministic high-risk summary.");
-      }
-      summaries.push(summary);
-      continue;
+    (settings ??= resolveCompactionSettings(v2, session));
+  const summaries = new Map<Turn, string>();
+  const evidenceByTurn = new Map<Turn, string>();
+  for (const turn of plan.summarizedTurns) {
+    if (requiresDeterministicSummary(turn)) {
+      summaries.set(turn, renderDeterministicSummary(turn));
+    } else {
+      evidenceByTurn.set(turn, renderStandardTurnEvidence(turn));
     }
-    batchNumber += 1;
-    for (let attempt = 1; attempt <= MAX_SUMMARY_ATTEMPTS; attempt += 1) {
+  }
+  const batches = createSummaryBatches(plan, evidenceByTurn);
+  let nextBatch = 0;
+  let stopped = false;
+  const errors: unknown[] = [];
+
+  const worker = async () => {
+    while (!stopped) {
+      const batchIndex = nextBatch;
+      nextBatch += 1;
+      const batch = batches[batchIndex];
+      if (!batch) return;
       try {
-        const selected = await runEphemeralPrompt(
+        const selected = await generateSummaryBatch(
           v2,
           session,
           getSettings,
-          buildCompactionPrompt(batch.turns, batch.nextTurn),
-          batch.turns,
-          { batch: batchNumber, batchCount, attempt },
+          batch,
+          batchIndex + 1,
+          batches.length,
         );
-        summaries.push(...selected);
-        break;
-      } catch (error) {
-        if (
-          !(error instanceof SummaryContractError)
-          || attempt === MAX_SUMMARY_ATTEMPTS
-        ) {
-          throw error;
+        for (const [index, turn] of batch.turns.entries()) {
+          summaries.set(turn, selected[index]!);
         }
+      } catch (error) {
+        errors[batchIndex] = error;
+        stopped = true;
+      }
+    }
+  };
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(MAX_CONCURRENT_SUMMARY_REQUESTS, batches.length) },
+      worker,
+    ),
+  );
+  const generationError = errors.find(error => error !== undefined);
+  if (generationError !== undefined) throw generationError;
+
+  return plan.summarizedTurns.map(turn => {
+    const summary = summaries.get(turn);
+    if (summary === undefined)
+      throw new Error("Missing generated turn summary.");
+    return summary;
+  });
+}
+
+async function generateSummaryBatch(
+  v2: V2Client,
+  session: Session,
+  getSettings: () => Promise<CompactionSettings>,
+  batch: SummaryBatch,
+  batchNumber: number,
+  batchCount: number,
+): Promise<string[]> {
+  for (let attempt = 1; attempt <= MAX_SUMMARY_ATTEMPTS; attempt += 1) {
+    try {
+      return await runScratchPrompt(
+        v2,
+        session,
+        getSettings,
+        batch.prompt,
+        batch.turns,
+        { batch: batchNumber, batchCount, attempt },
+      );
+    } catch (error) {
+      if (
+        !(error instanceof SummaryContractError)
+        || attempt === MAX_SUMMARY_ATTEMPTS
+      ) {
+        throw error;
       }
     }
   }
-
-  return summaries;
+  throw new Error("Summary retry loop ended without a result.");
 }
 
-export function prepareHighRiskSummaries(
+function createSummaryBatches(
   plan: CompactionPlan,
-): ReadonlyMap<Turn, string> {
-  const summaries = new Map<Turn, string>();
-  for (const turn of plan.summarizedTurns) {
-    if (!isHighRiskTurn(turn)) continue;
-    summaries.set(turn, renderDeterministicHighRiskSummary(turn));
-  }
-  return summaries;
-}
-
-function isHighRiskTurn(turn: Turn): boolean {
-  const messages = [...turn.user, ...turn.assistants];
-  const tools = messages.flatMap(message =>
-    message.parts.filter((part): part is ToolPart => part.type === "tool"),
-  );
-  return (
-    Buffer.byteLength(JSON.stringify(turn)) >= HIGH_RISK_SERIALIZED_BYTES
-    || messages.length >= HIGH_RISK_MESSAGE_COUNT
-    || tools.length >= HIGH_RISK_TOOL_COUNT
-    || tools.some(tool => tool.state.status !== "completed")
-  );
-}
-
-function createSummaryBatches(plan: CompactionPlan): SummaryBatch[] {
+  evidenceByTurn: ReadonlyMap<Turn, string>,
+): SummaryBatch[] {
   const batches: SummaryBatch[] = [];
-  let standard: Turn[] = [];
-  const flush = (nextTurn: Turn | null) => {
-    if (standard.length === 0) return;
-    batches.push({ turns: standard, nextTurn, highRisk: false });
-    standard = [];
+  let current: Turn[] = [];
+  const standard = plan.summarizedTurns.filter(turn =>
+    evidenceByTurn.has(turn),
+  );
+
+  const createBatch = (turns: Turn[]): SummaryBatch => {
+    const finalTurn = turns.at(-1)!;
+    const sourceIndex = plan.summarizedTurns.indexOf(finalTurn);
+    const nextTurn = plan.summarizedTurns[sourceIndex + 1] ?? plan.nextTurn;
+    const prompt = buildCompactionPrompt(turns, nextTurn, evidenceByTurn);
+    return { turns, prompt };
   };
 
-  for (const [index, turn] of plan.summarizedTurns.entries()) {
-    const sourceNext = plan.summarizedTurns[index + 1] ?? plan.nextTurn;
-    if (isHighRiskTurn(turn)) {
-      flush(turn);
-      batches.push({ turns: [turn], nextTurn: sourceNext, highRisk: true });
+  for (const turn of standard) {
+    const candidate = createBatch([...current, turn]);
+    if (countGptTokens(candidate.prompt) <= MAX_SUMMARY_INPUT_TOKENS) {
+      current.push(turn);
       continue;
     }
-    standard.push(turn);
-    if (standard.length === MAX_SUMMARY_BATCH_TURNS) flush(sourceNext);
+    if (current.length === 0) {
+      throw new Error(
+        `One bounded turn evidence map exceeds the ${MAX_SUMMARY_INPUT_TOKENS}-token summary input cap.`,
+      );
+    }
+    batches.push(createBatch(current));
+    current = [turn];
+    if (
+      countGptTokens(createBatch(current).prompt) > MAX_SUMMARY_INPUT_TOKENS
+    ) {
+      throw new Error(
+        `One bounded turn evidence map exceeds the ${MAX_SUMMARY_INPUT_TOKENS}-token summary input cap.`,
+      );
+    }
   }
-  flush(plan.nextTurn);
+  if (current.length > 0) batches.push(createBatch(current));
   return batches;
 }
 
-async function runEphemeralPrompt(
+async function runScratchPrompt(
   v2: V2Client,
   sourceSession: Session,
   getSettings: () => Promise<CompactionSettings>,
@@ -165,48 +208,57 @@ async function runEphemeralPrompt(
   turns: Turn[],
   diagnostic: { batch: number; batchCount: number; attempt: number },
 ): Promise<string[]> {
-  const ephemeral = unwrap(
-    await v2.session.fork({ sessionID: sourceSession.id }),
+  const route = {
+    directory: sourceSession.directory,
+    ...(sourceSession.workspaceID
+      ? { workspace: sourceSession.workspaceID }
+      : {}),
+  };
+  const scratch = unwrap(
+    await v2.session.create({
+      ...route,
+      ...(sourceSession.workspaceID
+        ? {
+            workspaceID: sourceSession.workspaceID,
+          }
+        : {}),
+      title: `[TEMP] ${sourceSession.title}`,
+      permission: SCRATCH_PERMISSION,
+    }),
   );
   let operationError: unknown;
   let result: string[] | undefined;
-  let clearOmissionSource: (() => void) | undefined;
   try {
-    let checkpointSnapshot: NativeCheckpointSnapshot;
-    try {
-      checkpointSnapshot = captureNativeCheckpointSnapshot(
-        unwrap(await v2.session.messages({ sessionID: ephemeral.id })),
-      );
-    } catch (error) {
-      throw new EphemeralCheckpointChangedError(error);
-    }
-    clearOmissionSource = installTemporaryOmissionSource(
-      ephemeral.id,
-      sourceSession.id,
-    );
-    unwrap(
-      await v2.session.update({
-        sessionID: ephemeral.id,
-        title: `[TEMP] ${sourceSession.title}`,
-      }),
-    );
     const settings = await getSettings();
     let promptError: unknown;
     let body:
       | NonNullable<Awaited<ReturnType<V2Client["session"]["prompt"]>>["data"]>
       | undefined;
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(new Error("Summary request timed out.")),
+      SUMMARY_REQUEST_TIMEOUT_MS,
+    );
     try {
       body = unwrap(
-        await v2.session.prompt({
-          sessionID: ephemeral.id,
-          agent: MAGIC_COMPACT_SUMMARIZER_AGENT,
-          ...(settings.model ? { model: settings.model } : {}),
-          ...(settings.variant ? { variant: settings.variant } : {}),
-          parts: [{ type: "text", text: promptText }],
-        }),
+        await v2.session.prompt(
+          {
+            sessionID: scratch.id,
+            ...route,
+            agent: MAGIC_COMPACT_SUMMARIZER_AGENT,
+            ...(settings.model ? { model: settings.model } : {}),
+            ...(settings.variant ? { variant: settings.variant } : {}),
+            parts: [{ type: "text", text: promptText }],
+          },
+          { signal: controller.signal },
+        ),
       );
     } catch (error) {
-      promptError = error;
+      promptError = controller.signal.aborted
+        ? new Error("Summary request timed out.", { cause: error })
+        : error;
+    } finally {
+      clearTimeout(timeout);
     }
     if (promptError === undefined && body?.info.error) {
       promptError = new Error(
@@ -214,20 +266,22 @@ async function runEphemeralPrompt(
       );
     }
 
-    let artifactError: unknown;
-    try {
-      assertNativeCheckpointSnapshotUnchanged(
-        unwrap(await v2.session.messages({ sessionID: ephemeral.id })),
-        checkpointSnapshot,
-      );
-    } catch (error) {
-      artifactError = new EphemeralCheckpointChangedError(error);
+    if (
+      promptError !== undefined
+      && (controller.signal.aborted || isAbortError(promptError))
+    ) {
+      try {
+        unwrap(
+          await v2.session.abort({
+            sessionID: scratch.id,
+            ...route,
+          }),
+        );
+      } catch (abortError) {
+        promptError = combinePromptErrors(promptError, abortError);
+      }
     }
-    if (artifactError !== undefined) {
-      throw promptError === undefined
-        ? artifactError
-        : combinePromptErrors(artifactError, promptError);
-    }
+
     if (promptError !== undefined) throw promptError;
 
     result = validateSummaries(
@@ -237,13 +291,11 @@ async function runEphemeralPrompt(
     );
   } catch (error) {
     operationError = error;
-  } finally {
-    clearOmissionSource?.();
   }
 
   let deleteError: unknown;
   try {
-    unwrap(await v2.session.delete({ sessionID: ephemeral.id }));
+    unwrap(await v2.session.delete({ sessionID: scratch.id, ...route }));
   } catch (error) {
     deleteError = error;
   }
@@ -253,6 +305,10 @@ async function runEphemeralPrompt(
   if (operationError !== undefined) throw operationError;
   if (deleteError !== undefined) throw deleteError;
   return result!;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 async function resolveCompactionSettings(
@@ -310,6 +366,9 @@ function parseSummaryOutput(
     .join("");
   if (!responseText.trim()) {
     throw contractError("missing-text-output", diagnostic);
+  }
+  if (countGptTokens(responseText) > MAX_SUMMARY_OUTPUT_TOKENS) {
+    throw contractError("response-too-large", diagnostic);
   }
   try {
     return JSON.parse(responseText);
@@ -396,7 +455,7 @@ function isTemplateBracketBody(body: string): boolean {
 function combinePromptErrors(primary: unknown, secondary: unknown): Error {
   return new AggregateError(
     [primary, secondary],
-    "Summary generation, ephemeral checkpoint validation, or cleanup failed alongside another operation.",
+    "Summary generation and scratch-session cleanup failed alongside one another.",
   );
 }
 

@@ -2,9 +2,46 @@ import { describe, expect, test } from "bun:test";
 import type { Message } from "@opencode-ai/sdk/v2";
 import type { V2Client } from "../src/api";
 import type { MessageWithParts } from "../src/compact/plan";
-import { getProviderTokens } from "../src/stats/tokenize";
+import {
+  countCanonicalContentTokens,
+  countSessionTokens,
+  getProviderTokens,
+} from "../src/stats/tokenize";
 
 describe("getProviderTokens", () => {
+  test("counts canonical content locally regardless of provider usage", async () => {
+    const messages: MessageWithParts[] = [
+      {
+        ...message("usr_local", "user"),
+        parts: [
+          {
+            id: "usr_local_text",
+            sessionID: "session",
+            messageID: "usr_local",
+            type: "text",
+            text: "Canonical local content",
+          },
+        ],
+      },
+      message("ast_usage", "assistant", {
+        tokens: {
+          input: 999_999,
+          output: 999_999,
+          reasoning: 999_999,
+          cache: { read: 999_999, write: 999_999 },
+        },
+      }),
+    ];
+    const v2 = {
+      session: { messages: async () => ({ data: messages }) },
+    } as unknown as V2Client;
+
+    expect(await countSessionTokens(v2, "session")).toBe(
+      countCanonicalContentTokens(messages),
+    );
+    expect(await countSessionTokens(v2, "session")).toBeLessThan(100);
+  });
+
   test("returns null when newest assistant tokens are present but all zero", async () => {
     const messages: MessageWithParts[] = [
       message("usr_1", "user"),

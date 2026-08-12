@@ -4,6 +4,7 @@ import { getV2Client } from "./api";
 import {
   MAGIC_COMPACT_SUMMARIZER_AGENT,
   MAGIC_COMPACT_SUMMARIZER_PROMPT,
+  MAX_SUMMARY_OUTPUT_TOKENS,
 } from "./compact/constants";
 import {
   COMPACT_NOOP,
@@ -18,16 +19,7 @@ import { handleStatsEvent } from "./stats/events";
 const COMPACT_COMMAND = "magic-compact";
 const TRIM_COMMAND = "magic-trim";
 const STATS_COMMAND = "magic-stats";
-const SUMMARIZER_PERMISSION = {
-  "*": "allow",
-  edit: "deny",
-  task: "deny",
-  question: "deny",
-  todowrite: "deny",
-  plan_enter: "deny",
-  plan_exit: "deny",
-  doom_loop: "deny",
-} as const;
+const SUMMARIZER_PERMISSION = { "*": "deny" } as const;
 
 const server: Plugin = async input => {
   return {
@@ -39,7 +31,8 @@ const server: Plugin = async input => {
         mode: "subagent",
         hidden: true,
         prompt: MAGIC_COMPACT_SUMMARIZER_PROMPT,
-        permission: SUMMARIZER_PERMISSION,
+        // Pinned plugin types omit the runtime-supported wildcard deny key.
+        permission: SUMMARIZER_PERMISSION as never,
       };
       config.command ??= {};
       config.command[COMPACT_COMMAND] = {
@@ -101,6 +94,14 @@ const server: Plugin = async input => {
     },
     event: async input => {
       await handleStatsEvent(input.event);
+    },
+    "chat.params": async (input, output) => {
+      if (input.agent !== MAGIC_COMPACT_SUMMARIZER_AGENT) return;
+      const current = output.maxOutputTokens;
+      output.maxOutputTokens =
+        typeof current === "number" && Number.isFinite(current) && current > 0
+          ? Math.min(current, MAX_SUMMARY_OUTPUT_TOKENS)
+          : MAX_SUMMARY_OUTPUT_TOKENS;
     },
     tool: {
       read_omitted_content: tool({

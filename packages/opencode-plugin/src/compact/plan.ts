@@ -16,37 +16,16 @@ export type Turn = {
 export type CompactionPlan = {
   summarizedTurns: Turn[];
   nextTurn: Turn | null;
-  nativeArtifacts: NativeArtifact[];
+  sourceSnapshot: SourceSnapshot;
 };
 
-type NativeArtifact = { info: Message; parts: Part[] };
-
-export type NativeCheckpointSnapshot = NativeArtifact[];
+type SourceSnapshot = Array<{ info: unknown; parts: unknown[] }>;
 
 export class NativeCheckpointChangedError extends Error {
   constructor(cause?: unknown) {
     const detail = cause instanceof Error ? ` ${cause.message}` : "";
-    super(
-      `OpenCode native compaction checkpoint changed during Magic Compact.${detail}`,
-      { cause },
-    );
+    super(`OpenCode source changed during Magic Compact.${detail}`, { cause });
     this.name = "NativeCheckpointChangedError";
-  }
-}
-
-export class EphemeralCheckpointChangedError extends Error {
-  constructor(cause?: unknown) {
-    const artifactCause =
-      cause instanceof NativeCheckpointChangedError
-        ? (cause.cause ?? new Error(cause.message))
-        : cause;
-    super(
-      artifactCause instanceof Error
-        ? artifactCause.message
-        : "OpenCode native compaction checkpoint changed in an ephemeral Magic Compact session.",
-      { cause: artifactCause },
-    );
-    this.name = "EphemeralCheckpointChangedError";
   }
 }
 
@@ -84,7 +63,7 @@ export async function createCompactionPlan(
   return {
     summarizedTurns,
     nextTurn,
-    nativeArtifacts: native.artifacts,
+    sourceSnapshot: captureSourceSnapshot(messages),
   };
 }
 
@@ -138,38 +117,50 @@ function buildTurns(messages: MessageWithParts[]): Turn[] {
   return turns;
 }
 
-export function assertNativeCheckpointUnchanged(
+export function assertCompactionSourceUnchanged(
   messages: MessageWithParts[],
   plan: CompactionPlan,
 ): void {
-  assertNativeCheckpointSnapshotUnchanged(messages, plan.nativeArtifacts);
-}
-
-export function captureNativeCheckpointSnapshot(
-  messages: MessageWithParts[],
-): NativeCheckpointSnapshot {
-  let current: ReturnType<typeof inspectNativeCheckpoints>;
-  try {
-    current = inspectNativeCheckpoints(messages);
-  } catch (error) {
-    throw new NativeCheckpointChangedError(error);
-  }
-  return current.artifacts;
-}
-
-export function assertNativeCheckpointSnapshotUnchanged(
-  messages: MessageWithParts[],
-  snapshot: NativeCheckpointSnapshot,
-): void {
-  const current = captureNativeCheckpointSnapshot(messages);
-  if (!isDeepStrictEqual(current, snapshot)) {
+  const current = captureSourceSnapshot(messages);
+  if (!isDeepStrictEqual(current, plan.sourceSnapshot)) {
     throw new NativeCheckpointChangedError();
   }
 }
 
+function captureSourceSnapshot(messages: MessageWithParts[]): SourceSnapshot {
+  try {
+    inspectNativeCheckpoints(messages);
+  } catch (error) {
+    throw new NativeCheckpointChangedError(error);
+  }
+  return messages.map(message => ({
+    info: sourceMessageInfo(message.info),
+    parts: message.parts.map(sourcePart),
+  }));
+}
+
+function sourceMessageInfo(info: Message): unknown {
+  const snapshot = structuredClone(info) as unknown as Record<string, unknown>;
+  delete snapshot["time"];
+  delete snapshot["tokens"];
+  delete snapshot["cost"];
+  return snapshot;
+}
+
+function sourcePart(part: Part): unknown {
+  const snapshot = structuredClone(part) as unknown as Record<string, unknown>;
+  delete snapshot["time"];
+  delete snapshot["tokens"];
+  delete snapshot["cost"];
+  if (part.type === "tool") {
+    const state = snapshot["state"] as Record<string, unknown>;
+    delete state["time"];
+  }
+  return snapshot;
+}
+
 function inspectNativeCheckpoints(messages: MessageWithParts[]): {
   summaryIndex: number | null;
-  artifacts: NativeArtifact[];
 } {
   const messageIndex = new Map(
     messages.map((message, index) => [message.info.id, index]),
@@ -299,27 +290,8 @@ function inspectNativeCheckpoints(messages: MessageWithParts[]): {
     );
   }
 
-  const artifacts: NativeArtifact[] = [];
-  for (const message of messages) {
-    const compactionParts = message.parts.filter(
-      part => part.type === "compaction",
-    );
-    if (compactionParts.length > 0) {
-      artifacts.push(
-        structuredClone({ info: message.info, parts: compactionParts }),
-      );
-      continue;
-    }
-    if (message.info.role === "assistant" && message.info.summary === true) {
-      artifacts.push(
-        structuredClone({ info: message.info, parts: message.parts }),
-      );
-    }
-  }
-
   return {
     summaryIndex: selected?.summary.index ?? null,
-    artifacts,
   };
 }
 

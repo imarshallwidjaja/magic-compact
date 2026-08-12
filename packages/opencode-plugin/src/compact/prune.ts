@@ -2,12 +2,22 @@ import type { Part, ToolPart } from "@opencode-ai/sdk/v2";
 import { unwrap, type V2Client } from "../api";
 import { inputOmissionNotice, outputOmissionNotice } from "./constants";
 import type { MessageWithParts, Turn } from "./plan";
-import { allocateOmission } from "../storage/omission";
+import {
+  allocateOmission,
+  commitPlannedOmission,
+  planOmission,
+  type PlannedOmission,
+} from "../storage/omission";
 import { isRecord, unwrapString } from "../util";
 
 type PruneContext = {
   v2: V2Client;
   sessionID: string;
+};
+
+export type PruneProjection = {
+  turns: Turn[];
+  omissions: PlannedOmission[];
 };
 
 const DEFAULT_OUTPUT_DESCRIPTION =
@@ -19,17 +29,71 @@ const TASK_OUTPUT_LIMIT = { words: 512, chars: 4096 };
 export async function pruneSummarizedTurns(
   context: PruneContext,
   turns: Turn[],
+  plannedOmissions: PlannedOmission[],
 ): Promise<void> {
   assertNoNativeArtifacts(turns);
+  let omissionIndex = 0;
+  const allocate = async (entry: { content: string }) => {
+    const omission = plannedOmissions[omissionIndex++];
+    if (!omission || omission.content !== entry.content) {
+      throw new Error("Planned omission order changed before pruning.");
+    }
+    await commitPlannedOmission(context.sessionID, omission);
+    return omission.contentID;
+  };
   for (const turn of turns) {
     for (const user of turn.user) {
       await pruneUserParts(context, user);
     }
 
     for (const assistant of turn.assistants) {
-      await pruneAssistantParts(context, assistant);
+      await pruneAssistantParts(context, assistant, allocate);
     }
   }
+  if (omissionIndex !== plannedOmissions.length) {
+    throw new Error("Not every planned omission was consumed during pruning.");
+  }
+}
+
+export async function createPruneProjection(
+  turns: Turn[],
+  sessionID: string,
+): Promise<PruneProjection> {
+  assertNoNativeArtifacts(turns);
+  const projected = structuredClone(turns);
+  const omissions: PlannedOmission[] = [];
+  const allocate = async (entry: { content: string }) => {
+    const omission = planOmission(sessionID, entry);
+    omissions.push(omission);
+    return omission.contentID;
+  };
+
+  for (const turn of projected) {
+    for (const user of turn.user) {
+      user.parts = user.parts.filter(
+        part =>
+          part.type !== "text"
+          || part.synthetic !== true
+          || isImportantSyntheticPart(part),
+      );
+    }
+    const assistants: MessageWithParts[] = [];
+    for (const assistant of turn.assistants) {
+      const kept: Part[] = [];
+      for (const part of assistant.parts) {
+        if (isSummaryPart(part)) {
+          kept.push(part);
+        } else if (part.type === "tool") {
+          await prepareToolPart(part, allocate);
+          kept.push(part);
+        }
+      }
+      assistant.parts = kept;
+      if (kept.length > 0) assistants.push(assistant);
+    }
+    turn.assistants = assistants;
+  }
+  return { turns: projected, omissions };
 }
 
 function assertNoNativeArtifacts(turns: Turn[]): void {
@@ -56,7 +120,12 @@ export async function trimToolParts(
   for (const turn of turns) {
     for (const assistant of turn.assistants) {
       for (const part of assistant.parts) {
-        if (part.type === "tool" && (await pruneToolPart(context, part))) {
+        if (
+          part.type === "tool"
+          && (await pruneToolPart(context, part, entry =>
+            allocateOmission(context.sessionID, entry),
+          ))
+        ) {
           trimmed += 1;
         }
       }
@@ -94,6 +163,7 @@ async function pruneUserParts(
 async function pruneAssistantParts(
   context: PruneContext,
   message: MessageWithParts,
+  allocate: (entry: { content: string }) => Promise<string>,
 ): Promise<void> {
   let keptParts = 0;
 
@@ -106,7 +176,7 @@ async function pruneAssistantParts(
 
     // If it is a tool call, prune but keep
     if (part.type === "tool") {
-      await pruneToolPart(context, part);
+      await pruneToolPart(context, part, allocate);
       keptParts += 1;
       continue;
     }
@@ -134,29 +204,10 @@ async function pruneAssistantParts(
 async function pruneToolPart(
   context: PruneContext,
   part: ToolPart,
+  allocate: (entry: { content: string }) => Promise<string>,
 ): Promise<boolean> {
-  if (part.state.status !== "completed") {
-    return false;
-  }
-  const magicCompact = part.state.metadata["magicCompact"];
-  if (isRecord(magicCompact) && magicCompact["trimmed"] === true) {
-    return false;
-  }
-
-  const inputNotice = await applyInputOmissions(context, part);
-  await applyOutputOmissions(context, part);
-
-  if (inputNotice) {
-    part.state.output = `${inputNotice}\n\n${part.state.output}`;
-  }
-
-  part.state.metadata = {
-    ...part.state.metadata,
-    magicCompact: {
-      ...(isRecord(magicCompact) ? magicCompact : {}),
-      trimmed: true,
-    },
-  };
+  const changed = await prepareToolPart(part, allocate);
+  if (!changed) return false;
 
   unwrap(
     await context.v2.part.update({
@@ -172,9 +223,39 @@ async function pruneToolPart(
   return true;
 }
 
-async function applyInputOmissions(
-  context: PruneContext,
+async function prepareToolPart(
   part: ToolPart,
+  allocate: (entry: { content: string }) => Promise<string>,
+): Promise<boolean> {
+  if (part.state.status !== "completed") {
+    return false;
+  }
+  const magicCompact = part.state.metadata["magicCompact"];
+  if (isRecord(magicCompact) && magicCompact["trimmed"] === true) {
+    return false;
+  }
+
+  const inputNotice = await applyInputOmissions(part, allocate);
+  await applyOutputOmissions(part, allocate);
+
+  if (inputNotice) {
+    part.state.output = `${inputNotice}\n\n${part.state.output}`;
+  }
+
+  part.state.metadata = {
+    ...part.state.metadata,
+    magicCompact: {
+      ...(isRecord(magicCompact) ? magicCompact : {}),
+      trimmed: true,
+    },
+  };
+
+  return true;
+}
+
+async function applyInputOmissions(
+  part: ToolPart,
+  allocate: (entry: { content: string }) => Promise<string>,
 ): Promise<string | null> {
   if (part.state.status !== "completed") {
     return null;
@@ -185,7 +266,7 @@ async function applyInputOmissions(
   if (part.tool === "write") {
     const content = unwrapString(input["content"]);
     if (content && exceeds(content, DEFAULT_LIMIT)) {
-      const contentID = await allocateOmission(context.sessionID, { content });
+      const contentID = await allocate({ content });
       input["content"] = "[Omitted]";
       return inputOmissionNotice(
         "File write contents omitted due to a compaction operation. If necessary, reread file to see current contents.",
@@ -198,7 +279,7 @@ async function applyInputOmissions(
   if (part.tool === "apply_patch") {
     const content = unwrapString(input["patchText"]);
     if (content && exceeds(content, DEFAULT_LIMIT)) {
-      const contentID = await allocateOmission(context.sessionID, { content });
+      const contentID = await allocate({ content });
       input["patchText"] = "[Omitted]";
       return inputOmissionNotice(
         "Patch text omitted due to compaction operation. If necessary, reread files to see current contents.",
@@ -211,7 +292,7 @@ async function applyInputOmissions(
   if (part.tool === "bash") {
     const content = unwrapString(input["command"]);
     if (content && content.length > 1024) {
-      const contentID = await allocateOmission(context.sessionID, { content });
+      const contentID = await allocate({ content });
       input["command"] =
         `${content.slice(0, 512)}\n[REST OF COMMAND TRUNCATED]`;
       return inputOmissionNotice(
@@ -227,7 +308,7 @@ async function applyInputOmissions(
     const newString = unwrapString(input["newString"]);
     const combined = `${oldString}\n${newString}`;
     if (exceeds(combined, DEFAULT_LIMIT)) {
-      const contentID = await allocateOmission(context.sessionID, {
+      const contentID = await allocate({
         content: combined,
       });
       input["oldString"] = "[Omitted]";
@@ -244,8 +325,8 @@ async function applyInputOmissions(
 }
 
 async function applyOutputOmissions(
-  context: PruneContext,
   part: ToolPart,
+  allocate: (entry: { content: string }) => Promise<string>,
 ): Promise<void> {
   if (part.state.status !== "completed") {
     return;
@@ -269,7 +350,7 @@ async function applyOutputOmissions(
   }
 
   if (part.tool === "read") {
-    const contentID = await allocateOmission(context.sessionID, {
+    const contentID = await allocate({
       content: output,
     });
     part.state.output = outputOmissionNotice(
@@ -282,7 +363,7 @@ async function applyOutputOmissions(
 
   if (part.tool === "task") {
     if (exceeds(output, TASK_OUTPUT_LIMIT)) {
-      const contentID = await allocateOmission(context.sessionID, {
+      const contentID = await allocate({
         content: output,
       });
       part.state.output = outputOmissionNotice(
@@ -298,7 +379,7 @@ async function applyOutputOmissions(
     return;
   }
 
-  const contentID = await allocateOmission(context.sessionID, {
+  const contentID = await allocate({
     content: output,
   });
   part.state.output = outputOmissionNotice(

@@ -1,29 +1,32 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, jest, test } from "bun:test";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import type { Config, PluginInput } from "@opencode-ai/plugin";
+import type { Config, PluginInput, ToolContext } from "@opencode-ai/plugin";
 import type {
   Agent,
   Message,
   Part,
   Session,
   TextPart,
+  ToolPart,
 } from "@opencode-ai/sdk/v2";
 import type { V2Client } from "../src/api";
+import { encode } from "gpt-tokenizer";
 import {
-  DETERMINISTIC_HIGH_RISK_SUMMARY_MAX_BYTES,
   generateCompactionSummaries,
-  HIGH_RISK_MESSAGE_COUNT,
-  HIGH_RISK_SERIALIZED_BYTES,
-  HIGH_RISK_TOOL_COUNT,
   injectSummaries,
-  MAX_SUMMARY_BATCH_TURNS,
+  MAX_SUMMARY_INPUT_TOKENS,
+  SUMMARY_REQUEST_TIMEOUT_MS,
 } from "../src/compact/compact";
-import { HighRiskEvidenceOverflowError } from "../src/compact/high-risk";
+import { MAX_SUMMARY_OUTPUT_TOKENS } from "../src/compact/constants";
 import {
-  assertNativeCheckpointUnchanged,
+  DETERMINISTIC_SUMMARY_MAX_TOKENS,
+  renderDeterministicSummary,
+} from "../src/compact/high-risk";
+import {
+  assertCompactionSourceUnchanged,
   createCompactionPlan,
   NativeCheckpointChangedError,
   type MessageWithParts,
@@ -39,6 +42,20 @@ import {
   readOmittedContent,
   writeCache,
 } from "../src/storage/omission";
+import { readStats } from "../src/storage/stats";
+import {
+  countCanonicalContentTokens,
+  countSessionTokens,
+} from "../src/stats/tokenize";
+import {
+  INCIDENT_DETERMINISTIC_TURN_COUNT,
+  INCIDENT_ERROR_TOOL_COUNT,
+  INCIDENT_RUNNING_TOOL_COUNT,
+  INCIDENT_STANDARD_TURN_COUNT,
+  INCIDENT_TOOL_COUNT,
+  INCIDENT_TURN_COUNT,
+  incidentSessionFixture,
+} from "./fixtures/incident-session";
 
 let storageDirectory: string;
 const originalDataHome = process.env.XDG_DATA_HOME;
@@ -70,24 +87,62 @@ describe("magic compact", () => {
       hidden: true,
     });
     expect(config.agent?.["magic-compact-summarizer"]?.permission).toEqual({
-      "*": "allow",
-      edit: "deny",
-      task: "deny",
-      question: "deny",
-      todowrite: "deny",
-      plan_enter: "deny",
-      plan_exit: "deny",
-      doom_loop: "deny",
+      "*": "deny",
     });
     expect(config.agent?.["magic-compact-summarizer"]?.prompt).toContain(
-      "Historical transcript evidence is primary",
+      "bounded exact evidence map in each request is authoritative",
     );
     expect(config.agent?.["magic-compact-summarizer"]?.prompt).toContain(
-      "Never continue unfinished work",
+      "continue unfinished work",
     );
     expect(config.agent?.["magic-compact-summarizer"]?.prompt).toContain(
       "Reply only with the JSON object required by each Magic Compact request",
     );
+  });
+
+  test("caps only Magic Compact summarizer generation at the provider boundary", async () => {
+    const hooks = await server({} as PluginInput);
+    const applyParams = hooks["chat.params"];
+    expect(applyParams).toBeDefined();
+
+    const absentLimit = chatParams(undefined);
+    await applyParams!(
+      chatParamsInput("scratch-1", "magic-compact-summarizer"),
+      absentLimit,
+    );
+    expect(absentLimit.maxOutputTokens).toBe(MAX_SUMMARY_OUTPUT_TOKENS);
+
+    const higherLimit = chatParams(8_192);
+    await applyParams!(
+      chatParamsInput("scratch-1", "magic-compact-summarizer"),
+      higherLimit,
+    );
+    expect(higherLimit.maxOutputTokens).toBe(MAX_SUMMARY_OUTPUT_TOKENS);
+
+    const lowerLimit = chatParams(1_500);
+    await applyParams!(
+      chatParamsInput("scratch-2", "magic-compact-summarizer"),
+      lowerLimit,
+    );
+    expect(lowerLimit.maxOutputTokens).toBe(1_500);
+
+    for (const current of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const invalidLimit = chatParams(current);
+      await applyParams!(
+        chatParamsInput("scratch-3", "magic-compact-summarizer"),
+        invalidLimit,
+      );
+      expect(invalidLimit.maxOutputTokens).toBe(MAX_SUMMARY_OUTPUT_TOKENS);
+    }
+
+    for (const [sessionID, agent] of [
+      ["source", "build"],
+      ["scratch-1", "compaction"],
+    ] as const) {
+      const ordinary = chatParams(8_192);
+      await applyParams!(chatParamsInput(sessionID, agent), ordinary);
+      expect(ordinary.maxOutputTokens).toBe(8_192);
+    }
   });
 
   test("uses the native compaction model and variant with the custom agent", async () => {
@@ -118,14 +173,18 @@ describe("magic compact", () => {
     expect(requests.agentRequests).toEqual([
       { directory: "/workspace", workspace: "workspace" },
     ]);
-    expect(requests.updates).toEqual([
+    expect(requests.updates).toEqual([]);
+    expect(requests.creates).toEqual([
       {
-        sessionID: "ephemeral",
+        directory: "/workspace",
+        workspace: "workspace",
+        workspaceID: "workspace",
         title: "[TEMP] Test session",
+        permission: [{ permission: "*", pattern: "*", action: "deny" }],
       },
     ]);
     expect(requests.prompts[0]).toMatchObject({
-      sessionID: "ephemeral",
+      sessionID: "scratch-1",
       agent: "magic-compact-summarizer",
       model: {
         providerID: "compaction-provider",
@@ -163,14 +222,7 @@ describe("magic compact", () => {
       runCompaction(session("source"), { agents: [], lifecycle }),
     ).rejects.toThrow("native hidden compaction agent");
 
-    expect(lifecycle).toEqual([
-      "messages",
-      "fork",
-      "messages",
-      "update",
-      "agents",
-      "delete",
-    ]);
+    expect(lifecycle).toEqual(["messages", "create", "agents", "delete"]);
   });
 
   test("rejects invalid explicit compaction model configuration", async () => {
@@ -185,22 +237,22 @@ describe("magic compact", () => {
     ).rejects.toThrow("invalid model configuration");
   });
 
-  test("maps omission reads to the source only while summarization is active", async () => {
+  test("does not route omission reads from transcript-free scratch sessions", async () => {
     const contentID = "source:omitted-AAAAAAAAAAAAAAAAAAAAAA";
     await writeCache("source", v2Cache(contentID, "historical output"));
     let contentDuringPrompt: string | null = null;
 
     await runCompaction(session("source"), {
       onPrompt: async () => {
-        contentDuringPrompt = await readOmittedContent("ephemeral", contentID);
+        contentDuringPrompt = await readOmittedContent("scratch-1", contentID);
       },
     });
 
-    expect(contentDuringPrompt).toBe("historical output");
-    expect(await readOmittedContent("ephemeral", contentID)).toBeNull();
+    expect(contentDuringPrompt).toBeNull();
+    expect(await readOmittedContent("scratch-1", contentID)).toBeNull();
   });
 
-  test("clears the omission source mapping when summarization fails", async () => {
+  test("keeps omission reads unavailable when scratch summarization fails", async () => {
     const contentID = "source:omitted-BBBBBBBBBBBBBBBBBBBBBB";
     await writeCache("source", v2Cache(contentID, "historical output"));
     let contentDuringPrompt: string | null = null;
@@ -209,7 +261,7 @@ describe("magic compact", () => {
       runCompaction(session("source"), {
         onPrompt: async () => {
           contentDuringPrompt = await readOmittedContent(
-            "ephemeral",
+            "scratch-1",
             contentID,
           );
         },
@@ -217,8 +269,8 @@ describe("magic compact", () => {
       }),
     ).rejects.toThrow("summary failed");
 
-    expect(contentDuringPrompt).toBe("historical output");
-    expect(await readOmittedContent("ephemeral", contentID)).toBeNull();
+    expect(contentDuringPrompt).toBeNull();
+    expect(await readOmittedContent("scratch-1", contentID)).toBeNull();
   });
 
   test("requests strict plain JSON without a format property while preserving summarizer constraints", async () => {
@@ -236,13 +288,12 @@ describe("magic compact", () => {
       "Do not return Markdown fences, prose, XML, or a nested wrapper",
     );
     expect(promptText).not.toContain("<summary>");
-    expect(promptText).not.toContain("Do not call any tools");
     expect(promptText).toContain(
-      "Tools may be used only when needed to recover missing historical evidence or clarify it through current inspection",
+      "No tools or external inspection are available",
     );
-    expect(promptText).toContain("Must not continue unfinished work");
+    expect(promptText).toContain('"exactEvidence":');
     expect(promptText).toContain(
-      "After any tool use, return only the required JSON object",
+      "Preserve failed, not-run, running, and unresolved state exactly",
     );
     expect(requests.partUpdates[0]).toMatchObject({
       part: {
@@ -335,6 +386,12 @@ describe("magic compact", () => {
         output: JSON.stringify({ assistant: " " }),
         category: "empty-summary",
       },
+      {
+        output: JSON.stringify({
+          assistant: "oversized ".repeat(MAX_SUMMARY_OUTPUT_TOKENS + 1),
+        }),
+        category: "response-too-large",
+      },
       ...[
         "[Replace with summary]",
         "Replace with your summary...",
@@ -385,14 +442,14 @@ describe("magic compact", () => {
     }
   });
 
-  test("does not retry a contract failure when ephemeral cleanup fails", async () => {
+  test("does not retry a contract failure when scratch cleanup fails", async () => {
     const lifecycle: string[] = [];
     let error: unknown;
 
     try {
       await runCompaction(session("source"), {
         textResponses: [JSON.stringify({ assistant: "[TODO]" })],
-        deleteError: new Error("ephemeral cleanup failed"),
+        deleteError: new Error("scratch cleanup failed"),
         deleteErrorAt: 1,
         lifecycle,
       });
@@ -404,11 +461,11 @@ describe("magic compact", () => {
     expect(nestedErrorMessages(error)).toEqual(
       expect.arrayContaining([
         expect.stringContaining("category=placeholder-summary"),
-        "ephemeral cleanup failed",
+        "scratch cleanup failed",
       ]),
     );
     expect(lifecycle.filter(event => event === "prompt")).toHaveLength(1);
-    expect(lifecycle.filter(event => event === "fork")).toHaveLength(1);
+    expect(lifecycle.filter(event => event === "create")).toHaveLength(1);
     expect(lifecycle.filter(event => event === "delete")).toHaveLength(1);
   });
 
@@ -439,6 +496,116 @@ describe("magic compact", () => {
       }),
     ).rejects.toThrow("prompt transport failed");
     expect(sdkLifecycle.filter(event => event === "prompt")).toHaveLength(1);
+
+    for (const failure of [
+      new Error("summary timed out"),
+      new DOMException("summary cancelled", "AbortError"),
+    ]) {
+      const lifecycle: string[] = [];
+      await expect(
+        runCompaction(session("source"), {
+          promptError: failure,
+          lifecycle,
+        }),
+      ).rejects.toThrow(failure.message);
+      expect(lifecycle.filter(event => event === "prompt")).toHaveLength(1);
+      expect(lifecycle.filter(event => event === "delete")).toHaveLength(1);
+    }
+  });
+
+  test("aborts the server-side scratch runner before delete when the client request times out", async () => {
+    jest.useFakeTimers();
+    const lifecycle: string[] = [];
+    const abortRequests: Record<string, unknown>[] = [];
+    const deleteRequests: Record<string, unknown>[] = [];
+    let promptSignal: AbortSignal | undefined;
+    try {
+      const compaction = runCompaction(session("source"), {
+        lifecycle,
+        abortRequests,
+        deleteRequests,
+        onPrompt: async signal => {
+          promptSignal = signal;
+          await new Promise<never>((_resolve, reject) => {
+            signal?.addEventListener("abort", () => reject(signal.reason), {
+              once: true,
+            });
+          });
+        },
+      });
+      for (
+        let index = 0;
+        index < 20 && !lifecycle.includes("prompt");
+        index += 1
+      ) {
+        await Promise.resolve();
+      }
+      expect(lifecycle).toContain("prompt");
+
+      jest.advanceTimersByTime(SUMMARY_REQUEST_TIMEOUT_MS);
+
+      await expect(compaction).rejects.toThrow("Summary request timed out.");
+      expect(promptSignal).toBeInstanceOf(AbortSignal);
+      expect(promptSignal?.aborted).toBeTrue();
+      expect(abortRequests).toEqual([
+        {
+          sessionID: "scratch-1",
+          directory: "/workspace",
+          workspace: "workspace",
+        },
+      ]);
+      expect(deleteRequests).toEqual(abortRequests);
+      expect(lifecycle).toEqual([
+        "messages",
+        "create",
+        "agents",
+        "prompt",
+        "abort",
+        "delete",
+      ]);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test("retains prompt, server abort, and delete failures after client cancellation", async () => {
+    const lifecycle: string[] = [];
+    const abortRequests: Record<string, unknown>[] = [];
+    const deleteRequests: Record<string, unknown>[] = [];
+    const promptFailure = new DOMException("summary cancelled", "AbortError");
+    let error: unknown;
+
+    try {
+      await runCompaction(session("source"), {
+        promptError: promptFailure,
+        abortError: new Error("scratch abort failed"),
+        deleteError: new Error("scratch cleanup failed"),
+        deleteErrorAt: 1,
+        lifecycle,
+        abortRequests,
+        deleteRequests,
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(AggregateError);
+    expect(nestedErrorMessages(error)).toEqual(
+      expect.arrayContaining([
+        "summary cancelled",
+        "scratch abort failed",
+        "scratch cleanup failed",
+      ]),
+    );
+    expect(lifecycle).toEqual([
+      "messages",
+      "create",
+      "agents",
+      "prompt",
+      "abort",
+      "delete",
+    ]);
+    expect(abortRequests).toEqual(deleteRequests);
   });
 
   test("prefers body-info errors over valid or malformed response text without retrying", async () => {
@@ -460,7 +627,7 @@ describe("magic compact", () => {
         }),
       ).rejects.toThrow("Summary provider failed (ProviderBodyError).");
       expect(lifecycle.filter(event => event === "prompt")).toHaveLength(1);
-      expect(lifecycle.filter(event => event === "fork")).toHaveLength(1);
+      expect(lifecycle.filter(event => event === "create")).toHaveLength(1);
       expect(lifecycle.filter(event => event === "delete")).toHaveLength(1);
     }
   });
@@ -479,7 +646,7 @@ describe("magic compact", () => {
     expect((requests.partUpdates[0]!.part as TextPart).text).toBe(
       "Completed the request.",
     );
-    expect(lifecycle.filter(event => event === "messages")).toHaveLength(3);
+    expect(lifecycle.filter(event => event === "messages")).toHaveLength(1);
 
     await requests.v2.session.prompt({
       sessionID: "probe-format",
@@ -507,10 +674,8 @@ describe("magic compact", () => {
       lifecycle,
     });
 
-    expect(requests.updates.map(update => update.sessionID)).toEqual([
-      "ephemeral",
-      "ephemeral-2",
-    ]);
+    expect(requests.creates).toHaveLength(2);
+    expect(requests.deletes).toEqual(["scratch-1", "scratch-2"]);
     expect(lifecycle.filter(event => event === "prompt")).toHaveLength(2);
     expect(lifecycle.filter(event => event === "delete")).toHaveLength(2);
     expect((requests.partUpdates[0]!.part as TextPart).text).toBe(
@@ -546,7 +711,11 @@ describe("magic compact", () => {
       assistants: [message("assistant", "assistant", [])],
     };
 
-    const prompt = buildCompactionPrompt([turn], null);
+    const prompt = buildCompactionPrompt(
+      [turn],
+      null,
+      new Map([[turn, "bounded evidence"]]),
+    );
 
     expect(prompt).toContain(JSON.stringify('<request & "proof">\n...'));
     expect(prompt).not.toContain("&lt;request");
@@ -555,26 +724,28 @@ describe("magic compact", () => {
   test("truncates user previews by Unicode code point and removes provider-invalid input", () => {
     const emojiBoundary = `${"a".repeat(299)}\ud83d\ude80ignored`;
     const invalidXml = "before\u0000\u000b\ud800middle\ud801after";
+    const turns = [
+      {
+        user: [
+          message("emoji-user", "user", [
+            textPart("emoji-text", "source", "emoji-user", emojiBoundary),
+          ]),
+        ],
+        assistants: [message("emoji-assistant", "assistant", [])],
+      },
+      {
+        user: [
+          message("invalid-user", "user", [
+            textPart("invalid-text", "source", "invalid-user", invalidXml),
+          ]),
+        ],
+        assistants: [message("invalid-assistant", "assistant", [])],
+      },
+    ];
     const prompt = buildCompactionPrompt(
-      [
-        {
-          user: [
-            message("emoji-user", "user", [
-              textPart("emoji-text", "source", "emoji-user", emojiBoundary),
-            ]),
-          ],
-          assistants: [message("emoji-assistant", "assistant", [])],
-        },
-        {
-          user: [
-            message("invalid-user", "user", [
-              textPart("invalid-text", "source", "invalid-user", invalidXml),
-            ]),
-          ],
-          assistants: [message("invalid-assistant", "assistant", [])],
-        },
-      ],
+      turns,
       null,
+      new Map(turns.map(turn => [turn, "bounded evidence"])),
     );
 
     expect(prompt).toContain(`${"a".repeat(299)}\ud83d\ude80...`);
@@ -585,93 +756,806 @@ describe("magic compact", () => {
     expect(hasUnpairedSurrogate(prompt)).toBeFalse();
   });
 
-  test("classifies high-risk turns at exact adjacent thresholds without model requests", async () => {
-    const cases = [
-      [metricTurn(HIGH_RISK_SERIALIZED_BYTES - 1, 1, 0), 1],
-      [metricTurn(HIGH_RISK_SERIALIZED_BYTES, 1, 0), 0],
-      [metricTurn(1, HIGH_RISK_MESSAGE_COUNT - 1, 0), 1],
-      [metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0), 0],
-      [metricTurn(1, 1, HIGH_RISK_TOOL_COUNT - 1), 1],
-      [metricTurn(1, 1, HIGH_RISK_TOOL_COUNT), 0],
-      [metricTurn(1, 1, 1, "error"), 0],
-    ] as const;
+  test("routes large completed turns to bounded scratch summarization", async () => {
+    const turn = metricTurn(170_000, 21, 32);
+    const finalText = turn.assistants
+      .at(-1)!
+      .parts.find((part): part is TextPart => part.type === "text")!;
+    finalText.text = `Historical exact delivery marker. ${finalText.text}`;
 
-    for (const [turn, promptCount] of cases) {
+    const requests = await runCompaction(session("source"), {
+      messages: [...turn.user, ...turn.assistants],
+    });
+
+    expect(requests.prompts).toHaveLength(1);
+    expect(requests.creates).toHaveLength(1);
+    expect(requests.creates[0]).toMatchObject({
+      directory: "/workspace",
+      workspace: "workspace",
+      permission: [{ permission: "*", pattern: "*", action: "deny" }],
+    });
+    expect(requests.creates[0]).not.toHaveProperty("parentID");
+    expect(requests.forks).toEqual([]);
+    expect(requests.updates).toEqual([]);
+    expect(requests.prompts[0]).toMatchObject({
+      sessionID: "scratch-1",
+      agent: "magic-compact-summarizer",
+    });
+    expect(requests.prompts[0]).not.toHaveProperty("tools");
+    expect(promptText(requests.prompts[0]!)).toContain(
+      "Historical exact delivery marker",
+    );
+    expect(encode(promptText(requests.prompts[0]!)).length).toBeLessThanOrEqual(
+      24_000,
+    );
+    expect(requests.deletes).toEqual(["scratch-1"]);
+  }, 30_000);
+
+  test("routes unresolved semantic evidence deterministically with no scratch prompts", async () => {
+    const errorState = metricTurn(1, 1, 1, "error");
+    const runningState = metricTurn(1, 1, 0);
+    runningState.assistants[0]!.parts.push(
+      genericToolPart("running", "metric-assistant-0", "bash", {
+        status: "running",
+        input: { command: "synthetic-watch" },
+        metadata: {},
+        time: { start: 1 },
+      }),
+    );
+    const unknownState = metricTurn(1, 1, 0);
+    unknownState.assistants[0]!.parts.push(
+      genericToolPart("unknown", "metric-assistant-0", "custom", {
+        status: "unknown",
+        input: {},
+        metadata: {},
+      }),
+    );
+    const failedResult = metricTurn(1, 1, 0);
+    failedResult.assistants[0]!.parts.push(
+      commandToolPart(
+        "failed",
+        "metric-assistant-0",
+        "bun test",
+        "Process exited with code 1",
+      ),
+    );
+    const notRunResult = metricTurn(1, 1, 0);
+    notRunResult.assistants[0]!.parts.push(
+      commandToolPart(
+        "not-run",
+        "metric-assistant-0",
+        "bun test",
+        "Tests were not run",
+      ),
+    );
+    const incompleteProse = metricTurn(1, 1, 0);
+    incompleteProse.assistants[0]!.parts.push(
+      textPart(
+        "incomplete",
+        "source",
+        "metric-assistant-0",
+        "Work remains: run the integration checks.",
+      ),
+    );
+
+    for (const turn of [
+      errorState,
+      runningState,
+      unknownState,
+      failedResult,
+      notRunResult,
+      incompleteProse,
+    ]) {
       const requests = await runCompaction(session("source"), {
         messages: [...turn.user, ...turn.assistants],
       });
-      expect(requests.prompts).toHaveLength(promptCount);
-      expect(requests.agentRequests).toHaveLength(promptCount > 0 ? 1 : 0);
+      expect(requests.prompts).toEqual([]);
+      expect(requests.creates).toEqual([]);
+      expect(requests.forks).toEqual([]);
+      expect(requests.agentRequests).toEqual([]);
     }
   });
 
-  test("batches standard turns chronologically at the exported cap with source-turn anchors", async () => {
-    const messages = Array.from(
-      { length: MAX_SUMMARY_BATCH_TURNS + 1 },
-      (_, index) => completedTurn(`batch-${index}`, `Request ${index}`),
-    ).flat();
+  test("routes a final assistant metadata error deterministically with bounded structured evidence", async () => {
+    const messages = completedTurn("assistant-error", "Authenticate provider");
+    const assistant = messages[1]!;
+    Object.assign(assistant.info, {
+      error: {
+        name: "ProviderAuthError",
+        data: {
+          providerID: "provider-x",
+          message: "Authentication token expired.",
+        },
+      },
+    });
 
     const requests = await runCompaction(session("source"), { messages });
-    const prompts = requests.prompts.map(promptText);
-    const firstBatchIDs = Array.from(
-      { length: MAX_SUMMARY_BATCH_TURNS },
-      (_, index) => `batch-${index}-assistant`,
-    );
-    const finalBatchID = `batch-${MAX_SUMMARY_BATCH_TURNS}-assistant`;
+    const stored = storedSummary(requests, assistant.info.id);
 
-    expect(prompts).toHaveLength(2);
-    expect(requests.prompts.map(summaryRequestIDs)).toEqual([
-      firstBatchIDs,
-      [finalBatchID],
-    ]);
-    expect(prompts[0]).toContain('"stopAnchor": {');
-    expect(prompts[0]).toContain(`"assistantTurnID": "${finalBatchID}"`);
-    expect(prompts[1]).toContain('"stopAnchor": null');
-    expect(requests.agentRequests).toHaveLength(1);
-    expect(requests.updates.map(update => update.sessionID)).toEqual([
-      "ephemeral",
-      "ephemeral-2",
-    ]);
+    expect(requests.prompts).toEqual([]);
+    expect(requests.creates).toEqual([]);
+    expect(requests.agentRequests).toEqual([]);
+    expect(stored).toStartWith("Outcome: partial\n");
+    expect(stored).toContain('"kind":"assistant-message-status"');
+    expect(stored).toContain('"status":"error"');
+    expect(stored).toContain('"errorType":"ProviderAuthError"');
+    expect(stored).toContain('"message":"Authentication token expired."');
   });
 
-  test("retries only a failed late batch in a fresh ephemeral fork", async () => {
-    const messages = Array.from(
-      { length: MAX_SUMMARY_BATCH_TURNS + 1 },
-      (_, index) => completedTurn(`retry-${index}`, `Request ${index}`),
-    ).flat();
-    const firstBatchIDs = Array.from(
-      { length: MAX_SUMMARY_BATCH_TURNS },
-      (_, index) => `retry-${index}-assistant`,
+  test("keeps an earlier assistant metadata error model-eligible after a successful recovery", async () => {
+    const messages = completedTurn("assistant-recovery", "Retry provider");
+    const failed = messages[1]!;
+    Object.assign(failed.info, {
+      error: {
+        name: "ProviderAuthError",
+        data: {
+          providerID: "provider-x",
+          message: "Authentication token expired.",
+        },
+      },
+    });
+    const recovered = message("assistant-recovery-success", "assistant", [
+      textPart(
+        "assistant-recovery-success-text",
+        "source",
+        "assistant-recovery-success",
+        "Recovered after provider credentials were refreshed.",
+      ),
+    ]);
+    Object.assign(recovered.info, { finish: "stop" });
+    messages.push(recovered);
+
+    const requests = await runCompaction(session("source"), { messages });
+    const evidence = summaryRequestEvidence(requests.prompts[0]!);
+
+    expect(requests.prompts).toHaveLength(1);
+    expect(requests.creates).toHaveLength(1);
+    expect(requests.agentRequests).toHaveLength(1);
+    expect(evidence).toContain('"kind":"assistant-message-status"');
+    expect(evidence).toContain('"status":"recovered"');
+    expect(evidence).toContain('"errorType":"ProviderAuthError"');
+    expect(evidence).toContain('"message":"Authentication token expired."');
+    expect(evidence).toContain(
+      "Recovered after provider credentials were refreshed.",
     );
-    const lateID = `retry-${MAX_SUMMARY_BATCH_TURNS}-assistant`;
+  });
+
+  test("keeps the final substantive assistant response in a saturated standard scratch prompt", async () => {
+    const marker = "FINAL RESPONSE DELIVERED";
+    const denseBody = `${marker}\n${Array.from(
+      { length: 120 },
+      (_, index) => `"key${index}": "value \\"escaped\\" ${"z".repeat(30)}"`,
+    ).join("\n")}`;
+    const messages = completedTurn("saturated-final", "Deliver the change");
+    messages[1]!.parts.push(
+      textPart(
+        "saturated-final-text",
+        "source",
+        messages[1]!.info.id,
+        denseBody,
+      ),
+    );
+
+    const requests = await runCompaction(session("source"), { messages });
+    const evidence = summaryRequestEvidence(requests.prompts[0]!);
+
+    expect(requests.prompts).toHaveLength(1);
+    expect(requests.creates).toHaveLength(1);
+    expect(evidence).toContain(marker);
+    expect(
+      labeledSummarySection(
+        evidence,
+        "Historical assistant text (authoritative)",
+        "Verification",
+      ),
+    ).not.toContain("omitted-record-count=1");
+    expect(encode(evidence).length).toBeLessThanOrEqual(
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
+    );
+  });
+
+  test("keeps recovered assistant error status in a saturated standard scratch prompt", async () => {
+    const failed = message("recovered-dense-error", "assistant", []);
+    Object.assign(failed.info, {
+      error: {
+        name: "ProviderAuthError",
+        data: {
+          providerID: "provider-x",
+          message: "Authentication token expired.",
+        },
+      },
+    });
+    failed.parts.push(
+      ...Array.from({ length: 12 }, (_, index) =>
+        commandToolPart(
+          `recovered-dense-tool-${index}`,
+          failed.info.id,
+          "bun test",
+          `10 passed, 0 failed ${"y".repeat(3_000)}`,
+        ),
+      ),
+    );
+    const recovered = message("recovered-dense-success", "assistant", [
+      textPart(
+        "recovered-dense-success-text",
+        "source",
+        "recovered-dense-success",
+        "Recovered after provider credentials were refreshed.",
+      ),
+    ]);
+    Object.assign(recovered.info, { finish: "stop" });
+    const user = message("recovered-dense-user", "user", [
+      textPart(
+        "recovered-dense-user-text",
+        "source",
+        "recovered-dense-user",
+        "Retry the provider",
+      ),
+    ]);
+
+    const requests = await runCompaction(session("source"), {
+      messages: [user, failed, recovered],
+    });
+    const evidence = summaryRequestEvidence(requests.prompts[0]!);
+
+    expect(requests.prompts).toHaveLength(1);
+    expect(evidence).toContain('"kind":"assistant-message-status"');
+    expect(evidence).toContain('"status":"recovered"');
+    expect(evidence).toContain('"errorType":"ProviderAuthError"');
+    expect(encode(evidence).length).toBeLessThanOrEqual(
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
+    );
+  });
+
+  test("keeps the final substantive assistant response inside a required-record overflow capsule", async () => {
+    const marker = "FINAL SUBSTANTIVE RESPONSE";
+    const denseBody = `${marker}\n${Array.from(
+      { length: 120 },
+      (_, index) => `"key${index}": "value \\"escaped\\" ${"z".repeat(30)}"`,
+    ).join("\n")}`;
+    const user = message("overflow-capsule-user", "user", [
+      textPart(
+        "overflow-capsule-user-text",
+        "source",
+        "overflow-capsule-user",
+        "Recover and finish",
+      ),
+    ]);
+    const failed = Array.from({ length: 40 }, (_, index) => {
+      const item = message(`overflow-capsule-error-${index}`, "assistant", []);
+      Object.assign(item.info, {
+        error: {
+          name: `ProviderAuthError-${index}-${"x".repeat(180)}`,
+          data: {
+            providerID: "provider-x",
+            message: `Authentication token expired for attempt ${index}.`,
+          },
+        },
+      });
+      return item;
+    });
+    const recovered = message("overflow-capsule-success", "assistant", [
+      textPart(
+        "overflow-capsule-success-text",
+        "source",
+        "overflow-capsule-success",
+        "Recovered after provider credentials were refreshed.",
+      ),
+    ]);
+    Object.assign(recovered.info, { finish: "stop" });
+    recovered.parts.push(
+      textPart(
+        "overflow-capsule-final-text",
+        "source",
+        "overflow-capsule-success",
+        denseBody,
+      ),
+    );
+
+    const requests = await runCompaction(session("source"), {
+      messages: [user, ...failed, recovered],
+    });
+    const evidence = summaryRequestEvidence(requests.prompts[0]!);
+
+    expect(requests.prompts).toHaveLength(1);
+    expect(requests.creates).toHaveLength(1);
+    expect(requests.agentRequests).toHaveLength(1);
+    expect(evidence).toContain(
+      "Required deterministic evidence overflow capsule:",
+    );
+    expect(evidence).toContain(marker);
+    expect(evidence).toContain('"status":"recovered"');
+    expect(evidence).toContain('"assistant-message-recovered":40');
+    expect(evidence).toContain("required-record-total=41");
+    const omitted = Number(
+      evidence.match(/required-record-overflow=(\d+)/)?.[1],
+    );
+    const includedRecords = evidence
+      .slice(
+        evidence.indexOf("required-records:"),
+        evidence.indexOf("required-record-overflow="),
+      )
+      .split("\n")
+      .filter(line => line.startsWith("{")).length;
+    expect(omitted).toBe(41 - includedRecords);
+    expect(encode(evidence).length).toBeLessThanOrEqual(
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
+    );
+  });
+
+  test.each([
+    ["assistant", "No tests were run."],
+    ["assistant", "No tests have been executed."],
+    ["assistant", "Tests have not yet run."],
+    ["assistant", "Tests were never executed."],
+    ["assistant", "Unable to run tests."],
+    ["assistant", "Tests have yet to run."],
+    ["tool", "No tests were run."],
+    ["tool", "No tests have been executed."],
+    ["tool", "Tests have not yet run."],
+    ["tool", "never executed"],
+    ["tool", "unable to run"],
+    ["tool", "have yet to run"],
+  ] as const)(
+    "routes %s not-run evidence deterministically without a scratch prompt: %s",
+    async (source, text) => {
+      const messages = completedTurn("not-run-form", "Verify the change");
+      const assistant = messages[1]!;
+      assistant.parts.push(
+        source === "assistant"
+          ? textPart(
+              "not-run-assistant-text",
+              "source",
+              assistant.info.id,
+              text,
+            )
+          : commandToolPart(
+              "not-run-tool",
+              assistant.info.id,
+              "bun test",
+              text,
+            ),
+      );
+
+      const requests = await runCompaction(session("source"), { messages });
+      const stored = storedSummary(requests, assistant.info.id);
+
+      expect(requests.prompts).toEqual([]);
+      expect(requests.creates).toEqual([]);
+      expect(requests.agentRequests).toEqual([]);
+      expect(stored).toStartWith("Outcome: partial\n");
+      expect(stored).toContain(text);
+      expect(stored).toContain('"polarity":"not-run"');
+    },
+  );
+
+  test.each(["assistant", "passive tool"] as const)(
+    "keeps generic %s inability prose model-eligible",
+    async source => {
+      const messages = completedTurn("generic-inability", "Inspect the parser");
+      const assistant = messages[1]!;
+      assistant.parts.push(
+        source === "assistant"
+          ? textPart(
+              "generic-inability-text",
+              "source",
+              assistant.info.id,
+              "Unable to run parser normalization in this code path.",
+            )
+          : genericToolPart(
+              "generic-inability-tool",
+              assistant.info.id,
+              "read",
+              {
+                status: "completed",
+                input: { filePath: "/workspace/notes.md" },
+                output: "unable to run",
+                title: "Read notes",
+                metadata: {},
+                time: { start: 1, end: 2 },
+              },
+            ),
+      );
+
+      const requests = await runCompaction(session("source"), { messages });
+
+      expect(requests.prompts).toHaveLength(1);
+      expect(requests.creates).toHaveLength(1);
+      expect(requests.agentRequests).toHaveLength(1);
+    },
+  );
+
+  test("keeps a packed standard request within the 24K input cap", async () => {
+    const messages = Array.from({ length: 24 }, (_, index) =>
+      completedTurn(`packed-${index}`, `Request ${index}`),
+    ).flat();
+    const expectedIDs = Array.from(
+      { length: 24 },
+      (_, index) => `packed-${index}-assistant`,
+    );
+
+    const requests = await runCompaction(session("source"), { messages });
+
+    expect(requests.prompts.length).toBeGreaterThanOrEqual(1);
+    expect(requests.prompts.flatMap(summaryRequestIDs)).toEqual(expectedIDs);
+    for (const prompt of requests.prompts) {
+      expect(encode(promptText(prompt)).length).toBeLessThanOrEqual(24_000);
+    }
+    expect(requests.creates).toHaveLength(requests.prompts.length);
+    expect(requests.forks).toEqual([]);
+  });
+
+  test("rejects a single standard request that exceeds the 24K input cap", async () => {
+    const oversizedID = `oversized-${"\u03ff".repeat(7_000)}`;
+    const messages = [
+      ...completedTurn("small", "Small request"),
+      ...completedTurn(oversizedID, "Oversized exact ID"),
+    ];
+
+    await expect(
+      runCompaction(session("source"), { messages }),
+    ).rejects.toThrow("One bounded turn evidence map exceeds");
+  });
+
+  test("runs no more than two scratch summary requests concurrently", async () => {
+    const messages = Array.from({ length: 240 }, (_, index) =>
+      completedTurn(`concurrent-${index}`, `Request ${index}`),
+    ).flat();
 
     const requests = await runCompaction(session("source"), {
       messages,
-      textResponses: [
-        summaryJsonForIDs(firstBatchIDs),
-        JSON.stringify({ [lateID]: "[TODO]" }),
-        JSON.stringify({ [lateID]: "Recovered late batch summary." }),
+      onPrompt: async () => {
+        await Bun.sleep(5);
+      },
+    });
+
+    expect(requests.prompts.length).toBeGreaterThan(1);
+    expect(requests.maxPromptConcurrency).toBe(2);
+    expect(requests.forks).toEqual([]);
+    expect(requests.deletes).toHaveLength(requests.creates.length);
+  });
+
+  test("rejects weak projected savings before backup, source writes, or stats", async () => {
+    const messages = completedTurn("weak", "Small request");
+    messages[1]!.parts.push(
+      textPart(
+        "weak-result",
+        "source",
+        "weak-assistant",
+        "A short final answer.",
+      ),
+    );
+    addProviderTokens(messages);
+    const command = createCommandHarness(messages, {
+      summaryTextOutputs: [
+        JSON.stringify({
+          "weak-assistant":
+            "A replacement that cannot provide useful net context reduction.",
+        }),
       ],
     });
 
-    expect(requests.prompts.map(summaryRequestIDs)).toEqual([
-      firstBatchIDs,
-      [lateID],
-      [lateID],
-    ]);
-    expect(requests.updates.map(update => update.sessionID)).toEqual([
-      "ephemeral",
-      "ephemeral-2",
-      "ephemeral-3",
-    ]);
-    expect(requests.partUpdates.map(update => update.messageID)).toEqual([
-      ...firstBatchIDs,
-      lateID,
-    ]);
-    expect((requests.partUpdates.at(-1)!.part as TextPart).text).toBe(
-      "Recovered late batch summary.",
+    await expect(executeMagicCompact(command.v2, "source", 0)).rejects.toThrow(
+      "useful active-context savings",
     );
+
+    expect(command.backupForks).toEqual([]);
+    expect(command.sourcePrompts).toEqual([]);
+    expect(command.partUpdates).toEqual([]);
+    expect(command.partDeletes).toEqual([]);
+    expect(command.messageDeletes).toEqual([]);
+    expect(
+      command.sessionUpdates.filter(request => request.sessionID === "source"),
+    ).toEqual([]);
+    expect(await readStats("source")).toBeNull();
+    expect(command.toasts.at(-1)).toMatchObject({
+      title: "Magic Compact Failed",
+      message: expect.stringContaining("useful active-context savings"),
+      variant: "error",
+    });
   });
+
+  test("retrieves every planned omission notice through the authorized plugin tool", async () => {
+    const inputContent = "exact planned input\n".repeat(180);
+    const outputContent = "exact planned output\n".repeat(180);
+    const messages = completedTurn("planned-omissions", "Write the artifact");
+    const assistant = messages[1]!;
+    assistant.parts.push(
+      genericToolPart("planned-write", assistant.info.id, "write", {
+        status: "completed",
+        input: { filePath: "/workspace/artifact.txt", content: inputContent },
+        output: outputContent,
+        title: "Write artifact",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      }),
+    );
+    addProviderTokens(messages);
+    await rm(statsPath("source"), { force: true });
+    await rm(cachePath("source"), { force: true });
+    const command = createCommandHarness(messages);
+
+    expect(await executeMagicCompact(command.v2, "source", 0)).toBe(true);
+    const compacted = messages
+      .flatMap(item => item.parts)
+      .find((part): part is ToolPart => part.id === "planned-write")!;
+    const contentIDs = omissionContentIDs(compacted);
+    const omissionTool = await canonicalOmissionTool();
+
+    expect(contentIDs).toHaveLength(2);
+    const retrieved = await Promise.all(
+      contentIDs.map(contentID =>
+        omissionTool.execute(
+          { contentId: contentID },
+          omissionToolContext("source"),
+        ),
+      ),
+    );
+    expect(retrieved).toEqual([inputContent, outputContent]);
+    for (const [index, original] of [inputContent, outputContent].entries()) {
+      expect(Buffer.from(String(retrieved[index]), "utf16le")).toEqual(
+        Buffer.from(original, "utf16le"),
+      );
+    }
+    for (const contentID of contentIDs) {
+      expect(
+        await omissionTool.execute(
+          { contentId: contentID },
+          omissionToolContext("other-session"),
+        ),
+      ).toContain("no authorized current-session cache entry exists");
+    }
+  });
+
+  test("compacts a second boundary while preserving summaries, cache lineage, stats, users, and native checkpoint", async () => {
+    for (const sessionID of ["source", "backup", "ephemeral"]) {
+      await rm(cachePath(sessionID), { force: true });
+      await rm(statsPath(sessionID), { force: true });
+    }
+    const firstOutput = "first exact historical read\n".repeat(180);
+    const secondOutput = "second exact historical read\n".repeat(180);
+    const messages = nativeCheckpointFixture({ tailStartID: "tail-assistant" });
+    const firstAssistant = messages.find(
+      item => item.info.id === "suffix-1-assistant",
+    )!;
+    firstAssistant.parts.push(
+      genericToolPart("first-lineage-read", firstAssistant.info.id, "read", {
+        status: "completed",
+        input: { filePath: "/workspace/first.txt" },
+        output: firstOutput,
+        title: "Read first artifact",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      }),
+    );
+    addProviderTokens(messages);
+    const nativeSummaryIndex = messages.findIndex(
+      item => item.info.id === "native-summary",
+    );
+    const nativePrefix = structuredClone(
+      messages.slice(0, nativeSummaryIndex + 1),
+    );
+    const exactUserText = userTextByPartID(messages);
+    const command = createCommandHarness(messages);
+
+    expect(await executeMagicCompact(command.v2, "source", 1)).toBe(true);
+    const firstSummary = summaryText(messages, "suffix-1-assistant");
+    const firstID = omissionContentIDs(
+      messages
+        .flatMap(item => item.parts)
+        .find((part): part is ToolPart => part.id === "first-lineage-read")!,
+    )[0]!;
+    const firstStats = await readStats("source");
+    expect(firstStats?.totalTokensPruned).toBeGreaterThan(0);
+    expect(boundaryParts(messages)).toEqual([
+      expect.objectContaining({ messageID: "suffix-2-user" }),
+    ]);
+
+    const secondAssistant = messages.find(
+      item => item.info.id === "suffix-2-assistant",
+    )!;
+    secondAssistant.parts.push(
+      {
+        id: "suffix-2-removable-detail",
+        sessionID: "source",
+        messageID: secondAssistant.info.id,
+        type: "reasoning",
+        text: "second removable historical detail ".repeat(1_200),
+        time: { start: 1, end: 2 },
+      } as Part,
+      genericToolPart("second-lineage-read", secondAssistant.info.id, "read", {
+        status: "completed",
+        input: { filePath: "/workspace/second.txt" },
+        output: secondOutput,
+        title: "Read second artifact",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      }),
+    );
+    messages.push(
+      ...completedTurn(
+        "suffix-3",
+        "Current exact user request after compaction",
+      ),
+    );
+    addProviderTokens(messages);
+    const beforeSecond = countCanonicalContentTokens(messages);
+    const secondPlan = await planFor(messages, 1);
+    const secondEligible = countCanonicalContentTokens(
+      secondPlan.summarizedTurns.flatMap(turn => turn.assistants),
+    );
+
+    expect(await executeMagicCompact(command.v2, "source", 1)).toBe(true);
+    const afterSecond = countCanonicalContentTokens(messages);
+    const secondSaved = beforeSecond - afterSecond;
+    const secondID = omissionContentIDs(
+      messages
+        .flatMap(item => item.parts)
+        .find((part): part is ToolPart => part.id === "second-lineage-read")!,
+    )[0]!;
+    const secondStats = await readStats("source");
+    const omissionTool = await canonicalOmissionTool();
+
+    expect(summaryText(messages, "suffix-1-assistant")).toBe(firstSummary);
+    expect(boundaryParts(messages)).toHaveLength(1);
+    expect(boundaryParts(messages)[0]!.messageID).not.toBe("suffix-2-user");
+    expect(secondSaved).toBeGreaterThanOrEqual(
+      Math.max(32, Math.ceil(secondEligible * 0.2)),
+    );
+    expect(secondStats?.totalTokensPruned).toBe(
+      firstStats!.totalTokensPruned + secondSaved,
+    );
+    expect(command.currentSourceSession.metadata?.magicCompact).toMatchObject({
+      compactionCount: 2,
+    });
+    expect(
+      messages.some(message =>
+        message.parts.some(
+          part =>
+            part.type === "text" && part.text.includes("Magic Compaction #2"),
+        ),
+      ),
+    ).toBeTrue();
+    expect(messages.slice(0, nativeSummaryIndex + 1)).toEqual(nativePrefix);
+    expect(userTextByPartID(messages)).toMatchObject(exactUserText);
+    expect(userTextByPartID(messages)["suffix-3-text"]).toBe(
+      "Current exact user request after compaction",
+    );
+    expect(
+      await omissionTool.execute(
+        { contentId: firstID },
+        omissionToolContext("source"),
+      ),
+    ).toBe(firstOutput);
+    expect(
+      await omissionTool.execute(
+        { contentId: secondID },
+        omissionToolContext("source"),
+      ),
+    ).toBe(secondOutput);
+    expect(
+      await omissionTool.execute(
+        { contentId: firstID },
+        omissionToolContext("ephemeral"),
+      ),
+    ).toBe(firstOutput);
+    expect(
+      await omissionTool.execute(
+        { contentId: secondID },
+        omissionToolContext("ephemeral"),
+      ),
+    ).toContain("no authorized current-session cache entry exists");
+  });
+
+  test("meets the incident-shaped structural and token acceptance gates", async () => {
+    const messages = incidentSessionFixture();
+    const beforeTokens = countCanonicalContentTokens(messages);
+    const toolParts = messages.flatMap(message =>
+      message.parts.filter(part => part.type === "tool"),
+    );
+    const errorTools = toolParts.filter(
+      part => part.type === "tool" && part.state.status === "error",
+    );
+    const runningTools = toolParts.filter(
+      part => part.type === "tool" && part.state.status === "running",
+    );
+
+    await rm(statsPath("source"), { force: true });
+    await rm(cachePath("source"), { force: true });
+    const command = createCommandHarness(messages);
+    expect(await executeMagicCompact(command.v2, "source", 0)).toBe(true);
+    const afterTokens = await countSessionTokens(command.v2, "source");
+    const stats = await readStats("source");
+    const summaries = command.partUpdates
+      .filter(update =>
+        (update.part as TextPart).metadata?.magicCompact
+          ? (
+              (update.part as TextPart).metadata!.magicCompact as Record<
+                string,
+                unknown
+              >
+            ).summary === true
+          : false,
+      )
+      .map(update => (update.part as TextPart).text);
+    const deterministic = summaries.filter(summary =>
+      summary.startsWith("Outcome:"),
+    );
+    const replacements = summaries.reduce(
+      (sum, summary) => sum + encode(summary).length,
+      0,
+    );
+    const deterministicTokens = deterministic.reduce(
+      (sum, summary) => sum + encode(summary).length,
+      0,
+    );
+    const promptTokens = command.summaryRequests.map(
+      request => encode(promptText(request)).length,
+    );
+    const result = {
+      turns: messages.filter(message => message.info.role === "assistant")
+        .length,
+      tools: toolParts.length,
+      errorTools: errorTools.length,
+      runningTools: runningTools.length,
+      beforeTokens,
+      afterTokens,
+      reduction: (beforeTokens - afterTokens) / beforeTokens,
+      replacementTokens: replacements,
+      deterministicTokens,
+      deterministicTurns: deterministic.length,
+      standardTurns: command.summaryRequests.flatMap(summaryRequestIDs).length,
+      modelInputTokens: promptTokens.reduce((sum, count) => sum + count, 0),
+      maxRequestTokens: Math.max(...promptTokens),
+      requests: command.summaryRequests.length,
+      maxConcurrency: command.maxSummaryConcurrency,
+      backupForks: command.backupForks.length,
+      scratchCreates: command.scratchCreates.length,
+    };
+    console.info(`INCIDENT_ACCEPTANCE ${JSON.stringify(result)}`);
+
+    expect(
+      messages.filter(message => message.info.role === "assistant"),
+    ).toHaveLength(INCIDENT_TURN_COUNT);
+    expect(toolParts).toHaveLength(INCIDENT_TOOL_COUNT);
+    expect(errorTools).toHaveLength(INCIDENT_ERROR_TOOL_COUNT);
+    expect(runningTools).toHaveLength(INCIDENT_RUNNING_TOOL_COUNT);
+    expect(deterministic).toHaveLength(INCIDENT_DETERMINISTIC_TURN_COUNT);
+    expect(command.summaryRequests.flatMap(summaryRequestIDs)).toHaveLength(
+      INCIDENT_STANDARD_TURN_COUNT,
+    );
+    expect(beforeTokens).toBeGreaterThanOrEqual(300_000);
+    expect(beforeTokens).toBeLessThanOrEqual(360_000);
+    expect(afterTokens).toBeLessThanOrEqual(195_000);
+    expect(stats?.totalTokensPruned).toBe(beforeTokens - afterTokens);
+    expect(result.reduction).toBeGreaterThanOrEqual(0.4);
+    expect(replacements).toBeLessThanOrEqual(18_000);
+    expect(deterministicTokens).toBeLessThanOrEqual(12_288);
+    expect(result.modelInputTokens).toBeLessThanOrEqual(48_000);
+    expect(result.maxRequestTokens).toBeLessThanOrEqual(
+      MAX_SUMMARY_INPUT_TOKENS,
+    );
+    expect(command.summaryRequests.length).toBeLessThanOrEqual(2);
+    expect(command.maxSummaryConcurrency).toBeGreaterThanOrEqual(1);
+    expect(command.maxSummaryConcurrency).toBeLessThanOrEqual(2);
+    for (const request of command.summaryRequests) {
+      expect(request).not.toHaveProperty("tools");
+    }
+    expect(command.backupForks).toHaveLength(1);
+    for (const create of command.scratchCreates) {
+      expect(create).not.toHaveProperty("parentID");
+      expect(create).toHaveProperty("permission", [
+        { permission: "*", pattern: "*", action: "deny" },
+      ]);
+    }
+    for (const summary of deterministic) {
+      expect(encode(summary).length).toBeLessThanOrEqual(
+        DETERMINISTIC_SUMMARY_MAX_TOKENS,
+      );
+      expect(summary).toContain("omitted-record-count=");
+      expect(summary).toContain("Unresolved:");
+    }
+  }, 30_000);
 
   test("renders a measured outlier deterministically between standard batches", async () => {
     const lifecycle: string[] = [];
@@ -695,22 +1579,21 @@ describe("magic compact", () => {
       textResponses: [
         JSON.stringify({
           "ordinary-before-assistant": "Before summary.",
-        }),
-        JSON.stringify({
           "ordinary-after-assistant": "After summary.",
         }),
       ],
     });
     const prompts = requests.prompts.map(promptText);
 
-    expect(prompts).toHaveLength(2);
-    expect(requests.updates).toHaveLength(2);
+    expect(prompts).toHaveLength(1);
+    expect(requests.updates).toHaveLength(0);
     expect(requests.agentRequests).toHaveLength(1);
     expect(requests.prompts.map(summaryRequestIDs)).toEqual([
-      ["ordinary-before-assistant"],
-      ["ordinary-after-assistant"],
+      ["ordinary-before-assistant", "ordinary-after-assistant"],
     ]);
-    expect(prompts[0]).toContain('"assistantTurnID": "outlier-assistant-0"');
+    expect(prompts[0]).not.toContain(
+      '"assistantTurnID": "outlier-assistant-0"',
+    );
     expect(prompts.join("\n")).not.toContain("Replace with your summary");
     expect(requests.partUpdates.map(update => update.messageID)).toEqual([
       "ordinary-before-assistant",
@@ -729,15 +1612,16 @@ describe("magic compact", () => {
     expect(stored).toContain("final assistant evidence");
     expect(stored).toContain('"command":"bun test"');
     expect(stored).toContain("Process exited with code 1");
-    expect(stored).toContain('"command":"git status --short"');
-    expect(stored).toContain("push succeeded");
+    expect(
+      labeledSummarySection(stored, "VCS/Deployment", "Unresolved"),
+    ).toContain("omitted-record-count=2");
     expect(stored).toContain('"status":"running"');
     expect(
       stored.split("Historical terminal evidence (authoritative):"),
     ).toHaveLength(2);
     expect(stored).toContain("omitted-record-count=");
-    expect(Buffer.byteLength(stored)).toBeLessThanOrEqual(
-      DETERMINISTIC_HIGH_RISK_SUMMARY_MAX_BYTES,
+    expect(encode(stored).length).toBeLessThanOrEqual(
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
     );
     expect(hasUnpairedSurrogate(stored)).toBeFalse();
   });
@@ -765,7 +1649,7 @@ describe("magic compact", () => {
   });
 
   test("excludes synthetic, ignored, Magic summary, empty, and placeholder assistant text", async () => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants.at(-1)!;
     assistant.parts.push(
       textPart(
@@ -804,7 +1688,7 @@ describe("magic compact", () => {
       textPart("placeholder-final", "source", assistant.info.id, "[TODO]"),
       textPart("empty-final", "source", assistant.info.id, "   "),
     );
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -817,8 +1701,8 @@ describe("magic compact", () => {
     expect(stored).not.toContain("[TODO]");
   });
 
-  test("reserves twenty pending records and a late failure with exact anchors under the total UTF-8 cap", async () => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+  test("caps required pending overflow with an explicit deterministic disclosure", async () => {
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     const latePaths = Array.from(
       { length: 16 },
@@ -861,44 +1745,18 @@ describe("magic compact", () => {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
-    const terminal = labeledSummarySection(
-      stored,
-      "Historical terminal evidence (authoritative)",
-    );
-    const unresolved = labeledSummarySection(
-      stored,
-      "Unresolved",
-      "Historical terminal evidence (authoritative)",
-    );
 
-    expect(Buffer.byteLength(stored)).toBeLessThanOrEqual(
-      DETERMINISTIC_HIGH_RISK_SUMMARY_MAX_BYTES,
+    expect(requests.prompts).toEqual([]);
+    expect(stored).toStartWith("Outcome: partial\n");
+    expect(stored).toContain("required-record-overflow=");
+    expect(stored).not.toStartWith("Outcome: completed\n");
+    expect(encode(stored).length).toBeLessThanOrEqual(
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
     );
-    expect(hasUnpairedSurrogate(stored)).toBeFalse();
-    expect(stored).toContain('bun test \\"packages/late suite.test.ts\\"');
-    expect(stored).toContain("Process exited with code 1");
-    expect(stored).toContain('\\"/workspace/project/late failure.ts\\"');
-    expect(stored).toContain("./src/relative.ts");
-    for (const path of latePaths) expect(unresolved).toContain(path);
-    expect(stored).toContain("../shared/check.ts");
-    expect(stored).toContain("were not run");
-    expect(unresolved).toContain('"status":"pending"');
-    expect(unresolved).toContain('"categories":["verification","incomplete"]');
-    expect(unresolved).toContain('"polarity":"incomplete"');
-    expect(unresolved).toContain('"polarity":"failed"');
-    expect(unresolved).toContain('"state":{"input":');
-    for (let index = 0; index < 20; index++) {
-      expect(unresolved).toContain(`/workspace/pending-${index}.json`);
-    }
-    expect(omittedRecordCount(unresolved)).toBe(0);
-    expect(omittedRecordCount(terminal)).toBe(
-      82 - terminal.split("\n").filter(line => line.startsWith("{")).length,
-    );
-    expect(omittedRecordCount(terminal)).toBeGreaterThan(0);
   });
 
-  test("fails closed rather than reporting complete inclusion for one hundred required not-run records", async () => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+  test("caps one hundred required not-run records without reporting complete inclusion", async () => {
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     assistant.parts.push(
       ...Array.from({ length: 100 }, (_, index) => {
@@ -911,28 +1769,166 @@ describe("magic compact", () => {
         );
       }),
     );
-    const partUpdates: Record<string, unknown>[] = [];
-    let error: unknown;
-
-    try {
-      await runCompaction(session("source"), {
-        messages: [...turn.user, ...turn.assistants],
-        partUpdates,
-      });
-    } catch (caught) {
-      error = caught;
-    }
-
-    expect(error).toMatchObject({
-      name: "HighRiskEvidenceOverflowError",
-      message: expect.stringContaining("64 KiB"),
+    const requests = await runCompaction(session("source"), {
+      messages: [...turn.user, ...turn.assistants],
     });
-    expect(error).toBeInstanceOf(HighRiskEvidenceOverflowError);
-    expect(partUpdates).toEqual([]);
+    const stored = storedSummary(requests, "metric-assistant-0");
+
+    expect(requests.prompts).toEqual([]);
+    expect(stored).toStartWith("Outcome: partial\n");
+    expect(stored).toContain("required-record-overflow=");
+    expect(stored).not.toStartWith("Outcome: completed\n");
+    expect(encode(stored).length).toBeLessThanOrEqual(
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
+    );
   });
 
-  test("aborts one hundred twenty required final response parts before source summary or prune writes", async () => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+  test("compacts adjacent turns with many error tools while retaining every error tool part", async () => {
+    const errorTurn = metricTurn(1, 2, 0);
+    errorTurn.user[0]!.info.id = "overflow-user";
+    errorTurn.assistants[0]!.info.id = "overflow-assistant";
+    const errorPartIDs = Array.from(
+      { length: 30 },
+      (_, index) =>
+        `overflow-error-${index}-${"stable-identifier-".repeat(12)}`,
+    );
+    errorTurn.assistants[0]!.parts = errorPartIDs.map((partID, index) =>
+      genericToolPart(
+        partID,
+        "overflow-assistant",
+        index % 2 === 0 ? "bash" : "read",
+        {
+          status: "error",
+          input:
+            index % 2 === 0
+              ? { command: `bun test --case overflow-${index}` }
+              : { filePath: `/workspace/missing-${index}.ts` },
+          error: `Required failure ${index}: Process exited with code 1`,
+          metadata: {},
+          time: { start: 1, end: 2 },
+        },
+      ),
+    );
+    errorTurn.assistants[0]!.parts.push(
+      {
+        id: "overflow-removable-detail",
+        sessionID: "source",
+        messageID: "overflow-assistant",
+        type: "reasoning",
+        text: "removable historical detail ".repeat(4_000),
+        time: { start: 1, end: 2 },
+      } as Part,
+      textPart(
+        "overflow-final",
+        "source",
+        "overflow-assistant",
+        "The requested checks remain failed; inspect the retained error tool records.",
+      ),
+    );
+    const messages = [
+      ...errorTurn.user,
+      ...errorTurn.assistants,
+      message("overflow-adjacent-user", "user", [
+        textPart(
+          "overflow-adjacent-user-text",
+          "source",
+          "overflow-adjacent-user",
+          "Continue after failures",
+        ),
+      ]),
+      message("overflow-adjacent-assistant", "assistant", [
+        genericToolPart(
+          "overflow-adjacent-error",
+          "overflow-adjacent-assistant",
+          "bash",
+          {
+            status: "error",
+            input: { command: "bun test --case adjacent" },
+            error: "Adjacent required failure: Process exited with code 1",
+            metadata: {},
+            time: { start: 1, end: 2 },
+          },
+        ),
+      ]),
+    ];
+    addProviderTokens(messages);
+    await rm(statsPath("source"), { force: true });
+    await rm(cachePath("source"), { force: true });
+    const command = createCommandHarness(messages);
+
+    expect(await executeMagicCompact(command.v2, "source", 0)).toBe(true);
+    const stored = storedSummary(command, "overflow-assistant");
+    const activeErrors = messages
+      .flatMap(message => message.parts)
+      .filter(
+        (part): part is ToolPart =>
+          part.type === "tool" && part.state.status === "error",
+      );
+    const overflow = Number(
+      stored.match(/required-record-overflow=(\d+)/)?.[1],
+    );
+    const requiredRecords = Number(
+      stored.match(/required-record-total=(\d+)/)?.[1],
+    );
+    console.info(
+      `OVERFLOW_STRESS ${JSON.stringify({ requiredRecords, overflow, summaryTokens: encode(stored).length, activeErrorTools: activeErrors.length, prompts: command.summaryRequests.length })}`,
+    );
+
+    expect(command.summaryRequests).toEqual([]);
+    expect(stored).toStartWith("Outcome: partial\n");
+    expect(stored).toContain("required-record-counts=");
+    expect(stored).toContain("required-record-overflow=");
+    expect(overflow).toBeGreaterThan(0);
+    expect(encode(stored).length).toBeLessThanOrEqual(
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
+    );
+    expect(activeErrors).toHaveLength(31);
+    expect(activeErrors.slice(0, 30).map(part => part.id)).toEqual(
+      errorPartIDs,
+    );
+    expect(command.partDeletes).not.toContainEqual(
+      expect.objectContaining({
+        partID: expect.stringContaining("overflow-error"),
+      }),
+    );
+    expect((await readStats("source"))?.totalTokensPruned).toBeGreaterThan(0);
+  });
+
+  test("keeps resolved verification optional when unresolved evidence makes a turn deterministic", async () => {
+    const turn = metricTurn(1, 20, 0);
+    const assistant = turn.assistants[0]!;
+    assistant.parts.push(
+      genericToolPart("running", assistant.info.id, "bash", {
+        status: "running",
+        input: { command: "synthetic-watch" },
+        metadata: {},
+        time: { start: 1 },
+      }),
+      ...Array.from({ length: 100 }, (_, index) =>
+        commandToolPart(
+          `resolved-${index}`,
+          assistant.info.id,
+          `bun test --case resolved-${index}`,
+          "1 passed, 0 failed",
+        ),
+      ),
+    );
+
+    const requests = await runDeterministicRenderer(session("source"), {
+      messages: [...turn.user, ...turn.assistants],
+    });
+    const stored = storedSummary(requests, "metric-assistant-0");
+
+    expect(requests.prompts).toEqual([]);
+    expect(stored).toContain('"status":"running"');
+    expect(stored).toContain("omitted-record-count=");
+    expect(encode(stored).length).toBeLessThanOrEqual(
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
+    );
+  });
+
+  test("routes completed final response parts to standard summarization regardless of count", async () => {
+    const turn = metricTurn(1, 20, 0);
     const finalAssistant = turn.assistants.at(-1)!;
     finalAssistant.parts.push(
       ...Array.from({ length: 120 }, (_, index) =>
@@ -947,34 +1943,15 @@ describe("magic compact", () => {
     const messages = [...turn.user, ...turn.assistants];
     addProviderTokens(messages);
     const command = createCommandHarness(messages);
-    let error: unknown;
-
-    try {
-      await executeMagicCompact(command.v2, "source", 0);
-    } catch (caught) {
-      error = caught;
-    }
-
-    expect(error).toMatchObject({
-      name: "HighRiskEvidenceOverflowError",
-      message: expect.stringContaining("64 KiB"),
-    });
-    expect(error).toBeInstanceOf(HighRiskEvidenceOverflowError);
-    expect(command.partUpdates).toEqual([]);
-    expect(command.partDeletes).toEqual([]);
-    expect(command.events).not.toContain("summary-update");
-    expect(command.events).not.toContain("boundary-update");
-    expect(
-      command.sessionUpdates.filter(request => request.sessionID === "source"),
-    ).toEqual([]);
-    expect(command.sourcePrompts).toEqual([]);
-    expect(command.messageDeletes).toEqual([]);
-    expect(command.selectedSessions).toEqual(["backup"]);
-    expect(command.sessionDeletes).toEqual(["source"]);
+    expect(await executeMagicCompact(command.v2, "source", 0)).toBe(true);
+    expect(command.summaryRequests).toHaveLength(1);
+    expect(command.scratchCreates).toHaveLength(1);
+    expect(command.events).toContain("summary-update");
+    expect(command.backupForks).toHaveLength(1);
   });
 
   test("preserves quoted, spaced, absolute, and relative command paths", async () => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     const commands = [
       'bun test "packages/unit suite.test.ts"',
@@ -992,27 +1969,28 @@ describe("magic compact", () => {
         ),
       ),
     );
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
 
     expect(stored).toStartWith("Outcome: completed\n");
-    for (const command of commands) {
+    for (const command of commands.slice(0, 3)) {
       expect(stored).toContain(JSON.stringify(command).slice(1, -1));
     }
     for (const path of [
       "/workspace/service/Cargo.toml",
       "./src/file with spaces.ts",
-      "../shared/config.ts",
-      "~/project/readme.md",
     ]) {
       expect(stored).toContain(path);
     }
+    expect(
+      labeledSummarySection(stored, "VCS/Deployment", "Unresolved"),
+    ).toContain("omitted-record-count=1");
   });
 
   test("distinguishes zero failures from checks that did not run", async () => {
-    const successful = await runCompaction(session("source"), {
+    const successful = await runDeterministicRenderer(session("source"), {
       messages: completedCommandTurn("bun test", "10 passed, 0 failed"),
     });
     const notRun = await runCompaction(session("source"), {
@@ -1038,6 +2016,69 @@ describe("magic compact", () => {
     ).toContain("tests were not run");
   });
 
+  test.each(["No tests were skipped.", "Tests are not failing."])(
+    "keeps resolved tool verification negation model-eligible and preserves it as completed evidence: %s",
+    async text => {
+      const messages = completedCommandTurn("bun test", text);
+      const routed = await runCompaction(session("source"), { messages });
+
+      expect(routed.prompts).toHaveLength(1);
+      expect(promptText(routed.prompts[0]!)).toContain(text);
+
+      const turn = await planFor(completedCommandTurn("bun test", text), 0);
+      const rendered = renderDeterministicSummary(turn.summarizedTurns[0]!);
+      expect(rendered).toStartWith("Outcome: completed\n");
+      expect(rendered).toContain(text);
+      expect(rendered).toContain("Unresolved: None evidenced.");
+      expect(rendered).not.toContain('"polarity":"failed"');
+      expect(rendered).not.toContain('"polarity":"not-run"');
+    },
+  );
+
+  test.each(["No tests were skipped.", "Tests are not failing."])(
+    "keeps resolved assistant verification negation model-eligible and preserves it as completed evidence: %s",
+    async text => {
+      const messages = completedTurn("resolved-assistant", "Verify the change");
+      messages[1]!.parts.push(
+        textPart(
+          "resolved-assistant-evidence",
+          "source",
+          messages[1]!.info.id,
+          text,
+        ),
+      );
+      const routed = await runCompaction(session("source"), { messages });
+
+      expect(routed.prompts).toHaveLength(1);
+      expect(promptText(routed.prompts[0]!)).toContain(text);
+
+      const plan = await planFor(
+        (() => {
+          const copy = completedTurn(
+            "resolved-assistant-render",
+            "Verify the change",
+          );
+          copy[1]!.parts.push(
+            textPart(
+              "resolved-assistant-render-evidence",
+              "source",
+              copy[1]!.info.id,
+              text,
+            ),
+          );
+          return copy;
+        })(),
+        0,
+      );
+      const rendered = renderDeterministicSummary(plan.summarizedTurns[0]!);
+      expect(rendered).toStartWith("Outcome: completed\n");
+      expect(rendered).toContain(text);
+      expect(rendered).toContain("Unresolved: None evidenced.");
+      expect(rendered).not.toContain('"polarity":"failed"');
+      expect(rendered).not.toContain('"polarity":"not-run"');
+    },
+  );
+
   test.each([
     "No unresolved issues",
     "Nothing remains to do",
@@ -1051,13 +2092,13 @@ describe("magic compact", () => {
   ])(
     "does not infer execution evidence from assistant prose: %s",
     async text => {
-      const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+      const turn = metricTurn(1, 20, 0);
       const finalAssistant = turn.assistants.at(-1)!;
       finalAssistant.parts.push(
         textPart("prose", "source", finalAssistant.info.id, text),
       );
 
-      const requests = await runCompaction(session("source"), {
+      const requests = await runDeterministicRenderer(session("source"), {
         messages: [...turn.user, ...turn.assistants],
       });
       const stored = storedSummary(requests, "metric-assistant-0");
@@ -1082,13 +2123,13 @@ describe("magic compact", () => {
   ] as const)(
     "preserves contextual assistant execution evidence: %s",
     async (text, outcome, sectionLabel) => {
-      const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+      const turn = metricTurn(1, 20, 0);
       const finalAssistant = turn.assistants.at(-1)!;
       finalAssistant.parts.push(
         textPart("prose", "source", finalAssistant.info.id, text),
       );
 
-      const requests = await runCompaction(session("source"), {
+      const requests = await runDeterministicRenderer(session("source"), {
         messages: [...turn.user, ...turn.assistants],
       });
       const stored = storedSummary(requests, "metric-assistant-0");
@@ -1109,13 +2150,13 @@ describe("magic compact", () => {
   test("round-trips exact assistant source code units through JSON records", async () => {
     const sourceText =
       "exact\u0000nul\u000bvt\ud800lone and trailing\udfff units";
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const finalAssistant = turn.assistants.at(-1)!;
     finalAssistant.parts.push(
       textPart("units", "source", finalAssistant.info.id, sourceText),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -1139,13 +2180,13 @@ describe("magic compact", () => {
     expect(record!.text).toBe(sourceText);
     expect(stored).toContain("\\u0000");
     expect(stored).toContain("\\ud800");
-    expect(Buffer.byteLength(stored)).toBeLessThanOrEqual(
-      DETERMINISTIC_HIGH_RISK_SUMMARY_MAX_BYTES,
+    expect(encode(stored).length).toBeLessThanOrEqual(
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
     );
   });
 
   test("keeps substantive bracket arrays and TODO prose while dropping whole-body placeholders", async () => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const finalAssistant = turn.assistants.at(-1)!;
     finalAssistant.parts.push(
       textPart(
@@ -1165,7 +2206,7 @@ describe("magic compact", () => {
       textPart("whole-na", "source", finalAssistant.info.id, "N/A"),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -1217,7 +2258,7 @@ describe("magic compact", () => {
 
   test("round-trips exact tool input/output/error code units through JSON records", async () => {
     const units = "exact\u0000nul\u000bvt\ud800lone\ud801more";
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     assistant.parts.push(
       genericToolPart("units-io", assistant.info.id, "read", {
@@ -1231,7 +2272,7 @@ describe("magic compact", () => {
       }),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -1268,13 +2309,13 @@ describe("magic compact", () => {
 
   test("escapes XML-invalid U+FFFE/U+FFFF in assistant records for provider-safe round-trip", async () => {
     const sourceText = "marker\ufffe\ufffftail";
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const finalAssistant = turn.assistants.at(-1)!;
     finalAssistant.parts.push(
       textPart("xml-invalid", "source", finalAssistant.info.id, sourceText),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -1301,7 +2342,7 @@ describe("magic compact", () => {
 
   test("escapes XML-invalid U+FFFE/U+FFFF in tool input/output/error records", async () => {
     const units = "io\ufffe\uffffunits";
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     assistant.parts.push(
       genericToolPart("xml-invalid-io", assistant.info.id, "read", {
@@ -1315,7 +2356,7 @@ describe("magic compact", () => {
       }),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -1352,13 +2393,13 @@ describe("magic compact", () => {
 
   test("positive independent pass overrides earlier no-run in assistant prose", async () => {
     const text = "No tests ran. 10 tests passed.";
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const finalAssistant = turn.assistants.at(-1)!;
     finalAssistant.parts.push(
       textPart("positive-override", "source", finalAssistant.info.id, text),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -1377,7 +2418,7 @@ describe("magic compact", () => {
 
   test("positive independent pass overrides earlier no-run in real command tool output", async () => {
     const output = "No tests ran. 10 tests passed.";
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: completedCommandTurn("bun test", output),
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -1391,7 +2432,7 @@ describe("magic compact", () => {
 
   test("pure no-run with zero failures remains not-run", async () => {
     const output = "No tests ran; 0 failed";
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: completedCommandTurn("bun test", output),
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -1413,7 +2454,7 @@ describe("magic compact", () => {
   ] as const)(
     "ignores passive read title context: %s",
     async (title, output, kind) => {
-      const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+      const turn = metricTurn(1, 20, 0);
       const assistant = turn.assistants[0]!;
       assistant.parts.push(
         genericToolPart("passive-read", assistant.info.id, "read", {
@@ -1426,7 +2467,7 @@ describe("magic compact", () => {
         }),
       );
 
-      const requests = await runCompaction(session("source"), {
+      const requests = await runDeterministicRenderer(session("source"), {
         messages: [...turn.user, ...turn.assistants],
       });
       const stored = storedSummary(requests, "metric-assistant-0");
@@ -1449,7 +2490,7 @@ describe("magic compact", () => {
   );
 
   test("treats passive read failures, pending prose, and not-deployed text as neutral", async () => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     assistant.parts.push(
       genericToolPart("read-fail", assistant.info.id, "read", {
@@ -1478,7 +2519,7 @@ describe("magic compact", () => {
       }),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -1490,7 +2531,7 @@ describe("magic compact", () => {
   });
 
   test("accepts real bash, git, and test tool identity or command context", async () => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     assistant.parts.push(
       commandToolPart(
@@ -1515,7 +2556,7 @@ describe("magic compact", () => {
       }),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -1545,7 +2586,7 @@ describe("magic compact", () => {
   ] as const)(
     "keeps passive identity %s neutral despite keyword-like name",
     async (toolName, output, kind) => {
-      const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+      const turn = metricTurn(1, 20, 0);
       const assistant = turn.assistants[0]!;
       assistant.parts.push(
         genericToolPart("passive-identity", assistant.info.id, toolName, {
@@ -1558,7 +2599,7 @@ describe("magic compact", () => {
         }),
       );
 
-      const requests = await runCompaction(session("source"), {
+      const requests = await runDeterministicRenderer(session("source"), {
         messages: [...turn.user, ...turn.assistants],
       });
       const stored = storedSummary(requests, "metric-assistant-0");
@@ -1621,7 +2662,7 @@ describe("magic compact", () => {
   ] as const)(
     "treats runner verification command %s success as verification evidence",
     async (command, output) => {
-      const requests = await runCompaction(session("source"), {
+      const requests = await runDeterministicRenderer(session("source"), {
         messages: completedCommandTurn(command, output),
       });
       const stored = storedSummary(requests, "metric-assistant-0");
@@ -1639,7 +2680,7 @@ describe("magic compact", () => {
   );
 
   test("does not treat arbitrary prose mentioning make/test as a verification command", async () => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     assistant.parts.push(
       genericToolPart("prose-bash", assistant.info.id, "bash", {
@@ -1654,7 +2695,7 @@ describe("magic compact", () => {
       }),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -1671,7 +2712,7 @@ describe("magic compact", () => {
     "pending color",
     "fail\ud800ed",
   ])("treats completed arbitrary tool output as neutral: %s", async output => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     assistant.parts.push(
       genericToolPart("neutral-read", assistant.info.id, "read", {
@@ -1692,7 +2733,7 @@ describe("magic compact", () => {
       }),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -1704,7 +2745,7 @@ describe("magic compact", () => {
   });
 
   test("does not overflow required budget on hundreds of neutral completed tool records", async () => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     const neutralOutputs = [
       "No unresolved issues",
@@ -1729,7 +2770,7 @@ describe("magic compact", () => {
       ),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -1738,8 +2779,8 @@ describe("magic compact", () => {
     expect(stored).toContain("Verification: None evidenced.");
     expect(stored).toContain("VCS/Deployment: None evidenced.");
     expect(stored).toContain("Unresolved: None evidenced.");
-    expect(Buffer.byteLength(stored)).toBeLessThanOrEqual(
-      DETERMINISTIC_HIGH_RISK_SUMMARY_MAX_BYTES,
+    expect(encode(stored).length).toBeLessThanOrEqual(
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
     );
   });
 
@@ -1754,7 +2795,7 @@ describe("magic compact", () => {
   ])(
     "requires unresolved evidence for failed command-running tool %s",
     async (tool, command, failure) => {
-      const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+      const turn = metricTurn(1, 20, 0);
       const assistant = turn.assistants[0]!;
       assistant.parts.push(
         genericToolPart("cmd-fail", assistant.info.id, tool, {
@@ -1785,7 +2826,7 @@ describe("magic compact", () => {
   );
 
   test("keeps passive completed tools neutral when output only looks like failure prose", async () => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     assistant.parts.push(
       genericToolPart("passive-read", assistant.info.id, "read", {
@@ -1806,7 +2847,7 @@ describe("magic compact", () => {
       }),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -1816,7 +2857,7 @@ describe("magic compact", () => {
   });
 
   test("keeps late generic failed bash authoritative under saturated optional budget", async () => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     const command = "ls /workspace/late-secret";
     const failure = "permission denied";
@@ -1841,7 +2882,7 @@ describe("magic compact", () => {
       }),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -1869,13 +2910,13 @@ describe("magic compact", () => {
     expect(record!.command).toBe(command);
     expect(record!.polarity).toBe("failed");
     expect(JSON.stringify(record!.state)).toContain(failure);
-    expect(Buffer.byteLength(stored)).toBeLessThanOrEqual(
-      DETERMINISTIC_HIGH_RISK_SUMMARY_MAX_BYTES,
+    expect(encode(stored).length).toBeLessThanOrEqual(
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
     );
   });
 
   test("preserves real bash bun test polarity and failed tool state", async () => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     assistant.parts.push(
       commandToolPart(
@@ -1905,7 +2946,7 @@ describe("magic compact", () => {
       }),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -1930,7 +2971,7 @@ describe("magic compact", () => {
   });
 
   test("categorizes mutation tools by identity rather than output prose", async () => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     assistant.parts.push(
       genericToolPart("write-tool", assistant.info.id, "write", {
@@ -1951,7 +2992,7 @@ describe("magic compact", () => {
       }),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -1985,7 +3026,7 @@ describe("magic compact", () => {
   ] as const)(
     "normalizes tool identity separators for context: %s",
     async (tool, output, kind) => {
-      const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+      const turn = metricTurn(1, 20, 0);
       const assistant = turn.assistants[0]!;
       assistant.parts.push(
         genericToolPart("named-tool", assistant.info.id, tool, {
@@ -1998,7 +3039,7 @@ describe("magic compact", () => {
         }),
       );
 
-      const requests = await runCompaction(session("source"), {
+      const requests = await runDeterministicRenderer(session("source"), {
         messages: [...turn.user, ...turn.assistants],
       });
       const stored = storedSummary(requests, "metric-assistant-0");
@@ -2020,7 +3061,7 @@ describe("magic compact", () => {
   );
 
   test("keeps passive read identities neutral after tool-name normalization", async () => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     assistant.parts.push(
       genericToolPart("read-snake", assistant.info.id, "read_file", {
@@ -2041,7 +3082,7 @@ describe("magic compact", () => {
       }),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -2058,7 +3099,7 @@ describe("magic compact", () => {
   ] as const)(
     "classifies full assistant text before segmentation: %s",
     async (text, polarity) => {
-      const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+      const turn = metricTurn(1, 20, 0);
       const finalAssistant = turn.assistants.at(-1)!;
       finalAssistant.parts.push(
         textPart("cross-sentence", "source", finalAssistant.info.id, text),
@@ -2082,13 +3123,13 @@ describe("magic compact", () => {
 
   test("preserves positive-run precedence across segmented assistant sentences", async () => {
     const text = "No tests ran. 10 tests passed.";
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const finalAssistant = turn.assistants.at(-1)!;
     finalAssistant.parts.push(
       textPart("positive-full", "source", finalAssistant.info.id, text),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -2109,13 +3150,13 @@ describe("magic compact", () => {
   ])(
     "treats resolved pending negation as no incomplete evidence: %s",
     async text => {
-      const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+      const turn = metricTurn(1, 20, 0);
       const finalAssistant = turn.assistants.at(-1)!;
       finalAssistant.parts.push(
         textPart("resolved-pending", "source", finalAssistant.info.id, text),
       );
 
-      const requests = await runCompaction(session("source"), {
+      const requests = await runDeterministicRenderer(session("source"), {
         messages: [...turn.user, ...turn.assistants],
       });
       const stored = storedSummary(requests, "metric-assistant-0");
@@ -2128,13 +3169,13 @@ describe("magic compact", () => {
   test.each(["tasks are pending", "work remains: run smoke"])(
     "preserves real incomplete assistant evidence: %s",
     async text => {
-      const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+      const turn = metricTurn(1, 20, 0);
       const finalAssistant = turn.assistants.at(-1)!;
       finalAssistant.parts.push(
         textPart("real-pending", "source", finalAssistant.info.id, text),
       );
 
-      const requests = await runCompaction(session("source"), {
+      const requests = await runDeterministicRenderer(session("source"), {
         messages: [...turn.user, ...turn.assistants],
       });
       const stored = storedSummary(requests, "metric-assistant-0");
@@ -2186,7 +3227,7 @@ describe("magic compact", () => {
   });
 
   test("extracts title paths into dedicated path fields without promoting title labels to context", async () => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     assistant.parts.push(
       genericToolPart("title-path", assistant.info.id, "bash", {
@@ -2199,7 +3240,7 @@ describe("magic compact", () => {
       }),
     );
 
-    const requests = await runCompaction(session("source"), {
+    const requests = await runDeterministicRenderer(session("source"), {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
@@ -2230,7 +3271,7 @@ describe("magic compact", () => {
   });
 
   test("high-risk path still classifies normalized identities and resolved pending at cutover", async () => {
-    const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+    const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     assistant.parts.push(
       genericToolPart("threshold-run-tests", assistant.info.id, "run_tests", {
@@ -2286,101 +3327,34 @@ describe("magic compact", () => {
     );
   });
 
-  test("accepts an unchanged SDK-remapped native checkpoint in an ephemeral fork", async () => {
+  test("uses an empty transcript-free scratch session without checkpoint inheritance", async () => {
     const source = nativeCheckpointFixture({ tailStartID: "tail-assistant" });
-    const ephemeral = remapForkMessages(source, "ephemeral");
 
     const requests = await runCompaction(session("source"), {
       messages: source,
-      ephemeralMessages: ephemeral,
     });
 
+    expect(requests.creates).toHaveLength(1);
+    expect(requests.creates[0]).not.toHaveProperty("parentID");
+    expect(requests.forks).toEqual([]);
     expect(requests.prompts).toHaveLength(1);
     expect(requests.partUpdates).toHaveLength(2);
   });
 
-  test("aborts when a prompt creates a native checkpoint in its ephemeral fork", async () => {
-    const inherited = compactableMessages();
-    const ephemeral = remapForkMessages(inherited, "ephemeral");
-    const changed = [
-      ...ephemeral,
-      nativeMarker("ephemeral-marker", null, false, "ephemeral"),
-    ];
+  test("cleans the scratch session when the prompt transport fails", async () => {
     const lifecycle: string[] = [];
 
-    let error: unknown;
-    try {
-      await runCompaction(session("source"), {
-        messages: inherited,
-        ephemeralMessages: ephemeral,
-        ephemeralMessagesAfterPrompt: changed,
+    await expect(
+      runCompaction(session("source"), {
         lifecycle,
-      });
-    } catch (caught) {
-      error = caught;
-    }
-
-    expect(error).toMatchObject({ name: "EphemeralCheckpointChangedError" });
-    expect(error).not.toBeInstanceOf(NativeCheckpointChangedError);
-    expect(lifecycle).toContain("prompt");
-  });
-
-  test("aborts when a prompt changes an inherited native checkpoint in its ephemeral fork", async () => {
-    const source = nativeCheckpointFixture({ tailStartID: "tail-assistant" });
-    const ephemeral = remapForkMessages(source, "ephemeral");
-    const changed = structuredClone(ephemeral);
-    Object.assign(
-      changed.find(item => item.info.id.endsWith("native-marker"))!.parts[0]!,
-      { auto: false },
-    );
-    const lifecycle: string[] = [];
-
-    let error: unknown;
-    try {
-      await runCompaction(session("source"), {
-        messages: source,
-        ephemeralMessages: ephemeral,
-        ephemeralMessagesAfterPrompt: changed,
-        lifecycle,
-      });
-    } catch (caught) {
-      error = caught;
-    }
-
-    expect(error).toMatchObject({ name: "EphemeralCheckpointChangedError" });
-    expect(error).not.toBeInstanceOf(NativeCheckpointChangedError);
-    expect(lifecycle).toContain("prompt");
-  });
-
-  test("retains an in-band prompt SDK error with an incomplete ephemeral checkpoint", async () => {
-    const inherited = compactableMessages();
-    const changed = [
-      ...inherited,
-      nativeMarker("ephemeral-incomplete", null, false, "ephemeral"),
-    ];
-    let error: unknown;
-
-    try {
-      await runCompaction(session("source"), {
-        messages: inherited,
-        ephemeralMessagesAfterPrompt: changed,
         promptResponseError: "prompt SDK response failed",
-      });
-    } catch (caught) {
-      error = caught;
-    }
+      }),
+    ).rejects.toThrow("prompt SDK response failed");
 
-    expect(error).toBeInstanceOf(AggregateError);
-    expect(error).not.toBeInstanceOf(NativeCheckpointChangedError);
-    expect((error as AggregateError).errors).toContainEqual(
-      expect.objectContaining({ name: "EphemeralCheckpointChangedError" }),
-    );
-    expect(nestedErrorMessages(error)).toEqual(
-      expect.arrayContaining([
-        "Native compaction marker ephemeral-incomplete is incomplete or errored.",
-        "prompt SDK response failed",
-      ]),
-    );
+    expect(lifecycle.filter(event => event === "create")).toHaveLength(1);
+    expect(lifecycle.filter(event => event === "prompt")).toHaveLength(1);
+    expect(lifecycle.filter(event => event === "delete")).toHaveLength(1);
+    expect(lifecycle).not.toContain("fork");
   });
 });
 
@@ -2662,34 +3636,27 @@ describe("native OpenCode checkpoint coexistence", () => {
       {
         sessionID: "source",
         messageID: "suffix-1-assistant",
+        partID: "suffix-1-removable-detail",
+      },
+      {
+        sessionID: "source",
+        messageID: "suffix-1-assistant",
         partID: "suffix-1-old-text",
       },
     ]);
-    expect(command.messageDeletes).toEqual([
-      { sessionID: "source", messageID: "progress" },
-    ]);
-    expect(command.sessionDeletes).toEqual(["ephemeral"]);
+    expect(command.messageDeletes).toEqual([]);
+    expect(command.sessionDeletes).toEqual(["scratch-1"]);
     expect(command.selectedSessions).toEqual([]);
 
-    const progressPromptIndex = command.events.indexOf("progress-prompt");
     const summaryPromptIndex = command.events.indexOf("summary-prompt");
     const summaryUpdateIndex = command.events.indexOf("summary-update");
-    // plan + provider-token load + pre-progress checkpoint revalidation
-    const preProgressMessageLoads = command.events
-      .slice(0, progressPromptIndex)
-      .filter(event => event === "messages").length;
-    const initialRevalidationIndex = command.events.lastIndexOf(
-      "messages",
-      progressPromptIndex - 1,
-    );
+    const initialRevalidationIndex = command.events.indexOf("messages", 1);
     const postSummaryRevalidationIndex = command.events.indexOf(
       "messages",
       summaryPromptIndex + 1,
     );
-    expect(progressPromptIndex).toBeGreaterThanOrEqual(0);
-    expect(summaryPromptIndex).toBeGreaterThan(progressPromptIndex);
-    expect(preProgressMessageLoads).toBe(3);
-    expect(initialRevalidationIndex).toBe(progressPromptIndex - 1);
+    expect(command.events).not.toContain("progress-prompt");
+    expect(summaryPromptIndex).toBeGreaterThanOrEqual(0);
     expect(command.events[initialRevalidationIndex]).toBe("messages");
     expect(postSummaryRevalidationIndex).toBeGreaterThan(summaryPromptIndex);
     expect(postSummaryRevalidationIndex).toBeLessThan(summaryUpdateIndex);
@@ -2716,25 +3683,111 @@ describe("native OpenCode checkpoint coexistence", () => {
     expect(command.events).not.toContain("delete-source");
     expect(command.events).not.toContain("failure-toast");
     expect(command.selectedSessions).toEqual([]);
-    expect(command.sessionDeletes).toEqual(["ephemeral"]);
+    expect(command.sessionDeletes).toEqual(["scratch-1"]);
   });
 
-  test("rolls back without partial compaction writes when a late batch exhausts its retry", async () => {
-    const messages = Array.from(
-      { length: MAX_SUMMARY_BATCH_TURNS + 1 },
-      (_, index) => completedTurn(`exhaust-${index}`, `Request ${index}`),
+  test("preserves the partially mutated source and backup when final projection detects late source drift", async () => {
+    const messages = nativeCheckpointFixture({ tailStartID: "tail-assistant" });
+    addProviderTokens(messages);
+    await rm(statsPath("source"), { force: true });
+    const command = createCommandHarness(messages, {
+      mutateSourceBeforeFinalCount(source) {
+        const target = source.find(
+          message => message.info.id === "suffix-2-assistant",
+        )!;
+        target.parts.push(
+          textPart(
+            "late-concurrent-content",
+            "source",
+            target.info.id,
+            "Concurrent content written after final source revalidation.",
+          ),
+        );
+      },
+    });
+    let error: unknown;
+
+    try {
+      await executeMagicCompact(command.v2, "source", 1);
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toMatchObject({ name: "CompactionSourceDriftError" });
+    expect(String(error)).toContain("projection mismatch");
+    expect(String(error)).toContain("backup");
+    expect(String(error)).toContain("preserved");
+    expect(command.events).not.toContain("select-backup");
+    expect(command.events).not.toContain("delete-source");
+    expect(command.selectedSessions).toEqual([]);
+    expect(command.sessionDeletes).toEqual(["scratch-1"]);
+    expect(
+      command.sessionUpdates.filter(
+        request =>
+          request.sessionID === "backup" && request.title === "Test session",
+      ),
+    ).toEqual([]);
+    expect(
+      messages.some(message => message.info.id === "source-notice-1"),
+    ).toBe(true);
+    expect(
+      messages.some(message =>
+        message.parts.some(part => part.id === "late-concurrent-content"),
+      ),
+    ).toBe(true);
+    expect(await readStats("source")).toBeNull();
+    expect(command.toasts.at(-1)).toMatchObject({
+      title: "Magic Compact Failed",
+      message: expect.stringContaining("backup"),
+      variant: "error",
+    });
+  });
+
+  test("keeps ordinary post-backup failure rollback behavior", async () => {
+    const messages = nativeCheckpointFixture({ tailStartID: "tail-assistant" });
+    addProviderTokens(messages);
+    await rm(statsPath("source"), { force: true });
+    const primary = new Error("stats notice failed");
+    const command = createCommandHarness(messages, {
+      sourcePromptError: primary,
+    });
+    let error: unknown;
+
+    try {
+      await executeMagicCompact(command.v2, "source", 1);
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBe(primary);
+    expect(error).not.toMatchObject({ name: "CompactionSourceDriftError" });
+    expect(command.selectedSessions).toEqual(["backup"]);
+    expect(command.sessionDeletes).toEqual(["scratch-1", "source"]);
+    expect(
+      command.sessionUpdates.filter(
+        request =>
+          request.sessionID === "backup" && request.title === "Test session",
+      ),
+    ).toEqual([{ sessionID: "backup", title: "Test session" }]);
+    expect(command.events.indexOf("select-backup")).toBeLessThan(
+      command.events.indexOf("delete-source"),
+    );
+    expect(await readStats("source")).toBeNull();
+  });
+
+  test("rolls back without partial compaction writes when a packed batch exhausts its retry", async () => {
+    const messages = Array.from({ length: 9 }, (_, index) =>
+      completedTurn(`exhaust-${index}`, `Request ${index}`),
     ).flat();
     addProviderTokens(messages);
-    const firstBatchIDs = Array.from(
-      { length: MAX_SUMMARY_BATCH_TURNS },
+    const allIDs = Array.from(
+      { length: 9 },
       (_, index) => `exhaust-${index}-assistant`,
     );
-    const lateID = `exhaust-${MAX_SUMMARY_BATCH_TURNS}-assistant`;
     const command = createCommandHarness(messages, {
       summaryTextOutputs: [
-        summaryJsonForIDs(firstBatchIDs),
-        JSON.stringify({ [lateID]: "[TODO]" }),
-        JSON.stringify({ [lateID]: "[TODO]" }),
+        JSON.stringify(Object.fromEntries(allIDs.map(id => [id, "[TODO]"]))),
+        JSON.stringify(Object.fromEntries(allIDs.map(id => [id, "[TODO]"]))),
       ],
     });
     let error: unknown;
@@ -2748,39 +3801,22 @@ describe("native OpenCode checkpoint coexistence", () => {
     expect(error).toMatchObject({
       name: "SummaryContractError",
       category: "placeholder-summary",
-      batch: 2,
-      batchCount: 2,
+      batch: 1,
+      batchCount: 1,
       attempt: 2,
     });
     expect(
       command.events.filter(event => event === "summary-prompt"),
-    ).toHaveLength(3);
+    ).toHaveLength(2);
     expect(command.partUpdates).toEqual([]);
     expect(command.partDeletes).toEqual([]);
     expect(
       command.sessionUpdates.filter(request => request.sessionID === "source"),
     ).toEqual([]);
-    // The only source prompt before validation is the temporary progress
-    // notice; rollback cleanup deletes it.
-    expect(command.sourcePrompts).toHaveLength(1);
-    expect(command.sourcePrompts[0]).toMatchObject({
-      noReply: true,
-      parts: [
-        {
-          metadata: { magicCompact: { progress: true } },
-        },
-      ],
-    });
-    expect(command.messageDeletes).toEqual([
-      { sessionID: "source", messageID: "progress" },
-    ]);
-    expect(command.sessionDeletes).toEqual([
-      "ephemeral",
-      "ephemeral-2",
-      "ephemeral-3",
-      "source",
-    ]);
-    expect(command.selectedSessions).toEqual(["backup"]);
+    expect(command.sourcePrompts).toEqual([]);
+    expect(command.messageDeletes).toEqual([]);
+    expect(command.sessionDeletes).toEqual(["scratch-1", "scratch-2"]);
+    expect(command.selectedSessions).toEqual([]);
     expect(command.events).not.toContain("summary-update");
     expect(command.events).not.toContain("boundary-update");
     expect(String(command.toasts.at(-1)?.message)).not.toContain("[TODO]");
@@ -2836,7 +3872,7 @@ describe("native OpenCode checkpoint coexistence", () => {
       changedSummaryInfo,
       changedSummaryPart,
     ]) {
-      expect(() => assertNativeCheckpointUnchanged(changed, plan)).toThrow(
+      expect(() => assertCompactionSourceUnchanged(changed, plan)).toThrow(
         "changed",
       );
     }
@@ -2854,8 +3890,57 @@ describe("native OpenCode checkpoint coexistence", () => {
     }));
 
     expect(() =>
-      assertNativeCheckpointUnchanged(reordered, plan),
+      assertCompactionSourceUnchanged(reordered, plan),
     ).not.toThrow();
+  });
+
+  test("does not report source drift for volatile timestamp or accounting changes", async () => {
+    const messages = nativeCheckpointFixture({ tailStartID: null });
+    const assistant = messages.find(
+      item => item.info.id === "suffix-1-assistant",
+    )!;
+    assistant.parts.push(
+      commandToolPart(
+        "stable-tool",
+        assistant.info.id,
+        "bun test",
+        "12 tests passed",
+      ),
+    );
+    addProviderTokens(messages);
+    Object.assign(messages[0]!.info, { time: { created: 1 } });
+    Object.assign(assistant.info, {
+      time: { created: 1, completed: 2 },
+      cost: 1,
+    });
+    const plan = await planFor(messages, 0);
+    const changed = structuredClone(messages);
+    Object.assign(changed[0]!.info, { time: { created: 10 } });
+    const changedAssistant = changed.find(
+      item => item.info.id === assistant.info.id,
+    )!;
+    Object.assign(changedAssistant.info, {
+      time: { created: 10, completed: 20 },
+      cost: 2,
+      tokens: {
+        input: 100,
+        output: 50,
+        reasoning: 25,
+        cache: { read: 10, write: 5 },
+      },
+    });
+    const changedReasoning = changedAssistant.parts.find(
+      part => part.id === "suffix-1-removable-detail",
+    ) as Part & { time: { start: number; end: number } };
+    changedReasoning.time = { start: 10, end: 20 };
+    const changedTool = changedAssistant.parts.find(
+      (part): part is ToolPart => part.id === "stable-tool",
+    )!;
+    if (changedTool.state.status === "completed") {
+      changedTool.state.time = { start: 10, end: 20, compacted: 30 };
+    }
+
+    expect(() => assertCompactionSourceUnchanged(changed, plan)).not.toThrow();
   });
 
   test("aborts before source writes and preserves both sessions when a checkpoint races the summary prompt", async () => {
@@ -2872,33 +3957,119 @@ describe("native OpenCode checkpoint coexistence", () => {
     ).rejects.toMatchObject({ name: "NativeCheckpointChangedError" });
     expect(command.partUpdates).toEqual([]);
     expect(command.partDeletes).toEqual([]);
-    expect(command.messageDeletes).toEqual([
-      { sessionID: "source", messageID: "progress" },
-    ]);
-    expect(command.sessionDeletes).toEqual(["ephemeral"]);
+    expect(command.messageDeletes).toEqual([]);
+    expect(command.sessionDeletes).toEqual(["scratch-1"]);
     expect(command.selectedSessions).toEqual([]);
-    expect(
-      command.sessionUpdates.filter(
-        request =>
-          request.sessionID === "backup" && request.title === "Test session",
-      ),
-    ).toEqual([]);
-    expect(command.sourcePrompts).toHaveLength(1);
-    expect(command.sourcePrompts[0]).toMatchObject({
-      noReply: true,
-      parts: [
-        {
-          metadata: { magicCompact: { progress: true } },
-        },
-      ],
-    });
+    expect(command.sourcePrompts).toEqual([]);
+    expect(command.backupForks).toHaveLength(1);
     expect(command.toasts.at(-1)).toMatchObject({
       title: "Magic Compact Failed",
       variant: "error",
     });
   });
 
-  test("retains an incomplete-marker race and progress-delete failure while preserving both sessions", async () => {
+  test.each(["completed", "error"] as const)(
+    "aborts before source writes when a pending tool becomes %s during summary generation",
+    async status => {
+      const messages = nativeCheckpointFixture({ tailStartID: null });
+      const racedAssistant = messages.find(
+        item => item.info.id === "suffix-1-assistant",
+      )!;
+      racedAssistant.parts.push(
+        pendingCommandToolPart(
+          "raced-pending-tool",
+          racedAssistant.info.id,
+          "bun test",
+        ),
+      );
+      addProviderTokens(messages);
+      const raced = structuredClone(messages);
+      const racedTool = raced
+        .find(item => item.info.id === racedAssistant.info.id)!
+        .parts.find(
+          (part): part is ToolPart => part.id === "raced-pending-tool",
+        )!;
+      racedTool.state =
+        status === "completed"
+          ? {
+              status,
+              input: { command: "bun test" },
+              output: "12 tests passed",
+              title: "Run tests",
+              metadata: {},
+              time: { start: 1, end: 2 },
+            }
+          : {
+              status,
+              input: { command: "bun test" },
+              error: "Process exited with code 1",
+              metadata: {},
+              time: { start: 1, end: 2 },
+            };
+      const command = createCommandHarness(messages, { racedMessages: raced });
+
+      await expect(
+        executeMagicCompact(command.v2, "source", 0),
+      ).rejects.toMatchObject({ name: "NativeCheckpointChangedError" });
+      expect(command.partUpdates).toEqual([]);
+      expect(command.partDeletes).toEqual([]);
+      expect(command.messageDeletes).toEqual([]);
+      expect(command.sourcePrompts).toEqual([]);
+      expect(command.backupForks).toHaveLength(1);
+      expect(command.selectedSessions).toEqual([]);
+    },
+  );
+
+  test.each(["part", "message"] as const)(
+    "aborts before source writes when an assistant %s is appended during summary generation",
+    async addition => {
+      const messages = nativeCheckpointFixture({ tailStartID: null });
+      addProviderTokens(messages);
+      const raced = structuredClone(messages);
+      if (addition === "part") {
+        const assistant = raced.find(
+          item => item.info.id === "suffix-1-assistant",
+        )!;
+        assistant.parts.push(
+          textPart(
+            "raced-assistant-part",
+            "source",
+            assistant.info.id,
+            "Late assistant state that must not be pruned under a stale summary.",
+          ),
+        );
+      } else {
+        const nextTurnIndex = raced.findIndex(
+          item => item.info.id === "suffix-2-user",
+        );
+        raced.splice(
+          nextTurnIndex,
+          0,
+          message("raced-assistant-message", "assistant", [
+            textPart(
+              "raced-assistant-message-text",
+              "source",
+              "raced-assistant-message",
+              "Late assistant message that must remain in the live source.",
+            ),
+          ]),
+        );
+      }
+      const command = createCommandHarness(messages, { racedMessages: raced });
+
+      await expect(
+        executeMagicCompact(command.v2, "source", 1),
+      ).rejects.toMatchObject({ name: "NativeCheckpointChangedError" });
+      expect(command.partUpdates).toEqual([]);
+      expect(command.partDeletes).toEqual([]);
+      expect(command.messageDeletes).toEqual([]);
+      expect(command.sourcePrompts).toEqual([]);
+      expect(command.backupForks).toHaveLength(1);
+      expect(command.selectedSessions).toEqual([]);
+    },
+  );
+
+  test("ignores stale progress-delete fault injection during a checkpoint race", async () => {
     const messages = nativeCheckpointFixture({ tailStartID: null });
     addProviderTokens(messages);
     const raced = [
@@ -2920,19 +4091,13 @@ describe("native OpenCode checkpoint coexistence", () => {
 
     expect(error).toBeInstanceOf(NativeCheckpointChangedError);
     expect(error).not.toBe(cleanupError);
-    expect((error as Error).cause).toBeInstanceOf(AggregateError);
-    expect(nestedErrorMessages((error as Error).cause)).toEqual(
-      expect.arrayContaining([
-        "Native compaction marker raced-marker is incomplete or errored.",
-        "progress cleanup failed",
-      ]),
+    expect(nestedErrorMessages((error as Error).cause)).toContain(
+      "Native compaction marker raced-marker is incomplete or errored.",
     );
     expect(command.partUpdates).toEqual([]);
     expect(command.partDeletes).toEqual([]);
-    expect(command.messageDeletes).toEqual([
-      { sessionID: "source", messageID: "progress" },
-    ]);
-    expect(command.sessionDeletes).toEqual(["ephemeral"]);
+    expect(command.messageDeletes).toEqual([]);
+    expect(command.sessionDeletes).toEqual(["scratch-1"]);
     expect(command.selectedSessions).toEqual([]);
     expect(
       command.sessionUpdates.filter(
@@ -2946,7 +4111,7 @@ describe("native OpenCode checkpoint coexistence", () => {
     });
   });
 
-  test("retains an incomplete-marker race and ephemeral-delete failure while preserving both sessions", async () => {
+  test("retains scratch cleanup failure before a checkpoint race can be observed", async () => {
     const messages = nativeCheckpointFixture({ tailStartID: null });
     addProviderTokens(messages);
     const raced = [
@@ -2966,21 +4131,11 @@ describe("native OpenCode checkpoint coexistence", () => {
       error = caught;
     }
 
-    expect(error).toBeInstanceOf(NativeCheckpointChangedError);
-    expect(error).not.toBe(ephemeralDeleteError);
-    expect((error as Error).cause).toBeInstanceOf(AggregateError);
-    expect(nestedErrorMessages((error as Error).cause)).toEqual(
-      expect.arrayContaining([
-        "Native compaction marker raced-marker is incomplete or errored.",
-        "ephemeral delete failed",
-      ]),
-    );
+    expect(error).toBe(ephemeralDeleteError);
     expect(command.partUpdates).toEqual([]);
     expect(command.partDeletes).toEqual([]);
-    expect(command.messageDeletes).toEqual([
-      { sessionID: "source", messageID: "progress" },
-    ]);
-    expect(command.sessionDeletes).toEqual(["ephemeral"]);
+    expect(command.messageDeletes).toEqual([]);
+    expect(command.sessionDeletes).toEqual(["scratch-1"]);
     expect(command.selectedSessions).toEqual([]);
     expect(
       command.sessionUpdates.filter(
@@ -3018,10 +4173,8 @@ describe("native OpenCode checkpoint coexistence", () => {
     });
     expect(command.partUpdates).toEqual([]);
     expect(command.partDeletes).toEqual([]);
-    expect(command.messageDeletes).toEqual([
-      { sessionID: "source", messageID: "progress" },
-    ]);
-    expect(command.sessionDeletes).toEqual(["ephemeral"]);
+    expect(command.messageDeletes).toEqual([]);
+    expect(command.sessionDeletes).toEqual(["scratch-1"]);
     expect(command.selectedSessions).toEqual([]);
     expect(
       command.sessionUpdates.filter(
@@ -3031,7 +4184,7 @@ describe("native OpenCode checkpoint coexistence", () => {
     ).toEqual([]);
   });
 
-  test("retains generation and revalidation messages-fetch SDK errors while preserving both sessions", async () => {
+  test("does not revalidate after a generation failure", async () => {
     const messages = nativeCheckpointFixture({ tailStartID: null });
     addProviderTokens(messages);
     const generationError = new Error("summary prompt failed");
@@ -3048,20 +4201,11 @@ describe("native OpenCode checkpoint coexistence", () => {
       error = caught;
     }
 
-    expect(error).toBeInstanceOf(NativeCheckpointChangedError);
-    expect((error as Error).cause).toBeInstanceOf(AggregateError);
-    expect(nestedErrorMessages((error as Error).cause)).toEqual(
-      expect.arrayContaining([
-        "summary prompt failed",
-        "revalidation messages fetch failed",
-      ]),
-    );
+    expect(error).toBe(generationError);
     expect(command.partUpdates).toEqual([]);
     expect(command.partDeletes).toEqual([]);
-    expect(command.messageDeletes).toEqual([
-      { sessionID: "source", messageID: "progress" },
-    ]);
-    expect(command.sessionDeletes).toEqual(["ephemeral"]);
+    expect(command.messageDeletes).toEqual([]);
+    expect(command.sessionDeletes).toEqual(["scratch-1"]);
     expect(command.selectedSessions).toEqual([]);
     expect(
       command.sessionUpdates.filter(
@@ -3071,7 +4215,7 @@ describe("native OpenCode checkpoint coexistence", () => {
     ).toEqual([]);
   });
 
-  test("retains prompt and progress-delete failures without a race and safely rolls back", async () => {
+  test("generation failure before backup leaves the source untouched", async () => {
     const messages = nativeCheckpointFixture({ tailStartID: null });
     addProviderTokens(messages);
     const generationError = new Error("summary prompt failed");
@@ -3088,35 +4232,17 @@ describe("native OpenCode checkpoint coexistence", () => {
       error = caught;
     }
 
-    expect(error).toBeInstanceOf(AggregateError);
+    expect(error).toBe(generationError);
     expect(error).not.toBeInstanceOf(NativeCheckpointChangedError);
-    expect(nestedErrorMessages(error)).toEqual(
-      expect.arrayContaining([
-        "summary prompt failed",
-        "progress cleanup failed",
-      ]),
-    );
     expect(command.partUpdates).toEqual([]);
     expect(command.partDeletes).toEqual([]);
-    expect(command.messageDeletes).toEqual([
-      { sessionID: "source", messageID: "progress" },
-    ]);
-    expect(command.sessionDeletes).toEqual(["ephemeral", "source"]);
-    expect(command.selectedSessions).toEqual(["backup"]);
-    expect(
-      command.sessionUpdates.filter(
-        request =>
-          request.sessionID === "backup" && request.title === "Test session",
-      ),
-    ).toEqual([
-      {
-        sessionID: "backup",
-        title: "Test session",
-      },
-    ]);
+    expect(command.messageDeletes).toEqual([]);
+    expect(command.sessionDeletes).toEqual(["scratch-1"]);
+    expect(command.selectedSessions).toEqual([]);
+    expect(command.backupForks).toEqual([]);
   });
 
-  test("retains prompt and ephemeral-delete failures without a race and safely rolls back", async () => {
+  test("retains scratch cleanup failure with a generation failure before backup", async () => {
     const messages = nativeCheckpointFixture({ tailStartID: null });
     addProviderTokens(messages);
     const generationError = new Error("summary prompt failed");
@@ -3135,33 +4261,21 @@ describe("native OpenCode checkpoint coexistence", () => {
 
     expect(error).toBeInstanceOf(AggregateError);
     expect(error).not.toBeInstanceOf(NativeCheckpointChangedError);
+    expect(command.partUpdates).toEqual([]);
+    expect(command.partDeletes).toEqual([]);
     expect(nestedErrorMessages(error)).toEqual(
       expect.arrayContaining([
         "summary prompt failed",
         "ephemeral delete failed",
       ]),
     );
-    expect(command.partUpdates).toEqual([]);
-    expect(command.partDeletes).toEqual([]);
-    expect(command.messageDeletes).toEqual([
-      { sessionID: "source", messageID: "progress" },
-    ]);
-    expect(command.sessionDeletes).toEqual(["ephemeral", "source"]);
-    expect(command.selectedSessions).toEqual(["backup"]);
-    expect(
-      command.sessionUpdates.filter(
-        request =>
-          request.sessionID === "backup" && request.title === "Test session",
-      ),
-    ).toEqual([
-      {
-        sessionID: "backup",
-        title: "Test session",
-      },
-    ]);
+    expect(command.messageDeletes).toEqual([]);
+    expect(command.sessionDeletes).toEqual(["scratch-1"]);
+    expect(command.selectedSessions).toEqual([]);
+    expect(command.backupForks).toEqual([]);
   });
 
-  test("retains prompt and ephemeral-delete failures with a concurrent checkpoint race while preserving both sessions", async () => {
+  test("generation failure wins before a later source race can be observed", async () => {
     const messages = nativeCheckpointFixture({ tailStartID: null });
     addProviderTokens(messages);
     const raced = [
@@ -3183,23 +4297,18 @@ describe("native OpenCode checkpoint coexistence", () => {
       error = caught;
     }
 
-    expect(error).toBeInstanceOf(NativeCheckpointChangedError);
-    expect(error).not.toBe(generationError);
+    expect(error).toBeInstanceOf(AggregateError);
     expect(error).not.toBe(ephemeralDeleteError);
-    expect((error as Error).cause).toBeInstanceOf(AggregateError);
-    expect(nestedErrorMessages((error as Error).cause)).toEqual(
+    expect(nestedErrorMessages(error)).toEqual(
       expect.arrayContaining([
-        "Native compaction marker raced-marker is incomplete or errored.",
         "summary prompt failed",
         "ephemeral delete failed",
       ]),
     );
     expect(command.partUpdates).toEqual([]);
     expect(command.partDeletes).toEqual([]);
-    expect(command.messageDeletes).toEqual([
-      { sessionID: "source", messageID: "progress" },
-    ]);
-    expect(command.sessionDeletes).toEqual(["ephemeral"]);
+    expect(command.messageDeletes).toEqual([]);
+    expect(command.sessionDeletes).toEqual(["scratch-1"]);
     expect(command.selectedSessions).toEqual([]);
     expect(
       command.sessionUpdates.filter(
@@ -3216,7 +4325,7 @@ describe("native OpenCode checkpoint coexistence", () => {
     });
   });
 
-  test("progress cleanup-only failure after successful summaries follows ordinary backup rollback", async () => {
+  test("stale progress cleanup injection cannot affect a successful compaction", async () => {
     const messages = nativeCheckpointFixture({ tailStartID: null });
     addProviderTokens(messages);
     const cleanupError = new Error("progress cleanup failed");
@@ -3224,9 +4333,7 @@ describe("native OpenCode checkpoint coexistence", () => {
       deleteProgressError: cleanupError,
     });
 
-    await expect(executeMagicCompact(command.v2, "source", 1)).rejects.toBe(
-      cleanupError,
-    );
+    expect(await executeMagicCompact(command.v2, "source", 1)).toBe(true);
     expect(
       command.partUpdates.map(request => ({
         messageID: request.messageID,
@@ -3237,31 +4344,16 @@ describe("native OpenCode checkpoint coexistence", () => {
         messageID: "suffix-1-assistant",
         partID: "prt_-magic_summary_suffix-1-assistant",
       },
-    ]);
-    expect(command.partDeletes).toEqual([]);
-    expect(command.messageDeletes).toEqual([
-      { sessionID: "source", messageID: "progress" },
-    ]);
-    expect(command.sessionDeletes).toEqual(["ephemeral", "source"]);
-    expect(command.selectedSessions).toEqual(["backup"]);
-    expect(
-      command.sessionUpdates.filter(
-        request =>
-          request.sessionID === "backup" && request.title === "Test session",
-      ),
-    ).toEqual([
       {
-        sessionID: "backup",
-        title: "Test session",
+        messageID: "suffix-2-user",
+        partID: "prt_-magic_boundary_suffix-2-user",
       },
     ]);
-    expect(command.toasts.at(-1)).toMatchObject({
-      title: "Magic Compact Failed",
-      variant: "error",
-    });
+    expect(command.messageDeletes).toEqual([]);
+    expect(command.selectedSessions).toEqual([]);
   });
 
-  test("retains the primary generation failure when backup selection also fails", async () => {
+  test("does not attempt backup selection for a pre-backup generation failure", async () => {
     const messages = nativeCheckpointFixture({ tailStartID: null });
     addProviderTokens(messages);
     const primary = new Error("summary generation failed");
@@ -3278,34 +4370,21 @@ describe("native OpenCode checkpoint coexistence", () => {
       error = caught;
     }
 
-    expect(error).toBeInstanceOf(AggregateError);
-    expect(nestedErrorMessages(error)).toEqual(
-      expect.arrayContaining([
-        "summary generation failed",
-        "backup selection failed",
-      ]),
-    );
-    expect(command.selectedSessions).toEqual(["backup"]);
-    expect(command.sessionDeletes).toEqual(["ephemeral"]);
-    expect(command.events.indexOf("backup-update")).toBeLessThan(
-      command.events.indexOf("select-backup"),
-    );
+    expect(error).toBe(primary);
+    expect(command.selectedSessions).toEqual([]);
+    expect(command.sessionDeletes).toEqual(["scratch-1"]);
+    expect(command.backupForks).toEqual([]);
     expect(command.events).not.toContain("delete-source");
     expect(command.events.indexOf("select-backup")).toBeLessThan(
       command.events.indexOf("failure-toast"),
     );
   });
 
-  test("ephemeral checkpoint and progress cleanup failures use ordinary safe backup rollback", async () => {
+  test("scratch ignores stale progress cleanup fault injection", async () => {
     const messages = nativeCheckpointFixture({ tailStartID: null });
     addProviderTokens(messages);
-    const changedEphemeral = [
-      ...messages,
-      nativeMarker("ephemeral-marker", null, false, "ephemeral"),
-    ];
     const cleanupError = new Error("progress cleanup failed");
     const command = createCommandHarness(messages, {
-      ephemeralMessagesAfterPrompt: changedEphemeral,
       deleteProgressError: cleanupError,
     });
     let error: unknown;
@@ -3316,25 +4395,13 @@ describe("native OpenCode checkpoint coexistence", () => {
       error = caught;
     }
 
-    expect(error).toBeInstanceOf(AggregateError);
+    expect(error).toBeUndefined();
     expect(error).not.toBeInstanceOf(NativeCheckpointChangedError);
-    expect(nestedErrorMessages(error)).toEqual(
-      expect.arrayContaining([
-        "Native compaction marker ephemeral-marker is incomplete or errored.",
-        "progress cleanup failed",
-      ]),
-    );
-    expect(command.sessionDeletes).toEqual(["ephemeral", "source"]);
-    expect(command.selectedSessions).toEqual(["backup"]);
-    expect(command.events.indexOf("backup-update")).toBeLessThan(
-      command.events.indexOf("select-backup"),
-    );
-    expect(command.events.indexOf("select-backup")).toBeLessThan(
-      command.events.indexOf("delete-source"),
-    );
+    expect(command.sessionDeletes).toEqual(["scratch-1"]);
+    expect(command.selectedSessions).toEqual([]);
   });
 
-  test("retains the primary generation failure when deleting the source also fails", async () => {
+  test("does not attempt source deletion for a pre-backup generation failure", async () => {
     const messages = nativeCheckpointFixture({ tailStartID: null });
     addProviderTokens(messages);
     const primary = new Error("summary generation failed");
@@ -3351,21 +4418,9 @@ describe("native OpenCode checkpoint coexistence", () => {
       error = caught;
     }
 
-    expect(error).toBeInstanceOf(AggregateError);
-    expect(nestedErrorMessages(error)).toEqual(
-      expect.arrayContaining([
-        "summary generation failed",
-        "source deletion failed",
-      ]),
-    );
-    expect(command.selectedSessions).toEqual(["backup"]);
-    expect(command.sessionDeletes).toEqual(["ephemeral", "source"]);
-    expect(command.events.indexOf("select-backup")).toBeLessThan(
-      command.events.indexOf("delete-source"),
-    );
-    expect(command.events.indexOf("delete-source")).toBeLessThan(
-      command.events.indexOf("failure-toast"),
-    );
+    expect(error).toBe(primary);
+    expect(command.selectedSessions).toEqual([]);
+    expect(command.sessionDeletes).toEqual(["scratch-1"]);
   });
 
   test.each([
@@ -3403,11 +4458,9 @@ describe("native OpenCode checkpoint coexistence", () => {
           expectedNotification,
         ]),
       );
-      expect(command.selectedSessions).toEqual(["backup"]);
-      expect(command.sessionDeletes).toEqual(["ephemeral", "source"]);
-      expect(command.events.indexOf("delete-source")).toBeLessThan(
-        command.events.indexOf("failure-toast"),
-      );
+      expect(command.selectedSessions).toEqual([]);
+      expect(command.sessionDeletes).toEqual(["scratch-1"]);
+      expect(command.backupForks).toEqual([]);
     },
   );
 
@@ -3440,7 +4493,7 @@ describe("native OpenCode checkpoint coexistence", () => {
       ]),
     );
     expect(command.selectedSessions).toEqual([]);
-    expect(command.sessionDeletes).toEqual(["ephemeral"]);
+    expect(command.sessionDeletes).toEqual(["scratch-1"]);
     expect(command.events).not.toContain("delete-source");
   });
 
@@ -3545,7 +4598,7 @@ describe("native OpenCode checkpoint coexistence", () => {
       } as unknown as V2Client;
 
       await expect(
-        pruneSummarizedTurns({ v2, sessionID: "source" }, [turn]),
+        pruneSummarizedTurns({ v2, sessionID: "source" }, [turn], []),
       ).rejects.toThrow("native compaction artifact");
       expect(deletes).toEqual([]);
     },
@@ -3729,7 +4782,7 @@ function statsPath(sessionID: string): string {
 type RunOptions = {
   agents?: Agent[];
   lifecycle?: string[];
-  onPrompt?: () => Promise<void>;
+  onPrompt?: (signal?: AbortSignal) => Promise<void>;
   promptError?: Error;
   promptErrorAt?: number;
   promptResponseError?: string;
@@ -3738,35 +4791,56 @@ type RunOptions = {
     data?: unknown;
     parts?: Array<{ type: "text"; text: string }>;
   }>;
+  abortRequests?: Record<string, unknown>[];
+  deleteRequests?: Record<string, unknown>[];
+  abortError?: Error;
   deleteError?: Error;
   deleteErrorAt?: number;
   messages?: MessageWithParts[];
   textResponses?: Array<string | string[] | undefined>;
   partUpdates?: Record<string, unknown>[];
-  ephemeralMessages?: MessageWithParts[];
-  ephemeralMessagesAfterPrompt?: MessageWithParts[];
 };
+
+async function runDeterministicRenderer(
+  sourceSession: Session,
+  options: RunOptions = {},
+) {
+  return runCompaction(sourceSession, options, true);
+}
 
 async function runCompaction(
   sourceSession: Session,
   options: RunOptions = {},
+  deterministicRenderer = false,
 ): Promise<{
+  creates: Record<string, unknown>[];
+  forks: Record<string, unknown>[];
+  aborts: Record<string, unknown>[];
+  deletes: string[];
   prompts: Record<string, unknown>[];
   updates: Record<string, unknown>[];
   agentRequests: Record<string, unknown>[];
   partUpdates: Record<string, unknown>[];
   v2: V2Client;
+  maxPromptConcurrency: number;
 }> {
+  const creates: Record<string, unknown>[] = [];
+  const forks: Record<string, unknown>[] = [];
+  const aborts = options.abortRequests ?? [];
+  const deleteRequests = options.deleteRequests ?? [];
+  const deletes: string[] = [];
   const prompts: Record<string, unknown>[] = [];
   const updates: Record<string, unknown>[] = [];
   const agentRequests: Record<string, unknown>[] = [];
   const partUpdates = options.partUpdates ?? [];
   const lifecycle = options.lifecycle ?? [];
   const sourceMessages = options.messages ?? compactableMessages();
-  let forks = 0;
+  let forkCount = 0;
+  let scratches = 0;
   let promptCount = 0;
+  let promptConcurrency = 0;
+  let maxPromptConcurrency = 0;
   let deleteCount = 0;
-  const promptedSessions = new Set<string>();
   const promptedWithFormat = new Map<string, boolean>();
   const v2 = {
     app: {
@@ -3777,30 +4851,32 @@ async function runCompaction(
       },
     },
     session: {
-      messages: async (request: { sessionID?: string } = {}) => {
+      messages: async (request: Record<string, unknown>) => {
         lifecycle.push("messages");
         if (request.sessionID && promptedWithFormat.get(request.sessionID)) {
           return {
             error: "OpenCode 1.18.15 format-poisoned session.messages read",
           };
         }
-        if (
-          request.sessionID
-          && promptedSessions.has(request.sessionID)
-          && options.ephemeralMessagesAfterPrompt
-        ) {
-          return { data: options.ephemeralMessagesAfterPrompt };
-        }
-        if (request.sessionID?.startsWith("ephemeral")) {
-          return { data: options.ephemeralMessages ?? sourceMessages };
+        if (request.sessionID?.startsWith("scratch")) {
+          return { data: [] };
         }
         return { data: sourceMessages };
       },
-      fork: async () => {
+      create: async (request: Record<string, unknown>) => {
+        lifecycle.push("create");
+        creates.push(request);
+        scratches += 1;
+        return { data: session(`scratch-${scratches}`) };
+      },
+      fork: async (request: Record<string, unknown>) => {
         lifecycle.push("fork");
-        forks += 1;
+        forks.push(request);
+        forkCount += 1;
         return {
-          data: session(forks === 1 ? "ephemeral" : `ephemeral-${forks}`),
+          data: session(
+            forkCount === 1 ? "ephemeral" : `ephemeral-${forkCount}`,
+          ),
         };
       },
       update: async (request: Record<string, unknown>) => {
@@ -3808,12 +4884,23 @@ async function runCompaction(
         updates.push(request);
         return { data: session("ephemeral") };
       },
-      prompt: async (request: Record<string, unknown>) => {
+      prompt: async (
+        request: Record<string, unknown>,
+        sdkOptions?: { signal?: AbortSignal },
+      ) => {
         lifecycle.push("prompt");
         prompts.push(request);
-        await options.onPrompt?.();
         promptCount += 1;
-        promptedSessions.add(String(request.sessionID));
+        promptConcurrency += 1;
+        maxPromptConcurrency = Math.max(
+          maxPromptConcurrency,
+          promptConcurrency,
+        );
+        try {
+          await options.onPrompt?.(sdkOptions?.signal);
+        } finally {
+          promptConcurrency -= 1;
+        }
         promptedWithFormat.set(String(request.sessionID), "format" in request);
         if (
           options.promptError
@@ -3851,8 +4938,16 @@ async function runCompaction(
           },
         };
       },
-      delete: async () => {
+      abort: async (request: Record<string, unknown>) => {
+        lifecycle.push("abort");
+        aborts.push(request);
+        if (options.abortError) throw options.abortError;
+        return { data: true };
+      },
+      delete: async (request: { sessionID: string }) => {
         lifecycle.push("delete");
+        deleteRequests.push(request);
+        deletes.push(request.sessionID);
         deleteCount += 1;
         if (options.deleteErrorAt === deleteCount) {
           throw options.deleteError;
@@ -3881,14 +4976,21 @@ async function runCompaction(
   } as unknown as V2Client;
 
   const plan = await createCompactionPlan(v2, "source", 0);
-  const summaries = await generateCompactionSummaries(v2, sourceSession, plan);
+  const summaries = deterministicRenderer
+    ? plan.summarizedTurns.map(renderDeterministicSummary)
+    : await generateCompactionSummaries(v2, sourceSession, plan);
   await injectSummaries(v2, "source", plan.summarizedTurns, summaries);
   return {
+    creates,
+    forks,
+    aborts,
+    deletes,
     prompts,
     updates,
     agentRequests,
     partUpdates,
     v2,
+    maxPromptConcurrency,
   };
 }
 
@@ -3896,7 +4998,6 @@ function createCommandHarness(
   messages: MessageWithParts[],
   options: {
     racedMessages?: MessageWithParts[];
-    ephemeralMessagesAfterPrompt?: MessageWithParts[];
     deleteProgressError?: Error;
     deleteEphemeralError?: Error;
     summaryPromptError?: Error;
@@ -3908,6 +5009,8 @@ function createCommandHarness(
     showToastError?: Error;
     failureToastResponseError?: string;
     successToastResponseError?: string;
+    sourcePromptError?: Error;
+    mutateSourceBeforeFinalCount?: (messages: MessageWithParts[]) => void;
   } = {},
 ) {
   const events: string[] = [];
@@ -3918,23 +5021,32 @@ function createCommandHarness(
   const sessionDeletes: string[] = [];
   const selectedSessions: string[] = [];
   const sourcePrompts: Record<string, unknown>[] = [];
+  const summaryRequests: Record<string, unknown>[] = [];
+  const scratchCreates: Record<string, unknown>[] = [];
+  const backupForks: Record<string, unknown>[] = [];
   const toasts: Record<string, unknown>[] = [];
   let forks = 0;
   let raceActive = false;
   let summaryPrompts = 0;
+  let summaryConcurrency = 0;
+  let maxSummaryConcurrency = 0;
+  let scratches = 0;
+  let sourceNotices = 0;
+  let finalCountMutationApplied = false;
+  let currentSourceSession = session("source");
 
   const v2 = {
     app: { agents: async () => ({ data: [compactionAgent()] }) },
     session: {
-      messages: async (request: { sessionID?: string } = {}) => {
+      messages: async () => {
         events.push("messages");
-        if (request.sessionID?.startsWith("ephemeral")) {
-          return {
-            data:
-              summaryPrompts > 0 && options.ephemeralMessagesAfterPrompt
-                ? options.ephemeralMessagesAfterPrompt
-                : messages,
-          };
+        if (
+          sourceNotices >= 1
+          && !finalCountMutationApplied
+          && options.mutateSourceBeforeFinalCount
+        ) {
+          finalCountMutationApplied = true;
+          options.mutateSourceBeforeFinalCount(messages);
         }
         if (raceActive && options.revalidationMessagesError) {
           return { error: options.revalidationMessagesError.message };
@@ -3946,8 +5058,15 @@ function createCommandHarness(
               : messages,
         };
       },
-      get: async () => ({ data: session("source") }),
-      fork: async () => {
+      get: async () => ({ data: currentSourceSession }),
+      create: async (request: Record<string, unknown>) => {
+        scratchCreates.push(request);
+        scratches += 1;
+        return { data: session(`scratch-${scratches}`) };
+      },
+      abort: async () => ({ data: true }),
+      fork: async (request: Record<string, unknown>) => {
+        backupForks.push(request);
         forks += 1;
         return {
           data: session(
@@ -3961,6 +5080,12 @@ function createCommandHarness(
       },
       update: async (request: Record<string, unknown>) => {
         sessionUpdates.push(request);
+        if (request.sessionID === "source") {
+          currentSourceSession = {
+            ...currentSourceSession,
+            ...(request.metadata ? { metadata: request.metadata } : {}),
+          } as Session;
+        }
         if (
           request.sessionID === "backup"
           && request.title === "Test session"
@@ -3970,13 +5095,23 @@ function createCommandHarness(
         return { data: session(String(request.sessionID)) };
       },
       prompt: async (request: Record<string, unknown>) => {
-        if (String(request.sessionID).startsWith("ephemeral")) {
+        if (
+          String(request.sessionID).startsWith("ephemeral")
+          || String(request.sessionID).startsWith("scratch")
+        ) {
           events.push("summary-prompt");
           summaryPrompts += 1;
+          summaryRequests.push(request);
+          summaryConcurrency += 1;
+          maxSummaryConcurrency = Math.max(
+            maxSummaryConcurrency,
+            summaryConcurrency,
+          );
           if (summaryPrompts === (options.activateRaceAtSummaryPrompt ?? 1)) {
             raceActive = true;
           }
           if (options.summaryPromptError) {
+            summaryConcurrency -= 1;
             throw options.summaryPromptError;
           }
           const responseIndex = summaryPrompts - 1;
@@ -3985,12 +5120,14 @@ function createCommandHarness(
             && responseIndex in options.summaryTextOutputs
               ? options.summaryTextOutputs[responseIndex]
               : summaryJsonForPrompt(request);
-          return {
+          const response = {
             data: {
               info: {},
               parts: text === undefined ? [] : [{ type: "text", text }],
             },
           };
+          summaryConcurrency -= 1;
+          return response;
         }
 
         if (request.noReply === true) {
@@ -4003,10 +5140,23 @@ function createCommandHarness(
         }
 
         sourcePrompts.push(request);
+        sourceNotices += 1;
+        if (options.sourcePromptError) throw options.sourcePromptError;
+        const messageID = `source-notice-${sourceNotices}`;
+        const parts = ((request.parts as Part[] | undefined) ?? []).map(
+          (part, index) =>
+            ({
+              ...part,
+              id: `${messageID}-part-${index}`,
+              sessionID: "source",
+              messageID,
+            }) as Part,
+        );
+        messages.push(message(messageID, "user", parts));
         return {
           data: {
-            info: { id: "progress" },
-            parts: [],
+            info: { id: messageID },
+            parts,
           },
         };
       },
@@ -4015,6 +5165,10 @@ function createCommandHarness(
         if (options.deleteProgressError) {
           throw options.deleteProgressError;
         }
+        const index = messages.findIndex(
+          message => message.info.id === request.messageID,
+        );
+        if (index !== -1) messages.splice(index, 1);
         return { data: true };
       },
       delete: async (request: { sessionID: string }) => {
@@ -4023,7 +5177,10 @@ function createCommandHarness(
           events.push("delete-source");
           if (options.deleteSourceError) throw options.deleteSourceError;
         }
-        if (options.deleteEphemeralError && request.sessionID === "ephemeral") {
+        if (
+          options.deleteEphemeralError
+          && request.sessionID.startsWith("scratch")
+        ) {
           throw options.deleteEphemeralError;
         }
         return { data: true };
@@ -4104,6 +5261,15 @@ function createCommandHarness(
     sessionDeletes,
     selectedSessions,
     sourcePrompts,
+    summaryRequests,
+    get maxSummaryConcurrency() {
+      return maxSummaryConcurrency;
+    },
+    get currentSourceSession() {
+      return currentSourceSession;
+    },
+    scratchCreates,
+    backupForks,
     toasts,
   };
 }
@@ -4197,7 +5363,7 @@ type NativeFixtureOptions = {
 function nativeCheckpointFixture(
   options: NativeFixtureOptions = {},
 ): MessageWithParts[] {
-  return [
+  const messages = [
     ...completedTurn("tail", "Pre-checkpoint tail"),
     nativeMarker(
       "native-marker",
@@ -4213,6 +5379,17 @@ function nativeCheckpointFixture(
     ...completedTurn("suffix-1", "First suffix request"),
     ...completedTurn("suffix-2", "Second suffix request"),
   ];
+  messages
+    .find(message => message.info.id === "suffix-1-assistant")!
+    .parts.push({
+      id: "suffix-1-removable-detail",
+      sessionID: "source",
+      messageID: "suffix-1-assistant",
+      type: "reasoning",
+      text: "historical removable detail ".repeat(2_000),
+      time: { start: 1, end: 2 },
+    } as Part);
+  return messages;
 }
 
 function completedTurn(
@@ -4249,44 +5426,6 @@ function nativeMarker(
     "user",
     duplicate ? [part, { ...part, id: `${id}-part-2` }] : [part],
   );
-}
-
-function remapForkMessages(
-  messages: MessageWithParts[],
-  sessionID: string,
-): MessageWithParts[] {
-  const messageIDs = new Map(
-    messages.map(item => [item.info.id, `${sessionID}-${item.info.id}`]),
-  );
-  return messages.map(item => {
-    const messageID = messageIDs.get(item.info.id)!;
-    const info = {
-      ...item.info,
-      id: messageID,
-      ...(item.info.role === "assistant" && item.info.parentID
-        ? { parentID: messageIDs.get(item.info.parentID)! }
-        : {}),
-    } as Message;
-    const parts = item.parts.map(part => {
-      const mapped = {
-        ...part,
-        id: `${sessionID}-${part.id}`,
-        sessionID,
-        messageID,
-      } as unknown as Record<string, unknown>;
-      if (
-        part.type === "compaction"
-        && typeof (part as unknown as Record<string, unknown>)["tail_start_id"]
-          === "string"
-      ) {
-        mapped["tail_start_id"] = messageIDs.get(
-          (part as unknown as Record<string, string>)["tail_start_id"]!,
-        )!;
-      }
-      return mapped as unknown as Part;
-    });
-    return { info, parts };
-  });
 }
 
 function assistantCompaction(id: string): MessageWithParts {
@@ -4339,6 +5478,35 @@ function nestedErrorMessages(error: unknown): string[] {
   return [error instanceof Error ? error.message : String(error)];
 }
 
+type ChatParamsHook = NonNullable<
+  Awaited<ReturnType<typeof server>>["chat.params"]
+>;
+
+function chatParamsInput(
+  sessionID: string,
+  agent: string,
+): Parameters<ChatParamsHook>[0] {
+  return {
+    sessionID,
+    agent,
+    model: {} as Parameters<ChatParamsHook>[0]["model"],
+    provider: {} as Parameters<ChatParamsHook>[0]["provider"],
+    message: {} as Parameters<ChatParamsHook>[0]["message"],
+  };
+}
+
+function chatParams(
+  maxOutputTokens: number | undefined,
+): Parameters<ChatParamsHook>[1] {
+  return {
+    temperature: 0,
+    topP: 1,
+    topK: 0,
+    maxOutputTokens,
+    options: {},
+  };
+}
+
 function promptText(request: Record<string, unknown>): string {
   const parts = request.parts as Array<{ text?: string }> | undefined;
   return parts?.[0]?.text ?? "";
@@ -4355,6 +5523,80 @@ function storedSummary(
   return (update!.part as TextPart).text;
 }
 
+function summaryText(messages: MessageWithParts[], messageID: string): string {
+  const part = messages
+    .find(message => message.info.id === messageID)
+    ?.parts.find(
+      (item): item is TextPart =>
+        item.type === "text"
+        && (
+          item.metadata?.magicCompact as Record<string, unknown> | undefined
+        )?.["summary"] === true,
+    );
+  expect(part).toBeDefined();
+  return part!.text;
+}
+
+function boundaryParts(messages: MessageWithParts[]): TextPart[] {
+  return messages.flatMap(message =>
+    message.parts.filter(
+      (part): part is TextPart =>
+        part.type === "text"
+        && (
+          part.metadata?.magicCompact as Record<string, unknown> | undefined
+        )?.["boundary"] === true,
+    ),
+  );
+}
+
+function userTextByPartID(
+  messages: MessageWithParts[],
+): Record<string, string> {
+  return Object.fromEntries(
+    messages.flatMap(message =>
+      message.info.role === "user"
+        ? message.parts.flatMap(part =>
+            part.type === "text"
+            && part.synthetic !== true
+            && part.ignored !== true
+              ? [[part.id, part.text] as const]
+              : [],
+          )
+        : [],
+    ),
+  );
+}
+
+function omissionContentIDs(part: ToolPart): string[] {
+  const state = part.state as unknown as Record<string, unknown>;
+  const serialized = JSON.stringify([state["input"], state["output"]]);
+  return [
+    ...new Set(
+      serialized.match(/[A-Za-z0-9_-]{1,12}:omitted-[A-Za-z0-9_-]{22}/g) ?? [],
+    ),
+  ];
+}
+
+async function canonicalOmissionTool() {
+  const hooks = await server({} as PluginInput);
+  const omissionTool = hooks.tool?.read_omitted_content;
+  expect(omissionTool).toBeDefined();
+  return omissionTool!;
+}
+
+function omissionToolContext(sessionID: string): ToolContext {
+  return {
+    sessionID,
+    messageID: "test-message",
+    agent: "test-agent",
+    directory: "/workspace",
+    worktree: "/workspace",
+    abort: new AbortController().signal,
+    metadata() {},
+    async ask() {},
+  };
+}
+
 function hasUnpairedSurrogate(value: string): boolean {
   for (let index = 0; index < value.length; index++) {
     const current = value.charCodeAt(index);
@@ -4367,12 +5609,6 @@ function hasUnpairedSurrogate(value: string): boolean {
     }
   }
   return false;
-}
-
-function omittedRecordCount(value: string): number {
-  const match = value.match(/(?:^|\n)omitted-record-count=(\d+)(?:\n|$)/);
-  expect(match).not.toBeNull();
-  return Number(match![1]);
 }
 
 function labeledSummarySection(
@@ -4390,6 +5626,20 @@ function labeledSummarySection(
 }
 
 function summaryRequestIDs(request: Record<string, unknown>): string[] {
+  return summaryPromptSelection(request).turns.map(
+    turn => turn.assistantTurnID,
+  );
+}
+
+function summaryRequestEvidence(request: Record<string, unknown>): string {
+  const turns = summaryPromptSelection(request).turns;
+  expect(turns).toHaveLength(1);
+  return turns[0]!.exactEvidence;
+}
+
+function summaryPromptSelection(request: Record<string, unknown>): {
+  turns: Array<{ assistantTurnID: string; exactEvidence: string }>;
+} {
   const text = promptText(request);
   const startMarker = "Selected historical turns and stop anchor:\n";
   const endMarker = "\n\nEach summary";
@@ -4398,10 +5648,9 @@ function summaryRequestIDs(request: Record<string, unknown>): string[] {
   if (start === -1 || end === -1) {
     throw new Error("Summary prompt selection is missing or malformed.");
   }
-  const selection = JSON.parse(text.slice(start + startMarker.length, end)) as {
-    turns: Array<{ assistantTurnID: string }>;
+  return JSON.parse(text.slice(start + startMarker.length, end)) as {
+    turns: Array<{ assistantTurnID: string; exactEvidence: string }>;
   };
-  return selection.turns.map(turn => turn.assistantTurnID);
 }
 
 function summaryJsonForIDs(ids: string[]): string {
@@ -4409,7 +5658,9 @@ function summaryJsonForIDs(ids: string[]): string {
     Object.fromEntries(
       ids.map(id => [
         id,
-        id === "assistant" ? "Completed the request." : `Completed ${id}.`,
+        id === "assistant"
+          ? "Completed the request."
+          : "Completed the selected historical turn.",
       ]),
     ),
   );
@@ -4666,7 +5917,7 @@ function completedCommandTurn(
   command: string,
   output: string,
 ): MessageWithParts[] {
-  const turn = metricTurn(1, HIGH_RISK_MESSAGE_COUNT, 0);
+  const turn = metricTurn(1, 20, 0);
   turn.assistants[0]!.parts.push({
     id: "metric-command",
     sessionID: "source",

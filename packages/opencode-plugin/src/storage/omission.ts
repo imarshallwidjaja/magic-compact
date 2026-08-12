@@ -38,6 +38,7 @@ const OmissionCacheSchema = z
 
 export type OmissionEntry = { content: string };
 export type OmissionCache = z.infer<typeof OmissionCacheSchema>;
+export type PlannedOmission = OmissionEntry & { contentID: string };
 
 export class OmissionIntegrityError extends Error {
   constructor(message: string) {
@@ -56,7 +57,6 @@ export function omissionReadDiagnostic(
   return `Omitted content unavailable for Content ID ${contentID}: the omission cache could not be read safely.`;
 }
 
-const temporaryOmissionSources = new Map<string, string>();
 const mutationQueues = new Map<string, Promise<void>>();
 
 export async function allocateOmission(
@@ -74,6 +74,30 @@ export async function allocateOmission(
       return contentID;
     }
     throw new Error("Unable to allocate a unique omission Content ID.");
+  });
+}
+
+export function planOmission(
+  sessionID: string,
+  entry: OmissionEntry,
+): PlannedOmission {
+  return { contentID: formatContentID(sessionID, createToken()), ...entry };
+}
+
+export async function commitPlannedOmission(
+  sessionID: string,
+  omission: PlannedOmission,
+): Promise<void> {
+  await withSessionMutation(sessionID, async () => {
+    const cache = (await readCacheFile(sessionID)) ?? createEmptyCache();
+    if (cache.entries[omission.contentID]) {
+      throw new Error("Planned omission Content ID collided before pruning.");
+    }
+    cache.entries[omission.contentID] = createEntry(
+      omission.contentID,
+      omission.content,
+    );
+    await writeCacheFile(sessionID, cache);
   });
 }
 
@@ -107,8 +131,7 @@ export async function readOmittedContent(
     );
   }
 
-  const sourceSessionID = temporaryOmissionSources.get(sessionID) ?? sessionID;
-  const cache = await readCacheFile(sourceSessionID);
+  const cache = await readCacheFile(sessionID);
   if (!cache) return null;
 
   if (QualifiedContentIDSchema.safeParse(contentID).success) {
@@ -117,18 +140,6 @@ export async function readOmittedContent(
     return entry.content;
   }
   return null;
-}
-
-export function installTemporaryOmissionSource(
-  temporarySessionID: string,
-  sourceSessionID: string,
-): () => void {
-  temporaryOmissionSources.set(temporarySessionID, sourceSessionID);
-  return () => {
-    if (temporaryOmissionSources.get(temporarySessionID) === sourceSessionID) {
-      temporaryOmissionSources.delete(temporarySessionID);
-    }
-  };
 }
 
 export async function readCache(

@@ -3,10 +3,11 @@ A compaction operation has just been applied to all messages above. You may have
 </post-compaction-notice>`;
 
 export const MAGIC_COMPACT_SUMMARIZER_AGENT = "magic-compact-summarizer";
+export const MAX_SUMMARY_OUTPUT_TOKENS = 4_000;
 
 export const MAGIC_COMPACT_SUMMARIZER_PROMPT = `You summarize selected historical assistant turns for Magic Compact.
 
-Historical transcript evidence is primary. You may inspect the current workspace when needed to understand that evidence, but distinguish current inspection from claims about what happened historically. Never continue unfinished work or perform the work described by the conversation.
+The bounded exact evidence map in each request is authoritative. Never infer missing history, inspect external state, continue unfinished work, or perform the work described by the conversation.
 
 Preserve decisions, results, errors, fixes, and unresolved next steps faithfully and concisely. Reply only with the JSON object required by each Magic Compact request. Do not wrap it in Markdown fences or add prose.`;
 

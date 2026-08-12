@@ -6,7 +6,7 @@ import {
   boundaryPartID,
 } from "./constants";
 import {
-  assertNativeCheckpointUnchanged,
+  assertCompactionSourceUnchanged,
   NativeCheckpointChangedError,
   type CompactionPlan,
   type MessageWithParts,
@@ -102,45 +102,6 @@ export async function applyBackup(
   unwrap(
     await v2.session.delete({
       sessionID: originalSession.id,
-    }),
-  );
-}
-
-export async function injectProgressNotice(
-  v2: V2Client,
-  sessionID: string,
-): Promise<string> {
-  const message = unwrap(
-    await v2.session.prompt({
-      sessionID,
-      noReply: true,
-      parts: [
-        {
-          type: "text",
-          text: "Magic Compact: Compaction in progress...",
-          ignored: true,
-          metadata: {
-            magicCompact: {
-              progress: true,
-            },
-          },
-        },
-      ],
-    }),
-  );
-
-  return message.info.id;
-}
-
-export async function deleteProgressNotice(
-  v2: V2Client,
-  sessionID: string,
-  messageID: string,
-): Promise<void> {
-  unwrap(
-    await v2.session.deleteMessage({
-      sessionID,
-      messageID,
     }),
   );
 }
@@ -251,8 +212,7 @@ export async function recordPruningStats(input: {
   const stats = await copyStats(input.sourceSessionID, input.sessionID);
   const nextStats = {
     ...stats,
-    totalTokensPruned:
-      stats.totalTokensPruned + Math.max(0, input.tokensPruned),
+    totalTokensPruned: stats.totalTokensPruned + input.tokensPruned,
   };
 
   await writeStats(input.sessionID, nextStats);
@@ -338,7 +298,7 @@ export async function reloadTurns(
   }));
 }
 
-export async function revalidateNativeCheckpoint(
+export async function revalidateCompactionSource(
   v2: V2Client,
   sessionID: string,
   plan: CompactionPlan,
@@ -349,7 +309,7 @@ export async function revalidateNativeCheckpoint(
         sessionID,
       }),
     );
-    assertNativeCheckpointUnchanged(messages, plan);
+    assertCompactionSourceUnchanged(messages, plan);
   } catch (error) {
     if (error instanceof NativeCheckpointChangedError) {
       throw error;

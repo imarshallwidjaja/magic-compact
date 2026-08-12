@@ -35,7 +35,7 @@ export function statsMessage(
   stats: ConversationStats,
   modelID: string | null,
 ): string {
-  const savedTokens = Math.max(0, beforeTokens - afterTokens);
+  const savedTokens = beforeTokens - afterTokens;
   const percent =
     beforeTokens > 0 ? Math.round((savedTokens / beforeTokens) * 100) : 0;
   const moneySaved = moneySavedMessage(stats, modelID);
