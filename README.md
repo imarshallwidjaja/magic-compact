@@ -30,7 +30,7 @@ Exact user messages remain in context. Resolved assistant turns become bounded s
 - Smart tool call pruning — Bulky completed tool I/O is replaced with omission notices, with original content cached and retrievable on demand via `read_omitted_content`.
 - Recompactable — Run `/magic-compact` again later to compact new turns while preserving prior summaries.
 - Trim without summarizing — OpenCode can prune historical tool I/O with `/magic-trim` while preserving assistant responses.
-- Bounded summarization — Completed turns use transcript-free scratch sessions with bounded exact evidence, deny-all permissions, a provider-side 4,000-token output cap, and at most two concurrent requests. Failed, not-run, running, or otherwise unresolved turns stay model-free; required-record overflow becomes a bounded aggregate capsule while the underlying error tool parts stay active.
+- Bounded summarization — Completed turns use transcript-free scratch sessions with bounded exact evidence, deny-all permissions, a best-effort 4,000-token provider output cap that only clamps an active limit OpenCode supplies, and at most two concurrent requests. Failed, not-run, running, or otherwise unresolved turns stay model-free; required-record overflow becomes a bounded aggregate capsule while the underlying error tool parts stay active.
 - Useful-savings gate — If the projected result cannot save at least 20% of eligible removable content, Magic Compact fails unchanged before backup, mutation, or a stats increment instead of claiming weak savings.
 
 ## Installation

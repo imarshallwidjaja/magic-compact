@@ -98,10 +98,13 @@ const server: Plugin = async input => {
     "chat.params": async (input, output) => {
       if (input.agent !== MAGIC_COMPACT_SUMMARIZER_AGENT) return;
       const current = output.maxOutputTokens;
-      output.maxOutputTokens =
-        typeof current === "number" && Number.isFinite(current) && current > 0
-          ? Math.min(current, MAX_SUMMARY_OUTPUT_TOKENS)
-          : MAX_SUMMARY_OUTPUT_TOKENS;
+      if (
+        typeof current === "number"
+        && Number.isFinite(current)
+        && current > 0
+      ) {
+        output.maxOutputTokens = Math.min(current, MAX_SUMMARY_OUTPUT_TOKENS);
+      }
     },
     tool: {
       read_omitted_content: tool({

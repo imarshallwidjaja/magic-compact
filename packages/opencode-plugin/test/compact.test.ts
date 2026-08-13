@@ -100,7 +100,7 @@ describe("magic compact", () => {
     );
   });
 
-  test("caps only Magic Compact summarizer generation at the provider boundary", async () => {
+  test("clamps only existing positive finite summarizer limits at the provider boundary", async () => {
     const hooks = await server({} as PluginInput);
     const applyParams = hooks["chat.params"];
     expect(applyParams).toBeDefined();
@@ -110,7 +110,7 @@ describe("magic compact", () => {
       chatParamsInput("scratch-1", "magic-compact-summarizer"),
       absentLimit,
     );
-    expect(absentLimit.maxOutputTokens).toBe(MAX_SUMMARY_OUTPUT_TOKENS);
+    expect(absentLimit.maxOutputTokens).toBeUndefined();
 
     const higherLimit = chatParams(8_192);
     await applyParams!(
@@ -132,7 +132,7 @@ describe("magic compact", () => {
         chatParamsInput("scratch-3", "magic-compact-summarizer"),
         invalidLimit,
       );
-      expect(invalidLimit.maxOutputTokens).toBe(MAX_SUMMARY_OUTPUT_TOKENS);
+      expect(invalidLimit.maxOutputTokens).toBe(current);
     }
 
     for (const [sessionID, agent] of [
@@ -143,6 +143,15 @@ describe("magic compact", () => {
       await applyParams!(chatParamsInput(sessionID, agent), ordinary);
       expect(ordinary.maxOutputTokens).toBe(8_192);
     }
+
+    const options = { custom: { seed: 7 } };
+    const withOptions = chatParams(8_192, options);
+    await applyParams!(
+      chatParamsInput("scratch-4", "magic-compact-summarizer"),
+      withOptions,
+    );
+    expect(withOptions.maxOutputTokens).toBe(MAX_SUMMARY_OUTPUT_TOKENS);
+    expect(withOptions.options).toBe(options);
   });
 
   test("uses the native compaction model and variant with the custom agent", async () => {
@@ -5497,13 +5506,14 @@ function chatParamsInput(
 
 function chatParams(
   maxOutputTokens: number | undefined,
+  options: Record<string, unknown> = {},
 ): Parameters<ChatParamsHook>[1] {
   return {
     temperature: 0,
     topP: 1,
     topK: 0,
     maxOutputTokens,
-    options: {},
+    options,
   };
 }
 
