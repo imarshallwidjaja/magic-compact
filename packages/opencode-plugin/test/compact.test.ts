@@ -1264,6 +1264,236 @@ describe("magic compact", () => {
     });
   });
 
+  test("keeps a net-negative replacement turn message-identical while compacting profitable turns", async () => {
+    const messages = [
+      ...completedTurn("profitable", "Trim the bulky tool output"),
+      ...completedTurn("net-negative", "Small request"),
+    ];
+    const profitableAssistant = messages[1]!;
+    profitableAssistant.parts.push(
+      genericToolPart("profitable-read", profitableAssistant.info.id, "read", {
+        status: "completed",
+        input: { filePath: "/workspace/artifact.txt" },
+        output: "exact bulky historical read output\n".repeat(400),
+        title: "Read artifact",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      }),
+    );
+    const negativeAssistant = messages[3]!;
+    negativeAssistant.parts.push(
+      textPart(
+        "net-negative-answer",
+        "source",
+        negativeAssistant.info.id,
+        "done.",
+      ),
+    );
+    addProviderTokens(messages);
+    const negativeSnapshot = structuredClone(
+      messages.filter(message =>
+        ["net-negative-user", "net-negative-assistant"].includes(
+          message.info.id,
+        ),
+      ),
+    );
+    const verboseReplacement =
+      "A verbose replacement summary that cannot fit the terse source turn. ".repeat(
+        12,
+      );
+    const command = createCommandHarness(messages, {
+      summaryTextOutputs: [
+        JSON.stringify({
+          "profitable-assistant": "Trimmed the bulky tool output.",
+          "net-negative-assistant": verboseReplacement,
+        }),
+      ],
+    });
+
+    expect(await executeMagicCompact(command.v2, "source", 0)).toBe(true);
+
+    expect(summaryText(messages, "profitable-assistant")).toBe(
+      "Trimmed the bulky tool output.",
+    );
+    expect(
+      messages.filter(message =>
+        ["net-negative-user", "net-negative-assistant"].includes(
+          message.info.id,
+        ),
+      ),
+    ).toEqual(negativeSnapshot);
+    expect(
+      command.partUpdates.filter(
+        update =>
+          update.messageID === "net-negative-assistant"
+          || update.messageID === "net-negative-user",
+      ),
+    ).toEqual([]);
+    expect(
+      command.partDeletes.filter(
+        update =>
+          update.messageID === "net-negative-assistant"
+          || update.messageID === "net-negative-user",
+      ),
+    ).toEqual([]);
+    expect(command.messageDeletes).toEqual([]);
+    expect(boundaryParts(messages)).toHaveLength(1);
+    const pruned = messages
+      .flatMap(item => item.parts)
+      .find((part): part is ToolPart => part.id === "profitable-read")!;
+    expect(omissionContentIDs(pruned)).toHaveLength(1);
+    expect((await readStats("source"))?.totalTokensPruned).toBeGreaterThan(0);
+  });
+
+  test("rejects a net-negative already-trimmed deterministic candidate without mutating the turn", async () => {
+    const messages = [
+      ...completedTurn("profitable", "Trim the bulky tool output"),
+      ...completedTurn("deterministic", "Retry the failing test"),
+    ];
+    const profitableAssistant = messages[1]!;
+    profitableAssistant.parts.push(
+      genericToolPart("profitable-read", profitableAssistant.info.id, "read", {
+        status: "completed",
+        input: { filePath: "/workspace/artifact.txt" },
+        output: "exact bulky historical read output\n".repeat(400),
+        title: "Read artifact",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      }),
+    );
+    const deterministicAssistant = messages[3]!;
+    deterministicAssistant.parts.push(
+      genericToolPart(
+        "deterministic-failure",
+        deterministicAssistant.info.id,
+        "bash",
+        {
+          status: "error",
+          input: { command: "bun test" },
+          error: "Process exited with code 1",
+          metadata: {},
+          time: { start: 1, end: 2 },
+        },
+      ),
+      genericToolPart(
+        "deterministic-trimmed",
+        deterministicAssistant.info.id,
+        "todowrite",
+        {
+          status: "completed",
+          input: { todos: [] },
+          output: "Successfully updated todos.",
+          title: "Update todos",
+          metadata: { magicCompact: { trimmed: true } },
+          time: { start: 1, end: 2 },
+        },
+      ),
+    );
+    addProviderTokens(messages);
+    const deterministicSnapshot = structuredClone(
+      messages.filter(message =>
+        ["deterministic-user", "deterministic-assistant"].includes(
+          message.info.id,
+        ),
+      ),
+    );
+    const command = createCommandHarness(messages, {
+      summaryTextOutputs: [
+        JSON.stringify({
+          "profitable-assistant": "Trimmed the bulky tool output.",
+        }),
+      ],
+    });
+
+    expect(await executeMagicCompact(command.v2, "source", 0)).toBe(true);
+
+    expect(command.summaryRequests).toHaveLength(1);
+    expect(summaryRequestIDs(command.summaryRequests[0]!)).toEqual([
+      "profitable-assistant",
+    ]);
+    expect(summaryText(messages, "profitable-assistant")).toBe(
+      "Trimmed the bulky tool output.",
+    );
+    expect(
+      messages.filter(message =>
+        ["deterministic-user", "deterministic-assistant"].includes(
+          message.info.id,
+        ),
+      ),
+    ).toEqual(deterministicSnapshot);
+    expect(
+      command.partUpdates.filter(
+        update =>
+          update.messageID === "deterministic-assistant"
+          || update.messageID === "deterministic-user",
+      ),
+    ).toEqual([]);
+    expect(
+      command.partDeletes.filter(
+        update =>
+          update.messageID === "deterministic-assistant"
+          || update.messageID === "deterministic-user",
+      ),
+    ).toEqual([]);
+    expect(command.messageDeletes).toEqual([]);
+    expect(boundaryParts(messages)).toHaveLength(1);
+    expect((await readStats("source"))?.totalTokensPruned).toBeGreaterThan(0);
+  });
+
+  test("projects each candidate turn exactly once so near-boundary selection stays stable", async () => {
+    const messages: MessageWithParts[] = [];
+    for (let index = 0; index < 240; index += 1) {
+      messages.push(...nearBoundaryReadTurn(`stable-${index}`));
+    }
+    for (const id of ["bulky-a", "bulky-b"]) {
+      messages.push(
+        ...nearBoundaryReadTurn(
+          id,
+          "exact bulky historical read output\n".repeat(800),
+        ),
+      );
+    }
+    addProviderTokens(messages);
+    const boundarySnapshot = structuredClone(
+      messages.filter(message => message.info.id.startsWith("stable-")),
+    );
+    const command = createCommandHarness(messages);
+
+    expect(await executeMagicCompact(command.v2, "source", 0)).toBe(true);
+
+    const compactedMessageIDs = new Set(
+      messages
+        .filter(message =>
+          message.parts.some(
+            part =>
+              part.type === "text"
+              && (
+                part.metadata?.magicCompact as
+                  | Record<string, unknown>
+                  | undefined
+              )?.["summary"] === true,
+          ),
+        )
+        .map(message => message.info.id),
+    );
+    const boundaryByID = new Map(
+      boundarySnapshot.map(message => [message.info.id, message]),
+    );
+    const liveByID = new Map(
+      messages.map(message => [message.info.id, message]),
+    );
+    for (const [messageID, snapshot] of boundaryByID) {
+      if (compactedMessageIDs.has(messageID)) {
+        expect(liveByID.get(messageID)).toBeDefined();
+      } else {
+        expect(liveByID.get(messageID)).toEqual(snapshot);
+      }
+    }
+    expect(summaryText(messages, "bulky-a-assistant")).toBe(
+      "Completed the selected historical turn.",
+    );
+  });
+
   test("retrieves every planned omission notice through the authorized plugin tool", async () => {
     const inputContent = "exact planned input\n".repeat(180);
     const outputContent = "exact planned output\n".repeat(180);
@@ -5945,4 +6175,25 @@ function completedCommandTurn(
     },
   } as Part);
   return [...turn.user, ...turn.assistants];
+}
+
+function nearBoundaryReadTurn(
+  id: string,
+  output = `near boundary read output ${"y".repeat(287)}`,
+): MessageWithParts[] {
+  return [
+    message(`${id}-user`, "user", [
+      textPart(`${id}-text`, "source", `${id}-user`, `Request ${id}`),
+    ]),
+    message(`${id}-assistant`, "assistant", [
+      genericToolPart(`${id}-read`, `${id}-assistant`, "read", {
+        status: "completed",
+        input: { filePath: `/workspace/${id}.txt` },
+        output,
+        title: "Read file",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      }),
+    ]),
+  ];
 }

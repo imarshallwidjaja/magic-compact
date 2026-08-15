@@ -277,7 +277,7 @@ export async function injectTrimStatsNotice(
 export async function reloadTurns(
   v2: V2Client,
   sessionID: string,
-  plan: CompactionPlan,
+  turns: Turn[],
 ): Promise<Turn[]> {
   const messages: MessageWithParts[] = unwrap(
     await v2.session.messages({
@@ -288,7 +288,7 @@ export async function reloadTurns(
     messages.map(message => [message.info.id, message]),
   );
 
-  return plan.summarizedTurns.map(turn => ({
+  return turns.map(turn => ({
     user: turn.user.map(message =>
       requireMessage(messageByID, message.info.id),
     ),

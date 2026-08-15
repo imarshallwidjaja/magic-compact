@@ -20,8 +20,13 @@ import {
   type CompactionPlan,
   type MessageWithParts,
   NativeCheckpointChangedError,
+  type Turn,
 } from "./compact/plan";
-import { createPruneProjection, pruneSummarizedTurns } from "./compact/prune";
+import {
+  createPruneProjection,
+  pruneSummarizedTurns,
+  type PruneProjection,
+} from "./compact/prune";
 import {
   countCanonicalContentTokens,
   countSessionTokens,
@@ -35,6 +40,7 @@ import {
 } from "./compact/constants";
 import { readStats, type ConversationStats } from "./storage/stats";
 import { STATS_METADATA, statsMessage } from "./stats/constants";
+import type { PlannedOmission } from "./storage/omission";
 
 export const COMPACT_SUCCESS = "Magic compaction successful.";
 export const COMPACT_NOOP = "No assistant turns are old enough to compact.";
@@ -42,6 +48,12 @@ export const COMPACT_INSUFFICIENT_SAVINGS =
   "Magic Compact projected no useful active-context savings; the source session was left unchanged.";
 const MINIMUM_USEFUL_SAVINGS_RATIO = 0.2;
 const MINIMUM_USEFUL_SAVINGS_TOKENS = 32;
+
+type CompactionSelection = {
+  turns: Turn[];
+  summaries: string[];
+  pruning: PruneProjection;
+};
 
 class CompactionSourceDriftError extends Error {
   constructor(
@@ -100,17 +112,23 @@ export async function executeMagicCompact(
       sourcePlan,
     );
 
+    const selection = await selectProfitableTurns(
+      sourcePlan,
+      summaries,
+      sessionID,
+    );
+
     const projection = await projectCompaction(
       sourceMessages,
       sourcePlan,
-      summaries,
+      selection,
       sessionID,
       currentCompactionCount,
       sourceSession.model?.id ?? null,
       beforeTokens,
     );
     const eligibleTokens = countCanonicalContentTokens(
-      sourcePlan.summarizedTurns.flatMap(turn => turn.assistants),
+      selection.turns.flatMap(turn => turn.assistants),
     );
     const projectedSavings = beforeTokens - projection.afterTokens;
     const minimumSavings = Math.max(
@@ -128,14 +146,14 @@ export async function executeMagicCompact(
     );
     await revalidateCompactionSource(v2, sessionID, sourcePlan);
 
-    await injectSummaries(v2, sessionID, sourcePlan.summarizedTurns, summaries);
+    await injectSummaries(v2, sessionID, selection.turns, selection.summaries);
 
     // Mark the new compaction boundary for future recompactions
     // Message placed outside of summarization range so unaffected by pruning
     await injectPostCompactionNotice(v2, sessionID, sourcePlan.nextTurn);
 
     // Prune messages & tool calls
-    const summarizedTurns = await reloadTurns(v2, sessionID, sourcePlan);
+    const summarizedTurns = await reloadTurns(v2, sessionID, selection.turns);
     await pruneSummarizedTurns(
       { v2, sessionID },
       summarizedTurns,
@@ -166,7 +184,7 @@ export async function executeMagicCompact(
       sourceSessionID: sessionID,
       tokensPruned: beforeTokens - projection.afterTokens,
     });
-    compactedTurnCount = sourcePlan.summarizedTurns.length;
+    compactedTurnCount = selection.turns.length;
   } catch (error) {
     let failure = error;
     if (
@@ -208,10 +226,70 @@ export async function executeMagicCompact(
   return true;
 }
 
+async function selectProfitableTurns(
+  plan: CompactionPlan,
+  summaries: string[],
+  sessionID: string,
+): Promise<CompactionSelection> {
+  const selectedTurns: Turn[] = [];
+  const selectedSummaries: string[] = [];
+  const projectedTurns: Turn[] = [];
+  const omissions: PlannedOmission[] = [];
+  for (const [index, turn] of plan.summarizedTurns.entries()) {
+    const summary = summaries[index];
+    if (summary === undefined)
+      throw new Error("Missing summary for assistant turn.");
+    const candidates = injectProjectedSummaries([turn], [summary], sessionID);
+    const pruning = await createPruneProjection(candidates, sessionID);
+    const projectedTurn = pruning.turns[0]!;
+    if (
+      countTurnCanonicalTokens(projectedTurn) < countTurnCanonicalTokens(turn)
+    ) {
+      selectedTurns.push(turn);
+      selectedSummaries.push(summary);
+      projectedTurns.push(projectedTurn);
+      omissions.push(...pruning.omissions);
+    }
+  }
+  return {
+    turns: selectedTurns,
+    summaries: selectedSummaries,
+    pruning: { turns: projectedTurns, omissions },
+  };
+}
+
+function injectProjectedSummaries(
+  turns: Turn[],
+  summaries: string[],
+  sessionID: string,
+): Turn[] {
+  return turns.map((turn, index) => {
+    const projected = structuredClone(turn);
+    const firstAssistant = projected.assistants[0];
+    if (!firstAssistant) throw new Error("Turn missing assistant message.");
+    const summary = summaries[index];
+    if (summary === undefined)
+      throw new Error("Missing summary for assistant turn.");
+    firstAssistant.parts.push({
+      id: summaryPartID(firstAssistant.info.id),
+      sessionID,
+      messageID: firstAssistant.info.id,
+      type: "text",
+      text: summary,
+      metadata: summaryMetadata(),
+    } satisfies TextPart);
+    return projected;
+  });
+}
+
+function countTurnCanonicalTokens(turn: Turn): number {
+  return countCanonicalContentTokens([...turn.user, ...turn.assistants]);
+}
+
 async function projectCompaction(
   sourceMessages: MessageWithParts[],
   plan: CompactionPlan,
-  summaries: string[],
+  selection: CompactionSelection,
   sessionID: string,
   compactionCount: number,
   modelID: string | null,
@@ -220,25 +298,10 @@ async function projectCompaction(
   const messages = structuredClone(sourceMessages);
   const byID = new Map(messages.map(message => [message.info.id, message]));
   const summarizedIDs = new Set(
-    plan.summarizedTurns.flatMap(turn =>
+    selection.turns.flatMap(turn =>
       [...turn.user, ...turn.assistants].map(message => message.info.id),
     ),
   );
-  const turns = plan.summarizedTurns.map(turn => ({
-    user: turn.user.map(message => byID.get(message.info.id)!),
-    assistants: turn.assistants.map(message => byID.get(message.info.id)!),
-  }));
-  for (const [index, turn] of turns.entries()) {
-    const firstAssistant = turn.assistants[0]!;
-    firstAssistant.parts.push({
-      id: summaryPartID(firstAssistant.info.id),
-      sessionID,
-      messageID: firstAssistant.info.id,
-      type: "text",
-      text: summaries[index]!,
-      metadata: summaryMetadata(),
-    });
-  }
   let appendedBoundary: MessageWithParts | null = null;
   if (plan.nextTurn) {
     const nextUser = byID.get(plan.nextTurn.user[0]!.info.id)!;
@@ -259,9 +322,8 @@ async function projectCompaction(
       BOUNDARY_METADATA,
     );
   }
-  const pruning = await createPruneProjection(turns, sessionID);
   const projectedByID = new Map(
-    pruning.turns
+    selection.pruning.turns
       .flatMap(turn => [...turn.user, ...turn.assistants])
       .map(message => [message.info.id, message]),
   );
@@ -300,7 +362,7 @@ async function projectCompaction(
     if (nextAfter === afterTokens) {
       return {
         afterTokens,
-        omissions: pruning.omissions,
+        omissions: selection.pruning.omissions,
         stats: projectedStats,
       };
     }
