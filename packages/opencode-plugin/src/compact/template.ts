@@ -9,7 +9,7 @@ export function buildCompactionPrompt(
   return `<system>
 # Attention: Conversation Compaction Required
 
-Summarize only the selected historical assistant turns from the bounded exact evidence map below. The evidence map is authoritative. Do not infer missing history or continue unfinished work.
+Summarize only the selected historical assistant turns from the bounded exact evidence map below. The evidence map is authoritative. Do not infer missing history or continue unfinished work. Assistant-text records may use \`textEncoding: "ordered-literal-runs-v1"\` with \`textSegments\` only when a whole source part is provably periodic: an optional leading unique segment with repetitions 1, then one segment whose literal repeated that many times reproduces the exact source. Expand each segment by repeating its literal; any other text stays verbatim in \`text\`.
 
 Return only one JSON object whose keys are exactly the selected assistant turn IDs and whose values are non-empty summary strings. Required output keys: ${JSON.stringify(turns.map(turnID))}
 Preserve the IDs exactly. Do not return Markdown fences, prose, XML, or a nested wrapper. The complete response must fit within 4,000 local gpt-tokenizer tokens.
@@ -17,16 +17,16 @@ Preserve the IDs exactly. Do not return Markdown fences, prose, XML, or a nested
 Selected historical turns and stop anchor:
 ${buildPromptSelection(turns, nextTurn, evidenceByTurn)}
 
-Each summary must preserve all evidenced continuation state, prioritizing completeness over brevity:
-- outcome: completed, partial, blocked, or analysis-only
-- delivered implementation or other concrete changes
-- verification commands and results, plus checks explicitly not run
+Each summary is a human-readable continuation capsule for one turn. Start with exactly \`Outcome: completed\`, \`Outcome: partial\`, or \`Outcome: analysis-only\` as established by exactEvidence. Follow it with a non-empty \`Work:\` field. Add only non-empty \`Verification:\`, \`VCS:\`, \`Unresolved:\`, and \`Next:\` sections, using \`- \` bullets. Correctness and continuation fidelity come before brevity. Preserve every continuation-critical fact in readable prose or short bullets:
+- outcome: completed, partial, or analysis-only
+- delivered implementation or other concrete work, and the decisions made
+- verification results, plus checks explicitly not run
 - version-control, deployment, branch, source, and backup state
 - errors encountered and their fixes
 - unresolved work and the exact next action
-- exact identifiers such as paths, commits, branches, sessions, deployments, and commands when evidenced
+- exact identifiers such as paths, commits, branches, sessions, deployments, and commands, but only when the next agent needs them to continue
 
-Do not emit placeholders, unknown IDs, user text, or a summary for the stop anchor. No tools or external inspection are available. Preserve failed, not-run, running, and unresolved state exactly as represented. Return only the required JSON object.
+Write each capsule without restating tool structure or evidence the transcript already keeps. Never copy machine evidence records, JSON fields such as sourceBytes/windows, record labels, or internal record accounting into a visible capsule. Do not emit placeholders, unknown IDs, user text, or a summary for the stop anchor. No tools or external inspection are available. Preserve failed, not-run, running, and unresolved state exactly as represented. Return only the required JSON object.
 </system>`;
 }
 

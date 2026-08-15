@@ -23,7 +23,9 @@ import {
 import { MAX_SUMMARY_OUTPUT_TOKENS } from "../src/compact/constants";
 import {
   DETERMINISTIC_SUMMARY_MAX_TOKENS,
+  encodeOrderedLiteralRuns,
   renderDeterministicSummary,
+  renderStandardTurnEvidence,
 } from "../src/compact/high-risk";
 import {
   assertCompactionSourceUnchanged,
@@ -42,12 +44,24 @@ import {
   readOmittedContent,
   writeCache,
 } from "../src/storage/omission";
-import { readStats } from "../src/storage/stats";
+import {
+  deleteStats,
+  readStats,
+  type ConversationStats,
+  writeStats,
+} from "../src/storage/stats";
+import {
+  statsMessage,
+  statsSummaryMessage,
+  trimStatsMessage,
+} from "../src/stats/constants";
 import {
   countCanonicalContentTokens,
   countSessionTokens,
 } from "../src/stats/tokenize";
 import {
+  INCIDENT_ASSISTANT_REPEAT_COUNT,
+  INCIDENT_ASSISTANT_REPEAT_LITERAL,
   INCIDENT_DETERMINISTIC_TURN_COUNT,
   INCIDENT_ERROR_TOOL_COUNT,
   INCIDENT_RUNNING_TOOL_COUNT,
@@ -304,9 +318,17 @@ describe("magic compact", () => {
     expect(promptText).toContain(
       "Preserve failed, not-run, running, and unresolved state exactly",
     );
+    expect(promptText).toContain("human-readable continuation capsule");
+    expect(promptText).toContain(
+      "Correctness and continuation fidelity come before brevity",
+    );
+    expect(promptText).toContain("exact next action");
+    expect(promptText).toContain(
+      "without restating tool structure or evidence the transcript already keeps",
+    );
     expect(requests.partUpdates[0]).toMatchObject({
       part: {
-        text: "Completed the request.",
+        text: modelCapsule("analysis-only", "Completed the request."),
         metadata: { magicCompact: { summary: true } },
       },
     });
@@ -321,21 +343,25 @@ describe("magic compact", () => {
       messages,
       textResponses: [
         JSON.stringify({
-          "second-assistant": "Second result.",
-          "first-assistant": "First result.",
+          "second-assistant": modelCapsule("analysis-only", "Second result."),
+          "first-assistant": modelCapsule("analysis-only", "First result."),
         }),
       ],
     });
 
     expect(
       requests.partUpdates.map(request => (request.part as TextPart).text),
-    ).toEqual(["First result.", "Second result."]);
+    ).toEqual([
+      modelCapsule("analysis-only", "First result."),
+      modelCapsule("analysis-only", "Second result."),
+    ]);
   });
 
   test("reconstructs split plain-JSON responses by exact part concatenation", async () => {
     const technical =
       'Compared <left> & <right>.\nRan `bun test "packages/unit suite.test.ts"`.\nUpdated C:\\work\\app and /workspace/app/[slug]/page.tsx, then returned \ud83d\ude80 and \u4f60\u597d.';
-    const encoded = JSON.stringify({ assistant: technical });
+    const capsule = modelCapsule("analysis-only", technical);
+    const encoded = JSON.stringify({ assistant: capsule });
     const splits = [
       encoded.indexOf("\\n") + 1,
       encoded.indexOf('\\"') + 1,
@@ -347,7 +373,7 @@ describe("magic compact", () => {
       const requests = await runCompaction(session("source"), {
         textResponses: [[encoded.slice(0, split), encoded.slice(split)]],
       });
-      expect((requests.partUpdates[0]!.part as TextPart).text).toBe(technical);
+      expect((requests.partUpdates[0]!.part as TextPart).text).toBe(capsule);
     }
   });
 
@@ -449,6 +475,98 @@ describe("magic compact", () => {
       expect(String(error)).not.toContain("Private summary content");
       expect(partUpdates).toEqual([]);
     }
+  });
+
+  test.each([
+    ["Completed the request.", "invalid-capsule-shape"],
+    [
+      "Outcome: completed\nWork: Claimed completion without source evidence.",
+      "outcome-mismatch",
+    ],
+    [
+      '{"kind":"assistant-text","sourceBytes":42,"windows":["raw"]}',
+      "machine-evidence-summary",
+    ],
+    [
+      'Outcome: analysis-only\nWork: {"sourceBytes":42,"windows":["raw"]}',
+      "machine-evidence-summary",
+    ],
+    [
+      'Outcome: analysis-only\nWork: sourceBytes=42; windows=["raw"]',
+      "machine-evidence-summary",
+    ],
+    [
+      'Outcome: analysis-only\nWork: "kind": "tool"',
+      "machine-evidence-summary",
+    ],
+    [
+      "Outcome: analysis-only\nWork: sourceBytes = 128",
+      "machine-evidence-summary",
+    ],
+    [
+      "Outcome: analysis-only\nWork: Reviewed the request.\n- omitted-record-count=2",
+      "machine-evidence-summary",
+    ],
+    [
+      "Outcome: analysis-only\nWork: Reviewed the request.\nevidence-records\nomitted-record-count=2",
+      "machine-evidence-summary",
+    ],
+    [
+      "Outcome: analysis-only\nWork: Reviewed the work.\nVerification:",
+      "invalid-capsule-shape",
+    ],
+  ])(
+    "rejects a visible model summary outside the readable capsule contract: %s",
+    async (summary, category) => {
+      const partUpdates: Record<string, unknown>[] = [];
+      let error: unknown;
+      try {
+        await runCompaction(session("source"), {
+          textResponses: [
+            JSON.stringify({ assistant: summary }),
+            JSON.stringify({ assistant: summary }),
+          ],
+          partUpdates,
+        });
+      } catch (caught) {
+        error = caught;
+      }
+
+      expect(error).toMatchObject({
+        name: "SummaryContractError",
+        category,
+        attempt: 2,
+      });
+      expect(String(error)).not.toContain(summary);
+      expect(partUpdates).toEqual([]);
+    },
+  );
+
+  test("rejects a model Outcome that contradicts completed source evidence", async () => {
+    let error: unknown;
+    try {
+      await runCompaction(session("source"), {
+        messages: completedCommandTurn("bun test", "10 passed, 0 failed"),
+        textResponses: [
+          JSON.stringify({
+            "metric-assistant-0":
+              "Outcome: analysis-only\nWork: Reviewed the historical request.",
+          }),
+          JSON.stringify({
+            "metric-assistant-0":
+              "Outcome: analysis-only\nWork: Reviewed the historical request.",
+          }),
+        ],
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toMatchObject({
+      name: "SummaryContractError",
+      category: "outcome-mismatch",
+      attempt: 2,
+    });
   });
 
   test("does not retry a contract failure when scratch cleanup fails", async () => {
@@ -646,14 +764,18 @@ describe("magic compact", () => {
     const requests = await runCompaction(session("source"), {
       lifecycle,
       textResponses: [
-        JSON.stringify({ assistant: "Completed the request." }),
-        JSON.stringify({ assistant: "Probe summary." }),
+        JSON.stringify({
+          assistant: modelCapsule("analysis-only", "Completed the request."),
+        }),
+        JSON.stringify({
+          assistant: modelCapsule("analysis-only", "Probe summary."),
+        }),
       ],
     });
 
     expect(requests.prompts[0]).not.toHaveProperty("format");
     expect((requests.partUpdates[0]!.part as TextPart).text).toBe(
-      "Completed the request.",
+      modelCapsule("analysis-only", "Completed the request."),
     );
     expect(lifecycle.filter(event => event === "messages")).toHaveLength(1);
 
@@ -678,7 +800,9 @@ describe("magic compact", () => {
     const requests = await runCompaction(session("source"), {
       textResponses: [
         failedOutput,
-        JSON.stringify({ assistant: "Recovered summary." }),
+        JSON.stringify({
+          assistant: modelCapsule("analysis-only", "Recovered summary."),
+        }),
       ],
       lifecycle,
     });
@@ -688,7 +812,7 @@ describe("magic compact", () => {
     expect(lifecycle.filter(event => event === "prompt")).toHaveLength(2);
     expect(lifecycle.filter(event => event === "delete")).toHaveLength(2);
     expect((requests.partUpdates[0]!.part as TextPart).text).toBe(
-      "Recovered summary.",
+      modelCapsule("analysis-only", "Recovered summary."),
     );
   });
 
@@ -702,13 +826,30 @@ describe("magic compact", () => {
     "TBD after validation.",
     "[waiting for details]",
   ])("accepts substantive standard summary text: %s", async text => {
+    const summary = modelCapsule("analysis-only", text);
     const requests = await runCompaction(session("source"), {
       messages: compactableMessages(),
-      textResponses: [JSON.stringify({ assistant: text })],
+      textResponses: [JSON.stringify({ assistant: summary })],
     });
 
-    expect((requests.partUpdates[0]!.part as TextPart).text).toBe(text);
+    expect((requests.partUpdates[0]!.part as TextPart).text).toBe(summary);
   });
+
+  test.each([
+    "Documented sourceBytes, windows, evidence-records, and omitted-record-count as ordinary field names.",
+    'Documented the JSON field "kind": "tool".',
+    "Set sourceBytes = 128.",
+  ])(
+    "accepts machine-field syntax inside ordinary capsule prose: %s",
+    async text => {
+      const summary = `Outcome: analysis-only\nWork: ${text}`;
+      const requests = await runCompaction(session("source"), {
+        textResponses: [JSON.stringify({ assistant: summary })],
+      });
+
+      expect((requests.partUpdates[0]!.part as TextPart).text).toBe(summary);
+    },
+  );
 
   test("serializes user previews as JSON", () => {
     const turn = {
@@ -800,6 +941,52 @@ describe("magic compact", () => {
     expect(requests.deletes).toEqual(["scratch-1"]);
   }, 30_000);
 
+  test("renders deterministic summaries as human-readable continuation capsules without machine scaffolding", async () => {
+    const requests = await runDeterministicRenderer(session("source"), {
+      messages: outlierTurn(),
+    });
+    const stored = storedSummary(requests, "outlier-assistant-0");
+
+    expect(requests.prompts).toEqual([]);
+    expect(requests.creates).toEqual([]);
+    expect(requests.agentRequests).toEqual([]);
+    expect(stored).toStartWith("Outcome: partial");
+    expect(stored).toContain(
+      "Work: Delivered implementation in src/critical.ts.",
+    );
+    expect(stored).toContain("VCS:");
+    expect(stored).toContain("Unresolved:");
+    expect(stored).toContain(
+      "[error] bun run integration → integration failed",
+    );
+    expect(stored).toContain("[running] bun run long-check");
+    expect(stored).toContain("[failed] bun test: Process exited with code 1");
+    expect(stored).toContain("[not-run] bun run smoke: smoke not run");
+    expect(stored).toContain("bun test reported 88 pass");
+    expect(stored).toContain("commit abc123 was pushed");
+    expect(stored).toContain("final assistant evidence");
+    for (const scaffolding of [
+      '"kind"',
+      '"polarity"',
+      '"sourceBytes"',
+      '"windows"',
+      "omitted-record-count",
+      "required-record-counts",
+      "required-record-overflow",
+      "required-record-total",
+      "assistant-text-records",
+      "evidence-records",
+      "Historical assistant text (authoritative)",
+      "Historical terminal evidence (authoritative)",
+    ]) {
+      expect(stored).not.toContain(scaffolding);
+    }
+    expect(encode(stored).length).toBeLessThanOrEqual(
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
+    );
+    expect(hasUnpairedSurrogate(stored)).toBeFalse();
+  }, 300_000);
+
   test("routes unresolved semantic evidence deterministically with no scratch prompts", async () => {
     const errorState = metricTurn(1, 1, 1, "error");
     const runningState = metricTurn(1, 1, 0);
@@ -865,7 +1052,40 @@ describe("magic compact", () => {
     }
   });
 
-  test("routes a final assistant metadata error deterministically with bounded structured evidence", async () => {
+  test.each([
+    "Blocked: provider credentials are missing.",
+    "Blocked: waiting for operator approval.",
+    "| Status | Blocked: waiting for operator approval. |",
+    "| Release | Blocked: awaiting operator approval. |",
+    "Could not finish the migration because the signing key is unavailable.",
+    "I couldn't complete the request without deployment credentials.",
+    "Unable to continue: API credentials are missing.",
+    "The task remains unfinished because the required token is unavailable.",
+  ])(
+    "routes explicit unresolved assistant prose deterministically: %s",
+    async text => {
+      const messages = completedTurn("explicit-unresolved", "Finish the work");
+      messages[1]!.parts.push(
+        textPart(
+          "explicit-unresolved-text",
+          "source",
+          messages[1]!.info.id,
+          text,
+        ),
+      );
+
+      const requests = await runCompaction(session("source"), { messages });
+      const stored = storedSummary(requests, messages[1]!.info.id);
+
+      expect(requests.prompts).toEqual([]);
+      expect(requests.creates).toEqual([]);
+      expect(stored).toStartWith("Outcome: partial");
+      expect(stored).toContain(text);
+      expect(stored).not.toStartWith("Outcome: completed");
+    },
+  );
+
+  test("routes a final assistant metadata error deterministically with readable evidence", async () => {
     const messages = completedTurn("assistant-error", "Authenticate provider");
     const assistant = messages[1]!;
     Object.assign(assistant.info, {
@@ -884,11 +1104,13 @@ describe("magic compact", () => {
     expect(requests.prompts).toEqual([]);
     expect(requests.creates).toEqual([]);
     expect(requests.agentRequests).toEqual([]);
-    expect(stored).toStartWith("Outcome: partial\n");
-    expect(stored).toContain('"kind":"assistant-message-status"');
-    expect(stored).toContain('"status":"error"');
-    expect(stored).toContain('"errorType":"ProviderAuthError"');
-    expect(stored).toContain('"message":"Authentication token expired."');
+    expect(stored).toStartWith("Outcome: partial");
+    expect(stored).toContain("Unresolved:");
+    expect(stored).toContain("[error] ProviderAuthError");
+    expect(stored).toContain("Authentication token expired.");
+    expect(stored).toContain("provider-x");
+    expect(stored).not.toContain('"kind"');
+    expect(stored).not.toContain('"status":"error"');
   });
 
   test("keeps an earlier assistant metadata error model-eligible after a successful recovery", async () => {
@@ -959,7 +1181,7 @@ describe("magic compact", () => {
       ),
     ).not.toContain("omitted-record-count=1");
     expect(encode(evidence).length).toBeLessThanOrEqual(
-      DETERMINISTIC_SUMMARY_MAX_TOKENS,
+      MAX_SUMMARY_INPUT_TOKENS,
     );
   });
 
@@ -1016,7 +1238,7 @@ describe("magic compact", () => {
     );
   });
 
-  test("keeps the final substantive assistant response inside a required-record overflow capsule", async () => {
+  test("keeps the final substantive assistant response as exact evidence beside recovered statuses", async () => {
     const marker = "FINAL SUBSTANTIVE RESPONSE";
     const denseBody = `${marker}\n${Array.from(
       { length: 120 },
@@ -1069,26 +1291,22 @@ describe("magic compact", () => {
     expect(requests.prompts).toHaveLength(1);
     expect(requests.creates).toHaveLength(1);
     expect(requests.agentRequests).toHaveLength(1);
-    expect(evidence).toContain(
+    expect(evidence).toContain(marker);
+    expect(evidence).toContain('"partID":"overflow-capsule-final-text"');
+    expect(evidence).toContain('"status":"recovered"');
+    expect(evidence).toContain('"errorType":"ProviderAuthError-0-');
+    expect(evidence).not.toContain(
       "Required deterministic evidence overflow capsule:",
     );
-    expect(evidence).toContain(marker);
-    expect(evidence).toContain('"status":"recovered"');
-    expect(evidence).toContain('"assistant-message-recovered":40');
-    expect(evidence).toContain("required-record-total=41");
-    const omitted = Number(
-      evidence.match(/required-record-overflow=(\d+)/)?.[1],
-    );
-    const includedRecords = evidence
-      .slice(
-        evidence.indexOf("required-records:"),
-        evidence.indexOf("required-record-overflow="),
-      )
-      .split("\n")
-      .filter(line => line.startsWith("{")).length;
-    expect(omitted).toBe(41 - includedRecords);
+    expect(
+      labeledSummarySection(
+        evidence,
+        "Historical assistant text (authoritative)",
+        "Verification",
+      ),
+    ).not.toMatch(/omitted-record-count=[1-9]/);
     expect(encode(evidence).length).toBeLessThanOrEqual(
-      DETERMINISTIC_SUMMARY_MAX_TOKENS,
+      MAX_SUMMARY_INPUT_TOKENS,
     );
   });
 
@@ -1132,9 +1350,11 @@ describe("magic compact", () => {
       expect(requests.prompts).toEqual([]);
       expect(requests.creates).toEqual([]);
       expect(requests.agentRequests).toEqual([]);
-      expect(stored).toStartWith("Outcome: partial\n");
+      expect(stored).toStartWith("Outcome: partial");
+      expect(stored).toContain("Unresolved:");
       expect(stored).toContain(text);
-      expect(stored).toContain('"polarity":"not-run"');
+      expect(stored).toContain("[not-run]");
+      expect(stored).not.toContain('"polarity"');
     },
   );
 
@@ -1238,14 +1458,16 @@ describe("magic compact", () => {
     const command = createCommandHarness(messages, {
       summaryTextOutputs: [
         JSON.stringify({
-          "weak-assistant":
+          "weak-assistant": modelCapsule(
+            "analysis-only",
             "A replacement that cannot provide useful net context reduction.",
+          ),
         }),
       ],
     });
 
     await expect(executeMagicCompact(command.v2, "source", 0)).rejects.toThrow(
-      "useful active-context savings",
+      "useful canonical active-content savings",
     );
 
     expect(command.backupForks).toEqual([]);
@@ -1259,9 +1481,138 @@ describe("magic compact", () => {
     expect(await readStats("source")).toBeNull();
     expect(command.toasts.at(-1)).toMatchObject({
       title: "Magic Compact Failed",
-      message: expect.stringContaining("useful active-context savings"),
+      message: expect.stringContaining(
+        "useful canonical active-content savings",
+      ),
       variant: "error",
     });
+  });
+
+  test("labels every stats string as a canonical active-content estimate with a stale provider snapshot note", () => {
+    const stats: ConversationStats = {
+      version: 1,
+      sourceSessionId: "source",
+      rootSessionId: "source",
+      totalTokensPruned: 133_194,
+      cachedTokensSaved: 0,
+      processedAssistantMessageIds: [],
+    };
+
+    const compact = statsMessage(1, 274_692, 141_498, stats, null);
+    const trim = trimStatsMessage(90_000, 50_000, stats, null);
+    const summary = statsSummaryMessage(1, stats, null);
+
+    expect(compact).toContain("Magic Compaction #1");
+    expect(trim).toContain("Magic Trim");
+    expect(summary).toContain("Magic Compact");
+    for (const text of [compact, trim, summary]) {
+      expect(text).toContain("canonical active-content");
+      expect(text).toContain("ignored reporting notice is excluded");
+      expect(text).toContain("provider usage snapshot");
+      expect(text).toContain("stale");
+      expect(text).toContain("later assistant response");
+    }
+    expect(compact).toContain("274.7K");
+    expect(compact).toContain("141.5K");
+    expect(
+      trimStatsMessage(100, 120, { ...stats, totalTokensPruned: -20 }, null),
+    ).toContain("~-20 tokens pruned");
+  });
+
+  test("reports compact stats on a cycle-free active basis across the 999-to-1K boundary", async () => {
+    const messages = completedTurn("stats-threshold", "Compact the history");
+    messages[1]!.parts.push({
+      id: "stats-threshold-reasoning",
+      sessionID: "source",
+      messageID: messages[1]!.info.id,
+      type: "reasoning",
+      text: "historical removable detail ".repeat(100),
+      time: { start: 1, end: 2 },
+    });
+    const beforeTokens = countCanonicalContentTokens(messages);
+    const command = createCommandHarness(messages);
+
+    try {
+      await writeStats("source", {
+        version: 1,
+        sourceSessionId: "source",
+        rootSessionId: "source",
+        totalTokensPruned: 999,
+        cachedTokensSaved: 0,
+        processedAssistantMessageIds: [],
+      });
+
+      expect(await executeMagicCompact(command.v2, "source", 0)).toBeTrue();
+
+      const activeMessages = messages.map(item => ({
+        ...item,
+        parts: item.parts.filter(
+          part => part.type !== "text" || part.ignored !== true,
+        ),
+      }));
+      const afterTokens = countCanonicalContentTokens(activeMessages);
+      const stats = await readStats("source");
+      const notice = messages
+        .flatMap(item => item.parts)
+        .find(
+          (part): part is TextPart =>
+            part.type === "text"
+            && part.ignored === true
+            && part.metadata?.magicCompact?.stats === true,
+        )!;
+
+      expect(await countSessionTokens(command.v2, "source")).toBe(afterTokens);
+      expect(stats?.totalTokensPruned).toBe(999 + beforeTokens - afterTokens);
+      expect(notice.text).toBe(
+        statsMessage(1, beforeTokens, afterTokens, stats!, null),
+      );
+      expect(notice.text).toContain("ignored reporting notice is excluded");
+      expect(notice.text).toMatch(/Total tokens pruned[^\n]*~1(?:\.\d)?K/);
+    } finally {
+      await Promise.all([deleteStats("source"), deleteStats("backup")]);
+    }
+  });
+
+  test("never mutates provider usage token metadata while compacting", async () => {
+    const messages = completedTurn("provider-usage", "Compact me");
+    const assistant = messages[1]!;
+    assistant.parts.push(
+      genericToolPart("provider-usage-read", assistant.info.id, "read", {
+        status: "completed",
+        input: { filePath: "/workspace/bulky.txt" },
+        output: "bulky provider usage output\n".repeat(400),
+        title: "Read bulky artifact",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      }),
+    );
+    addProviderTokens(messages);
+    const providerAssistant = messages.find(
+      item => item.info.id === "provider-usage-assistant",
+    )!;
+    const providerTokens = structuredClone(providerAssistant.info.tokens);
+    const command = createCommandHarness(messages, {
+      summaryTextOutputs: [
+        JSON.stringify({
+          "provider-usage-assistant": modelCapsule(
+            "completed",
+            "Compacted the resolved read turn.",
+          ),
+        }),
+      ],
+    });
+
+    expect(await executeMagicCompact(command.v2, "source", 0)).toBe(true);
+    expect(providerAssistant.info.tokens).toEqual(providerTokens);
+    expect(
+      messages.some(message =>
+        message.parts.some(
+          part =>
+            part.type === "text"
+            && part.text.includes("canonical active-content"),
+        ),
+      ),
+    ).toBeTrue();
   });
 
   test("keeps a net-negative replacement turn message-identical while compacting profitable turns", async () => {
@@ -1304,8 +1655,14 @@ describe("magic compact", () => {
     const command = createCommandHarness(messages, {
       summaryTextOutputs: [
         JSON.stringify({
-          "profitable-assistant": "Trimmed the bulky tool output.",
-          "net-negative-assistant": verboseReplacement,
+          "profitable-assistant": modelCapsule(
+            "completed",
+            "Trimmed the bulky tool output.",
+          ),
+          "net-negative-assistant": modelCapsule(
+            "analysis-only",
+            verboseReplacement,
+          ),
         }),
       ],
     });
@@ -1313,7 +1670,7 @@ describe("magic compact", () => {
     expect(await executeMagicCompact(command.v2, "source", 0)).toBe(true);
 
     expect(summaryText(messages, "profitable-assistant")).toBe(
-      "Trimmed the bulky tool output.",
+      modelCapsule("completed", "Trimmed the bulky tool output."),
     );
     expect(
       messages.filter(message =>
@@ -1400,7 +1757,10 @@ describe("magic compact", () => {
     const command = createCommandHarness(messages, {
       summaryTextOutputs: [
         JSON.stringify({
-          "profitable-assistant": "Trimmed the bulky tool output.",
+          "profitable-assistant": modelCapsule(
+            "completed",
+            "Trimmed the bulky tool output.",
+          ),
         }),
       ],
     });
@@ -1412,7 +1772,7 @@ describe("magic compact", () => {
       "profitable-assistant",
     ]);
     expect(summaryText(messages, "profitable-assistant")).toBe(
-      "Trimmed the bulky tool output.",
+      modelCapsule("completed", "Trimmed the bulky tool output."),
     );
     expect(
       messages.filter(message =>
@@ -1490,7 +1850,7 @@ describe("magic compact", () => {
       }
     }
     expect(summaryText(messages, "bulky-a-assistant")).toBe(
-      "Completed the selected historical turn.",
+      modelCapsule("completed", "Preserved."),
     );
   });
 
@@ -1687,6 +2047,13 @@ describe("magic compact", () => {
   });
 
   test("meets the incident-shaped structural and token acceptance gates", async () => {
+    const singleCopy = await runCompaction(session("source"), {
+      messages: incidentSessionFixture(1),
+    });
+    const singleCopyInputTokens = singleCopy.prompts.reduce(
+      (sum, request) => sum + encode(promptText(request)).length,
+      0,
+    );
     const messages = incidentSessionFixture();
     const beforeTokens = countCanonicalContentTokens(messages);
     const toolParts = messages.flatMap(message =>
@@ -1705,21 +2072,25 @@ describe("magic compact", () => {
     expect(await executeMagicCompact(command.v2, "source", 0)).toBe(true);
     const afterTokens = await countSessionTokens(command.v2, "source");
     const stats = await readStats("source");
-    const summaries = command.partUpdates
-      .filter(update =>
-        (update.part as TextPart).metadata?.magicCompact
-          ? (
-              (update.part as TextPart).metadata!.magicCompact as Record<
-                string,
-                unknown
-              >
-            ).summary === true
-          : false,
-      )
-      .map(update => (update.part as TextPart).text);
-    const deterministic = summaries.filter(summary =>
-      summary.startsWith("Outcome:"),
+    const summaryUpdates = command.partUpdates.filter(update =>
+      (update.part as TextPart).metadata?.magicCompact
+        ? (
+            (update.part as TextPart).metadata!.magicCompact as Record<
+              string,
+              unknown
+            >
+          ).summary === true
+        : false,
     );
+    const summaries = summaryUpdates.map(
+      update => (update.part as TextPart).text,
+    );
+    const standardIDs = new Set(
+      command.summaryRequests.flatMap(summaryRequestIDs),
+    );
+    const deterministic = summaryUpdates
+      .filter(update => !standardIDs.has(String(update.messageID)))
+      .map(update => (update.part as TextPart).text);
     const replacements = summaries.reduce(
       (sum, summary) => sum + encode(summary).length,
       0,
@@ -1750,6 +2121,8 @@ describe("magic compact", () => {
       maxConcurrency: command.maxSummaryConcurrency,
       backupForks: command.backupForks.length,
       scratchCreates: command.scratchCreates.length,
+      singleCopyInputTokens,
+      singleCopyRequests: singleCopy.prompts.length,
     };
     console.info(`INCIDENT_ACCEPTANCE ${JSON.stringify(result)}`);
 
@@ -1768,17 +2141,42 @@ describe("magic compact", () => {
     expect(afterTokens).toBeLessThanOrEqual(195_000);
     expect(stats?.totalTokensPruned).toBe(beforeTokens - afterTokens);
     expect(result.reduction).toBeGreaterThanOrEqual(0.4);
-    expect(replacements).toBeLessThanOrEqual(18_000);
-    expect(deterministicTokens).toBeLessThanOrEqual(12_288);
-    expect(result.modelInputTokens).toBeLessThanOrEqual(48_000);
+    const cardinalityOverhead =
+      INCIDENT_STANDARD_TURN_COUNT
+      * (encode(String(INCIDENT_ASSISTANT_REPEAT_COUNT)).length + 32);
+    expect(result.modelInputTokens).toBeLessThanOrEqual(
+      singleCopyInputTokens + cardinalityOverhead,
+    );
+    expect(result.requests).toBe(singleCopy.prompts.length);
+    expect(
+      encode(
+        INCIDENT_ASSISTANT_REPEAT_LITERAL.repeat(
+          INCIDENT_ASSISTANT_REPEAT_COUNT - 1,
+        ),
+      ).length * INCIDENT_STANDARD_TURN_COUNT,
+    ).toBeGreaterThan(result.modelInputTokens);
     expect(result.maxRequestTokens).toBeLessThanOrEqual(
       MAX_SUMMARY_INPUT_TOKENS,
     );
-    expect(command.summaryRequests.length).toBeLessThanOrEqual(2);
+    expect(command.summaryRequests.length).toBeLessThanOrEqual(
+      INCIDENT_STANDARD_TURN_COUNT,
+    );
     expect(command.maxSummaryConcurrency).toBeGreaterThanOrEqual(1);
     expect(command.maxSummaryConcurrency).toBeLessThanOrEqual(2);
     for (const request of command.summaryRequests) {
       expect(request).not.toHaveProperty("tools");
+      for (const turn of summaryPromptSelection(request).turns) {
+        const records = assistantTextRecords(turn.exactEvidence);
+        expect(records).toHaveLength(1);
+        expect(records[0]!.textEncoding).toBe("ordered-literal-runs-v1");
+        expect(
+          records[0]!.textSegments?.some(
+            segment =>
+              segment.literal === INCIDENT_ASSISTANT_REPEAT_LITERAL
+              && segment.repetitions === INCIDENT_ASSISTANT_REPEAT_COUNT,
+          ),
+        ).toBeTrue();
+      }
     }
     expect(command.backupForks).toHaveLength(1);
     for (const create of command.scratchCreates) {
@@ -1787,12 +2185,27 @@ describe("magic compact", () => {
         { permission: "*", pattern: "*", action: "deny" },
       ]);
     }
+    for (const summary of summaries) {
+      expect(encode(summary).length).toBeLessThanOrEqual(
+        MAX_SUMMARY_OUTPUT_TOKENS,
+      );
+    }
     for (const summary of deterministic) {
       expect(encode(summary).length).toBeLessThanOrEqual(
         DETERMINISTIC_SUMMARY_MAX_TOKENS,
       );
-      expect(summary).toContain("omitted-record-count=");
+      expect(summary).toStartWith("Outcome: partial");
       expect(summary).toContain("Unresolved:");
+      expect(summary).toContain("[error]");
+      for (const scaffolding of [
+        '"kind"',
+        '"sourceBytes"',
+        '"windows"',
+        "omitted-record-count",
+        "required-record-",
+      ]) {
+        expect(summary).not.toContain(scaffolding);
+      }
     }
   }, 30_000);
 
@@ -1817,8 +2230,14 @@ describe("magic compact", () => {
       messages,
       textResponses: [
         JSON.stringify({
-          "ordinary-before-assistant": "Before summary.",
-          "ordinary-after-assistant": "After summary.",
+          "ordinary-before-assistant": modelCapsule(
+            "analysis-only",
+            "Before summary.",
+          ),
+          "ordinary-after-assistant": modelCapsule(
+            "analysis-only",
+            "After summary.",
+          ),
         }),
       ],
     });
@@ -1841,29 +2260,27 @@ describe("magic compact", () => {
     ]);
 
     const stored = storedSummary(requests, "outlier-assistant-0");
-    expect(stored).toStartWith("Outcome: partial\n");
-    expect(stored).toContain("Historical assistant text (authoritative):");
-    expect(stored).toContain("Delivered implementation in src/critical.ts.");
+    expect(stored).toStartWith("Outcome: partial");
+    expect(stored).toContain(
+      "Work: Delivered implementation in src/critical.ts.",
+    );
     expect(stored).toContain("bun test reported 88 pass");
     expect(stored).toContain("commit abc123 was pushed");
     expect(stored).toContain("smoke not run");
     expect(stored).toContain("integration failed");
     expect(stored).toContain("final assistant evidence");
-    expect(stored).toContain('"command":"bun test"');
     expect(stored).toContain("Process exited with code 1");
-    expect(
-      labeledSummarySection(stored, "VCS/Deployment", "Unresolved"),
-    ).toContain("omitted-record-count=2");
-    expect(stored).toContain('"status":"running"');
-    expect(
-      stored.split("Historical terminal evidence (authoritative):"),
-    ).toHaveLength(2);
-    expect(stored).toContain("omitted-record-count=");
+    expect(labeledSummarySection(stored, "VCS", "Unresolved")).toContain(
+      "commit abc123 was pushed",
+    );
+    expect(stored).toContain("[running]");
+    expect(stored).not.toContain('"kind"');
+    expect(stored).not.toContain("omitted-record-count=");
     expect(encode(stored).length).toBeLessThanOrEqual(
       DETERMINISTIC_SUMMARY_MAX_TOKENS,
     );
     expect(hasUnpairedSurrogate(stored)).toBeFalse();
-  });
+  }, 300_000);
 
   test("classifies a failure from the middle of full tool output before bounding it", async () => {
     const marker = "Process exited with code 1";
@@ -1875,19 +2292,13 @@ describe("magic compact", () => {
     const stored = storedSummary(requests, "metric-assistant-0");
 
     expect(requests.prompts).toHaveLength(0);
-    expect(stored).toStartWith("Outcome: partial\n");
+    expect(stored).toStartWith("Outcome: partial");
     expect(stored).toContain(marker);
-    expect(stored).toContain('bun test \\"packages/middle suite.test.ts\\"');
-    expect(
-      labeledSummarySection(
-        stored,
-        "Unresolved",
-        "Historical terminal evidence (authoritative)",
-      ),
-    ).toContain(marker);
+    expect(stored).toContain('bun test "packages/middle suite.test.ts"');
+    expect(labeledSummarySection(stored, "Unresolved")).toContain(marker);
   });
 
-  test("excludes synthetic, ignored, Magic summary, empty, and placeholder assistant text", async () => {
+  test("includes ignored model-visible assistant text while excluding synthetic, Magic summary, empty, and placeholder text", async () => {
     const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants.at(-1)!;
     assistant.parts.push(
@@ -1932,15 +2343,571 @@ describe("magic compact", () => {
     });
     const stored = storedSummary(requests, "metric-assistant-0");
 
-    expect(stored).toStartWith("Outcome: analysis-only\n");
+    expect(stored).toStartWith("Outcome: analysis-only");
     expect(stored).toContain("Authoritative final response");
-    expect(stored).not.toContain("ignored evidence");
+    expect(stored).toContain("ignored evidence");
     expect(stored).not.toContain("synthetic evidence");
     expect(stored).not.toContain("old Magic summary");
     expect(stored).not.toContain("[TODO]");
   });
 
-  test("caps required pending overflow with an explicit deterministic disclosure", async () => {
+  test("keeps ignored assistant text counted, evidenced, and represented after pruning", async () => {
+    const standardMarker = "STANDARD_IGNORED_ASSISTANT_EVIDENCE";
+    const deterministicMarker = "DETERMINISTIC_IGNORED_ASSISTANT_EVIDENCE";
+    const ignoredUserNotice = "IGNORED_USER_REPORTING_NOTICE";
+    const standard = completedTurn(
+      "ignored-standard",
+      "Compact standard history",
+    );
+    standard[0]!.parts.push({
+      ...textPart(
+        "ignored-user-report",
+        "source",
+        standard[0]!.info.id,
+        ignoredUserNotice,
+      ),
+      ignored: true,
+    });
+    standard[1]!.parts.push({
+      ...textPart(
+        "ignored-standard-text",
+        "source",
+        standard[1]!.info.id,
+        `${standardMarker}${" historical context".repeat(5_000)}`,
+      ),
+      ignored: true,
+    });
+    const deterministic = completedTurn(
+      "ignored-deterministic",
+      "Compact unresolved history",
+    );
+    deterministic[1]!.parts.push(
+      pendingCommandToolPart(
+        "ignored-deterministic-pending",
+        deterministic[1]!.info.id,
+        "wait-for-operator",
+      ),
+      {
+        ...textPart(
+          "ignored-deterministic-text",
+          "source",
+          deterministic[1]!.info.id,
+          `${deterministicMarker}${" unresolved context".repeat(5_000)}`,
+        ),
+        ignored: true,
+      },
+    );
+    const messages = [...standard, ...deterministic];
+    addProviderTokens(messages);
+    const withoutUserNotice = structuredClone(messages);
+    withoutUserNotice[0]!.parts = withoutUserNotice[0]!.parts.filter(
+      part => part.id !== "ignored-user-report",
+    );
+    const withoutIgnoredAssistantText = structuredClone(messages);
+    for (const message of withoutIgnoredAssistantText) {
+      message.parts = message.parts.filter(
+        part =>
+          part.id !== "ignored-standard-text"
+          && part.id !== "ignored-deterministic-text",
+      );
+    }
+    const beforeTokens = countCanonicalContentTokens(messages);
+    const command = createCommandHarness(messages, {
+      summaryTextOutputs: [
+        JSON.stringify({
+          "ignored-standard-assistant": modelCapsule(
+            "analysis-only",
+            `Preserved ${standardMarker}.`,
+          ),
+        }),
+      ],
+    });
+
+    try {
+      await Promise.all([
+        deleteStats("source"),
+        deleteStats("backup"),
+        rm(cachePath("source"), { force: true }),
+        rm(cachePath("backup"), { force: true }),
+      ]);
+
+      expect(beforeTokens).toBe(countCanonicalContentTokens(withoutUserNotice));
+      expect(beforeTokens).toBeGreaterThan(
+        countCanonicalContentTokens(withoutIgnoredAssistantText),
+      );
+      expect(await executeMagicCompact(command.v2, "source", 0)).toBeTrue();
+
+      const standardEvidence = command.summaryRequests
+        .flatMap(request => summaryPromptSelection(request).turns)
+        .find(
+          turn => turn.assistantTurnID === "ignored-standard-assistant",
+        )!.exactEvidence;
+      expect(standardEvidence).toContain(standardMarker);
+      expect(standardEvidence).not.toContain(ignoredUserNotice);
+      expect(
+        storedSummary(command, "ignored-deterministic-assistant"),
+      ).toContain(deterministicMarker);
+      expect(storedSummary(command, "ignored-standard-assistant")).toContain(
+        standardMarker,
+      );
+      expect(command.partDeletes).toContainEqual(
+        expect.objectContaining({ partID: "ignored-standard-text" }),
+      );
+      expect(command.partDeletes).toContainEqual(
+        expect.objectContaining({ partID: "ignored-deterministic-text" }),
+      );
+      const activeText = messages
+        .flatMap(message => message.parts)
+        .filter((part): part is TextPart => part.type === "text")
+        .map(part => part.text)
+        .join("\n");
+      expect(activeText).toContain(standardMarker);
+      expect(activeText).toContain(deterministicMarker);
+      expect(activeText).toContain(ignoredUserNotice);
+    } finally {
+      await Promise.all([
+        deleteStats("source"),
+        deleteStats("backup"),
+        rm(cachePath("source"), { force: true }),
+        rm(cachePath("backup"), { force: true }),
+      ]);
+    }
+  });
+
+  test("preserves the full final substantive response when it fits the capsule ceiling", async () => {
+    const messages = completedTurn("full-final", "Finish the request");
+    const assistant = messages[1]!;
+    const finalText = [
+      "Implemented the requested continuation-safe capsule.",
+      "Context before the governing decision: " + "history ".repeat(90),
+      "Decision: keep retrieval tool-only and preserve the exact continuation state.",
+      "Context after the governing decision: " + "result ".repeat(70),
+      "The implementation is ready for the remaining credential check.",
+    ].join("\n");
+    assistant.parts.push(
+      pendingCommandToolPart(
+        "full-final-pending",
+        assistant.info.id,
+        "check-provider-credentials",
+      ),
+      textPart("full-final-text", "source", assistant.info.id, finalText),
+    );
+
+    const requests = await runCompaction(session("source"), { messages });
+    const stored = storedSummary(requests, assistant.info.id);
+    const collapsed = finalText.replace(/\s+/g, " ").trim();
+
+    expect(requests.prompts).toEqual([]);
+    expect(stored).toContain(`Work: ${collapsed}`);
+    expect(stored).toContain("Decision: keep retrieval tool-only");
+  });
+
+  test("preserves multipart final assistant text as one ordered response", async () => {
+    const messages = completedTurn("multipart-final", "Finish the request");
+    const assistant = messages[1]!;
+    const parts = [
+      "Implemented the readable capsule correction.",
+      "Decision: preserve every substantive part of the final assistant message in source order.",
+      "The remaining operator action is documented below.",
+    ];
+    assistant.parts.push(
+      pendingCommandToolPart(
+        "multipart-final-pending",
+        assistant.info.id,
+        "wait-for-operator-approval",
+      ),
+      ...parts.map((text, index) =>
+        textPart(
+          `multipart-final-text-${index}`,
+          "source",
+          assistant.info.id,
+          text,
+        ),
+      ),
+    );
+
+    const requests = await runCompaction(session("source"), { messages });
+    const stored = storedSummary(requests, assistant.info.id);
+
+    expect(requests.prompts).toEqual([]);
+    expect(stored).toContain(`Work: ${parts.join(" ")}`);
+    expect(
+      stored.match(/Decision: preserve every substantive part/g),
+    ).toHaveLength(1);
+  });
+
+  test("requires a middle decision from an oversized multipart final response", async () => {
+    const messages = completedTurn("multipart-cue", "Preserve the decision");
+    const assistant = messages[1]!;
+    const decision =
+      "Decision: keep source-anchored continuation cues from every final response part.";
+    assistant.parts.push(
+      pendingCommandToolPart(
+        "multipart-cue-pending",
+        assistant.info.id,
+        "wait-for-operator-approval",
+      ),
+      textPart(
+        "multipart-cue-opening",
+        "source",
+        assistant.info.id,
+        `Opening context ${"history ".repeat(2_500)}`,
+      ),
+      textPart("multipart-cue-decision", "source", assistant.info.id, decision),
+      textPart(
+        "multipart-cue-closing",
+        "source",
+        assistant.info.id,
+        `Closing context ${"result ".repeat(2_500)}`,
+      ),
+    );
+
+    const requests = await runCompaction(session("source"), { messages });
+    const stored = storedSummary(requests, assistant.info.id);
+
+    expect(requests.prompts).toEqual([]);
+    expect(stored).toContain(decision);
+    expect(encode(stored).length).toBeLessThanOrEqual(
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
+    );
+  });
+
+  test("preserves every classified final-response cue when the full response cannot fit", async () => {
+    const messages = completedTurn("anchored-final", "Recover and continue");
+    const assistant = messages[1]!;
+    const filler = (label: string) => `${label} ${"context ".repeat(1_200)}`;
+    const facts = [
+      "Decision: preserve tool-only retrieval through read_omitted_content.",
+      "Verification: bun test passed 42 tests.",
+      "VCS: the changes are not committed.",
+      "Blocked: provider credentials are missing.",
+      "Next action: refresh PROVIDER_TOKEN and rerun bun test.",
+    ];
+    const finalText = [
+      filler("opening"),
+      facts[0],
+      filler("decision-tail"),
+      facts[1],
+      filler("verification-tail"),
+      facts[2],
+      filler("vcs-tail"),
+      facts[3],
+      filler("blocked-tail"),
+      facts[4],
+      filler("closing"),
+    ].join("\n");
+    assistant.parts.push(
+      textPart("anchored-final-text", "source", assistant.info.id, finalText),
+    );
+
+    const requests = await runCompaction(session("source"), { messages });
+    const stored = storedSummary(requests, assistant.info.id);
+
+    expect(requests.prompts).toEqual([]);
+    for (const fact of facts) expect(stored).toContain(fact);
+    expect(encode(stored).length).toBeLessThanOrEqual(
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
+    );
+  });
+
+  test("keeps distinct long next actions that collide outside the cue window", async () => {
+    const messages = completedTurn(
+      "action-collision",
+      "Preserve both continuation actions",
+    );
+    const shared =
+      "Next action: refresh PROVIDER_TOKEN and continue the documented operator runbook "
+      + "step ".repeat(40);
+    const first = `${shared} ALPHA-UNIQUE /workspace/alpha-state.json`;
+    const second = `${shared} BETA-UNIQUE /workspace/beta-state.json`;
+    messages[1]!.parts.push(
+      pendingCommandToolPart(
+        "action-collision-pending",
+        messages[1]!.info.id,
+        "wait-for-operator-approval",
+      ),
+      textPart(
+        "action-collision-text",
+        "source",
+        messages[1]!.info.id,
+        [
+          `Opening context ${"history ".repeat(2_500)}`,
+          first,
+          second,
+          `Closing context ${"result ".repeat(2_500)}`,
+        ].join("\n"),
+      ),
+    );
+
+    const requests = await runCompaction(session("source"), { messages });
+    const stored = storedSummary(requests, messages[1]!.info.id);
+
+    expect(requests.prompts).toEqual([]);
+    expect(stored).toContain("ALPHA-UNIQUE");
+    expect(stored).toContain("BETA-UNIQUE");
+  });
+
+  test("fails closed when distinct final-response decisions cannot fit the capsule ceiling", async () => {
+    const messages = completedTurn("decision-overflow", "Preserve decisions");
+    const assistant = messages[1]!;
+    assistant.parts.push(
+      pendingCommandToolPart(
+        "decision-overflow-pending",
+        assistant.info.id,
+        "wait-for-credentials",
+      ),
+      textPart(
+        "decision-overflow-text",
+        "source",
+        assistant.info.id,
+        Array.from(
+          { length: 180 },
+          (_, index) =>
+            `Decision ${index}: preserve /workspace/decision-${index}/${"segment-".repeat(12)}state.json for continuation.`,
+        ).join("\n"),
+      ),
+    );
+    const plan = await planFor(messages, 0);
+
+    expect(() => renderDeterministicSummary(plan.summarizedTurns[0]!)).toThrow(
+      "local safety cap",
+    );
+  });
+
+  test("preserves every distinct unresolved repair action while it fits", async () => {
+    const turn = metricTurn(1, 20, 0);
+    const assistant = turn.assistants[0]!;
+    assistant.parts.push(
+      ...Array.from({ length: 12 }, (_, index) =>
+        pendingCommandToolPart(
+          `repair-${index}`,
+          assistant.info.id,
+          `repair-${index} --target /workspace/repair-${index}.json`,
+        ),
+      ),
+    );
+
+    const requests = await runCompaction(session("source"), {
+      messages: [...turn.user, ...turn.assistants],
+    });
+    const stored = storedSummary(requests, "metric-assistant-0");
+
+    for (let index = 0; index < 12; index += 1) {
+      expect(stored).toContain(
+        `repair-${index} --target /workspace/repair-${index}.json`,
+      );
+    }
+    expect(stored).not.toContain("×12");
+  });
+
+  test("aggregates only repeated equivalent unresolved facts", async () => {
+    const turn = metricTurn(1, 20, 0);
+    const assistant = turn.assistants[0]!;
+    assistant.parts.push(
+      ...Array.from({ length: 400 }, (_, index) =>
+        pendingCommandToolPart(
+          `equivalent-repair-${index}`,
+          assistant.info.id,
+          "repair-shared-state --target /workspace/shared.json",
+        ),
+      ),
+    );
+
+    const requests = await runCompaction(session("source"), {
+      messages: [...turn.user, ...turn.assistants],
+    });
+    const stored = storedSummary(requests, "metric-assistant-0");
+
+    expect(stored).toContain("×400");
+    expect(stored).toContain(
+      "repair-shared-state --target /workspace/shared.json",
+    );
+  });
+
+  test("does not aggregate distinct raw facts that share one rendered excerpt", async () => {
+    const turn = metricTurn(1, 20, 0);
+    const assistant = turn.assistants[0]!;
+    const sharedPrefix = "shared failure context ".repeat(8);
+    const sharedSuffix = " shared terminal suffix";
+    assistant.parts.push(
+      ...Array.from({ length: 300 }, (_, index) =>
+        genericToolPart(`raw-fact-${index}`, assistant.info.id, "bash", {
+          status: "error",
+          input: { command: "repair-shared-state" },
+          error: `${sharedPrefix}distinct fact ${index}${sharedSuffix}`,
+          metadata: {},
+          time: { start: 1, end: 2 },
+        }),
+      ),
+    );
+
+    await expect(
+      runDeterministicRenderer(session("source"), {
+        messages: [...turn.user, ...turn.assistants],
+      }),
+    ).rejects.toThrow("local safety cap");
+  });
+
+  test("aggregates interleaved duplicate unresolved facts at first-occurrence positions", async () => {
+    const turn = metricTurn(1, 20, 0);
+    const assistant = turn.assistants[0]!;
+    const commands = [
+      ...Array.from(
+        { length: 600 },
+        () => "repair-shared-state --target /workspace/group-A.json",
+      ),
+      ...Array.from(
+        { length: 600 },
+        () => "reinstall-deps --target /workspace/group-B.json",
+      ),
+      "single-retry --target /workspace/group-E.json",
+      ...Array.from(
+        { length: 600 },
+        () => "bump-version --target /workspace/group-C.json",
+      ),
+      ...Array.from(
+        { length: 600 },
+        () => "rotate-secrets --target /workspace/group-D.json",
+      ),
+    ];
+    assistant.parts.push(
+      ...commands.map((command, index) =>
+        pendingCommandToolPart(
+          `interleaved-${index}`,
+          assistant.info.id,
+          command,
+        ),
+      ),
+    );
+
+    const requests = await runDeterministicRenderer(session("source"), {
+      messages: [...turn.user, ...turn.assistants],
+    });
+    const stored = storedSummary(requests, "metric-assistant-0");
+
+    const unresolved = capsuleSection(stored, "Unresolved");
+    const bullets = unresolved
+      .split("\n")
+      .filter(line => line.startsWith("- "));
+    const markers = [
+      "- [pending] repair-shared-state --target /workspace/group-A.json ×600",
+      "- [pending] reinstall-deps --target /workspace/group-B.json ×600",
+      "- [pending] single-retry --target /workspace/group-E.json",
+      "- [pending] bump-version --target /workspace/group-C.json ×600",
+      "- [pending] rotate-secrets --target /workspace/group-D.json ×600",
+    ];
+    const positions = markers.map(marker =>
+      bullets.findIndex(line => line.includes(marker)),
+    );
+    expect(positions.every(position => position >= 0)).toBe(true);
+    expect(positions).toEqual(
+      [...positions].toSorted((left, right) => left - right),
+    );
+    expect(bullets[0]).toBe(markers[0]);
+    expect(bullets.filter(line => line.endsWith("×600")).length).toBe(4);
+    expect(bullets.some(line => /×[12]$/.test(line))).toBe(false);
+    expect(
+      bullets.filter(
+        line => line.includes("group-A.json") && line.includes("×"),
+      ).length,
+    ).toBe(1);
+  });
+
+  test("fails closed promptly on one hundred twenty-eight thousand distinct unresolved records", () => {
+    const turn = distinctUnresolvedTurn(128_000);
+
+    expect(() => renderDeterministicSummary(turn)).toThrow("local safety cap");
+  }, 60_000);
+
+  test("classifies interleaved assistant errors with exact recovered/error semantics and recovery IDs", () => {
+    const user = [message("status-user", "user", [])];
+    const errorMessage = (
+      id: string,
+      name: string,
+      data: Record<string, unknown>,
+    ) =>
+      ({
+        info: { id, role: "assistant", error: { name, data } } as Message,
+        parts: [],
+      }) satisfies MessageWithParts;
+    const successMessage = (id: string) =>
+      ({
+        info: { id, role: "assistant", finish: "stop" } as Message,
+        parts: [],
+      }) satisfies MessageWithParts;
+    const turn: Turn = {
+      user,
+      assistants: [
+        errorMessage("err-1", "ProviderError", {
+          message: "boom 1",
+          statusCode: 500,
+          providerID: "test-provider",
+        }),
+        successMessage("ok-1"),
+        errorMessage("err-2", "RateLimitError", { message: "slow down" }),
+        successMessage("ok-2"),
+        errorMessage("err-3", "ProviderError", { message: "final boom" }),
+      ],
+    };
+
+    const capsule = renderDeterministicSummary(turn);
+    expect(capsule).toContain("Outcome: partial");
+    expect(capsule).toContain(
+      "Recovered from ProviderError: boom 1, status 500, test-provider",
+    );
+    expect(capsule).toContain("Recovered from RateLimitError: slow down");
+    expect(
+      capsule.indexOf(
+        "Recovered from ProviderError: boom 1, status 500, test-provider",
+      ),
+    ).toBeLessThan(capsule.indexOf("Recovered from RateLimitError: slow down"));
+    expect(capsule).toContain("[error] ProviderError: final boom");
+
+    const statusRecords = machineEvidenceRecords(
+      renderStandardTurnEvidence(turn),
+    ).filter(record => record["kind"] === "assistant-message-status");
+    const byMessageID = (id: string) =>
+      statusRecords.find(record => record["messageID"] === id);
+    expect(byMessageID("err-1")).toEqual({
+      kind: "assistant-message-status",
+      messageID: "err-1",
+      status: "recovered",
+      errorType: "ProviderError",
+      categories: ["recovered"],
+      polarity: "reported",
+      message: "boom 1",
+      statusCode: 500,
+      providerID: "test-provider",
+      recoveredByMessageID: "ok-1",
+    });
+    expect(byMessageID("err-2")).toEqual({
+      kind: "assistant-message-status",
+      messageID: "err-2",
+      status: "recovered",
+      errorType: "RateLimitError",
+      categories: ["recovered"],
+      polarity: "reported",
+      message: "slow down",
+      recoveredByMessageID: "ok-2",
+    });
+    expect(byMessageID("err-3")).toEqual({
+      kind: "assistant-message-status",
+      messageID: "err-3",
+      status: "error",
+      errorType: "ProviderError",
+      categories: ["failure"],
+      polarity: "failed",
+      message: "final boom",
+    });
+  });
+
+  test("fails closed promptly on two hundred fifty-six thousand assistant errors without a later success", () => {
+    const turn = statusChainTurn(256_000);
+
+    expect(() => renderDeterministicSummary(turn)).toThrow("local safety cap");
+  }, 60_000);
+
+  test("caps dense required pending evidence with readable aggregation", async () => {
     const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     const latePaths = Array.from(
@@ -1986,15 +2953,25 @@ describe("magic compact", () => {
     const stored = storedSummary(requests, "metric-assistant-0");
 
     expect(requests.prompts).toEqual([]);
-    expect(stored).toStartWith("Outcome: partial\n");
-    expect(stored).toContain("required-record-overflow=");
-    expect(stored).not.toStartWith("Outcome: completed\n");
+    expect(stored).toStartWith("Outcome: partial");
+    expect(stored).toContain("Unresolved:");
+    expect(stored).toContain("[pending]");
+    expect(stored).toContain(
+      "bun run smoke --case 0 --config /workspace/pending-0.json",
+    );
+    expect(stored).toContain(
+      "bun run smoke --case 19 --config /workspace/pending-19.json",
+    );
+    expect(stored).toContain('bun test "packages/late suite.test.ts"');
+    expect(stored).toContain("Process exited with code 1");
+    expect(stored).toContain("checks in ../shared/check.ts were not run");
+    expect(stored).not.toContain("required-record-overflow=");
     expect(encode(stored).length).toBeLessThanOrEqual(
       DETERMINISTIC_SUMMARY_MAX_TOKENS,
     );
-  });
+  }, 30_000);
 
-  test("caps one hundred required not-run records without reporting complete inclusion", async () => {
+  test("fails closed instead of dropping one hundred distinct not-run repairs", async () => {
     const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     assistant.parts.push(
@@ -2008,18 +2985,41 @@ describe("magic compact", () => {
         );
       }),
     );
-    const requests = await runCompaction(session("source"), {
-      messages: [...turn.user, ...turn.assistants],
-    });
-    const stored = storedSummary(requests, "metric-assistant-0");
+    const partUpdates: Record<string, unknown>[] = [];
+    await expect(
+      runDeterministicRenderer(session("source"), {
+        messages: [...turn.user, ...turn.assistants],
+        partUpdates,
+      }),
+    ).rejects.toThrow("local safety cap");
+    expect(partUpdates).toEqual([]);
+  });
 
-    expect(requests.prompts).toEqual([]);
-    expect(stored).toStartWith("Outcome: partial\n");
-    expect(stored).toContain("required-record-overflow=");
-    expect(stored).not.toStartWith("Outcome: completed\n");
-    expect(encode(stored).length).toBeLessThanOrEqual(
-      DETERMINISTIC_SUMMARY_MAX_TOKENS,
+  test("fails closed when required unresolved evidence cannot fit the safety cap", async () => {
+    const turn = metricTurn(1, 20, 0);
+    const assistant = turn.assistants[0]!;
+    assistant.parts.push(
+      ...Array.from({ length: 300 }, (_, index) =>
+        genericToolPart(
+          `distinct-error-${index}`,
+          assistant.info.id,
+          `runner-${index}`,
+          {
+            status: "error",
+            input: { command: `run-${index} --case ${index}` },
+            error: `distinct failure ${index}: ${"detail ".repeat(60)}`,
+            metadata: {},
+            time: { start: 1, end: 2 },
+          },
+        ),
+      ),
     );
+
+    await expect(
+      runDeterministicRenderer(session("source"), {
+        messages: [...turn.user, ...turn.assistants],
+      }),
+    ).rejects.toThrow("local safety cap");
   });
 
   test("compacts adjacent turns with many error tools while retaining every error tool part", async () => {
@@ -2103,21 +3103,21 @@ describe("magic compact", () => {
         (part): part is ToolPart =>
           part.type === "tool" && part.state.status === "error",
       );
-    const overflow = Number(
-      stored.match(/required-record-overflow=(\d+)/)?.[1],
-    );
-    const requiredRecords = Number(
-      stored.match(/required-record-total=(\d+)/)?.[1],
-    );
     console.info(
-      `OVERFLOW_STRESS ${JSON.stringify({ requiredRecords, overflow, summaryTokens: encode(stored).length, activeErrorTools: activeErrors.length, prompts: command.summaryRequests.length })}`,
+      `OVERFLOW_STRESS ${JSON.stringify({ summaryTokens: encode(stored).length, activeErrorTools: activeErrors.length, prompts: command.summaryRequests.length })}`,
     );
 
     expect(command.summaryRequests).toEqual([]);
-    expect(stored).toStartWith("Outcome: partial\n");
-    expect(stored).toContain("required-record-counts=");
-    expect(stored).toContain("required-record-overflow=");
-    expect(overflow).toBeGreaterThan(0);
+    expect(stored).toStartWith("Outcome: partial");
+    expect(stored).toContain("Unresolved:");
+    expect(stored).toContain("[error]");
+    expect(stored).toContain("bun test --case overflow-0");
+    expect(stored).toContain("bun test --case overflow-28");
+    expect(stored).toContain("/workspace/missing-1.ts");
+    expect(stored).toContain("/workspace/missing-29.ts");
+    expect(stored).toContain("Process exited with code 1");
+    expect(stored).not.toContain("required-record-counts=");
+    expect(stored).not.toContain("required-record-overflow=");
     expect(encode(stored).length).toBeLessThanOrEqual(
       DETERMINISTIC_SUMMARY_MAX_TOKENS,
     );
@@ -2159,8 +3159,10 @@ describe("magic compact", () => {
     const stored = storedSummary(requests, "metric-assistant-0");
 
     expect(requests.prompts).toEqual([]);
-    expect(stored).toContain('"status":"running"');
-    expect(stored).toContain("omitted-record-count=");
+    expect(stored).toContain("[running]");
+    expect(stored).toContain("synthetic-watch");
+    expect(stored).toContain("Unresolved:");
+    expect(stored).not.toContain("omitted-record-count=");
     expect(encode(stored).length).toBeLessThanOrEqual(
       DETERMINISTIC_SUMMARY_MAX_TOKENS,
     );
@@ -2189,6 +3191,321 @@ describe("magic compact", () => {
     expect(command.backupForks).toHaveLength(1);
   });
 
+  test("requires every substantive final-message text part as exact standard evidence", async () => {
+    const messages = completedTurn("multipart-exact", "Deliver the change");
+    const parts = Array.from(
+      { length: 40 },
+      (_, index) =>
+        `FINAL-PART-${index} ${"body".repeat(120)} /workspace/final-${index}.ts`,
+    );
+    messages[1]!.parts.push(
+      ...parts.map((text, index) =>
+        textPart(
+          `multipart-exact-${index}`,
+          "source",
+          messages[1]!.info.id,
+          text,
+        ),
+      ),
+    );
+
+    const requests = await runCompaction(session("source"), { messages });
+    const evidence = summaryRequestEvidence(requests.prompts[0]!);
+
+    expect(requests.prompts).toHaveLength(1);
+    expect(requests.creates).toHaveLength(1);
+    expect(requests.forks).toEqual([]);
+    for (const text of parts) expect(evidence).toContain(text);
+    expect(
+      labeledSummarySection(
+        evidence,
+        "Historical assistant text (authoritative)",
+        "Verification",
+      ),
+    ).not.toMatch(/omitted-record-count=[1-9]/);
+  });
+
+  test("encodes a whole-part periodic source with literal cardinality", () => {
+    const literal = " repeated historical context";
+    const source = literal.repeat(137);
+    const record = assistantTextRecords(
+      standardEvidenceForAssistantText(source),
+    )[0]!;
+
+    expect(record.textEncoding).toBe("ordered-literal-runs-v1");
+    expect(record.textSegments).toEqual([{ literal, repetitions: 137 }]);
+    expect(decodeAssistantTextRecord(record)).toBe(source);
+  });
+
+  test("encodes an exact periodic suffix after a unique prefix", () => {
+    const literal = " repeated historical context";
+    const prefix =
+      "Synthetic partial delivery with exact terminal state below.";
+    const source = `${prefix}${literal.repeat(137)}`;
+    const record = assistantTextRecords(
+      standardEvidenceForAssistantText(source),
+    )[0]!;
+
+    expect(record.textEncoding).toBe("ordered-literal-runs-v1");
+    expect(record.textSegments).toEqual([
+      { literal: prefix, repetitions: 1 },
+      { literal, repetitions: 137 },
+    ]);
+    expect(decodeAssistantTextRecord(record)).toBe(source);
+  });
+
+  test("keeps near-identical repeated runs uncompressed", () => {
+    const repeated = " alpha";
+    const source = `head${repeated.repeat(80)} alphx${repeated.repeat(60)}tail`;
+    const record = assistantTextRecords(
+      standardEvidenceForAssistantText(source),
+    )[0]!;
+
+    expect(record.text).toBe(source);
+    expect(record.textEncoding).toBeUndefined();
+    expect(decodeAssistantTextRecord(record)).toBe(source);
+  });
+
+  test("keeps mixed exact runs with unique separators uncompressed", () => {
+    const first = " first-run";
+    const second = " second-run";
+    const source = `opening${first.repeat(90)}middle${second.repeat(70)}closing`;
+    const record = assistantTextRecords(
+      standardEvidenceForAssistantText(source),
+    )[0]!;
+
+    expect(record.text).toBe(source);
+    expect(record.textEncoding).toBeUndefined();
+    expect(decodeAssistantTextRecord(record)).toBe(source);
+  });
+
+  test("keeps a trailing unique segment from compressing an exact run", () => {
+    const literal = " repeated historical context";
+    const source = `${literal.repeat(80)}closing`;
+    const record = assistantTextRecords(
+      standardEvidenceForAssistantText(source),
+    )[0]!;
+
+    expect(record.text).toBe(source);
+    expect(record.textEncoding).toBeUndefined();
+    expect(decodeAssistantTextRecord(record)).toBe(source);
+  });
+
+  test("keeps short, low-cardinality, or ineligible periodic units uncompressed", () => {
+    const sources = [
+      "ab".repeat(400),
+      "abcdef".repeat(100),
+      " abcd".repeat(7),
+      "abcdefgh".repeat(33),
+    ];
+    for (const source of sources) {
+      const record = assistantTextRecords(
+        standardEvidenceForAssistantText(source),
+      )[0]!;
+      expect(record.text).toBe(source);
+      expect(record.textEncoding).toBeUndefined();
+      expect(decodeAssistantTextRecord(record)).toBe(source);
+    }
+  });
+
+  test("encodes short-period eligible units through an exact larger multiple", () => {
+    const source = "ab ".repeat(150);
+    const record = assistantTextRecords(
+      standardEvidenceForAssistantText(source),
+    )[0]!;
+
+    expect(record.textEncoding).toBe("ordered-literal-runs-v1");
+    expect(record.textSegments).toEqual([
+      { literal: "ab ab ", repetitions: 75 },
+    ]);
+    expect(decodeAssistantTextRecord(record)).toBe(source);
+  });
+
+  test("round-trips a deterministic fuzz corpus through the run encoding", () => {
+    let seed = 42_424;
+    const next = () => {
+      seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648;
+      return seed / 2_147_483_648;
+    };
+    const alphabet =
+      "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ,.\t\n\u0000\ud800\ufffe";
+    const sources: string[] = [];
+    for (let sample = 0; sample < 60; sample++) {
+      const mode = Math.floor(next() * 4);
+      const unitLength = 2 + Math.floor(next() * 30);
+      let unit = "";
+      while (unit.length < unitLength) {
+        unit += alphabet[Math.floor(next() * alphabet.length)];
+      }
+      const body = unit.repeat(3 + Math.floor(next() * 30));
+      if (mode === 0) sources.push(body);
+      else if (mode === 1) sources.push(`prefix ${sample} ${body}`);
+      else if (mode === 2) sources.push(`prefix ${body} suffix ${sample}`);
+      else sources.push(`${body} tail ${sample}`);
+    }
+    for (const source of sources) {
+      const record = assistantTextRecords(
+        standardEvidenceForAssistantText(source),
+      )[0]!;
+      expect(codeUnits(decodeAssistantTextRecord(record))).toEqual(
+        codeUnits(source),
+      );
+    }
+  });
+
+  test("round-trips repeated Unicode and invalid XML JavaScript code units", () => {
+    const literal = " 🚀\u0000\ud800\ufffe";
+    const source = literal.repeat(80);
+    const evidence = standardEvidenceForAssistantText(source);
+    const record = assistantTextRecords(evidence)[0]!;
+
+    expect(record.textEncoding).toBe("ordered-literal-runs-v1");
+    expect(record.textSegments).toEqual([{ literal, repetitions: 80 }]);
+    expect(codeUnits(decodeAssistantTextRecord(record))).toEqual(
+      codeUnits(source),
+    );
+    expect(evidence).not.toContain("\u0000");
+    expect(hasUnpairedSurrogate(evidence)).toBeFalse();
+  });
+
+  test("detects no literal run in high-entropy text within a bounded time", () => {
+    const source = deterministicHighEntropyText(100_000);
+    const start = performance.now();
+    const runs = encodeOrderedLiteralRuns(source);
+    const elapsed = performance.now() - start;
+
+    expect(runs).toBeNull();
+    expect(elapsed).toBeLessThan(2_000);
+  }, 30_000);
+
+  test.each([
+    [100_000, 5_000],
+    [500_000, 12_000],
+    [1_000_000, 20_000],
+  ])(
+    "rejects unique high-entropy evidence of %i bytes within %i ms",
+    (bytes, bound) => {
+      const source = deterministicHighEntropyText(bytes);
+      const turn = {
+        user: [message("perf-user", "user", [])],
+        assistants: [
+          message("perf-assistant", "assistant", [
+            textPart("perf-text", "source", "perf-assistant", source),
+          ]),
+        ],
+      };
+
+      const start = performance.now();
+      let rejected = false;
+      try {
+        renderStandardTurnEvidence(turn);
+      } catch (error) {
+        rejected = /summary input cap/.test(String(error));
+      }
+      const elapsed = performance.now() - start;
+
+      expect(rejected).toBeTrue();
+      expect(elapsed).toBeLessThan(bound);
+    },
+    120_000,
+  );
+
+  test("emits categorized standard terminal evidence records once in source order", () => {
+    const messages = completedTurn("standard-categories", "Check the worktree");
+    const assistant = messages[1]!;
+    assistant.parts.push(
+      commandToolPart(
+        "standard-verification",
+        assistant.info.id,
+        "bun test",
+        "10 passed, 0 failed",
+      ),
+      commandToolPart(
+        "standard-vcs",
+        assistant.info.id,
+        "git status --short",
+        "working tree clean",
+      ),
+    );
+    const evidence = renderStandardTurnEvidence({
+      user: [messages[0]!],
+      assistants: [assistant],
+    });
+    const terminalRecords = machineEvidenceRecords(evidence).filter(
+      record => record.kind === "tool-terminal",
+    );
+
+    expect(terminalRecords.map(record => record.index)).toEqual([1, 2]);
+    expect(terminalRecords[0]!.categories).toContain("verification");
+    expect(terminalRecords[1]!.categories).toContain("vcs");
+  });
+
+  test("fails closed before scratch when required final-message evidence cannot fit", async () => {
+    const messages = completedTurn("multipart-overflow", "Deliver the change");
+    messages[1]!.parts.push(
+      ...Array.from({ length: 8 }, (_, index) =>
+        textPart(
+          `multipart-overflow-${index}`,
+          "source",
+          messages[1]!.info.id,
+          `OVERFLOW-PART-${index} ${"x".repeat(400_000)}`,
+        ),
+      ),
+    );
+    const plan = await planFor(messages, 0);
+    const creates: unknown[] = [];
+    const v2 = {
+      session: {
+        create: async () => {
+          creates.push("create");
+          throw new Error("scratch should not be created");
+        },
+      },
+    } as unknown as V2Client;
+
+    await expect(
+      generateCompactionSummaries(v2, session("source"), plan),
+    ).rejects.toThrow("summary input cap");
+    expect(creates).toEqual([]);
+  });
+
+  test("rejects unique oversized evidence within a bounded time without scratch work", async () => {
+    const messages = completedTurn("unique-oversized", "Deliver the change");
+    messages[1]!.parts.push(
+      textPart(
+        "unique-oversized-evidence",
+        "source",
+        messages[1]!.info.id,
+        deterministicHighEntropyText(1_000_000),
+      ),
+    );
+    const plan = await planFor(messages, 0);
+    const calls: string[] = [];
+    const v2 = {
+      session: {
+        create: async () => {
+          calls.push("create");
+          throw new Error("scratch should not be created");
+        },
+      },
+      part: {
+        update: async () => {
+          calls.push("part.update");
+          throw new Error("source should not be mutated");
+        },
+      },
+    } as unknown as V2Client;
+
+    const start = performance.now();
+    await expect(
+      generateCompactionSummaries(v2, session("source"), plan),
+    ).rejects.toThrow("summary input cap");
+    const elapsed = performance.now() - start;
+
+    expect(calls).toEqual([]);
+    expect(elapsed).toBeLessThan(20_000);
+  }, 120_000);
+
   test("preserves quoted, spaced, absolute, and relative command paths", async () => {
     const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
@@ -2213,9 +3530,9 @@ describe("magic compact", () => {
     });
     const stored = storedSummary(requests, "metric-assistant-0");
 
-    expect(stored).toStartWith("Outcome: completed\n");
+    expect(stored).toStartWith("Outcome: completed");
     for (const command of commands.slice(0, 3)) {
-      expect(stored).toContain(JSON.stringify(command).slice(1, -1));
+      expect(stored).toContain(command);
     }
     for (const path of [
       "/workspace/service/Cargo.toml",
@@ -2223,9 +3540,10 @@ describe("magic compact", () => {
     ]) {
       expect(stored).toContain(path);
     }
-    expect(
-      labeledSummarySection(stored, "VCS/Deployment", "Unresolved"),
-    ).toContain("omitted-record-count=1");
+    expect(labeledSummarySection(stored, "VCS")).toContain(
+      "working tree clean",
+    );
+    expect(stored).not.toContain("omitted-record-count=");
   });
 
   test("distinguishes zero failures from checks that did not run", async () => {
@@ -2241,18 +3559,14 @@ describe("magic compact", () => {
     const successfulSummary = storedSummary(successful, "metric-assistant-0");
     const notRunSummary = storedSummary(notRun, "metric-assistant-0");
 
-    expect(successfulSummary).toStartWith("Outcome: completed\n");
+    expect(successfulSummary).toStartWith("Outcome: completed");
     expect(successfulSummary).toContain("10 passed, 0 failed");
-    expect(successfulSummary).toContain("Unresolved: None evidenced.");
-    expect(notRunSummary).toStartWith("Outcome: partial\n");
+    expect(successfulSummary).not.toContain("Unresolved:");
+    expect(notRunSummary).toStartWith("Outcome: partial");
     expect(notRunSummary).toContain("No tests ran");
-    expect(
-      labeledSummarySection(
-        notRunSummary,
-        "Unresolved",
-        "Historical terminal evidence (authoritative)",
-      ),
-    ).toContain("tests were not run");
+    expect(labeledSummarySection(notRunSummary, "Unresolved")).toContain(
+      "tests were not run",
+    );
   });
 
   test.each(["No tests were skipped.", "Tests are not failing."])(
@@ -2266,11 +3580,10 @@ describe("magic compact", () => {
 
       const turn = await planFor(completedCommandTurn("bun test", text), 0);
       const rendered = renderDeterministicSummary(turn.summarizedTurns[0]!);
-      expect(rendered).toStartWith("Outcome: completed\n");
+      expect(rendered).toStartWith("Outcome: completed");
       expect(rendered).toContain(text);
-      expect(rendered).toContain("Unresolved: None evidenced.");
-      expect(rendered).not.toContain('"polarity":"failed"');
-      expect(rendered).not.toContain('"polarity":"not-run"');
+      expect(rendered).not.toContain("Unresolved:");
+      expect(rendered).not.toContain('"polarity"');
     },
   );
 
@@ -2310,11 +3623,10 @@ describe("magic compact", () => {
         0,
       );
       const rendered = renderDeterministicSummary(plan.summarizedTurns[0]!);
-      expect(rendered).toStartWith("Outcome: completed\n");
+      expect(rendered).toStartWith("Outcome: completed");
       expect(rendered).toContain(text);
-      expect(rendered).toContain("Unresolved: None evidenced.");
-      expect(rendered).not.toContain('"polarity":"failed"');
-      expect(rendered).not.toContain('"polarity":"not-run"');
+      expect(rendered).not.toContain("Unresolved:");
+      expect(rendered).not.toContain('"polarity"');
     },
   );
 
@@ -2342,17 +3654,17 @@ describe("magic compact", () => {
       });
       const stored = storedSummary(requests, "metric-assistant-0");
 
-      expect(stored).toStartWith("Outcome: analysis-only\n");
-      expect(stored).toContain("Verification: None evidenced.");
-      expect(stored).toContain("VCS/Deployment: None evidenced.");
-      expect(stored).toContain("Unresolved: None evidenced.");
+      expect(stored).toStartWith("Outcome: analysis-only");
+      expect(stored).not.toContain("Verification:");
+      expect(stored).not.toContain("VCS:");
+      expect(stored).not.toContain("Unresolved:");
     },
   );
 
   test.each([
     ["tests passed", "completed", "Verification"],
     ["test not executed", "partial", "Unresolved"],
-    ["work remains: run smoke test", "partial", "Unresolved"],
+    ["work remains: run smoke test", "partial", "Next"],
     ["Tests couldn't be run", "partial", "Unresolved"],
     ["Tests could not be performed", "partial", "Unresolved"],
     ["Tests cannot be run", "partial", "Unresolved"],
@@ -2373,20 +3685,12 @@ describe("magic compact", () => {
       });
       const stored = storedSummary(requests, "metric-assistant-0");
 
-      expect(stored).toStartWith(`Outcome: ${outcome}\n`);
-      expect(
-        labeledSummarySection(
-          stored,
-          sectionLabel,
-          sectionLabel === "Verification"
-            ? "VCS/Deployment"
-            : "Historical terminal evidence (authoritative)",
-        ),
-      ).toContain(text);
+      expect(stored).toStartWith(`Outcome: ${outcome}`);
+      expect(capsuleSection(stored, sectionLabel)).toContain(text);
     },
   );
 
-  test("round-trips exact assistant source code units through JSON records", async () => {
+  test("keeps exact assistant source code units provider-safe in readable capsules", async () => {
     const sourceText =
       "exact\u0000nul\u000bvt\ud800lone and trailing\udfff units";
     const turn = metricTurn(1, 20, 0);
@@ -2399,26 +3703,13 @@ describe("magic compact", () => {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
-    const section = labeledSummarySection(
-      stored,
-      "Historical assistant text (authoritative)",
-      "Verification",
-    );
-    const record = section
-      .split("\n")
-      .map(line => line.trim())
-      .filter(line => line.startsWith("{"))
-      .map(line => JSON.parse(line) as { text?: string; windows?: string[] })
-      .find(
-        entry =>
-          entry.text === sourceText
-          || entry.windows?.join("").includes("exact"),
-      );
 
-    expect(record).toBeDefined();
-    expect(record!.text).toBe(sourceText);
+    expect(stored).toStartWith("Outcome: analysis-only");
     expect(stored).toContain("\\u0000");
     expect(stored).toContain("\\ud800");
+    expect(stored).toContain("\\udfff");
+    expect(stored).not.toContain("\u0000");
+    expect(hasUnpairedSurrogate(stored)).toBeFalse();
     expect(encode(stored).length).toBeLessThanOrEqual(
       DETERMINISTIC_SUMMARY_MAX_TOKENS,
     );
@@ -2449,26 +3740,13 @@ describe("magic compact", () => {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
-    const assistantSection = labeledSummarySection(
-      stored,
-      "Historical assistant text (authoritative)",
-      "Verification",
-    );
-    const unresolved = labeledSummarySection(
-      stored,
-      "Unresolved",
-      "Historical terminal evidence (authoritative)",
-    );
+    const next = capsuleSection(stored, "Next");
 
-    expect(assistantSection).toContain("['failed','pending']");
-    expect(assistantSection).toContain(
-      "Implemented parser. TODO: add evidence.",
-    );
-    expect(assistantSection).not.toContain('"[TODO]"');
-    expect(assistantSection).not.toMatch(/"text":"TBD"/);
-    expect(assistantSection).not.toMatch(/"text":"N\/A"/);
-    expect(stored).toStartWith("Outcome: partial\n");
-    expect(unresolved).toContain("TODO: add evidence");
+    expect(stored).toStartWith("Outcome: partial");
+    expect(stored).toContain("['failed','pending']");
+    expect(stored).toContain("Implemented parser. TODO: add evidence.");
+    expect(stored).not.toContain('"[TODO]"');
+    expect(next).toContain("TODO: add evidence");
   });
 
   test.each([
@@ -2484,26 +3762,19 @@ describe("magic compact", () => {
       });
       const stored = storedSummary(requests, "metric-assistant-0");
 
-      expect(stored).toStartWith("Outcome: partial\n");
-      expect(
-        labeledSummarySection(
-          stored,
-          "Unresolved",
-          "Historical terminal evidence (authoritative)",
-        ),
-      ).toContain(output);
+      expect(stored).toStartWith("Outcome: partial");
+      expect(capsuleSection(stored, "Unresolved")).toContain(output);
     },
   );
 
-  test("round-trips exact tool input/output/error code units through JSON records", async () => {
+  test("keeps tool and assistant prose provider-safe in readable capsules", async () => {
     const units = "exact\u0000nul\u000bvt\ud800lone\ud801more";
     const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     assistant.parts.push(
       genericToolPart("units-io", assistant.info.id, "read", {
-        status: "completed",
-        input: units,
-        output: units,
+        status: "error",
+        input: { filePath: units },
         error: units,
         title: "Read file",
         metadata: {},
@@ -2515,38 +3786,16 @@ describe("magic compact", () => {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
-    const terminal = labeledSummarySection(
-      stored,
-      "Historical terminal evidence (authoritative)",
-    );
-    const record = terminal
-      .split("\n")
-      .map(line => line.trim())
-      .filter(line => line.startsWith("{"))
-      .map(
-        line =>
-          JSON.parse(line) as {
-            state?: { input?: string; output?: string; error?: string };
-          },
-      )
-      .find(
-        entry =>
-          entry.state?.input === units
-          || entry.state?.output === units
-          || entry.state?.error === units,
-      );
 
-    expect(record).toBeDefined();
-    expect(record!.state?.input).toBe(units);
-    expect(record!.state?.output).toBe(units);
-    expect(record!.state?.error).toBe(units);
+    expect(stored).toStartWith("Outcome: partial");
     expect(stored).toContain("\\u0000");
     expect(stored).toContain("\\ud800");
     expect(stored).toContain("\\ud801");
+    expect(stored).not.toContain("\u0000");
     expect(hasUnpairedSurrogate(stored)).toBeFalse();
   });
 
-  test("escapes XML-invalid U+FFFE/U+FFFF in assistant records for provider-safe round-trip", async () => {
+  test("escapes XML-invalid U+FFFE/U+FFFF in assistant prose for provider-safe capsules", async () => {
     const sourceText = "marker\ufffe\ufffftail";
     const turn = metricTurn(1, 20, 0);
     const finalAssistant = turn.assistants.at(-1)!;
@@ -2558,20 +3807,8 @@ describe("magic compact", () => {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
-    const section = labeledSummarySection(
-      stored,
-      "Historical assistant text (authoritative)",
-      "Verification",
-    );
-    const record = section
-      .split("\n")
-      .map(line => line.trim())
-      .filter(line => line.startsWith("{"))
-      .map(line => JSON.parse(line) as { text?: string })
-      .find(entry => entry.text === sourceText);
 
-    expect(record).toBeDefined();
-    expect(record!.text).toBe(sourceText);
+    expect(stored).toStartWith("Outcome: analysis-only");
     expect(stored).toContain("\\ufffe");
     expect(stored).toContain("\\uffff");
     expect(stored).not.toContain("\ufffe");
@@ -2579,15 +3816,14 @@ describe("magic compact", () => {
     expect(hasUnpairedSurrogate(stored)).toBeFalse();
   });
 
-  test("escapes XML-invalid U+FFFE/U+FFFF in tool input/output/error records", async () => {
+  test("escapes XML-invalid U+FFFE/U+FFFF in tool evidence lines", async () => {
     const units = "io\ufffe\uffffunits";
     const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     assistant.parts.push(
       genericToolPart("xml-invalid-io", assistant.info.id, "read", {
-        status: "completed",
-        input: units,
-        output: units,
+        status: "error",
+        input: { filePath: units },
         error: units,
         title: "Read file",
         metadata: {},
@@ -2599,35 +3835,13 @@ describe("magic compact", () => {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
-    const terminal = labeledSummarySection(
-      stored,
-      "Historical terminal evidence (authoritative)",
-    );
-    const record = terminal
-      .split("\n")
-      .map(line => line.trim())
-      .filter(line => line.startsWith("{"))
-      .map(
-        line =>
-          JSON.parse(line) as {
-            state?: { input?: string; output?: string; error?: string };
-          },
-      )
-      .find(
-        entry =>
-          entry.state?.input === units
-          || entry.state?.output === units
-          || entry.state?.error === units,
-      );
 
-    expect(record).toBeDefined();
-    expect(record!.state?.input).toBe(units);
-    expect(record!.state?.output).toBe(units);
-    expect(record!.state?.error).toBe(units);
+    expect(stored).toStartWith("Outcome: partial");
     expect(stored).toContain("\\ufffe");
     expect(stored).toContain("\\uffff");
     expect(stored).not.toContain("\ufffe");
     expect(stored).not.toContain("\uffff");
+    expect(hasUnpairedSurrogate(stored)).toBeFalse();
   });
 
   test("positive independent pass overrides earlier no-run in assistant prose", async () => {
@@ -2642,17 +3856,13 @@ describe("magic compact", () => {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
-    const verification = labeledSummarySection(
-      stored,
-      "Verification",
-      "VCS/Deployment",
-    );
+    const verification = capsuleSection(stored, "Verification");
 
-    expect(stored).toStartWith("Outcome: completed\n");
+    expect(stored).toStartWith("Outcome: completed");
     expect(verification).toContain("No tests ran");
     expect(verification).toContain("10 tests passed");
-    expect(verification).not.toContain('"polarity":"not-run"');
-    expect(stored).toContain("Unresolved: None evidenced.");
+    expect(verification).not.toContain('"polarity"');
+    expect(stored).not.toContain("Unresolved:");
   });
 
   test("positive independent pass overrides earlier no-run in real command tool output", async () => {
@@ -2662,11 +3872,9 @@ describe("magic compact", () => {
     });
     const stored = storedSummary(requests, "metric-assistant-0");
 
-    expect(stored).toStartWith("Outcome: completed\n");
-    expect(
-      labeledSummarySection(stored, "Verification", "VCS/Deployment"),
-    ).toContain(output);
-    expect(stored).toContain("Unresolved: None evidenced.");
+    expect(stored).toStartWith("Outcome: completed");
+    expect(capsuleSection(stored, "Verification")).toContain(output);
+    expect(stored).not.toContain("Unresolved:");
   });
 
   test("pure no-run with zero failures remains not-run", async () => {
@@ -2676,14 +3884,8 @@ describe("magic compact", () => {
     });
     const stored = storedSummary(requests, "metric-assistant-0");
 
-    expect(stored).toStartWith("Outcome: partial\n");
-    expect(
-      labeledSummarySection(
-        stored,
-        "Unresolved",
-        "Historical terminal evidence (authoritative)",
-      ),
-    ).toContain("No tests ran");
+    expect(stored).toStartWith("Outcome: partial");
+    expect(capsuleSection(stored, "Unresolved")).toContain("No tests ran");
   });
 
   test.each([
@@ -2692,7 +3894,7 @@ describe("magic compact", () => {
     ["Read deployment config", "not deployed", "vcs"],
   ] as const)(
     "ignores passive read title context: %s",
-    async (title, output, kind) => {
+    async (title, output) => {
       const turn = metricTurn(1, 20, 0);
       const assistant = turn.assistants[0]!;
       assistant.parts.push(
@@ -2711,20 +3913,12 @@ describe("magic compact", () => {
       });
       const stored = storedSummary(requests, "metric-assistant-0");
 
-      expect(stored).toStartWith("Outcome: completed\n");
-      expect(stored).toContain("Verification: None evidenced.");
-      expect(stored).toContain("VCS/Deployment: None evidenced.");
-      expect(stored).toContain("Unresolved: None evidenced.");
-      expect(stored).toContain(output);
-      if (kind === "verification") {
-        expect(
-          labeledSummarySection(stored, "Verification", "VCS/Deployment"),
-        ).toBe("Verification: None evidenced.");
-      } else {
-        expect(
-          labeledSummarySection(stored, "VCS/Deployment", "Unresolved"),
-        ).toBe("VCS/Deployment: None evidenced.");
-      }
+      expect(stored).toStartWith("Outcome: completed");
+      expect(stored).not.toContain("Verification:");
+      expect(stored).not.toContain("VCS:");
+      expect(stored).not.toContain("Unresolved:");
+      expect(stored).not.toContain(output);
+      expect(stored).not.toContain(title);
     },
   );
 
@@ -2763,10 +3957,13 @@ describe("magic compact", () => {
     });
     const stored = storedSummary(requests, "metric-assistant-0");
 
-    expect(stored).toStartWith("Outcome: completed\n");
-    expect(stored).toContain("Verification: None evidenced.");
-    expect(stored).toContain("VCS/Deployment: None evidenced.");
-    expect(stored).toContain("Unresolved: None evidenced.");
+    expect(stored).toStartWith("Outcome: completed");
+    expect(stored).not.toContain("Verification:");
+    expect(stored).not.toContain("VCS:");
+    expect(stored).not.toContain("Unresolved:");
+    expect(stored).not.toContain("failed checks listed in docs");
+    expect(stored).not.toContain("pending color tokens remain");
+    expect(stored).not.toContain("service is not deployed yet");
   });
 
   test("accepts real bash, git, and test tool identity or command context", async () => {
@@ -2799,18 +3996,14 @@ describe("magic compact", () => {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
-    const verification = labeledSummarySection(
-      stored,
-      "Verification",
-      "VCS/Deployment",
-    );
-    const vcs = labeledSummarySection(stored, "VCS/Deployment", "Unresolved");
+    const verification = capsuleSection(stored, "Verification");
+    const vcs = capsuleSection(stored, "VCS");
 
-    expect(stored).toStartWith("Outcome: completed\n");
+    expect(stored).toStartWith("Outcome: completed");
     expect(verification).toContain("12 passed, 0 failed");
     expect(verification).toContain("10 passed");
     expect(vcs).toContain("working tree clean");
-    expect(stored).toContain("Unresolved: None evidenced.");
+    expect(stored).not.toContain("Unresolved:");
   });
 
   test.each([
@@ -2824,7 +4017,7 @@ describe("magic compact", () => {
     ["get-tests", "No tests ran", "verification"],
   ] as const)(
     "keeps passive identity %s neutral despite keyword-like name",
-    async (toolName, output, kind) => {
+    async (toolName, output) => {
       const turn = metricTurn(1, 20, 0);
       const assistant = turn.assistants[0]!;
       assistant.parts.push(
@@ -2843,20 +4036,11 @@ describe("magic compact", () => {
       });
       const stored = storedSummary(requests, "metric-assistant-0");
 
-      expect(stored).toStartWith("Outcome: completed\n");
-      expect(stored).toContain("Verification: None evidenced.");
-      expect(stored).toContain("VCS/Deployment: None evidenced.");
-      expect(stored).toContain("Unresolved: None evidenced.");
-      expect(stored).toContain(output);
-      if (kind === "verification") {
-        expect(
-          labeledSummarySection(stored, "Verification", "VCS/Deployment"),
-        ).toBe("Verification: None evidenced.");
-      } else {
-        expect(
-          labeledSummarySection(stored, "VCS/Deployment", "Unresolved"),
-        ).toBe("VCS/Deployment: None evidenced.");
-      }
+      expect(stored).toStartWith("Outcome: completed");
+      expect(stored).not.toContain("Verification:");
+      expect(stored).not.toContain("VCS:");
+      expect(stored).not.toContain("Unresolved:");
+      expect(stored).not.toContain(output);
     },
   );
 
@@ -2874,23 +4058,13 @@ describe("magic compact", () => {
         messages: completedCommandTurn(command, output),
       });
       const stored = storedSummary(requests, "metric-assistant-0");
-      const verification = labeledSummarySection(
-        stored,
-        "Verification",
-        "VCS/Deployment",
-      );
-      const unresolved = labeledSummarySection(
-        stored,
-        "Unresolved",
-        "Historical terminal evidence (authoritative)",
-      );
+      const unresolved = capsuleSection(stored, "Unresolved");
 
-      expect(stored).toStartWith("Outcome: partial\n");
-      expect(verification).toContain(command);
-      expect(verification).toContain(output);
+      expect(stored).toStartWith("Outcome: partial");
       expect(unresolved).toContain(command);
       expect(unresolved).toContain(output);
-      expect(unresolved).toContain('"polarity":"failed"');
+      expect(unresolved).toContain("[failed]");
+      expect(stored).not.toContain('"polarity"');
     },
   );
 
@@ -2905,16 +4079,12 @@ describe("magic compact", () => {
         messages: completedCommandTurn(command, output),
       });
       const stored = storedSummary(requests, "metric-assistant-0");
-      const verification = labeledSummarySection(
-        stored,
-        "Verification",
-        "VCS/Deployment",
-      );
+      const verification = capsuleSection(stored, "Verification");
 
-      expect(stored).toStartWith("Outcome: completed\n");
+      expect(stored).toStartWith("Outcome: completed");
       expect(verification).toContain(command);
       expect(verification).toContain(output);
-      expect(stored).toContain("Unresolved: None evidenced.");
+      expect(stored).not.toContain("Unresolved:");
     },
   );
 
@@ -2939,9 +4109,9 @@ describe("magic compact", () => {
     });
     const stored = storedSummary(requests, "metric-assistant-0");
 
-    expect(stored).toStartWith("Outcome: completed\n");
-    expect(stored).toContain("Verification: None evidenced.");
-    expect(stored).toContain("Unresolved: None evidenced.");
+    expect(stored).toStartWith("Outcome: completed");
+    expect(stored).not.toContain("Verification:");
+    expect(stored).not.toContain("Unresolved:");
   });
 
   test.each([
@@ -2977,10 +4147,10 @@ describe("magic compact", () => {
     });
     const stored = storedSummary(requests, "metric-assistant-0");
 
-    expect(stored).toStartWith("Outcome: completed\n");
-    expect(stored).toContain("Verification: None evidenced.");
-    expect(stored).toContain("Unresolved: None evidenced.");
-    expect(stored).toContain(JSON.stringify(output).slice(1, -1));
+    expect(stored).toStartWith("Outcome: completed");
+    expect(stored).not.toContain("Verification:");
+    expect(stored).not.toContain("Unresolved:");
+    expect(stored).not.toContain(JSON.stringify(output).slice(1, -1));
   });
 
   test("does not overflow required budget on hundreds of neutral completed tool records", async () => {
@@ -3014,10 +4184,10 @@ describe("magic compact", () => {
     });
     const stored = storedSummary(requests, "metric-assistant-0");
 
-    expect(stored).toStartWith("Outcome: completed\n");
-    expect(stored).toContain("Verification: None evidenced.");
-    expect(stored).toContain("VCS/Deployment: None evidenced.");
-    expect(stored).toContain("Unresolved: None evidenced.");
+    expect(stored).toStartWith("Outcome: completed");
+    expect(stored).not.toContain("Verification:");
+    expect(stored).not.toContain("VCS:");
+    expect(stored).not.toContain("Unresolved:");
     expect(encode(stored).length).toBeLessThanOrEqual(
       DETERMINISTIC_SUMMARY_MAX_TOKENS,
     );
@@ -3051,16 +4221,13 @@ describe("magic compact", () => {
         messages: [...turn.user, ...turn.assistants],
       });
       const stored = storedSummary(requests, "metric-assistant-0");
-      const unresolved = labeledSummarySection(
-        stored,
-        "Unresolved",
-        "Historical terminal evidence (authoritative)",
-      );
+      const unresolved = capsuleSection(stored, "Unresolved");
 
-      expect(stored).toStartWith("Outcome: partial\n");
+      expect(stored).toStartWith("Outcome: partial");
       expect(unresolved).toContain(command);
       expect(unresolved).toContain(failure);
-      expect(unresolved).toContain('"polarity":"failed"');
+      expect(unresolved).toContain("[failed]");
+      expect(stored).not.toContain('"polarity"');
     },
   );
 
@@ -3091,11 +4258,13 @@ describe("magic compact", () => {
     });
     const stored = storedSummary(requests, "metric-assistant-0");
 
-    expect(stored).toStartWith("Outcome: completed\n");
-    expect(stored).toContain("Unresolved: None evidenced.");
+    expect(stored).toStartWith("Outcome: completed");
+    expect(stored).not.toContain("Unresolved:");
+    expect(stored).not.toContain("permission denied");
+    expect(stored).not.toContain("command not found");
   });
 
-  test("keeps late generic failed bash authoritative under saturated optional budget", async () => {
+  test("keeps late generic failed bash authoritative among many neutral completed tool records", async () => {
     const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     const command = "ls /workspace/late-secret";
@@ -3125,30 +4294,12 @@ describe("magic compact", () => {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
-    const unresolved = labeledSummarySection(
-      stored,
-      "Unresolved",
-      "Historical terminal evidence (authoritative)",
-    );
-    const record = unresolved
-      .split("\n")
-      .map(line => line.trim())
-      .filter(line => line.startsWith("{"))
-      .map(
-        line =>
-          JSON.parse(line) as {
-            command?: string;
-            polarity?: string;
-            state?: { output?: unknown };
-          },
-      )
-      .find(entry => entry.command === command);
+    const unresolved = capsuleSection(stored, "Unresolved");
 
-    expect(stored).toStartWith("Outcome: partial\n");
-    expect(record).toBeDefined();
-    expect(record!.command).toBe(command);
-    expect(record!.polarity).toBe("failed");
-    expect(JSON.stringify(record!.state)).toContain(failure);
+    expect(stored).toStartWith("Outcome: partial");
+    expect(unresolved).toContain(command);
+    expect(unresolved).toContain(failure);
+    expect(stored).not.toContain('"kind"');
     expect(encode(stored).length).toBeLessThanOrEqual(
       DETERMINISTIC_SUMMARY_MAX_TOKENS,
     );
@@ -3189,24 +4340,18 @@ describe("magic compact", () => {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
-    const verification = labeledSummarySection(
-      stored,
-      "Verification",
-      "VCS/Deployment",
-    );
-    const unresolved = labeledSummarySection(
-      stored,
-      "Unresolved",
-      "Historical terminal evidence (authoritative)",
-    );
+    const verification = capsuleSection(stored, "Verification");
+    const unresolved = capsuleSection(stored, "Unresolved");
 
-    expect(stored).toStartWith("Outcome: partial\n");
+    expect(stored).toStartWith("Outcome: partial");
     expect(verification).toContain("10 passed, 0 failed");
-    expect(verification).toContain("Process exited with code 1");
+    expect(verification).not.toContain("Process exited with code 1");
     expect(unresolved).toContain("Process exited with code 1");
     expect(unresolved).toContain("tests were not run");
-    expect(unresolved).toContain('"status":"error"');
+    expect(unresolved).toContain("[error]");
+    expect(unresolved).toContain("/workspace/missing.ts");
     expect(unresolved).toContain("No unresolved issues");
+    expect(stored).not.toContain('"status"');
   });
 
   test("categorizes mutation tools by identity rather than output prose", async () => {
@@ -3235,22 +4380,10 @@ describe("magic compact", () => {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
-    const terminal = labeledSummarySection(
-      stored,
-      "Historical terminal evidence (authoritative)",
-    );
-    const records = terminal
-      .split("\n")
-      .map(line => line.trim())
-      .filter(line => line.startsWith("{"))
-      .map(line => JSON.parse(line) as { kind?: string; tool?: string });
 
-    expect(
-      records.some(r => r.kind === "tool-mutation" && r.tool === "write"),
-    ).toBe(true);
-    expect(
-      records.some(r => r.tool === "read" && r.kind === "tool-mutation"),
-    ).toBe(false);
+    expect(stored).toStartWith("Outcome: completed");
+    expect(stored).toContain("write: src/a.ts");
+    expect(stored).not.toContain("Someone wrote docs");
   });
 
   test.each([
@@ -3283,19 +4416,15 @@ describe("magic compact", () => {
       });
       const stored = storedSummary(requests, "metric-assistant-0");
 
-      expect(stored).toStartWith("Outcome: completed\n");
+      expect(stored).toStartWith("Outcome: completed");
       if (kind === "verification") {
-        expect(
-          labeledSummarySection(stored, "Verification", "VCS/Deployment"),
-        ).toContain(output);
-        expect(stored).toContain("VCS/Deployment: None evidenced.");
+        expect(capsuleSection(stored, "Verification")).toContain(output);
+        expect(stored).not.toContain("VCS:");
       } else {
-        expect(
-          labeledSummarySection(stored, "VCS/Deployment", "Unresolved"),
-        ).toContain(output);
-        expect(stored).toContain("Verification: None evidenced.");
+        expect(capsuleSection(stored, "VCS")).toContain(output);
+        expect(stored).not.toContain("Verification:");
       }
-      expect(stored).toContain("Unresolved: None evidenced.");
+      expect(stored).not.toContain("Unresolved:");
     },
   );
 
@@ -3326,10 +4455,12 @@ describe("magic compact", () => {
     });
     const stored = storedSummary(requests, "metric-assistant-0");
 
-    expect(stored).toStartWith("Outcome: completed\n");
-    expect(stored).toContain("Verification: None evidenced.");
-    expect(stored).toContain("VCS/Deployment: None evidenced.");
-    expect(stored).toContain("Unresolved: None evidenced.");
+    expect(stored).toStartWith("Outcome: completed");
+    expect(stored).not.toContain("Verification:");
+    expect(stored).not.toContain("VCS:");
+    expect(stored).not.toContain("Unresolved:");
+    expect(stored).not.toContain("12 passed, 0 failed");
+    expect(stored).not.toContain("Process exited with code 1");
   });
 
   test.each([
@@ -3337,7 +4468,7 @@ describe("magic compact", () => {
     ["Tests could not run. Database unavailable.", "not-run"],
   ] as const)(
     "classifies full assistant text before segmentation: %s",
-    async (text, polarity) => {
+    async text => {
       const turn = metricTurn(1, 20, 0);
       const finalAssistant = turn.assistants.at(-1)!;
       finalAssistant.parts.push(
@@ -3348,15 +4479,11 @@ describe("magic compact", () => {
         messages: [...turn.user, ...turn.assistants],
       });
       const stored = storedSummary(requests, "metric-assistant-0");
-      const unresolved = labeledSummarySection(
-        stored,
-        "Unresolved",
-        "Historical terminal evidence (authoritative)",
-      );
+      const unresolved = capsuleSection(stored, "Unresolved");
 
-      expect(stored).toStartWith("Outcome: partial\n");
+      expect(stored).toStartWith("Outcome: partial");
       expect(unresolved).toContain(text);
-      expect(unresolved).toContain(`"polarity":"${polarity}"`);
+      expect(stored).not.toContain('"polarity"');
     },
   );
 
@@ -3373,11 +4500,9 @@ describe("magic compact", () => {
     });
     const stored = storedSummary(requests, "metric-assistant-0");
 
-    expect(stored).toStartWith("Outcome: completed\n");
-    expect(stored).toContain("Unresolved: None evidenced.");
-    expect(
-      labeledSummarySection(stored, "Verification", "VCS/Deployment"),
-    ).toContain(text);
+    expect(stored).toStartWith("Outcome: completed");
+    expect(stored).not.toContain("Unresolved:");
+    expect(capsuleSection(stored, "Verification")).toContain(text);
   });
 
   test.each([
@@ -3400,8 +4525,9 @@ describe("magic compact", () => {
       });
       const stored = storedSummary(requests, "metric-assistant-0");
 
-      expect(stored).toStartWith("Outcome: analysis-only\n");
-      expect(stored).toContain("Unresolved: None evidenced.");
+      expect(stored).toStartWith("Outcome: analysis-only");
+      expect(stored).not.toContain("Unresolved:");
+      expect(stored).not.toContain("Next:");
     },
   );
 
@@ -3419,53 +4545,27 @@ describe("magic compact", () => {
       });
       const stored = storedSummary(requests, "metric-assistant-0");
 
-      expect(stored).toStartWith("Outcome: partial\n");
-      expect(
-        labeledSummarySection(
-          stored,
-          "Unresolved",
-          "Historical terminal evidence (authoritative)",
-        ),
-      ).toContain(text);
+      expect(stored).toStartWith("Outcome: partial");
+      expect(capsuleSection(stored, "Next")).toContain(text);
     },
   );
 
-  test("keeps command and paths on dedicated fields without duplicating them as anchors", async () => {
+  test("keeps exact command and failure text readable in unresolved capsules", async () => {
     const command = 'bun test "/workspace/service/exact suite.test.ts"';
     const requests = await runCompaction(session("source"), {
       messages: completedCommandTurn(command, "Process exited with code 1"),
     });
     const stored = storedSummary(requests, "metric-assistant-0");
-    const unresolved = labeledSummarySection(
-      stored,
-      "Unresolved",
-      "Historical terminal evidence (authoritative)",
-    );
-    const record = unresolved
-      .split("\n")
-      .map(line => line.trim())
-      .filter(line => line.startsWith("{"))
-      .map(
-        line =>
-          JSON.parse(line) as {
-            command?: string;
-            paths?: string[];
-            anchors?: string[];
-          },
-      )
-      .find(entry => entry.command === command);
+    const unresolved = capsuleSection(stored, "Unresolved");
 
-    expect(record).toBeDefined();
-    expect(record!.command).toBe(command);
-    expect(record!.paths).toContain('"/workspace/service/exact suite.test.ts"');
-    expect(record!.anchors ?? []).not.toContain(command);
-    expect(record!.anchors ?? []).not.toContain(
-      '"/workspace/service/exact suite.test.ts"',
-    );
-    expect(record!.anchors ?? []).toContain("Process exited with code 1");
+    expect(stored).toStartWith("Outcome: partial");
+    expect(unresolved).toContain(command);
+    expect(unresolved).toContain("Process exited with code 1");
+    expect(stored).not.toContain('"command"');
+    expect(stored).not.toContain('"kind"');
   });
 
-  test("extracts title paths into dedicated path fields without promoting title labels to context", async () => {
+  test("keeps verification commands readable without promoting title labels", async () => {
     const turn = metricTurn(1, 20, 0);
     const assistant = turn.assistants[0]!;
     assistant.parts.push(
@@ -3483,30 +4583,13 @@ describe("magic compact", () => {
       messages: [...turn.user, ...turn.assistants],
     });
     const stored = storedSummary(requests, "metric-assistant-0");
-    const verification = labeledSummarySection(
-      stored,
-      "Verification",
-      "VCS/Deployment",
-    );
-    const record = verification
-      .split("\n")
-      .map(line => line.trim())
-      .filter(line => line.startsWith("{"))
-      .map(
-        line =>
-          JSON.parse(line) as {
-            command?: string;
-            paths?: string[];
-            anchors?: string[];
-          },
-      )
-      .find(entry => entry.command === "bun test");
 
-    expect(record).toBeDefined();
-    expect(record!.paths).toContain("/workspace/title-only/path.test.ts");
-    expect(record!.anchors ?? []).not.toContain(
-      "/workspace/title-only/path.test.ts",
+    expect(stored).toStartWith("Outcome: completed");
+    expect(capsuleSection(stored, "Verification")).toContain("bun test");
+    expect(capsuleSection(stored, "Verification")).toContain(
+      "10 passed, 0 failed",
     );
+    expect(stored).not.toContain("/workspace/title-only/path.test.ts");
   });
 
   test("high-risk path still classifies normalized identities and resolved pending at cutover", async () => {
@@ -3547,23 +4630,15 @@ describe("magic compact", () => {
     const stored = storedSummary(requests, "metric-assistant-0");
 
     expect(requests.prompts).toHaveLength(0);
-    expect(stored).toStartWith("Outcome: partial\n");
-    expect(
-      labeledSummarySection(stored, "Verification", "VCS/Deployment"),
-    ).toContain("10 passed, 0 failed");
-    expect(
-      labeledSummarySection(stored, "VCS/Deployment", "Unresolved"),
-    ).toContain("working tree clean");
-    expect(
-      labeledSummarySection(
-        stored,
-        "Unresolved",
-        "Historical terminal evidence (authoritative)",
-      ),
-    ).toContain("Tests ran. They failed.");
-    expect(stored).not.toMatch(
-      /"polarity":"incomplete"[^}]*no tasks are pending/,
+    expect(stored).toStartWith("Outcome: partial");
+    expect(capsuleSection(stored, "Verification")).toContain(
+      "10 passed, 0 failed",
     );
+    expect(capsuleSection(stored, "VCS")).toContain("working tree clean");
+    expect(capsuleSection(stored, "Unresolved")).toContain(
+      "Tests ran. They failed.",
+    );
+    expect(stored).not.toContain('"polarity"');
   });
 
   test("uses an empty transcript-free scratch session without checkpoint inheritance", async () => {
@@ -5865,6 +6940,17 @@ function labeledSummarySection(
   return value.slice(start, end).trim();
 }
 
+function capsuleSection(value: string, label: string): string {
+  const start = value.indexOf(`${label}:\n`);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const tail = value.slice(start);
+  const next = tail
+    .slice(label.length + 2)
+    .match(/^(?:Work|Verification|VCS|Unresolved|Next):$/m);
+  const end = next ? tail.indexOf(next[0], label.length + 2) : tail.length;
+  return tail.slice(0, end).trim();
+}
+
 function summaryRequestIDs(request: Record<string, unknown>): string[] {
   return summaryPromptSelection(request).turns.map(
     turn => turn.assistantTurnID,
@@ -5893,21 +6979,105 @@ function summaryPromptSelection(request: Record<string, unknown>): {
   };
 }
 
-function summaryJsonForIDs(ids: string[]): string {
-  return JSON.stringify(
-    Object.fromEntries(
-      ids.map(id => [
-        id,
-        id === "assistant"
-          ? "Completed the request."
-          : "Completed the selected historical turn.",
-      ]),
-    ),
+type AssistantTextRecord = {
+  kind: "assistant-text";
+  text?: string;
+  textEncoding?: string;
+  textSegments?: Array<{ literal: string; repetitions: number }>;
+};
+
+function machineEvidenceRecords(value: string): Record<string, unknown>[] {
+  return value.split("\n").flatMap(line => {
+    if (!line.startsWith("{")) return [];
+    return [JSON.parse(line) as Record<string, unknown>];
+  });
+}
+
+function assistantTextRecords(value: string): AssistantTextRecord[] {
+  return machineEvidenceRecords(value).filter(
+    (record): record is AssistantTextRecord =>
+      record["kind"] === "assistant-text",
   );
 }
 
+function decodeAssistantTextRecord(record: AssistantTextRecord): string {
+  if (record.text !== undefined) return record.text;
+  if (
+    record.textEncoding !== "ordered-literal-runs-v1"
+    || record.textSegments === undefined
+  ) {
+    throw new Error("Assistant text record has no supported exact encoding.");
+  }
+  return record.textSegments
+    .map(segment => segment.literal.repeat(segment.repetitions))
+    .join("");
+}
+
+function standardEvidenceForAssistantText(text: string): string {
+  const user = message("repeat-user", "user", []);
+  const assistant = message("repeat-assistant", "assistant", [
+    textPart("repeat-text", "source", "repeat-assistant", text),
+  ]);
+  return renderStandardTurnEvidence({ user: [user], assistants: [assistant] });
+}
+
+function codeUnits(value: string): number[] {
+  return Array.from({ length: value.length }, (_, index) =>
+    value.charCodeAt(index),
+  );
+}
+
+function deterministicHighEntropyText(bytes: number): string {
+  const alphabet =
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \t\n";
+  let seed = 12_345;
+  const next = () => {
+    seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648;
+    return seed / 2_147_483_648;
+  };
+  const chunks: string[] = [];
+  let total = 0;
+  while (total < bytes) {
+    const chunk = Array.from(
+      { length: 4_096 },
+      () => alphabet[Math.floor(next() * alphabet.length)],
+    ).join("");
+    chunks.push(chunk);
+    total += chunk.length;
+  }
+  return chunks.join("");
+}
+
+function modelCapsule(
+  outcome: "completed" | "partial" | "analysis-only",
+  work: string,
+): string {
+  return `Outcome: ${outcome}\nWork: ${work}`;
+}
+
 function summaryJsonForPrompt(request: Record<string, unknown>): string {
-  return summaryJsonForIDs(summaryRequestIDs(request));
+  const selection = summaryPromptSelection(request);
+  return JSON.stringify(
+    Object.fromEntries(
+      selection.turns.map(({ assistantTurnID, exactEvidence }) => {
+        const outcome = exactEvidence.match(
+          /^Outcome: (completed|partial|analysis-only)$/m,
+        )?.[1] as "completed" | "partial" | "analysis-only" | undefined;
+        if (outcome === undefined) {
+          throw new Error("Standard evidence is missing its expected Outcome.");
+        }
+        return [
+          assistantTurnID,
+          modelCapsule(
+            outcome,
+            assistantTurnID === "assistant"
+              ? "Completed the request."
+              : "Preserved.",
+          ),
+        ];
+      }),
+    ),
+  );
 }
 
 function commandToolPart(
@@ -6151,6 +7321,53 @@ function metricTurn(
   const baseBytes = Buffer.byteLength(JSON.stringify(turn));
   filler.text = "x".repeat(Math.max(0, serializedBytes - baseBytes));
   return turn;
+}
+
+function distinctUnresolvedTurn(count: number): Turn {
+  const user = [message("scale-user", "user", [])];
+  const assistant = message("scale-assistant", "assistant", []);
+  assistant.parts = Array.from({ length: count }, (_, index) =>
+    pendingCommandToolPart(
+      `scale-tool-${index}`,
+      assistant.info.id,
+      `repair-${index} --target /workspace/repair-${index}.json`,
+    ),
+  );
+  return { user, assistants: [assistant] };
+}
+
+function statusChainTurn(count: number, trailingSuccess = false): Turn {
+  const user = [message("scale-user", "user", [])];
+  const assistants: MessageWithParts[] = Array.from(
+    { length: count },
+    (_, index) =>
+      ({
+        info: {
+          id: `scale-error-${index}`,
+          role: "assistant",
+          error: {
+            name: "ProviderError",
+            data: {
+              message: `boom ${index}`,
+              statusCode: 500,
+              providerID: "scale-provider",
+            },
+          },
+        } as Message,
+        parts: [],
+      }) satisfies MessageWithParts,
+  );
+  if (trailingSuccess) {
+    assistants.push({
+      info: {
+        id: "scale-success",
+        role: "assistant",
+        finish: "stop",
+      } as Message,
+      parts: [],
+    });
+  }
+  return { user, assistants };
 }
 
 function completedCommandTurn(

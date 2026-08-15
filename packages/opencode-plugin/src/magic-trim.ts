@@ -9,7 +9,7 @@ import {
   injectTrimStatsNotice,
   recordPruningStats,
 } from "./compact/session";
-import { countSessionTokens, getProviderTokens } from "./stats/tokenize";
+import { countSessionTokens } from "./stats/tokenize";
 
 export const TRIM_SUCCESS = "Magic trimming successful.";
 export const TRIM_NOOP = "No eligible tool calls need trimming.";
@@ -31,9 +31,7 @@ export async function executeMagicTrim(
       getCompactionCount(sourceSession),
     );
 
-    const beforeTokens =
-      (await getProviderTokens(v2, sessionID))
-      ?? (await countSessionTokens(v2, sessionID));
+    const beforeTokens = await countSessionTokens(v2, sessionID);
     const trimmedToolCalls = await trimToolParts(
       { v2, sessionID },
       plan.trimmedTurns,
@@ -63,6 +61,12 @@ export async function executeMagicTrim(
       stats,
       sourceSession.model?.id ?? null,
     );
+    const actualAfterTokens = await countSessionTokens(v2, sessionID);
+    if (actualAfterTokens !== afterTokens) {
+      throw new Error(
+        `Trim final canonical active token count did not match its projection (projected ${afterTokens}, actual ${actualAfterTokens}).`,
+      );
+    }
 
     await v2.tui.showToast({
       title: "Magic Trim",

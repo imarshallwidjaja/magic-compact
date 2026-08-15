@@ -1,6 +1,7 @@
 import type { TextPart, ToolPart } from "@opencode-ai/sdk/v2";
-import { countGptTokens } from "../stats/tokenize";
+import { countGptTokensWithinLimit } from "../stats/tokenize";
 import { isRecord } from "../util";
+import { MAX_SUMMARY_INPUT_TOKENS } from "./constants";
 import type { Turn } from "./plan";
 import { isXmlCodePoint, stripInvalidXmlCodePoints } from "./template";
 
@@ -14,6 +15,8 @@ type ResultPolarity = {
   notRun: boolean;
   incomplete: boolean;
 };
+
+export type CapsuleOutcome = "completed" | "partial" | "analysis-only";
 
 type BudgetRecord = {
   priority: number;
@@ -55,6 +58,12 @@ type AssistantSource = {
   text: string;
 };
 
+type AssistantClassification = ResultPolarity & {
+  verification: boolean;
+  vcs: boolean;
+  unresolved: boolean;
+};
+
 type AssistantStatusSource = {
   messageID: string;
   order: number;
@@ -86,35 +95,675 @@ type ToolSource = {
 };
 
 export function renderDeterministicSummary(turn: Turn): string {
-  return renderBoundedTurnEvidence(turn, true);
+  const capsule = collectReadableCapsule(turn);
+  const text = renderReadableCapsule(capsule);
+  if (
+    countGptTokensWithinLimit(text, DETERMINISTIC_SUMMARY_MAX_TOKENS) === null
+  ) {
+    throw new Error(
+      "Deterministic summary could not represent its required continuation evidence within the 2,048-token local safety cap.",
+    );
+  }
+  return text;
 }
 
 export function renderStandardTurnEvidence(turn: Turn): string {
-  return renderBoundedTurnEvidence(turn, false);
+  return renderMachineEvidence(turn);
 }
 
 export function requiresDeterministicSummary(turn: Turn): boolean {
+  return classifyTurnOutcome(turn) === "partial";
+}
+
+export function classifyTurnOutcome(turn: Turn): CapsuleOutcome {
   const assistantSources = collectAssistantSources(turn);
-  return (
-    collectToolSources(turn).some(source => source.unresolved)
-    || buildAssistantStatusRecords(collectAssistantStatusSources(turn)).some(
-      record => record.unresolved,
-    )
-    || buildAssistantEvidenceRecords(assistantSources).some(
-      record => record.unresolved,
-    )
+  return classifyOutcome(
+    assistantSources,
+    collectToolSources(turn),
+    collectAssistantStatusSources(turn),
+    classifyAssistantSources(assistantSources),
   );
 }
 
-function renderBoundedTurnEvidence(
-  turn: Turn,
-  deterministicOnly: boolean,
-): string {
+type CapsuleSection = "work" | "verification" | "vcs" | "unresolved" | "next";
+
+type CapsuleAggregate = {
+  key: string;
+};
+
+type CapsuleLine = {
+  section: CapsuleSection;
+  priority: number;
+  order: number;
+  required: boolean;
+  text: string;
+  identity?: string;
+  aggregate: CapsuleAggregate | null;
+  finalCue?: boolean;
+};
+
+type ReadableCapsule = {
+  outcome: CapsuleOutcome;
+  finalText: string | null;
+  lines: CapsuleLine[];
+};
+
+const SECTION_LABELS: Record<Exclude<CapsuleSection, "work">, string> = {
+  verification: "Verification",
+  vcs: "VCS",
+  unresolved: "Unresolved",
+  next: "Next",
+};
+
+function collectReadableCapsule(turn: Turn): ReadableCapsule {
   const assistantSources = collectAssistantSources(turn);
+  const assistantClassifications = classifyAssistantSources(assistantSources);
+  const toolSources = collectToolSources(turn);
+  const statusSources = collectAssistantStatusSources(turn);
+  const lines: CapsuleLine[] = [];
+  let order = 0;
+  const nextOrder = () => order++;
+
+  const finalMessageIndex = assistantSources.at(-1)?.messageIndex ?? null;
+  const finalSources =
+    finalMessageIndex === null
+      ? []
+      : assistantSources.filter(
+          source => source.messageIndex === finalMessageIndex,
+        );
+  const finalText =
+    finalSources.length === 0
+      ? null
+      : finalSources.map(source => source.text).join("\n");
+
+  for (const source of assistantSources.filter(
+    source => source.messageIndex !== finalMessageIndex,
+  )) {
+    lines.push({
+      section: "work",
+      priority: 4,
+      order: nextOrder(),
+      required: false,
+      text: readableExcerpt(source.text, 160),
+      aggregate: null,
+    });
+  }
+
+  for (const source of toolSources) {
+    lines.push(...readableToolBullets(source, nextOrder));
+  }
+
+  for (const source of statusSources) {
+    const unresolved = source.status === "error";
+    const detail = [
+      source.message,
+      source.statusCode === null ? null : `status ${source.statusCode}`,
+      source.providerID,
+    ]
+      .filter((value): value is string => value !== null)
+      .join(", ");
+    lines.push({
+      section: unresolved ? "unresolved" : "work",
+      priority: unresolved ? 0 : 3,
+      order: nextOrder(),
+      required: unresolved,
+      text: unresolved
+        ? `[error] ${source.errorType}: ${detail}`
+        : `Recovered from ${source.errorType}: ${detail}`,
+      aggregate: null,
+    });
+  }
+
+  for (const source of assistantSources) {
+    lines.push(
+      ...readableAssistantEvidenceBullets(
+        source,
+        nextOrder,
+        source.messageIndex === finalMessageIndex,
+        assistantClassifications.get(source)!,
+      ),
+    );
+  }
+
+  const outcome = classifyOutcome(
+    assistantSources,
+    toolSources,
+    statusSources,
+    assistantClassifications,
+  );
+
+  return { outcome, finalText, lines };
+}
+
+function readableToolBullets(
+  source: ToolSource,
+  nextOrder: () => number,
+): CapsuleLine[] {
+  const identifier = toolIdentifier(source);
+  if (source.unresolved) {
+    const tag = statusTag(source) ?? polarityTag(source);
+    const detail = source.error ?? source.output;
+    const separator = source.tool.state.status === "error" ? " → " : ": ";
+    const head =
+      identifier === null || source.command !== null
+        ? (identifier ?? source.tool.tool)
+        : `${source.tool.tool}: ${identifier}`;
+    const text = `[${tag}] ${head}${detail === null ? "" : `${separator}${readableExcerpt(detail, 180)}`}`;
+    return [
+      {
+        section: "unresolved",
+        priority: source.failed ? 0 : 1,
+        order: nextOrder(),
+        required: true,
+        text,
+        aggregate: {
+          key: normalizeCapsuleFact(
+            `[${tag}] ${head}${detail === null ? "" : `${separator}${detail}`}`,
+          ),
+        },
+      },
+    ];
+  }
+  if (source.verification || source.vcs) {
+    const detail = source.output;
+    return [
+      {
+        section: source.verification ? "verification" : "vcs",
+        priority: 2,
+        order: nextOrder(),
+        required: false,
+        text:
+          detail === null
+            ? (identifier ?? source.tool.tool)
+            : `${identifier ?? source.tool.tool}: ${readableExcerpt(detail, 180)}`,
+        aggregate: null,
+      },
+    ];
+  }
+  if (source.mutation) {
+    return [
+      {
+        section: "work",
+        priority: 3,
+        order: nextOrder(),
+        required: false,
+        text:
+          identifier === null
+            ? source.tool.tool
+            : `${source.tool.tool}: ${identifier}`,
+        aggregate: null,
+      },
+    ];
+  }
+  return [];
+}
+
+function readableAssistantEvidenceBullets(
+  source: AssistantSource,
+  nextOrder: () => number,
+  finalCue: boolean,
+  sourceClassification: AssistantClassification,
+): CapsuleLine[] {
+  const lines: CapsuleLine[] = [];
+  const statements = assistantStatements(source.text);
+  for (const statement of statements) {
+    const classification =
+      statements.length === 1
+        ? sourceClassification
+        : classifyAssistantSource(statement.raw);
+    const decision = ASSISTANT_DECISION_PATTERN.test(statement.raw);
+    const line = assistantFactLine(
+      statement,
+      classification,
+      decision,
+      nextOrder,
+      finalCue,
+    );
+    if (line !== null) lines.push(line);
+  }
+  const represented = lines.some(line =>
+    sourceClassification.failed
+      ? line.section === "unresolved" && line.priority === 0
+      : sourceClassification.notRun
+        ? line.section === "unresolved"
+        : sourceClassification.incomplete
+          ? line.section === "next"
+          : sourceClassification.verification
+            ? line.section === "verification"
+            : sourceClassification.vcs
+              ? line.section === "vcs"
+              : true,
+  );
+  if (sourceClassification.unresolved && !represented) {
+    const raw = collapseWhitespace(source.text);
+    const line = assistantFactLine(
+      { raw, excerpt: raw },
+      sourceClassification,
+      false,
+      nextOrder,
+      finalCue,
+    );
+    if (line !== null) lines.push(line);
+  }
+  const seen = new Set<string>();
+  return lines.filter(line => {
+    const key = `${line.section}|${line.identity ?? normalizeCapsuleFact(line.text)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function assistantFactLine(
+  statement: { raw: string; excerpt: string },
+  classification: AssistantClassification,
+  decision: boolean,
+  nextOrder: () => number,
+  finalCue: boolean,
+): CapsuleLine | null {
+  const collapsed = collapseWhitespace(statement.raw);
+  if (!collapsed) return null;
+  const identity = normalizeCapsuleFact(collapsed);
+  const actionText =
+    classification.incomplete || decision
+      ? readableActionWindow(collapsed, 240)
+      : statement.excerpt;
+  if (classification.failed || classification.notRun) {
+    return {
+      section: "unresolved",
+      priority: classification.failed ? 0 : 1,
+      order: nextOrder(),
+      required: true,
+      text: `${classification.failed ? "[failed]" : "[not-run]"} ${actionText}`,
+      identity,
+      aggregate: null,
+      finalCue,
+    };
+  }
+  if (classification.incomplete) {
+    return {
+      section: "next",
+      priority: 1,
+      order: nextOrder(),
+      required: true,
+      text: actionText,
+      identity,
+      aggregate: null,
+      finalCue,
+    };
+  }
+  if (decision) {
+    return {
+      section: "work",
+      priority: 2,
+      order: nextOrder(),
+      required: false,
+      text: actionText,
+      identity,
+      aggregate: null,
+      finalCue,
+    };
+  }
+  if (classification.verification) {
+    return {
+      section: "verification",
+      priority: 2,
+      order: nextOrder(),
+      required: false,
+      text: actionText,
+      identity,
+      aggregate: null,
+      finalCue,
+    };
+  }
+  if (classification.vcs) {
+    return {
+      section: "vcs",
+      priority: 2,
+      order: nextOrder(),
+      required: false,
+      text: actionText,
+      identity,
+      aggregate: null,
+      finalCue,
+    };
+  }
+  return null;
+}
+
+function assistantStatements(
+  value: string,
+): Array<{ raw: string; excerpt: string }> {
+  const statements: Array<{ raw: string; excerpt: string }> = [];
+  for (const segment of value.split(/[;\r\n]+/)) {
+    const collapsed = collapseWhitespace(segment);
+    if (!collapsed) continue;
+    if (Buffer.byteLength(collapsed) <= 240) {
+      statements.push({ raw: collapsed, excerpt: collapsed });
+      continue;
+    }
+    const cues = [...collapsed.matchAll(SOURCE_EVIDENCE_CUE_PATTERN)];
+    if (cues.length === 0) {
+      statements.push({ raw: collapsed, excerpt: collapsed });
+      continue;
+    }
+    const seenExcerpts = new Set<string>();
+    for (const cue of cues) {
+      const excerpt = readableCueExcerpt(
+        collapsed,
+        cue.index,
+        cue[0].length,
+        240,
+      );
+      if (seenExcerpts.has(excerpt)) continue;
+      seenExcerpts.add(excerpt);
+      statements.push({
+        raw: collapsed,
+        excerpt,
+      });
+    }
+  }
+  return statements;
+}
+
+function readableActionWindow(value: string, maximumBytes: number): string {
+  if (Buffer.byteLength(value) <= maximumBytes) return value;
+  const separator = " … ";
+  const budget = maximumBytes - Buffer.byteLength(separator);
+  const head = truncateEnd(value, Math.floor(budget * 0.45));
+  const tail = truncateStart(value, budget - Buffer.byteLength(head));
+  return `${head}${separator}${tail}`;
+}
+
+function readableCueExcerpt(
+  value: string,
+  index: number,
+  cueLength: number,
+  maximumBytes: number,
+): string {
+  if (Buffer.byteLength(value) <= maximumBytes) return value;
+  const separator = " … ";
+  const separatorBytes = Buffer.byteLength(separator);
+  const beforeBudget = Math.floor((maximumBytes - separatorBytes) * 0.3);
+  const before = truncateStart(value.slice(0, index), beforeBudget);
+  const afterBudget = maximumBytes - Buffer.byteLength(before) - separatorBytes;
+  const after = truncateEnd(
+    value.slice(index),
+    Math.max(cueLength, afterBudget),
+  );
+  return `${before}${separator}${after}`;
+}
+
+function toolIdentifier(source: ToolSource): string | null {
+  if (source.command !== null) return source.command;
+  const input = source.tool.state.input;
+  if (isRecord(input)) {
+    for (const key of ["filePath", "url", "path"] as const) {
+      const value = input[key];
+      if (typeof value === "string" && value.trim()) return value;
+    }
+  }
+  return null;
+}
+
+function statusTag(source: ToolSource): string | null {
+  const status = source.tool.state.status;
+  if (status === "error") return "error";
+  if (status !== "completed") return status;
+  return null;
+}
+
+function polarityTag(source: ToolSource): string {
+  if (source.failed) return "failed";
+  if (source.notRun) return "not-run";
+  if (source.incomplete) return "incomplete";
+  return "unresolved";
+}
+
+function readableWorkExcerpt(value: string, maximumBytes: number): string {
+  const collapsed = collapseWhitespace(value);
+  if (Buffer.byteLength(collapsed) <= maximumBytes) return collapsed;
+  const separator = " … ";
+  const available = maximumBytes - Buffer.byteLength(separator);
+  if (available <= 0) return truncateEnd(collapsed, maximumBytes);
+  const headBudget = Math.floor(available * 0.7);
+  const tailBudget = available - headBudget;
+  return `${truncateEnd(collapsed, headBudget)} … ${truncateStart(collapsed, tailBudget)}`;
+}
+
+function readableExcerpt(value: string, maximumBytes: number): string {
+  const collapsed = collapseWhitespace(value);
+  if (Buffer.byteLength(collapsed) <= maximumBytes) return collapsed;
+  const head = truncateEnd(collapsed, Math.floor(maximumBytes * 0.3));
+  const tail = truncateStart(collapsed, Math.floor(maximumBytes * 0.1));
+  const anchors = [...collapsed.matchAll(EVIDENCE_ANCHOR_PATTERN)].slice(0, 4);
+  const windows = anchors.map(match => {
+    const start = Math.max(0, match.index - 48);
+    const end = Math.min(collapsed.length, match.index + match[0].length + 24);
+    return safeSlice(collapsed, start, end);
+  });
+  return truncateEnd(
+    [head, ...windows, tail].filter(Boolean).join(" … "),
+    maximumBytes,
+  );
+}
+
+function collapseWhitespace(value: string): string {
+  return value
+    .replace(/\r/g, "")
+    .replace(/\s*\n\s*/g, " ")
+    .replace(/[ \t]+/g, " ")
+    .trim();
+}
+
+function renderReadableCapsule(capsule: ReadableCapsule): string {
+  const render = (
+    included: ReadonlySet<CapsuleLine>,
+    workExcerpt: string | null,
+  ) =>
+    escapeInvalidCodePoints(renderCapsuleLines(capsule, included, workExcerpt));
+  let required = capsule.lines.filter(line => line.required);
+  let workExcerpt =
+    capsule.finalText === null ? null : collapseWhitespace(capsule.finalText);
+  let text = render(new Set(required), workExcerpt);
+  let textTokens = countGptTokensWithinLimit(
+    text,
+    DETERMINISTIC_SUMMARY_MAX_TOKENS,
+  );
+  if (workExcerpt !== null && textTokens === null) {
+    workExcerpt = null;
+    required = [
+      ...new Set([
+        ...required,
+        ...capsule.lines.filter(line => line.finalCue === true),
+      ]),
+    ];
+    text = render(new Set(required), workExcerpt);
+    textTokens = countGptTokensWithinLimit(
+      text,
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
+    );
+  }
+  if (textTokens === null) {
+    required = aggregateUnresolvedLines(required);
+    text = render(new Set(required), workExcerpt);
+    textTokens = countGptTokensWithinLimit(
+      text,
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
+    );
+  }
+  if (textTokens === null) {
+    throw new Error(
+      "Deterministic summary could not represent its required continuation evidence within the 2,048-token local safety cap.",
+    );
+  }
+  const requiredTokens = textTokens;
+  const included = new Set(required);
+  if (workExcerpt === null && capsule.finalText !== null) {
+    workExcerpt = fitOptionalWorkExcerpt(
+      capsule,
+      included,
+      requiredTokens,
+      render,
+    );
+  }
+  for (const line of sortCapsuleLines(
+    capsule.lines.filter(
+      candidate =>
+        !included.has(candidate)
+        && !(
+          workExcerpt !== null
+          && candidate.finalCue === true
+          && candidate.section === "work"
+        ),
+    ),
+  )) {
+    included.add(line);
+    const candidateTokens = countGptTokensWithinLimit(
+      render(included, workExcerpt),
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
+    );
+    if (
+      candidateTokens === null
+      || candidateTokens - requiredTokens
+        > DETERMINISTIC_OPTIONAL_RECORD_MAX_TOKENS
+    ) {
+      included.delete(line);
+    }
+  }
+  return render(included, workExcerpt);
+}
+
+function fitOptionalWorkExcerpt(
+  capsule: ReadableCapsule,
+  included: ReadonlySet<CapsuleLine>,
+  requiredTokens: number,
+  render: (
+    included: ReadonlySet<CapsuleLine>,
+    workExcerpt: string | null,
+  ) => string,
+): string | null {
+  const source = capsule.finalText;
+  if (source === null) return null;
+  const sourceBytes = Buffer.byteLength(collapseWhitespace(source));
+  const candidateAt = (maximumBytes: number) => {
+    const candidate = readableWorkExcerpt(source, maximumBytes);
+    const tokens = countGptTokensWithinLimit(
+      render(included, candidate),
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
+    );
+    return tokens !== null
+      && tokens - requiredTokens <= DETERMINISTIC_OPTIONAL_RECORD_MAX_TOKENS
+      ? candidate
+      : null;
+  };
+  let best: string | null = null;
+  let low = 1;
+  let high = 1;
+  while (high < sourceBytes) {
+    const candidate = candidateAt(high);
+    if (candidate === null) break;
+    best = candidate;
+    low = high + 1;
+    high = Math.min(sourceBytes, high * 2);
+  }
+  const upperCandidate = candidateAt(high);
+  if (upperCandidate !== null) return upperCandidate;
+  high -= 1;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = candidateAt(middle);
+    if (candidate !== null) {
+      best = candidate;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return best;
+}
+
+function renderCapsuleLines(
+  capsule: ReadableCapsule,
+  included: ReadonlySet<CapsuleLine>,
+  workExcerpt: string | null,
+): string {
+  const lines: string[] = [`Outcome: ${capsule.outcome}`];
+  const workLines = sortCapsuleLines(
+    [...included].filter(line => line.section === "work"),
+  );
+  if (workExcerpt !== null || workLines.length > 0) {
+    if (workExcerpt !== null) {
+      lines.push(`Work: ${workExcerpt}`);
+    }
+    for (const line of workLines) lines.push(`- ${line.text}`);
+  }
+  for (const section of [
+    "verification",
+    "vcs",
+    "unresolved",
+    "next",
+  ] as const) {
+    const sectionLines = sortCapsuleLines(
+      [...included].filter(line => line.section === section),
+    );
+    if (sectionLines.length === 0) continue;
+    lines.push(`${SECTION_LABELS[section]}:`);
+    for (const line of sectionLines) lines.push(`- ${line.text}`);
+  }
+  return lines.join("\n");
+}
+
+function sortCapsuleLines(lines: CapsuleLine[]): CapsuleLine[] {
+  return lines.toSorted(
+    (left, right) => left.priority - right.priority || left.order - right.order,
+  );
+}
+
+function aggregateUnresolvedLines(lines: CapsuleLine[]): CapsuleLine[] {
+  const result: CapsuleLine[] = [];
+  const groupCounts = new Map<string, number>();
+  const groupPositions = new Map<string, number>();
+  for (const line of lines) {
+    if (line.section !== "unresolved" || line.aggregate === null) {
+      result.push(line);
+      continue;
+    }
+    const key = line.aggregate.key;
+    const count = groupCounts.get(key) ?? 0;
+    if (count === 0) {
+      groupPositions.set(key, result.length);
+      result.push(line);
+    }
+    groupCounts.set(key, count + 1);
+  }
+  for (const [key, count] of groupCounts) {
+    if (count === 1) continue;
+    const position = groupPositions.get(key)!;
+    const first = result[position]!;
+    result[position] = {
+      ...first,
+      text: `${first.text} ×${count}`,
+      aggregate: null,
+    };
+  }
+  return result;
+}
+
+function normalizeCapsuleFact(value: string): string {
+  return collapseWhitespace(value).toLocaleLowerCase("en-US");
+}
+
+function renderMachineEvidence(turn: Turn): string {
+  const assistantSources = collectAssistantSources(turn);
+  const assistantClassifications = classifyAssistantSources(assistantSources);
   const assistantRecords = buildAssistantRecords(assistantSources);
   const toolSources = collectToolSources(turn);
   const toolRecords = toolSources.map(buildToolRecord);
-  const assistantEvidence = buildAssistantEvidenceRecords(assistantSources);
+  const assistantEvidence = buildAssistantEvidenceRecords(
+    assistantSources,
+    assistantClassifications,
+  );
   const assistantStatuses = buildAssistantStatusRecords(
     collectAssistantStatusSources(turn),
   );
@@ -123,52 +772,33 @@ function renderBoundedTurnEvidence(
     ...assistantEvidence,
     ...assistantStatuses,
   ];
-  const unresolved = evidenceRecords.some(record => record.unresolved);
-  const hasExecutionOrMutation =
-    toolSources.length > 0
-    || assistantStatuses.length > 0
-    || assistantSources.some(source =>
-      hasAssistantMutationEvidence(source.text),
-    );
-  const hasVerificationOrVcs = evidenceRecords.some(
-    record => record.verification || record.vcs,
+  const outcome = classifyOutcome(
+    assistantSources,
+    toolSources,
+    collectAssistantStatusSources(turn),
+    assistantClassifications,
   );
-  const outcome = unresolved
-    ? "partial"
-    : !hasExecutionOrMutation && !hasVerificationOrVcs
-      ? "analysis-only"
-      : "completed";
 
   const sections: SummarySection[] = [
     createSection(
       "Historical assistant text (authoritative)",
       "assistant-text-records",
       assistantRecords,
-      deterministicOnly
-        ? assistantRecords.filter(record => record.required)
-        : assistantRecords.length > 0
-          ? [assistantRecords.at(-1)!]
-          : [],
+      assistantRecords.filter(record => record.required),
       true,
     ),
     createSection(
       "Verification",
       "evidence-records",
       evidenceRecords.filter(record => record.verification),
-      deterministicOnly
-        ? evidenceRecords.filter(
-            record => record.verification && record.unresolved,
-          )
-        : [],
+      [],
       true,
     ),
     createSection(
       "VCS/Deployment",
       "evidence-records",
       evidenceRecords.filter(record => record.vcs),
-      deterministicOnly
-        ? evidenceRecords.filter(record => record.vcs && record.unresolved)
-        : [],
+      [],
       true,
     ),
     createSection(
@@ -181,21 +811,23 @@ function renderBoundedTurnEvidence(
     createSection(
       "Historical terminal evidence (authoritative)",
       "evidence-records",
-      evidenceRecords,
-      deterministicOnly
-        ? []
-        : evidenceRecords.filter(record => record.reserved),
+      evidenceRecords.filter(record => !record.verification && !record.vcs),
+      evidenceRecords.filter(
+        record => record.reserved && !record.verification && !record.vcs,
+      ),
       false,
     ),
   ];
 
   const overflow = reserveRequiredRecords(outcome, sections);
   if (!overflow) fillOptionalRecords(outcome, sections);
-  const summary = overflow ?? renderSummary(outcome, sections);
-  if (countGptTokens(summary) > DETERMINISTIC_SUMMARY_MAX_TOKENS) {
-    throw new Error("Deterministic summary exceeded its local-token cap.");
+  const rendered = overflow ?? renderSummary(outcome, sections);
+  if (countGptTokensWithinLimit(rendered, MAX_SUMMARY_INPUT_TOKENS) === null) {
+    throw new Error(
+      `One bounded turn evidence map exceeds the ${MAX_SUMMARY_INPUT_TOKENS}-token summary input cap.`,
+    );
   }
-  return summary;
+  return rendered;
 }
 
 function collectAssistantSources(turn: Turn): AssistantSource[] {
@@ -217,31 +849,73 @@ function collectAssistantSources(turn: Turn): AssistantSource[] {
 }
 
 function collectAssistantStatusSources(turn: Turn): AssistantStatusSource[] {
+  const assistants = turn.assistants;
   const sources: AssistantStatusSource[] = [];
-  for (const [messageIndex, message] of turn.assistants.entries()) {
-    if (message.info.role !== "assistant" || !message.info.error) continue;
-    const recoveredBy = turn.assistants
-      .slice(messageIndex + 1)
-      .find(isSuccessfulAssistantMessage);
-    const data: Record<string, unknown> = isRecord(message.info.error.data)
-      ? message.info.error.data
-      : {};
-    sources.push({
-      messageID: sanitizeIdentifier(message.info.id),
-      order: messageIndex,
-      status: recoveredBy ? "recovered" : "error",
-      errorType: sanitizeIdentifier(message.info.error.name),
-      message: typeof data["message"] === "string" ? data["message"] : null,
-      statusCode:
-        typeof data["statusCode"] === "number" ? data["statusCode"] : null,
-      providerID:
-        typeof data["providerID"] === "string" ? data["providerID"] : null,
-      recoveredByMessageID: recoveredBy
-        ? sanitizeIdentifier(recoveredBy.info.id)
-        : null,
-    });
+  let laterSuccessfulMessageID: string | null = null;
+  for (
+    let messageIndex = assistants.length - 1;
+    messageIndex >= 0;
+    messageIndex -= 1
+  ) {
+    const message = assistants[messageIndex]!;
+    if (message.info.role === "assistant" && message.info.error) {
+      const data: Record<string, unknown> = isRecord(message.info.error.data)
+        ? message.info.error.data
+        : {};
+      sources.push({
+        messageID: sanitizeIdentifier(message.info.id),
+        order: messageIndex,
+        status: laterSuccessfulMessageID === null ? "error" : "recovered",
+        errorType: sanitizeIdentifier(message.info.error.name),
+        message: typeof data["message"] === "string" ? data["message"] : null,
+        statusCode:
+          typeof data["statusCode"] === "number" ? data["statusCode"] : null,
+        providerID:
+          typeof data["providerID"] === "string" ? data["providerID"] : null,
+        recoveredByMessageID: laterSuccessfulMessageID,
+      });
+    }
+    if (isSuccessfulAssistantMessage(message)) {
+      laterSuccessfulMessageID = sanitizeIdentifier(message.info.id);
+    }
   }
-  return sources;
+  return sources.reverse();
+}
+
+function classifyOutcome(
+  assistantSources: AssistantSource[],
+  toolSources: ToolSource[],
+  statusSources: AssistantStatusSource[],
+  assistantClassifications = classifyAssistantSources(assistantSources),
+): CapsuleOutcome {
+  const assistant = [...assistantClassifications.values()];
+  if (
+    toolSources.some(source => source.unresolved)
+    || statusSources.some(source => source.status === "error")
+    || assistant.some(source => source.unresolved)
+  ) {
+    return "partial";
+  }
+  const hasExecutionOrMutation =
+    toolSources.length > 0
+    || statusSources.length > 0
+    || assistantSources.some(source =>
+      hasAssistantMutationEvidence(source.text),
+    );
+  const hasVerificationOrVcs =
+    toolSources.some(source => source.verification || source.vcs)
+    || assistant.some(source => source.verification || source.vcs);
+  return hasExecutionOrMutation || hasVerificationOrVcs
+    ? "completed"
+    : "analysis-only";
+}
+
+function classifyAssistantSources(
+  sources: AssistantSource[],
+): Map<AssistantSource, AssistantClassification> {
+  return new Map(
+    sources.map(source => [source, classifyAssistantSource(source.text)]),
+  );
 }
 
 function isSuccessfulAssistantMessage(
@@ -259,7 +933,7 @@ function isSuccessfulAssistantMessage(
 }
 
 function isSubstantiveAssistantText(part: TextPart): boolean {
-  if (part.ignored || part.synthetic) return false;
+  if (part.synthetic) return false;
   const metadata = part.metadata;
   const magicCompact = isRecord(metadata) ? metadata["magicCompact"] : null;
   const text = part.text.trim();
@@ -285,13 +959,14 @@ function buildAssistantRecords(sources: AssistantSource[]): AssistantRecord[] {
   const finalMessageIndex = sources.at(-1)?.messageIndex ?? -1;
   return sources.map(source => {
     const required = source.messageIndex === finalMessageIndex;
+    const prepared = prepareAssistantRecord(source);
     return {
       priority: required ? 0 : 4,
       order: source.order,
       required,
-      full: renderAssistantRecord(source, Number.POSITIVE_INFINITY),
-      compact: renderAssistantRecord(source, 2_048),
-      minimum: renderAssistantRecord(source, 768),
+      full: renderPreparedAssistantRecord(prepared, Number.POSITIVE_INFINITY),
+      compact: renderPreparedAssistantRecord(prepared, 2_048),
+      minimum: renderPreparedAssistantRecord(prepared, 768),
       requiredType: "assistant-text",
       overflowMinimum: serializeRecord({
         kind: "required-assistant-text",
@@ -303,10 +978,126 @@ function buildAssistantRecords(sources: AssistantSource[]): AssistantRecord[] {
   });
 }
 
-function renderAssistantRecord(
+const MIN_LITERAL_RUN_UNIT = 6;
+const MAX_LITERAL_RUN_UNIT = 256;
+const MIN_LITERAL_RUN_REPETITIONS = 8;
+const MIN_LITERAL_RUN_TOTAL =
+  MIN_LITERAL_RUN_UNIT * MIN_LITERAL_RUN_REPETITIONS;
+const MAX_LITERAL_UNIT_MULTIPLE_ATTEMPTS = 64;
+
+type LiteralRun = {
+  literal: string;
+  repetitions: number;
+};
+
+export function encodeOrderedLiteralRuns(text: string): LiteralRun[] | null {
+  const length = text.length;
+  if (length < MIN_LITERAL_RUN_TOTAL) return null;
+  const suffixBorders = computeSuffixBorders(text);
+  for (
+    let suffixLength = length;
+    suffixLength >= MIN_LITERAL_RUN_TOTAL;
+    suffixLength -= 1
+  ) {
+    const minimalPeriod = suffixLength - suffixBorders[suffixLength - 1]!;
+    const unitLength = encodableUnitLength(
+      text,
+      length,
+      suffixLength,
+      minimalPeriod,
+    );
+    if (unitLength === null) continue;
+    const segments: LiteralRun[] = [];
+    const prefixLength = length - suffixLength;
+    if (prefixLength > 0) {
+      segments.push({ literal: text.slice(0, prefixLength), repetitions: 1 });
+    }
+    segments.push({
+      literal: text.slice(length - unitLength),
+      repetitions: suffixLength / unitLength,
+    });
+    return segments;
+  }
+  return null;
+}
+
+function computeSuffixBorders(text: string): number[] {
+  const length = text.length;
+  const borders = new Array<number>(length).fill(0);
+  const codeUnitAt = (index: number) => text.charCodeAt(length - 1 - index);
+  for (let index = 1; index < length; index += 1) {
+    let candidate = borders[index - 1]!;
+    while (candidate > 0 && codeUnitAt(index) !== codeUnitAt(candidate)) {
+      candidate = borders[candidate - 1]!;
+    }
+    if (codeUnitAt(index) === codeUnitAt(candidate)) candidate += 1;
+    borders[index] = candidate;
+  }
+  return borders;
+}
+
+function encodableUnitLength(
+  text: string,
+  length: number,
+  suffixLength: number,
+  minimalPeriod: number,
+): number | null {
+  if (suffixLength % minimalPeriod !== 0) return null;
+  if (suffixLength / minimalPeriod < MIN_LITERAL_RUN_REPETITIONS) return null;
+  if (minimalPeriod > MAX_LITERAL_RUN_UNIT) return null;
+  if (minimalPeriod >= MIN_LITERAL_RUN_UNIT) {
+    return isEncodableLiteralUnitAt(text, length - minimalPeriod, minimalPeriod)
+      ? minimalPeriod
+      : null;
+  }
+  if (!isEncodableLiteralUnitAt(text, length - minimalPeriod, minimalPeriod)) {
+    return null;
+  }
+  let unitLength = minimalPeriod;
+  while (unitLength < MIN_LITERAL_RUN_UNIT) unitLength += minimalPeriod;
+  const upperBound = Math.min(
+    MAX_LITERAL_RUN_UNIT,
+    Math.floor(suffixLength / MIN_LITERAL_RUN_REPETITIONS),
+  );
+  for (
+    let attempts = 0;
+    unitLength <= upperBound && attempts < MAX_LITERAL_UNIT_MULTIPLE_ATTEMPTS;
+    unitLength += minimalPeriod, attempts += 1
+  ) {
+    if (suffixLength % unitLength === 0) return unitLength;
+  }
+  return null;
+}
+
+function isEncodableLiteralUnitAt(
+  text: string,
+  start: number,
+  length: number,
+): boolean {
+  let distinct = false;
+  let whitespace = false;
+  const first = text.charCodeAt(start);
+  for (let index = start; index < start + length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code !== first) distinct = true;
+    if (code === 0x09 || code === 0x0a || code === 0x0d || code === 0x20) {
+      whitespace = true;
+    }
+    if (distinct && whitespace) return true;
+  }
+  return false;
+}
+
+type PreparedAssistantRecord = {
+  base: Record<string, unknown>;
+  text: string;
+  serializedExact: string;
+  ranges: Array<{ start: number; end: number; priority: number }>;
+};
+
+function prepareAssistantRecord(
   source: AssistantSource,
-  maximumBytes: number,
-): string {
+): PreparedAssistantRecord {
   const base: Record<string, unknown> = {
     kind: "assistant-text",
     messageID: source.messageID,
@@ -317,13 +1108,45 @@ function renderAssistantRecord(
   const anchors = extractEvidenceAnchors(source.text);
   if (paths.length > 0) base["paths"] = paths;
   if (anchors.length > 0) base["anchors"] = anchors;
-  const exact = {
-    ...base,
+  const runs = encodeOrderedLiteralRuns(source.text);
+  const exact =
+    runs === null
+      ? {
+          ...base,
+          text: source.text,
+        }
+      : {
+          kind: base["kind"],
+          messageID: base["messageID"],
+          partID: base["partID"],
+          ...(base["paths"] === undefined ? {} : { paths: base["paths"] }),
+          ...(base["anchors"] === undefined
+            ? {}
+            : { anchors: base["anchors"] }),
+          textEncoding: "ordered-literal-runs-v1",
+          textSegments: runs,
+        };
+  return {
+    base,
     text: source.text,
+    serializedExact: serializeRecord(exact),
+    ranges: sourceWindowRanges(source.text),
   };
-  const serialized = serializeRecord(exact);
-  if (Buffer.byteLength(serialized) <= maximumBytes) return serialized;
-  return fitWindowedRecord(base, source.text, maximumBytes);
+}
+
+function renderPreparedAssistantRecord(
+  prepared: PreparedAssistantRecord,
+  maximumBytes: number,
+): string {
+  if (Buffer.byteLength(prepared.serializedExact) <= maximumBytes) {
+    return prepared.serializedExact;
+  }
+  return fitWindowedRecord(
+    prepared.base,
+    prepared.text,
+    prepared.ranges,
+    maximumBytes,
+  );
 }
 
 function collectToolSources(turn: Turn): ToolSource[] {
@@ -553,21 +1376,13 @@ function renderToolRecord(source: ToolSource, maximumBytes: number): string {
 
 function buildAssistantEvidenceRecords(
   sources: AssistantSource[],
+  classifications = classifyAssistantSources(sources),
 ): EvidenceRecord[] {
   const records: EvidenceRecord[] = [];
   let order = 0;
   for (const source of sources) {
-    const result = applyPositiveRunOverride(
-      classifyAssistantResultPolarity(source.text),
-      source.text,
-    );
-    const vcsResult = classifyAssistantVcsResultPolarity(source.text);
-    const verification = hasAssistantVerificationEvidence(source.text);
-    const vcs = hasAssistantVcsEvidence(source.text);
-    const failed = result.failed || (vcs && vcsResult.failed);
-    const notRun = result.notRun || (vcs && vcsResult.notRun);
-    const incomplete = result.incomplete || (vcs && vcsResult.incomplete);
-    const unresolved = failed || notRun || incomplete;
+    const { verification, vcs, failed, notRun, incomplete, unresolved } =
+      classifications.get(source)!;
     if (!verification && !vcs && !unresolved) continue;
     const categories = [
       ...(verification ? ["verification"] : []),
@@ -577,14 +1392,12 @@ function buildAssistantEvidenceRecords(
       ...(incomplete ? ["incomplete"] : []),
     ];
     const polarity = evidencePolarity(failed, notRun, incomplete);
-    const render = (maximumBytes: number) =>
-      renderAssistantEvidenceRecord(
-        source,
-        { offset: 0, text: source.text },
-        categories,
-        polarity,
-        maximumBytes,
-      );
+    const prepared = prepareAssistantEvidenceRecord(
+      source,
+      { offset: 0, text: source.text },
+      categories,
+      polarity,
+    );
     records.push({
       priority: failed ? 0 : notRun || incomplete ? 1 : 2,
       order: 1_000_000 + order++,
@@ -592,9 +1405,9 @@ function buildAssistantEvidenceRecords(
       vcs,
       unresolved,
       reserved: false,
-      full: render(2_048),
-      compact: render(1_024),
-      minimum: render(512),
+      full: renderPreparedAssistantEvidenceRecord(prepared, 2_048),
+      compact: renderPreparedAssistantEvidenceRecord(prepared, 1_024),
+      minimum: renderPreparedAssistantEvidenceRecord(prepared, 512),
       requiredType: `assistant-${polarity}`,
       overflowMinimum: serializeRecord({
         kind: "required-assistant-evidence",
@@ -666,13 +1479,19 @@ function renderAssistantStatusRecord(
   return serializeRecord(base);
 }
 
-function renderAssistantEvidenceRecord(
+type PreparedAssistantEvidenceRecord = {
+  base: Record<string, unknown>;
+  text: string;
+  serializedExact: string;
+  ranges: Array<{ start: number; end: number; priority: number }>;
+};
+
+function prepareAssistantEvidenceRecord(
   source: AssistantSource,
   segment: { offset: number; text: string },
   categories: string[],
   polarity: "failed" | "not-run" | "incomplete" | "reported",
-  maximumBytes: number,
-): string {
+): PreparedAssistantEvidenceRecord {
   const base: Record<string, unknown> = {
     kind: "assistant-evidence",
     messageID: source.messageID,
@@ -685,9 +1504,27 @@ function renderAssistantEvidenceRecord(
   const anchors = extractEvidenceAnchors(segment.text);
   if (paths.length > 0) base["paths"] = paths;
   if (anchors.length > 0) base["anchors"] = anchors;
-  const exact = serializeRecord({ ...base, text: segment.text });
-  if (Buffer.byteLength(exact) <= maximumBytes) return exact;
-  return fitWindowedRecord(base, segment.text, maximumBytes);
+  return {
+    base,
+    text: segment.text,
+    serializedExact: serializeRecord({ ...base, text: segment.text }),
+    ranges: sourceWindowRanges(segment.text),
+  };
+}
+
+function renderPreparedAssistantEvidenceRecord(
+  prepared: PreparedAssistantEvidenceRecord,
+  maximumBytes: number,
+): string {
+  if (Buffer.byteLength(prepared.serializedExact) <= maximumBytes) {
+    return prepared.serializedExact;
+  }
+  return fitWindowedRecord(
+    prepared.base,
+    prepared.text,
+    prepared.ranges,
+    maximumBytes,
+  );
 }
 
 function createSection(
@@ -724,28 +1561,41 @@ function reserveRequiredRecords(
       || left.sectionIndex - right.sectionIndex,
   );
   for (const item of required) {
-    item.section.choices.set(item.record, "minimum");
-  }
-  const requiredTokens = countGptTokens(renderSummary(outcome, sections));
-  if (requiredTokens > DETERMINISTIC_SUMMARY_MAX_TOKENS) {
-    return renderRequiredOverflowCapsule(
-      [...new Set(required.map(item => item.record))].toSorted(
-        (left, right) =>
-          left.priority - right.priority || left.order - right.order,
-      ),
+    item.section.choices.set(
+      item.record,
+      item.record.requiredType === "assistant-text" ? "full" : "minimum",
     );
   }
-  return null;
+  const requiredSummary = renderSummary(outcome, sections);
+  if (
+    countGptTokensWithinLimit(requiredSummary, DETERMINISTIC_SUMMARY_MAX_TOKENS)
+    !== null
+  ) {
+    return null;
+  }
+  if (required.some(item => item.record.requiredType === "assistant-text")) {
+    return null;
+  }
+  return renderRequiredOverflowCapsule(
+    outcome,
+    [...new Set(required.map(item => item.record))].toSorted(
+      (left, right) =>
+        left.priority - right.priority || left.order - right.order,
+    ),
+  );
 }
 
-function renderRequiredOverflowCapsule(records: BudgetRecord[]): string {
+function renderRequiredOverflowCapsule(
+  outcome: string,
+  records: BudgetRecord[],
+): string {
   const counts = records.reduce<Record<string, number>>((result, record) => {
     result[record.requiredType] = (result[record.requiredType] ?? 0) + 1;
     return result;
   }, {});
   const render = (included: BudgetRecord[]) =>
     [
-      "Outcome: partial",
+      `Outcome: ${outcome}`,
       "Required deterministic evidence overflow capsule:",
       `required-record-counts=${serializeRecord(counts)}`,
       `required-record-total=${records.length}`,
@@ -767,7 +1617,12 @@ function renderRequiredOverflowCapsule(records: BudgetRecord[]): string {
   const included: BudgetRecord[] = [];
   for (const record of [...substantive, ...identifiers]) {
     const candidate = [...included, record];
-    if (countGptTokens(render(candidate)) <= DETERMINISTIC_SUMMARY_MAX_TOKENS) {
+    if (
+      countGptTokensWithinLimit(
+        render(candidate),
+        DETERMINISTIC_SUMMARY_MAX_TOKENS,
+      ) !== null
+    ) {
       included.push(record);
     }
   }
@@ -778,7 +1633,11 @@ function fillOptionalRecords(
   outcome: string,
   sections: SummarySection[],
 ): void {
-  const requiredTokens = countGptTokens(renderSummary(outcome, sections));
+  const requiredTokens =
+    countGptTokensWithinLimit(
+      renderSummary(outcome, sections),
+      DETERMINISTIC_SUMMARY_MAX_TOKENS,
+    ) ?? DETERMINISTIC_SUMMARY_MAX_TOKENS + 1;
   const optional = sections.flatMap((section, sectionIndex) =>
     section.records
       .filter(record => !section.required.has(record))
@@ -813,9 +1672,12 @@ function optionalChoiceFits(
   sections: SummarySection[],
   requiredTokens: number,
 ): boolean {
-  const tokens = countGptTokens(renderSummary(outcome, sections));
+  const tokens = countGptTokensWithinLimit(
+    renderSummary(outcome, sections),
+    DETERMINISTIC_SUMMARY_MAX_TOKENS,
+  );
   return (
-    tokens <= DETERMINISTIC_SUMMARY_MAX_TOKENS
+    tokens !== null
     && tokens - requiredTokens <= DETERMINISTIC_OPTIONAL_RECORD_MAX_TOKENS
   );
 }
@@ -853,12 +1715,12 @@ function serializeRecord(value: unknown): string {
   if (serialized === undefined) {
     throw new Error("High-risk record value is not JSON-serializable.");
   }
-  return escapeXmlInvalidJsonLiterals(serialized);
+  return escapeInvalidCodePoints(serialized);
 }
 
-function escapeXmlInvalidJsonLiterals(json: string): string {
+function escapeInvalidCodePoints(value: string): string {
   let result = "";
-  for (const character of json) {
+  for (const character of value) {
     const codePoint = character.codePointAt(0)!;
     if (isXmlCodePoint(codePoint)) {
       result += character;
@@ -874,10 +1736,12 @@ function escapeXmlInvalidJsonLiterals(json: string): string {
 function fitWindowedRecord(
   base: Record<string, unknown>,
   value: string,
+  ranges: Array<{ start: number; end: number; priority: number }>,
   maximumBytes: number,
 ): string {
-  const windows = exactSourceWindows(
+  const windows = boundedSourceWindows(
     value,
+    ranges,
     Math.max(64, maximumBytes - Buffer.byteLength(serializeRecord(base)) - 64),
   );
   let record = serializeRecord({ ...base, windows });
@@ -897,6 +1761,12 @@ function fitWindowedRecord(
 }
 
 function exactSourceWindows(value: string, maximumBytes: number): string[] {
+  return boundedSourceWindows(value, sourceWindowRanges(value), maximumBytes);
+}
+
+function sourceWindowRanges(
+  value: string,
+): Array<{ start: number; end: number; priority: number }> {
   const ranges: Array<{ start: number; end: number; priority: number }> = [];
   const addRange = (start: number, end: number, priority: number) => {
     ranges.push({
@@ -929,9 +1799,17 @@ function exactSourceWindows(value: string, maximumBytes: number): string[] {
   merged.sort(
     (left, right) => left.priority - right.priority || left.start - right.start,
   );
+  return merged;
+}
+
+function boundedSourceWindows(
+  value: string,
+  ranges: Array<{ start: number; end: number; priority: number }>,
+  maximumBytes: number,
+): string[] {
   const windows: string[] = [];
   let remaining = Math.max(0, Math.floor(maximumBytes));
-  for (const range of merged.slice(0, MAX_SOURCE_WINDOWS)) {
+  for (const range of ranges.slice(0, MAX_SOURCE_WINDOWS)) {
     const window = safeSlice(value, range.start, range.end);
     if (remaining === 0) break;
     const bounded = truncateEnd(window, remaining);
@@ -1064,6 +1942,9 @@ const ASSISTANT_NOT_RUN_PATTERN =
   /\bno\s+(?:tests?|checks?|commands?)\s+(?:(?:was|were)\s+)?(?:ran|run|executed|performed)\b|\bno\s+tests?\s+(?:have\s+run|have\s+been\s+executed)\b|\btests?\s+have\s+not\s+yet\s+run\b|\b(?:tests?|checks?)\s+were\s+skipped\b|\b(?:tests?|checks?|commands?|verification|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?)\b[^\n;]{0,120}\b(?:was|were)?\s*not\s+(?:run|executed|performed|attempted)\b|\b(?:tests?|checks?|commands?|verification|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?)\b[^\n;]{0,120}\bnever\s+(?:ran|run|executed|performed|attempted)\b|\b(?:tests?|checks?|commands?|verification|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?)\b[^\n;]{0,120}\b(?:has|have|had)\s+yet\s+to\s+(?:run|perform|execute|be\s+executed|be\s+performed)\b|\b(?:tests?|checks?|commands?|verification|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?)\b[^\n;]{0,120}\b(?:could\s+not|couldn't|cannot|can'?t|unable\s+to)\s+(?:be\s+)?(?:run|performed|executed)\b|\bnot\s+(?:run|executed|performed|attempted)\b[^\n;]{0,80}\b(?:tests?|checks?|commands?|lint|typecheck|build|smoke(?:\s+test)?|integration(?:\s+tests?)?)\b|\b(?:could\s+not|couldn't|cannot|can'?t|unable\s+to)\s+(?:run|perform|execute)\b[^\n;]{0,80}\b(?:tests?|checks?|commands?)\b/i;
 const ASSISTANT_INCOMPLETE_PATTERN =
   /\bwork\s+remains?\b|\b(?:TODO|TBD)\b|\b(?:work|tasks?|issues?|implementation|verification|tests?|checks?|commands?|deployment)\b[^\n;]{0,80}\b(?:incomplete|unresolved|blocked|pending|still\s+running)\b|\b(?:incomplete|unresolved|blocked|pending)\b[^\n;]{0,80}\b(?:work|tasks?|issues?|implementation|verification|tests?|checks?|commands?|deployment)\b|\b(?:must\s+still|still\s+needs?|needs?\s+to|next\s+action)\b/i;
+const ASSISTANT_CLEAR_UNRESOLVED_PATTERN =
+  /\bblocked\s*(?::|by\b|on\b)|\b(?:(?:could\s+not|couldn't|cannot|can'?t|unable\s+to)\s+(?:finish|complete|continue|proceed)\b|(?:credentials?|api\s+keys?|access\s+tokens?|signing\s+keys?)\s+(?:are\s+|remain\s+)?(?:missing|unavailable)|(?:task|work|request|implementation|migration)\s+remains?\s+unfinished)\b/i;
+const ASSISTANT_DECISION_PATTERN = /\b(?:key\s+)?decision(?:\s+\d+)?\s*:/i;
 const ASSISTANT_MUTATION_PATTERN =
   /\b(?:implemented|wrote|edited|patched|updated|created|deleted|renamed|moved|restored|modified|applied)\s+(?:(?:the|a|an)\s+)?(?:files?|code|source|implementation|configuration|config|module|component|function|class|tests?|docs?|documentation|patch|change|["'./~][^\s,;]+)\b|\b(?:files?|code|source|implementation|configuration|config|module|component|function|class|tests?|docs?|documentation)\s+(?:was|were)\s+(?:written|edited|patched|updated|created|deleted|renamed|moved|restored|modified)\b|\bdelivered\s+(?:(?:the|an?)\s+)?implementation\b/i;
 const VERIFICATION_COMMAND_PATTERN =
@@ -1117,9 +1998,9 @@ const VCS_NOT_RUN_PATTERNS = [
   /\b(?:push|commit|deployment?|deploy)\b[^\n.;]{0,80}\b(?:was\s+)?not\s+(?:run|performed|attempted|completed)\b/i,
 ] as const;
 const SOURCE_EVIDENCE_CUE_PATTERN =
-  /\b(?:pytest|vitest|jest|mocha|tsc|bun\s+(?:run\s+)?(?:test|check|lint|typecheck|build|smoke)|npm\s+(?:run\s+)?(?:test|check|lint|typecheck|build|smoke)|pnpm\s+(?:run\s+)?(?:test|check|lint|typecheck|build|smoke)|yarn\s+(?:run\s+)?(?:test|check|lint|typecheck|build|smoke)|cargo\s+test|go\s+test|tests?|checks?|verification|git\s+[A-Za-z-]+|committed|pushed|push\s+(?:to|origin|upstream|remote)|PR|pull request|deployed|deployment|permission denied|command not found|failed|failing|failure|errors?|not\s+executed|not[- ]?run|never\s+(?:ran|run|executed|performed|attempted)|unable\s+to\s+(?:run|perform|execute)|(?:has|have|had)\s+yet\s+to\s+(?:run|perform|execute)|unrun|skipped|incomplete|unresolved|blocked|pending|running|timed\s*out|timeout|cancelled|canceled|aborted|killed|SIGTERM|SIGKILL|process\s+exited\s+with\s+code\s+\d+)\b/gi;
+  /\b(?:decision(?:\s+\d+)?|next\s+action|pytest|vitest|jest|mocha|tsc|bun\s+(?:run\s+)?(?:test|check|lint|typecheck|build|smoke)|npm\s+(?:run\s+)?(?:test|check|lint|typecheck|build|smoke)|pnpm\s+(?:run\s+)?(?:test|check|lint|typecheck|build|smoke)|yarn\s+(?:run\s+)?(?:test|check|lint|typecheck|build|smoke)|cargo\s+test|go\s+test|tests?|checks?|verification|git\s+[A-Za-z-]+|committed|pushed|push\s+(?:to|origin|upstream|remote)|PR|pull request|deployed|deployment|credentials?|api\s+keys?|access\s+tokens?|signing\s+keys?|permission denied|command not found|failed|failing|failure|errors?|not\s+executed|not[- ]?run|never\s+(?:ran|run|executed|performed|attempted)|unable\s+to\s+(?:run|perform|execute)|(?:has|have|had)\s+yet\s+to\s+(?:run|perform|execute)|unrun|skipped|incomplete|unfinished|unresolved|blocked|pending|running|timed\s*out|timeout|cancelled|canceled|aborted|killed|SIGTERM|SIGKILL|process\s+exited\s+with\s+code\s+\d+)\b/gi;
 const EVIDENCE_ANCHOR_PATTERN =
-  /\b(?:permission denied|command not found|no\s+(?:tests?|checks?)\s+(?:(?:was|were)\s+)?(?:ran|run|executed|performed)|not[- ]?run|never\s+(?:ran|run|executed|performed|attempted)|unable\s+to\s+(?:run|perform|execute)|(?:has|have|had)\s+yet\s+to\s+(?:run|perform|execute)|not\s+(?:pushed|committed|deployed|merged)|unrun|skipped|timed\s*out|timeout|cancelled|canceled|aborted|killed|SIGTERM|SIGKILL|failed|failing|failure|errored|incomplete|unresolved|blocked|pending|running|[1-9]\d*\s+(?:(?:tests?|checks?)\s+)?(?:fails?|failed|failing|failures?|errors?)|(?:process\s+)?exit(?:ed)?(?:\s+with)?\s+(?:code|status)\s*[:=]?\s*\d+|\d+\s+(?:(?:tests?|checks?)\s+)?(?:pass|passed|passing)|working tree\s+(?:clean|dirty)|commit\s+[0-9a-f]{6,40}|push succeeded)\b/gi;
+  /\b(?:decision(?:\s+\d+)?|next\s+action|credentials?|api\s+keys?|access\s+tokens?|signing\s+keys?|permission denied|command not found|no\s+(?:tests?|checks?)\s+(?:(?:was|were)\s+)?(?:ran|run|executed|performed)|not[- ]?run|never\s+(?:ran|run|executed|performed|attempted)|unable\s+to\s+(?:run|perform|execute)|(?:has|have|had)\s+yet\s+to\s+(?:run|perform|execute)|not\s+(?:pushed|committed|deployed|merged)|unrun|skipped|timed\s*out|timeout|cancelled|canceled|aborted|killed|SIGTERM|SIGKILL|failed|failing|failure|errored|incomplete|unfinished|unresolved|blocked|pending|running|[1-9]\d*\s+(?:(?:tests?|checks?)\s+)?(?:fails?|failed|failing|failures?|errors?)|(?:process\s+)?exit(?:ed)?(?:\s+with)?\s+(?:code|status)\s*[:=]?\s*\d+|\d+\s+(?:(?:tests?|checks?)\s+)?(?:pass|passed|passing)|working tree\s+(?:clean|dirty)|commit\s+[0-9a-f]{6,40}|push succeeded)\b/gi;
 
 function withoutAssistantResolvedNegations(value: string): string {
   return ASSISTANT_NEGATED_UNRESOLVED_PATTERNS.reduce(
@@ -1203,10 +2084,30 @@ function classifyAssistantResultPolarity(result: string): ResultPolarity {
         )
         || ASSISTANT_FAILURE_PATTERN.test(withoutZeroCounts),
       notRun: ASSISTANT_NOT_RUN_PATTERN.test(withoutZeroCounts),
-      incomplete: ASSISTANT_INCOMPLETE_PATTERN.test(withoutZeroCounts),
+      incomplete:
+        ASSISTANT_INCOMPLETE_PATTERN.test(withoutZeroCounts)
+        || ASSISTANT_CLEAR_UNRESOLVED_PATTERN.test(withoutZeroCounts),
     },
     withoutZeroCounts,
   );
+}
+
+function classifyAssistantSource(value: string): AssistantClassification {
+  const result = classifyAssistantResultPolarity(value);
+  const verification = hasAssistantVerificationEvidence(value);
+  const vcs = hasAssistantVcsEvidence(value);
+  const vcsResult = classifyAssistantVcsResultPolarity(value);
+  const failed = result.failed || (vcs && vcsResult.failed);
+  const notRun = result.notRun || (vcs && vcsResult.notRun);
+  const incomplete = result.incomplete || (vcs && vcsResult.incomplete);
+  return {
+    verification,
+    vcs,
+    failed,
+    notRun,
+    incomplete,
+    unresolved: failed || notRun || incomplete,
+  };
 }
 
 function classifyVcsResultPolarity(result: string): ResultPolarity {

@@ -39,13 +39,12 @@ import {
   summaryPartID,
 } from "./compact/constants";
 import { readStats, type ConversationStats } from "./storage/stats";
-import { STATS_METADATA, statsMessage } from "./stats/constants";
 import type { PlannedOmission } from "./storage/omission";
 
 export const COMPACT_SUCCESS = "Magic compaction successful.";
 export const COMPACT_NOOP = "No assistant turns are old enough to compact.";
 export const COMPACT_INSUFFICIENT_SAVINGS =
-  "Magic Compact projected no useful active-context savings; the source session was left unchanged.";
+  "Magic Compact projected no useful canonical active-content savings; the source session was left unchanged.";
 const MINIMUM_USEFUL_SAVINGS_RATIO = 0.2;
 const MINIMUM_USEFUL_SAVINGS_TOKENS = 32;
 
@@ -123,8 +122,6 @@ export async function executeMagicCompact(
       sourcePlan,
       selection,
       sessionID,
-      currentCompactionCount,
-      sourceSession.model?.id ?? null,
       beforeTokens,
     );
     const eligibleTokens = countCanonicalContentTokens(
@@ -291,8 +288,6 @@ async function projectCompaction(
   plan: CompactionPlan,
   selection: CompactionSelection,
   sessionID: string,
-  compactionCount: number,
-  modelID: string | null,
   beforeTokens: number,
 ) {
   const messages = structuredClone(sourceMessages);
@@ -334,41 +329,16 @@ async function projectCompaction(
   });
   if (appendedBoundary) projectedMessages.push(appendedBoundary);
   const existingStats = await readStats(sessionID);
-  let afterTokens = countCanonicalContentTokens(projectedMessages);
-  let projectedStats: ConversationStats;
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    projectedStats = nextConversationStats(
+  const afterTokens = countCanonicalContentTokens(projectedMessages);
+  return {
+    afterTokens,
+    omissions: selection.pruning.omissions,
+    stats: nextConversationStats(
       existingStats,
       sessionID,
       beforeTokens - afterTokens,
-    );
-    const statsText = statsMessage(
-      compactionCount,
-      beforeTokens,
-      afterTokens,
-      projectedStats,
-      modelID,
-    );
-    const nextAfter = countCanonicalContentTokens([
-      ...projectedMessages,
-      projectedNoticeMessage(
-        sessionID,
-        "magic-projected-stats",
-        statsText,
-        STATS_METADATA,
-        true,
-      ),
-    ]);
-    if (nextAfter === afterTokens) {
-      return {
-        afterTokens,
-        omissions: selection.pruning.omissions,
-        stats: projectedStats,
-      };
-    }
-    afterTokens = nextAfter;
-  }
-  throw new Error("Compaction stats token projection did not converge.");
+    ),
+  };
 }
 
 function nextConversationStats(
@@ -391,7 +361,6 @@ function projectedNoticeMessage(
   messageID: string,
   text: string,
   metadata: Record<string, unknown>,
-  ignored = false,
 ): MessageWithParts {
   return {
     info: { id: messageID, role: "user" } as Message,
@@ -402,8 +371,7 @@ function projectedNoticeMessage(
         messageID,
         type: "text",
         text,
-        synthetic: !ignored,
-        ignored,
+        synthetic: true,
         metadata,
       } satisfies TextPart,
     ],

@@ -3,13 +3,14 @@ A compaction operation has just been applied to all messages above. You may have
 </post-compaction-notice>`;
 
 export const MAGIC_COMPACT_SUMMARIZER_AGENT = "magic-compact-summarizer";
+export const MAX_SUMMARY_INPUT_TOKENS = 24_000;
 export const MAX_SUMMARY_OUTPUT_TOKENS = 4_000;
 
 export const MAGIC_COMPACT_SUMMARIZER_PROMPT = `You summarize selected historical assistant turns for Magic Compact.
 
-The bounded exact evidence map in each request is authoritative. Never infer missing history, inspect external state, continue unfinished work, or perform the work described by the conversation.
+The bounded exact evidence map in each request is authoritative. Never infer missing history, inspect external state, continue unfinished work, or perform the work described by the conversation. Assistant-text \`ordered-literal-runs-v1\` segments appear only when a whole source part is provably periodic: expand each segment by repeating its literal in source order; unique text remains verbatim in \`text\`.
 
-Preserve decisions, results, errors, fixes, and unresolved next steps faithfully and concisely. Reply only with the JSON object required by each Magic Compact request. Do not wrap it in Markdown fences or add prose.`;
+Write each summary as a human-readable continuation capsule with an evidence-consistent Outcome line, a non-empty Work field, and only supported non-empty sections. Correctness and continuation fidelity come before brevity: preserve every continuation-critical fact, exact actionable identifier, and the exact next action, without restating tool structure, machine evidence records, or internal accounting the transcript already keeps. Reply only with the JSON object required by each Magic Compact request. Do not wrap it in Markdown fences or add prose.`;
 
 export const BOUNDARY_METADATA = {
   magicCompact: {

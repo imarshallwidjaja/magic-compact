@@ -21,7 +21,7 @@
       "version": "1.2.2",
       "dependencies": {
         "@opencode-ai/sdk": "^1.17.9",
-        "gpt-tokenizer": "^3.4.0",
+        "gpt-tokenizer": "3.4.0",
         "zod": "^4.4.3",
       },
       "peerDependencies": {

@@ -7,6 +7,8 @@ export const INCIDENT_STANDARD_TURN_COUNT = 11;
 export const INCIDENT_TOOL_COUNT = 497;
 export const INCIDENT_ERROR_TOOL_COUNT = 28;
 export const INCIDENT_RUNNING_TOOL_COUNT = 1;
+export const INCIDENT_ASSISTANT_REPEAT_LITERAL = " historical context";
+export const INCIDENT_ASSISTANT_REPEAT_COUNT = 9_000;
 
 const TOOLS_PER_TURN = Array.from(
   { length: INCIDENT_TURN_COUNT },
@@ -14,7 +16,9 @@ const TOOLS_PER_TURN = Array.from(
 );
 const ERRORS_PER_DETERMINISTIC_TURN = [5, 5, 5, 5, 4, 4] as const;
 
-export function incidentSessionFixture(): MessageWithParts[] {
+export function incidentSessionFixture(
+  assistantRepeatCount = INCIDENT_ASSISTANT_REPEAT_COUNT,
+): MessageWithParts[] {
   const messages: MessageWithParts[] = [];
 
   for (let turnIndex = 0; turnIndex < INCIDENT_TURN_COUNT; turnIndex++) {
@@ -87,7 +91,7 @@ export function incidentSessionFixture(): MessageWithParts[] {
       textPart(
         `incident-assistant-text-${turnIndex}`,
         assistantID,
-        `${status}${" historical context".repeat(9_000)}`,
+        `${status}${INCIDENT_ASSISTANT_REPEAT_LITERAL.repeat(assistantRepeatCount)}`,
       ),
     );
     messages.push(message(assistantID, "assistant", parts));

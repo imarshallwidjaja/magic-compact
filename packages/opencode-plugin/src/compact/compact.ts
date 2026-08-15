@@ -5,14 +5,17 @@ import type {
   TextPart,
 } from "@opencode-ai/sdk/v2";
 import { unwrap, type V2Client } from "../api";
-import { countGptTokens } from "../stats/tokenize";
+import { countGptTokensWithinLimit } from "../stats/tokenize";
 import {
   MAGIC_COMPACT_SUMMARIZER_AGENT,
+  MAX_SUMMARY_INPUT_TOKENS,
   MAX_SUMMARY_OUTPUT_TOKENS,
   summaryMetadata,
   summaryPartID,
 } from "./constants";
 import {
+  classifyTurnOutcome,
+  type CapsuleOutcome,
   renderDeterministicSummary,
   renderStandardTurnEvidence,
   requiresDeterministicSummary,
@@ -20,7 +23,7 @@ import {
 import { type CompactionPlan, type Turn } from "./plan";
 import { buildCompactionPrompt, turnID } from "./template";
 
-export const MAX_SUMMARY_INPUT_TOKENS = 24_000;
+export { MAX_SUMMARY_INPUT_TOKENS } from "./constants";
 export const MAX_CONCURRENT_SUMMARY_REQUESTS = 2;
 export const SUMMARY_REQUEST_TIMEOUT_MS = 90_000;
 const MAX_SUMMARY_ATTEMPTS = 2;
@@ -37,6 +40,9 @@ type SummaryContractCategory =
   | "invalid-summary-type"
   | "empty-summary"
   | "placeholder-summary"
+  | "invalid-capsule-shape"
+  | "outcome-mismatch"
+  | "machine-evidence-summary"
   | "response-too-large";
 
 class SummaryContractError extends Error {
@@ -177,7 +183,10 @@ function createSummaryBatches(
 
   for (const turn of standard) {
     const candidate = createBatch([...current, turn]);
-    if (countGptTokens(candidate.prompt) <= MAX_SUMMARY_INPUT_TOKENS) {
+    if (
+      countGptTokensWithinLimit(candidate.prompt, MAX_SUMMARY_INPUT_TOKENS)
+      !== null
+    ) {
       current.push(turn);
       continue;
     }
@@ -189,7 +198,10 @@ function createSummaryBatches(
     batches.push(createBatch(current));
     current = [turn];
     if (
-      countGptTokens(createBatch(current).prompt) > MAX_SUMMARY_INPUT_TOKENS
+      countGptTokensWithinLimit(
+        createBatch(current).prompt,
+        MAX_SUMMARY_INPUT_TOKENS,
+      ) === null
     ) {
       throw new Error(
         `One bounded turn evidence map exceeds the ${MAX_SUMMARY_INPUT_TOKENS}-token summary input cap.`,
@@ -367,7 +379,9 @@ function parseSummaryOutput(
   if (!responseText.trim()) {
     throw contractError("missing-text-output", diagnostic);
   }
-  if (countGptTokens(responseText) > MAX_SUMMARY_OUTPUT_TOKENS) {
+  if (
+    countGptTokensWithinLimit(responseText, MAX_SUMMARY_OUTPUT_TOKENS) === null
+  ) {
     throw contractError("response-too-large", diagnostic);
   }
   try {
@@ -396,7 +410,7 @@ function validateSummaries(
     throw contractError("missing-id", diagnostic);
   }
 
-  return expected.map(id => {
+  return expected.map((id, index) => {
     const value = byID[id];
     if (typeof value !== "string") {
       throw contractError("invalid-summary-type", diagnostic);
@@ -406,7 +420,123 @@ function validateSummaries(
     if (isNonSubstantiveMarker(summary)) {
       throw contractError("placeholder-summary", diagnostic);
     }
+    validateReadableCapsule(
+      summary,
+      classifyTurnOutcome(turns[index]!),
+      diagnostic,
+    );
     return summary;
+  });
+}
+
+function validateReadableCapsule(
+  summary: string,
+  expectedOutcome: CapsuleOutcome,
+  diagnostic: { batch: number; batchCount: number; attempt: number },
+): void {
+  if (containsMachineEvidence(summary)) {
+    throw contractError("machine-evidence-summary", diagnostic);
+  }
+  const lines = summary.split(/\r?\n/);
+  const outcome = lines[0]?.match(
+    /^Outcome: (completed|partial|analysis-only)$/,
+  )?.[1] as CapsuleOutcome | undefined;
+  if (outcome === undefined) {
+    throw contractError("invalid-capsule-shape", diagnostic);
+  }
+  if (outcome !== expectedOutcome) {
+    throw contractError("outcome-mismatch", diagnostic);
+  }
+
+  const seen = new Set<string>();
+  const hasContent = new Map<string, boolean>();
+  let current: "Work" | "Verification" | "VCS" | "Unresolved" | "Next" | null =
+    null;
+  let workContent = false;
+  for (const line of lines.slice(1)) {
+    if (!line.trim()) continue;
+    const work = line.match(/^Work:(?:\s+(\S.*))?$/);
+    if (work) {
+      if (seen.has("Work")) {
+        throw contractError("invalid-capsule-shape", diagnostic);
+      }
+      seen.add("Work");
+      current = "Work";
+      workContent = Boolean(work[1]);
+      hasContent.set("Work", workContent);
+      continue;
+    }
+    const section = line.match(/^(Verification|VCS|Unresolved|Next):$/)?.[1] as
+      | "Verification"
+      | "VCS"
+      | "Unresolved"
+      | "Next"
+      | undefined;
+    if (section !== undefined) {
+      if (seen.has(section)) {
+        throw contractError("invalid-capsule-shape", diagnostic);
+      }
+      seen.add(section);
+      current = section;
+      hasContent.set(section, false);
+      continue;
+    }
+    if (current === null || /^[A-Z][A-Za-z /-]+:$/.test(line)) {
+      throw contractError("invalid-capsule-shape", diagnostic);
+    }
+    hasContent.set(current, true);
+    if (current === "Work") workContent = true;
+  }
+  if (
+    !seen.has("Work")
+    || !workContent
+    || [...seen].some(section => hasContent.get(section) !== true)
+  ) {
+    throw contractError("invalid-capsule-shape", diagnostic);
+  }
+  if (
+    (outcome === "analysis-only" && seen.size > 1)
+    || (outcome === "completed" && (seen.has("Unresolved") || seen.has("Next")))
+    || (outcome === "partial" && !seen.has("Unresolved") && !seen.has("Next"))
+  ) {
+    throw contractError("outcome-mismatch", diagnostic);
+  }
+}
+
+function containsMachineEvidence(summary: string): boolean {
+  return summary.split(/\r?\n/).some(rawLine => {
+    const line = rawLine
+      .trim()
+      .replace(/^Work:\s*/, "")
+      .replace(/^-\s+/, "")
+      .trim();
+    if (!line) return false;
+    if (
+      /^(?:assistant-text-records|evidence-records|required-records:|required-record-[a-z-]+\s*=|omitted-record-count\s*=\s*\d+|sourceBytes\s*=\s*\d+|windows\s*=\s*\[|Required deterministic evidence overflow capsule:|Historical assistant text \(authoritative\):|Historical terminal evidence \(authoritative\):)/.test(
+        line,
+      )
+      || /^"(?:kind|sourceBytes|windows|assistant-text-records|evidence-records|omitted-record-count|required-record-[a-z-]+)"\s*:/.test(
+        line,
+      )
+    ) {
+      return true;
+    }
+    if (!line.startsWith("{") || !line.endsWith("}")) return false;
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      return (
+        parsed !== null
+        && typeof parsed === "object"
+        && !Array.isArray(parsed)
+        && Object.keys(parsed).some(key =>
+          /^(?:kind|sourceBytes|windows|assistant-text-records|evidence-records|omitted-record-count|required-record-[a-z-]+)$/.test(
+            key,
+          ),
+        )
+      );
+    } catch {
+      return false;
+    }
   });
 }
 

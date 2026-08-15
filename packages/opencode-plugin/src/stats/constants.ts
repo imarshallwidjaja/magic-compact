@@ -14,6 +14,9 @@ function formatTokenCount(tokens: number): string {
   return tokens.toString();
 }
 
+const PROVIDER_METER_NOTE =
+  "Counts are canonical active-content estimates; this ignored reporting notice is excluded. They are not provider usage. OpenCode's context meter is a provider usage snapshot and can stay stale after in-place compaction until a later assistant response refreshes it.";
+
 export function statsSummaryMessage(
   compactionCount: number,
   stats: ConversationStats,
@@ -23,8 +26,9 @@ export function statsSummaryMessage(
 
   return `
 Magic Compact      | ${compactionCount} compactions performed
-Conversation Stats | Total tokens pruned: ~${formatTokenCount(stats.totalTokensPruned)} | Total cache reads saved: ~${formatTokenCount(stats.cachedTokensSaved)} tokens
+Conversation Stats | Tokens pruned (canonical active content): ~${formatTokenCount(stats.totalTokensPruned)} | Total cache reads saved: ~${formatTokenCount(stats.cachedTokensSaved)} tokens
 Cost Savings       | ${moneySaved}
+Note               | ${PROVIDER_METER_NOTE}
 `.trim();
 }
 
@@ -42,9 +46,10 @@ export function statsMessage(
 
   return `
 Magic Compaction #${compactionCount}
-Compaction Stats   | ${formatTokenCount(beforeTokens)} → ${formatTokenCount(afterTokens)} tokens (${percent}% reduced) | ~${formatTokenCount(savedTokens)} tokens pruned
-Conversation Stats | Total tokens pruned: ~${formatTokenCount(stats.totalTokensPruned)} | Total cache reads saved: ~${formatTokenCount(stats.cachedTokensSaved)} tokens
+Active Content (canonical estimate; ignored notice excluded) | ${formatTokenCount(beforeTokens)} → ${formatTokenCount(afterTokens)} tokens (${percent}% reduced) | ~${formatTokenCount(savedTokens)} tokens pruned
+Conversation Stats | Total tokens pruned (canonical active content): ~${formatTokenCount(stats.totalTokensPruned)} | Total cache reads saved: ~${formatTokenCount(stats.cachedTokensSaved)} tokens
 Cost Savings       | ${moneySaved}
+Note               | ${PROVIDER_METER_NOTE}
 `.trim();
 }
 
@@ -54,16 +59,17 @@ export function trimStatsMessage(
   stats: ConversationStats,
   modelID: string | null,
 ): string {
-  const savedTokens = Math.max(0, beforeTokens - afterTokens);
+  const savedTokens = beforeTokens - afterTokens;
   const percent =
     beforeTokens > 0 ? Math.round((savedTokens / beforeTokens) * 100) : 0;
   const moneySaved = moneySavedMessage(stats, modelID);
 
   return `
 Magic Trim
-Trim Stats         | ${formatTokenCount(beforeTokens)} → ${formatTokenCount(afterTokens)} tokens (${percent}% reduced) | ~${formatTokenCount(savedTokens)} tokens pruned
-Conversation Stats | Total tokens pruned: ~${formatTokenCount(stats.totalTokensPruned)} | Total cache reads saved: ~${formatTokenCount(stats.cachedTokensSaved)} tokens
+Active Content (canonical estimate; ignored notice excluded) | ${formatTokenCount(beforeTokens)} → ${formatTokenCount(afterTokens)} tokens (${percent}% reduced) | ~${formatTokenCount(savedTokens)} tokens pruned
+Conversation Stats | Total tokens pruned (canonical active content): ~${formatTokenCount(stats.totalTokensPruned)} | Total cache reads saved: ~${formatTokenCount(stats.cachedTokensSaved)} tokens
 Cost Savings       | ${moneySaved}
+Note               | ${PROVIDER_METER_NOTE}
 `.trim();
 }
 

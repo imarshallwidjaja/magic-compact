@@ -16,7 +16,7 @@ Magic Compact takes a different approach: preserve the conversation skeleton, co
 
 Instead of collapsing an entire session into a single generic summary, Magic Compact replaces old assistant turns with high-fidelity summaries while leaving user messages and tool calls in place.
 
-Exact user messages remain in context. Resolved assistant turns become bounded summaries; unresolved or failed state remains as required evidence or a truthful overflow disclosure. Native checkpoints and source drift are guarded, and pruned tool I/O stays retrievable through `read_omitted_content`.
+Exact user messages remain in context. Resolved assistant turns become readable per-turn continuation capsules; unresolved or failed state stays visible as decisive readable evidence, and when it cannot be represented truthfully within the safety caps, compaction fails closed. Native checkpoints and source drift are guarded, and pruned tool I/O stays retrievable through `read_omitted_content`.
 
 <p align="center">
   <img src=".github/assets/visualization.png" alt="Compaction Comparison" />
@@ -30,7 +30,7 @@ Exact user messages remain in context. Resolved assistant turns become bounded s
 - Smart tool call pruning — Bulky completed tool I/O is replaced with omission notices, with original content cached and retrievable on demand via `read_omitted_content`.
 - Recompactable — Run `/magic-compact` again later to compact new turns while preserving prior summaries.
 - Trim without summarizing — OpenCode can prune historical tool I/O with `/magic-trim` while preserving assistant responses.
-- Bounded summarization — Completed turns use transcript-free scratch sessions with bounded exact evidence, deny-all permissions, a best-effort 4,000-token provider output cap that only clamps an active limit OpenCode supplies, and at most two concurrent requests. Failed, not-run, running, or otherwise unresolved turns stay model-free; required-record overflow becomes a bounded aggregate capsule while the underlying error tool parts stay active.
+- Bounded summarization — Completed turns use transcript-free scratch sessions with bounded exact evidence, deny-all permissions, a best-effort 4,000-token provider output cap that only clamps an active limit OpenCode supplies, and at most two concurrent requests. Model output must validate as a human-readable continuation capsule with an evidence-consistent Outcome and no raw machine evidence. Failed, not-run, running, or otherwise unresolved turns stay model-free. Their deterministic capsules treat every substantive text part in the final assistant message as one ordered final response and preserve it in full when it fits the remaining 2,048-token safety ceiling; otherwise they preserve every classified decision, verification, VCS, unresolved, and next-action fact as source-anchored readable evidence. Distinct required facts are never sampled away: if they cannot all fit, rendering fails closed before mutation while underlying error tool parts stay active.
 - Useful-savings gate — A turn is replaced only when its exact projected replacement (summary plus the same planned pruning) is strictly smaller than the turn's exact source. Net-negative turns stay byte-identical. If the projected result cannot save at least 20% of the selected profitable turns' eligible removable content, Magic Compact fails unchanged before backup, mutation, or a stats increment instead of claiming weak savings.
 
 ## Installation
@@ -71,7 +71,7 @@ Run `/magic-trim [N]` to apply the same tool I/O pruning rules without summarizi
 - `N` preserves tool I/O in the most recent assistant turns. Default: `0` (trim all eligible turns).
 - Trimming does not call an LLM or create a compaction boundary.
 - A backup session is created before trimming.
-- Token reductions are included in `/magic-stats`.
+- Token reductions are included in `/magic-stats` on the exact canonical active-content basis. The ignored trim notice is stored for display but excluded from that model-facing count.
 
 Examples:
 
@@ -81,6 +81,8 @@ Examples:
 ### `/magic-stats`
 
 Run `/magic-stats` to show cumulative token savings for the current conversation: tokens pruned, cached tokens saved, estimated money saved, among other statistics.
+
+Reported token counts are canonical active-content estimates, not provider usage. They include model-facing synthetic content such as the compaction boundary, exclude ignored user reporting notices including the notice that displays the count, and include ignored assistant text. OpenCode's context meter is a provider usage snapshot and can remain stale after in-place compaction until a later assistant response refreshes it. Magic Compact never mutates provider usage metadata or fabricates an after-provider count.
 
 ### The Omitted Content Tool
 
@@ -128,7 +130,7 @@ Magic Compact Offers:
 
 - Simplicity — One command, zero configuration.
 - Lossless quality — Turn-by-turn flow stays intact. All user commands are preserved. All past tool calls are preserved.
-- Maximum token savings — Safe completed turns are packed into bounded evidence-only scratch requests instead of repeatedly sending the full transcript. Turns with failed, not-run, running, error, unknown, or incomplete evidence use small deterministic capsules with required state reserved first; overflow preserves aggregate required counts/types and as many stable identifiers and statuses as fit. Long tool calls are aggressively pruned.
+- Maximum token savings — Safe completed turns are packed into bounded evidence-only scratch requests instead of repeatedly sending the full transcript. Turns with failed, not-run, running, error, unknown, or incomplete evidence use deterministic human-readable capsules where decisive state is required. Only normalized-equivalent repeated facts aggregate with truthful counts; distinct actions remain visible or compaction fails closed. Long tool calls are aggressively pruned.
 - No cache churn — Compaction happens once and is cache friendly, whereas DCP may invalidate entire conversations multiple times within one request.
 - Zero assistant overhead — No prompt injections asking the assistant to compact. Your assistant stay focused on its task.
 
@@ -143,7 +145,7 @@ Magic Compact Offers:
 - Efficiency — One explicit compaction command, no background summarization loop, no always-on memory RAG, and no recurring prompt injections.
 - Lower token burn — Context reduction happens once on demand instead of continuously consuming tokens across every turn.
 - Fewer cache invalidations — The session is rewritten once, then stays stable, instead of repeatedly re-rendering volatile background state.
-- Lossless conversation shape — User messages stay verbatim, tool structure is preserved, and omitted tool I/O remains retrievable. Optional exact assistant/evidence records may be dropped from bounded summaries and do not gain a separate retrieval guarantee.
+- Lossless conversation shape — User messages stay verbatim, tool structure is preserved, and omitted tool I/O remains retrievable. Optional resolved detail may be omitted from a bounded capsule, but distinct continuation-critical facts are preserved or compaction fails closed; assistant summary text has no separate archive.
 - Focused compaction — The plugin does one job: compress the conversation without turning the runtime into a memory subsystem.
 
 If you want a lightweight, user-driven compaction tool with minimal ongoing overhead, Magic Compact is the better fit. If you want a full long-term memory system with background maintenance, Magic Context is the heavier alternative.
