@@ -1,5 +1,9 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
+import {
+  MAGIC_COMPACT_SUMMARIZER_AGENT,
+  MAGIC_COMPACT_SUMMARIZER_PROMPT,
+} from "./compact/constants";
 import { getV2Client } from "./api";
 import {
   COMPACT_NOOP,
@@ -14,10 +18,19 @@ import { handleStatsEvent } from "./stats/events";
 const COMPACT_COMMAND = "magic-compact";
 const TRIM_COMMAND = "magic-trim";
 const STATS_COMMAND = "magic-stats";
+const SUMMARIZER_PERMISSION = { "*": "deny" } as const;
 
 const server: Plugin = async input => {
   return {
     config: async config => {
+      config.agent ??= {};
+      config.agent[MAGIC_COMPACT_SUMMARIZER_AGENT] = {
+        description: "Per-turn agentic capsule summarizer for Magic Compact",
+        mode: "subagent",
+        hidden: true,
+        prompt: MAGIC_COMPACT_SUMMARIZER_PROMPT,
+        permission: SUMMARIZER_PERMISSION as never,
+      };
       config.command ??= {};
       config.command[COMPACT_COMMAND] = {
         template: "",

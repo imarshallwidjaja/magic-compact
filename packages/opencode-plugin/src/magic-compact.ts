@@ -35,8 +35,8 @@ import {
 import {
   BOUNDARY_METADATA,
   POST_COMPACTION_NOTICE,
+  agenticCapsuleTextPart,
   boundaryPartID,
-  capsuleSummaryTextPart,
 } from "./compact/constants";
 import { readStats, type ConversationStats } from "./storage/stats";
 
@@ -49,7 +49,7 @@ const MINIMUM_USEFUL_SAVINGS_TOKENS = 32;
 
 type CompactionSelection = {
   turns: Turn[];
-  summaries: string[];
+  summaries: Exclude<GeneratedCapsule, null>[];
   pruning: PruneProjection;
 };
 
@@ -104,7 +104,11 @@ export async function executeMagicCompact(
 
     await revalidateCompactionSource(v2, sessionID, sourcePlan);
 
-    const summaries = generateCompactionCapsules(sourcePlan);
+    const summaries = await generateCompactionCapsules(
+      v2,
+      sourceSession,
+      sourcePlan,
+    );
 
     const selection = await selectProfitableTurns(
       sourcePlan,
@@ -249,7 +253,7 @@ async function selectProfitableTurns(
   sessionID: string,
 ): Promise<CompactionSelection> {
   const selectedTurns: Turn[] = [];
-  const selectedSummaries: string[] = [];
+  const selectedSummaries: Exclude<GeneratedCapsule, null>[] = [];
   const projectedTurns: Turn[] = [];
   const mutations: PruneProjection["mutations"] = [];
   for (const [index, turn] of plan.summarizedTurns.entries()) {
@@ -257,8 +261,10 @@ async function selectProfitableTurns(
     if (summary === undefined)
       throw new Error("Missing summary for assistant turn.");
     if (summary === null) continue;
-    const candidates = [injectProjectedSummary(turn, summary, sessionID)];
-    const pruning = await createPruneProjection(candidates, sessionID);
+    const candidates = [injectProjectedSummary(turn, summary.text, sessionID)];
+    const pruning = await createPruneProjection(candidates, sessionID, {
+      preserveAssistantPartIDs: summary.preservedPartIDs,
+    });
     const projectedTurn = pruning.turns[0]!;
     if (
       countTurnCanonicalTokens(projectedTurn) < countTurnCanonicalTokens(turn)
@@ -285,7 +291,7 @@ function injectProjectedSummary(
   const firstAssistant = projected.assistants[0];
   if (!firstAssistant) throw new Error("Turn missing assistant message.");
   firstAssistant.parts.push(
-    capsuleSummaryTextPart(firstAssistant.info.id, sessionID, summary),
+    agenticCapsuleTextPart(firstAssistant.info.id, sessionID, summary),
   );
   return projected;
 }

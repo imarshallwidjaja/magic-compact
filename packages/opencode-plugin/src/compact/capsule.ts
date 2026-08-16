@@ -1,116 +1,119 @@
 import type { Part, TextPart, ToolPart } from "@opencode-ai/sdk/v2";
-import { inspect } from "node:util";
-import { countGptTokensWithinLimit } from "../stats/tokenize";
 import { isRecord, unwrapString } from "../util";
 import type { MessageWithParts, Turn } from "./plan";
-
-export const DETERMINISTIC_SUMMARY_MAX_TOKENS = 2_048;
 
 type VerificationState = "passed" | "failed" | "not-run" | "unknown";
 
 type Observation = {
+  ref: string;
   key: string | null;
   state: "success" | "unresolved";
-  section: "Verification" | "VCS" | "Unresolved";
-  text: string;
-  next: string | null;
 };
 
-type CurrentUnresolved = {
+type PreservedFinalTextPart = {
+  id: string;
   text: string;
-  next: string | null;
+};
+
+export type AgenticTurnEvidence = {
+  evidenceRefs: string[];
+  requiredUnresolvedRefs: string[];
+  preservedFinalTextParts: PreservedFinalTextPart[];
+  internalSourceIdentifiers: string[];
 };
 
 type StructuredResult =
   | { kind: "none" }
-  | { kind: "success"; text: string }
-  | { kind: "unresolved"; text: string; next: string | null };
+  | { kind: "success" }
+  | { kind: "unresolved" };
 
 type ExitMetadata =
   | { kind: "absent" }
   | { kind: "valid"; code: number }
   | { kind: "invalid" };
 
-const PROVIDER_SAFE_CODE_POINT = (value: number): boolean =>
-  value === 0x09
-  || value === 0x0a
-  || value === 0x0d
-  || (value >= 0x20 && value <= 0xd7ff)
-  || (value >= 0xe000 && value <= 0xfffd)
-  || (value >= 0x10000 && value <= 0x10ffff);
+export function analyzeAgenticTurnEvidence(
+  turn: Turn,
+): AgenticTurnEvidence | null {
+  if (turnContainsMagicSummary(turn)) return null;
+  const evidenceRefs = collectEvidenceRefs(turn);
+  const state = resolveTurnState(turn);
+  const finalAssistant = turn.assistants.at(-1);
+  const preservedFinalTextParts =
+    finalAssistant?.parts.flatMap(part =>
+      isEligibleAssistantText(part) && isSubstantiveText(part.text)
+        ? [{ id: part.id, text: part.text }]
+        : [],
+    ) ?? [];
 
-export function renderCanonicalCapsule(turn: Turn): string | null {
-  if (
-    [...turn.user, ...turn.assistants].some(message =>
-      message.parts.some(
-        part => part.type === "text" && isMagicSummaryPart(part),
-      ),
-    )
-  ) {
-    return null;
-  }
-  const capsule = renderCapsule(turn);
-  return countGptTokensWithinLimit(capsule, DETERMINISTIC_SUMMARY_MAX_TOKENS)
-    === null
-    ? null
-    : capsule;
+  return {
+    evidenceRefs,
+    requiredUnresolvedRefs: [...state.values()],
+    preservedFinalTextParts,
+    internalSourceIdentifiers: collectInternalSourceIdentifiers(turn),
+  };
 }
 
-function renderCapsule(turn: Turn): string {
-  const assistantTexts = collectAssistantTexts(turn);
-  const state = resolveTurnState(turn);
-  const lines = [
-    `Outcome: ${state.unresolved.size === 0 ? "completed" : "partial"}`,
-  ];
-
-  lines.push("Work:");
-  if (assistantTexts.length === 0) {
-    lines.push("- No eligible assistant text parts.");
-  } else {
-    for (const [index, text] of assistantTexts.entries()) {
-      lines.push(`- Assistant text ${index + 1} of ${assistantTexts.length}:`);
-      lines.push("```json");
-      lines.push(jsonString(text));
-      lines.push("```");
-    }
-  }
-
-  appendSection(lines, "Verification", state.verification);
-  appendSection(lines, "VCS", state.vcs);
-  appendSection(lines, "Unresolved", [...state.unresolved.values()]);
-  appendSection(
-    lines,
-    "Next",
-    [...state.unresolved.values()].flatMap(item =>
-      item.next === null ? [] : [{ text: item.next, next: null }],
+function turnContainsMagicSummary(turn: Turn): boolean {
+  return [...turn.user, ...turn.assistants].some(message =>
+    message.parts.some(
+      part => part.type === "text" && isMagicSummaryPart(part),
     ),
   );
-
-  return lines.join("\n");
 }
 
-function appendSection(
-  lines: string[],
-  label: "Verification" | "VCS" | "Unresolved" | "Next",
-  items: Array<{ text: string }>,
-): void {
-  if (items.length === 0) return;
-  lines.push(`${label}:`);
-  for (const item of items) {
-    lines.push(`- ${item.text}`);
-  }
-}
-
-function collectAssistantTexts(turn: Turn): string[] {
-  const texts: string[] = [];
-  for (const assistant of turn.assistants) {
-    for (const part of assistant.parts) {
-      if (!isEligibleAssistantText(part)) continue;
-      if (part.text.length === 0) continue;
-      texts.push(part.text);
+function collectEvidenceRefs(turn: Turn): string[] {
+  const refs: string[] = [];
+  const seen = new Set<string>();
+  for (const message of [...turn.user, ...turn.assistants]) {
+    addEvidenceRef(refs, seen, "msg", message.info.id);
+    for (const part of message.parts) {
+      addEvidenceRef(refs, seen, "part", part.id);
     }
   }
-  return texts;
+  return refs;
+}
+
+function addEvidenceRef(
+  refs: string[],
+  seen: Set<string>,
+  namespace: "msg" | "part",
+  id: unknown,
+): void {
+  if (typeof id !== "string" || id.length === 0) {
+    throw new Error("Candidate trace contains an invalid source identifier.");
+  }
+  const ref = `${namespace}:${id}`;
+  if (seen.has(ref)) {
+    throw new Error("Candidate trace contains a duplicate namespaced ref.");
+  }
+  seen.add(ref);
+  refs.push(ref);
+}
+
+function collectInternalSourceIdentifiers(turn: Turn): string[] {
+  const identifiers = new Set<string>();
+  const add = (value: unknown) => {
+    if (typeof value === "string" && value.length > 0) identifiers.add(value);
+  };
+  for (const message of [...turn.user, ...turn.assistants]) {
+    const info = message.info as unknown as Record<string, unknown>;
+    add(info["id"]);
+    add(info["sessionID"]);
+    if (message.info.role === "assistant") add(info["parentID"]);
+    for (const part of message.parts) {
+      const record = part as unknown as Record<string, unknown>;
+      add(record["id"]);
+      add(record["sessionID"]);
+      add(record["messageID"]);
+      if (part.type === "tool") add(record["callID"]);
+    }
+  }
+  return [...identifiers];
+}
+
+function isSubstantiveText(value: string): boolean {
+  return value.trim().length > 0 && /[\p{L}\p{N}]/u.test(value);
 }
 
 function isEligibleAssistantText(part: Part): part is TextPart {
@@ -126,171 +129,69 @@ function isMagicSummaryPart(part: TextPart): boolean {
   return isRecord(magicCompact) && magicCompact["summary"] === true;
 }
 
-function resolveTurnState(turn: Turn): {
-  verification: Observation[];
-  vcs: Observation[];
-  unresolved: Map<string, CurrentUnresolved>;
-} {
-  const verificationByKey = new Map<string, Observation>();
-  const vcsByKey = new Map<string, Observation>();
-  const unresolved = new Map<string, CurrentUnresolved>();
-  let order = 0;
+function messageEvidenceRef(message: MessageWithParts): string {
+  return `msg:${message.info.id}`;
+}
+
+function partEvidenceRef(part: Part): string {
+  return `part:${part.id}`;
+}
+
+function resolveTurnState(turn: Turn): Map<string, string> {
+  const unresolved = new Map<string, string>();
 
   for (const assistant of turn.assistants) {
-    order = applyAssistantStatus(assistant, unresolved, order);
+    applyAssistantStatus(assistant, unresolved);
     for (const part of assistant.parts) {
       if (part.type !== "tool") continue;
       const observation = observeTool(part);
-      order += 1;
-      if (
-        observation.section === "Verification"
-        && observation.state === "success"
-      ) {
-        if (observation.key !== null)
-          verificationByKey.set(observation.key, observation);
-      } else if (
-        observation.section === "VCS"
-        && observation.state === "success"
-      ) {
-        if (observation.key !== null)
-          vcsByKey.set(observation.key, observation);
-      }
       if (observation.state === "success") {
         if (observation.key !== null) unresolved.delete(observation.key);
         continue;
       }
-      const key = observation.key ?? `unscoped:${order}`;
-      unresolved.set(key, {
-        text: observation.text,
-        next: observation.next,
-      });
+      unresolved.set(observation.key ?? observation.ref, observation.ref);
     }
   }
 
-  return {
-    verification: [...verificationByKey.values()],
-    vcs: [...vcsByKey.values()],
-    unresolved,
-  };
+  return unresolved;
 }
 
 function applyAssistantStatus(
   assistant: MessageWithParts,
-  unresolved: Map<string, CurrentUnresolved>,
-  order: number,
-): number {
+  unresolved: Map<string, string>,
+): void {
   const info = assistant.info as unknown as Record<string, unknown>;
   if (info["error"] !== undefined) {
-    unresolved.set("assistant-message", {
-      text: `assistant message ${assistant.info.id} errored: ${inlineText(formatValue(info["error"]))}`,
-      next: null,
-    });
-    return order + 1;
+    unresolved.set("assistant-message", messageEvidenceRef(assistant));
+    return;
   }
-  if (info["finish"] !== undefined) {
-    unresolved.delete("assistant-message");
-  }
-  return order;
+  if (info["finish"] !== undefined) unresolved.delete("assistant-message");
 }
 
 function observeTool(part: ToolPart): Observation {
+  const ref = partEvidenceRef(part);
   const command = sourceCommand(part);
-  const context = executionContext(part);
-  const key = semanticKey(part, command, context);
-  const label = toolLabel(part, command);
+  const key = semanticKey(part, command, executionContext(part));
   const structured = sourceStructuredResult(part);
-  if (structured.kind === "success") {
-    return {
-      key,
-      state: "success",
-      section: isVcsCommand(command) ? "VCS" : "Verification",
-      text: structured.text,
-      next: null,
-    };
-  }
+  if (structured.kind === "success") return { ref, key, state: "success" };
   if (structured.kind === "unresolved") {
-    return {
-      key,
-      state: "unresolved",
-      section: "Unresolved",
-      text: structured.text,
-      next: structured.next,
-    };
+    return { ref, key, state: "unresolved" };
   }
-
   if (part.state.status !== "completed") {
-    return {
-      key,
-      state: "unresolved",
-      section: "Unresolved",
-      text: `${label} is ${part.state.status}${toolError(part)}`,
-      next: null,
-    };
+    return { ref, key, state: "unresolved" };
   }
 
   const exit = exitMetadata(part);
-  if (exit.kind === "invalid") {
-    return {
-      key,
-      state: "unresolved",
-      section: "Unresolved",
-      text: `${label} has invalid exit metadata`,
-      next: null,
-    };
-  }
+  if (exit.kind === "invalid") return { ref, key, state: "unresolved" };
   const verification = classifyVerification(part.state.output, command);
-  if (verification === "failed") {
-    return {
-      key,
-      state: "unresolved",
-      section: "Unresolved",
-      text: `${label} failed: ${inlineText(formatValue(part.state.output))}`,
-      next: null,
-    };
-  }
+  if (verification === "failed") return { ref, key, state: "unresolved" };
   if (verification === "not-run") {
-    return {
-      key: null,
-      state: "unresolved",
-      section: "Unresolved",
-      text: `${label} did not run: ${inlineText(formatValue(part.state.output))}`,
-      next: null,
-    };
+    return { ref, key: null, state: "unresolved" };
   }
   if (exit.kind === "valid" && exit.code !== 0) {
-    return {
-      key,
-      state: "unresolved",
-      section: "Unresolved",
-      text: `${label} exited ${exit.code}`,
-      next: null,
-    };
+    return { ref, key, state: "unresolved" };
   }
-  if (verification === "passed") {
-    return {
-      key,
-      state: "success",
-      section: "Verification",
-      text: `${label} passed: ${inlineText(formatValue(part.state.output))}`,
-      next: null,
-    };
-  }
-  if (isVcsCommand(command)) {
-    return {
-      key,
-      state: "success",
-      section: "VCS",
-      text: `${label} completed`,
-      next: null,
-    };
-  }
-  return {
-    key,
-    state: "success",
-    section: "Verification",
-    text: `${label} completed`,
-    next: null,
-  };
+  return { ref, key, state: "success" };
 }
 
 function sourceStructuredResult(part: ToolPart): StructuredResult {
@@ -300,16 +201,14 @@ function sourceStructuredResult(part: ToolPart): StructuredResult {
   ) {
     return { kind: "none" };
   }
-  const output = part.state.output;
-  const parsed = parseWholeJsonValue(output);
-  if (parsed === undefined) return { kind: "none" };
-  if (!isPlainRecord(parsed)) return { kind: "none" };
+  const parsed = parseWholeJsonValue(part.state.output);
+  if (parsed === undefined || !isPlainRecord(parsed)) return { kind: "none" };
 
   const hasOk = hasOwn(parsed, "ok");
   const hasSuccess = hasOwn(parsed, "success");
   const hasStatus = hasOwn(parsed, "status");
   if (!hasOk && !hasSuccess && !hasStatus) return { kind: "none" };
-  const malformed = () => invalidStructuredResult(part, output);
+  const malformed = (): StructuredResult => ({ kind: "unresolved" });
   if (!isFiniteJsonValue(parsed)) return malformed();
 
   const ok = parsed["ok"];
@@ -351,51 +250,33 @@ function sourceStructuredResult(part: ToolPart): StructuredResult {
   if (failureSignal || unresolvedStatus) {
     if (status === "blocked" && !details.hasBlocker) return malformed();
     if (details.reason === null) return malformed();
-    return {
-      kind: "unresolved",
-      text: `${toolLabel(part, sourceCommand(part))} ${unresolvedStatus ? status : "failed"}: ${details.reason}`,
-      next: details.next,
-    };
+    return { kind: "unresolved" };
   }
   if (successSignal || successfulStatus) {
     if (details.hasBlocker || details.hasError) return malformed();
-    return {
-      kind: "success",
-      text: `${toolLabel(part, sourceCommand(part))} completed`,
-    };
+    return { kind: "success" };
   }
   return malformed();
 }
 
-function invalidStructuredResult(
-  part: ToolPart,
-  value: unknown,
-): StructuredResult {
-  return {
-    kind: "unresolved",
-    text: `${toolLabel(part, sourceCommand(part))} returned malformed structured result: ${formatValue(value)}`,
-    next: null,
-  };
-}
-
 function structuredDetails(value: Record<string, unknown>): {
   reason: string | null;
-  next: string | null;
   hasBlocker: boolean;
   hasError: boolean;
 } | null {
   const hasBlocker = hasOwn(value, "blocker");
   const hasError = hasOwn(value, "error");
   let blockerReason: string | null = null;
-  let recommendation: string | null = null;
   const blocker = value["blocker"];
   if (hasBlocker) {
     if (!isPlainRecord(blocker)) return null;
     blockerReason = nonEmptyString(blocker["reason"]);
     if (blockerReason === null) return null;
-    if (hasOwn(blocker, "recommendation")) {
-      recommendation = nonEmptyString(blocker["recommendation"]);
-      if (recommendation === null) return null;
+    if (
+      hasOwn(blocker, "recommendation")
+      && nonEmptyString(blocker["recommendation"]) === null
+    ) {
+      return null;
     }
   }
 
@@ -409,15 +290,14 @@ function structuredDetails(value: Record<string, unknown>): {
     }
     if (errorReason === null) return null;
   }
-
-  let next: string | null = null;
-  if (hasOwn(value, "nextAction")) {
-    next = nonEmptyString(value["nextAction"]);
-    if (next === null) return null;
+  if (
+    hasOwn(value, "nextAction")
+    && nonEmptyString(value["nextAction"]) === null
+  ) {
+    return null;
   }
   return {
     reason: blockerReason ?? errorReason,
-    next: next ?? recommendation,
     hasBlocker,
     hasError,
   };
@@ -466,9 +346,14 @@ function isFiniteJsonValue(
   if (ancestors.has(value)) return false;
   if (!Array.isArray(value) && !isPlainRecord(value)) return false;
   ancestors.add(value);
-  const valid = (Array.isArray(value) ? value : Object.values(value)).every(
-    item => isFiniteJsonValue(item, ancestors),
-  );
+  let items: unknown[];
+  try {
+    items = Array.isArray(value) ? value : Object.values(value);
+  } catch {
+    ancestors.delete(value);
+    return false;
+  }
+  const valid = items.every(item => isFiniteJsonValue(item, ancestors));
   ancestors.delete(value);
   return valid;
 }
@@ -487,7 +372,16 @@ function classifyVerification(
   command: string | null,
 ): VerificationState {
   if (!isVerificationCommand(command)) return "unknown";
-  const text = typeof output === "string" ? output : JSON.stringify(output);
+  let text: string | undefined;
+  if (typeof output === "string") {
+    text = output;
+  } else {
+    try {
+      text = JSON.stringify(output);
+    } catch {
+      return "unknown";
+    }
+  }
   if (!text) return "unknown";
   const counts = verificationCounts(text);
   if (counts.failed > 0 || counts.errors > 0) return "failed";
@@ -657,60 +551,4 @@ function isVerificationCommand(command: string | null): boolean {
       command,
     )
   );
-}
-
-function isVcsCommand(command: string | null): boolean {
-  return command !== null && /^git\s+/i.test(command);
-}
-
-function toolLabel(part: ToolPart, command: string | null): string {
-  return command === null ? part.tool : `${part.tool} \`${command}\``;
-}
-
-function toolError(part: ToolPart): string {
-  if (part.state.status !== "error") return "";
-  const error = formatValue(part.state.error);
-  return error ? `: ${inlineText(error)}` : "";
-}
-
-function formatValue(value: unknown): string {
-  if (typeof value === "string") return value;
-  try {
-    const serialized = JSON.stringify(value);
-    if (serialized !== undefined && isFiniteJsonValue(value)) return serialized;
-  } catch {
-    return inspect(value, {
-      depth: null,
-      breakLength: Infinity,
-      compact: true,
-    });
-  }
-  return inspect(value, { depth: null, breakLength: Infinity, compact: true });
-}
-
-function inlineText(value: string): string {
-  return value.replace(/\s+/g, " ").trim();
-}
-
-function jsonString(value: string): string {
-  const serialized = JSON.stringify(value);
-  if (serialized === undefined) {
-    throw new Error("Assistant text is not JSON-serializable.");
-  }
-  return escapeInvalidCodePoints(serialized);
-}
-
-function escapeInvalidCodePoints(value: string): string {
-  let result = "";
-  for (const character of value) {
-    const codePoint = character.codePointAt(0)!;
-    if (PROVIDER_SAFE_CODE_POINT(codePoint)) {
-      result += character;
-      continue;
-    }
-    for (let index = 0; index < character.length; index += 1) {
-      result += `\\u${character.charCodeAt(index).toString(16).padStart(4, "0")}`;
-    }
-  }
-  return result;
 }

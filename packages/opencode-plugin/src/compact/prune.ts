@@ -88,10 +88,12 @@ export async function pruneSummarizedTurns(
 export async function createPruneProjection(
   turns: Turn[],
   sessionID: string,
+  options: { preserveAssistantPartIDs?: Iterable<string> } = {},
 ): Promise<PruneProjection> {
   assertNoNativeArtifacts(turns);
   const projected = structuredClone(turns);
   const mutations: PruneMutation[] = [];
+  const preservedAssistantPartIDs = new Set(options.preserveAssistantPartIDs);
 
   for (const turn of projected) {
     for (const user of turn.user) {
@@ -119,6 +121,8 @@ export async function createPruneProjection(
       const partMutations: PruneMutation[] = [];
       for (const part of assistant.parts) {
         if (isSummaryPart(part)) {
+          kept.push(part);
+        } else if (preservedAssistantPartIDs.has(part.id)) {
           kept.push(part);
         } else if (part.type === "tool") {
           const partOmissions: PlannedOmission[] = [];

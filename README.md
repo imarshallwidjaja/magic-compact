@@ -10,13 +10,13 @@ Lossless context compression for OpenCode.
 
 OpenCode's built-in compaction replaces an entire conversation with one summary blob. The user messages, the assistant's reasoning, tool calls, design decisions, and workflow are all flattened into a generic template (Goal, Progress, Key Decisions...). The agent wakes up with amnesia, forced to reconstruct its working state from an abstraction that captured a fraction of what mattered.
 
-Magic Compact takes a different approach: preserve the conversation skeleton, encode each eligible old assistant turn in its own deterministic capsule, and keep omitted tool I/O retrievable. Required assistant text remains exact and mechanically recoverable instead of being sampled away.
+Magic Compact takes a different approach: preserve the conversation skeleton, ask a hidden deny-all summarizer to write one capsule per eligible old assistant turn from the complete turn trace, and keep omitted tool I/O retrievable. Safety comes from full-trace inputs, strict result validation, exact profitability projection, source revalidation, and rollback.
 
 ## How
 
-Instead of collapsing an entire session into a single generic summary, Magic Compact replaces old assistant turns with deterministic extractive capsules while leaving user messages and tool calls in place.
+Instead of collapsing an entire session into a single generic summary, Magic Compact replaces old assistant turns with validated per-turn agentic capsules while leaving user messages and tool calls in place.
 
-Exact user messages remain in context. Every eligible assistant text part in a selected turn is represented code-unit-exact in source order inside the capsule. Structured tool state determines `Outcome: completed` or `Outcome: partial`; reasoning remains removable; tool call skeletons stay visible; only tool input/output bytes are cached for `read_omitted_content`. If the exact assistant text plus required unresolved structured state cannot fit the 2,048-token safety ceiling, that turn is left message- and part-identical.
+Exact user messages remain in context. For each candidate turn, Magic Compact sends one complete untruncated ordered trace to a hidden scratch session: user messages, assistant text/reasoning/subtask/file/patch/snapshot parts, tool names, inputs, statuses, outputs, errors, MCP calls, and stable record refs. The model returns a canonical JSON result that is host-framed as `Outcome: <Human Status> — <outcome>` followed by `Process:` and readable Markdown. Required unresolved refs from structured tool state, assistant errors, and narrow Hive/task terminal failures must remain unresolved, and completed or analysis-only capsules cannot carry unresolved refs. Tool call skeletons stay visible; only tool input/output bytes are cached for `read_omitted_content`.
 
 <p align="center">
   <img src=".github/assets/visualization.png" alt="Compaction Comparison" />
@@ -25,12 +25,12 @@ Exact user messages remain in context. Every eligible assistant text part in a s
 ## Features
 
 - Lossless boundary — Preserve exact user messages, native checkpoint safety, required failure/not-run/unresolved evidence, and retrievable omitted tool I/O instead of flattening history into one recap.
-- Zero compaction overhead — Compaction happens once on your command rather than during the agentic loop. Maximum token savings, minimal cache invalidations.
+- On-demand compaction overhead — Model summarization happens only when you run `/magic-compact`, not during the normal agentic loop.
 - Preserved user messages — Exact requirements and guidance remain visible to the agent, verbatim.
 - Smart tool call pruning — Bulky completed tool I/O is replaced with omission notices, with original content cached and retrievable on demand via `read_omitted_content`.
 - Recompactable — Run `/magic-compact` again later to compact new turns while preserving prior summaries.
 - Trim without summarizing — OpenCode can prune historical tool I/O with `/magic-trim` while preserving assistant responses.
-- Deterministic capsules — Compaction makes zero model requests. `Work:` contains every substantive non-synthetic non-Magic-summary assistant text part across every assistant message in the selected turn, encoded as provider-safe JSON strings that recover the exact JavaScript code units with `JSON.parse`. `Verification`, `VCS`, `Unresolved`, and `Next` contain only canonical structured tool evidence and allowlisted Hive/task result schemas.
+- Agentic capsules — Replaces each old assistant turn with one plain-language `Outcome:`/`Process:` capsule written by a hidden model request from the complete turn trace. Unresolved or failed work stays visible; contradictory, incomplete, or unsafe summaries abort unchanged instead of replacing history.
 - Useful-savings gate — A turn is replaced only when its exact projected replacement (summary plus the same planned pruning) is strictly smaller than the turn's exact source. Net-negative turns stay byte-identical. If the projected result cannot save at least 20% of the selected profitable turns' eligible removable content, Magic Compact fails unchanged before backup, mutation, or a stats increment instead of claiming weak savings.
 
 ## Installation
@@ -104,7 +104,7 @@ Kept:
 
 Removed or condensed:
 
-- Assistant reasoning, text, and step markers — replaced by the per-turn summary
+- Assistant reasoning, non-preserved text, and step markers — replaced by the per-turn capsule
 - Most synthetic/injected messages (file expansions, plan reminders, prior compaction notices, etc.)
 - Bulky completed tool I/O — replaced with an omission notice pointing to the cache
 
@@ -131,11 +131,11 @@ Magic Compact Offers:
 
 - Simplicity — One command, zero configuration.
 - Lossless quality — Turn-by-turn flow stays intact. All user commands are preserved. All past tool calls are preserved.
-- Maximum token savings — The old assistant prose is represented once in a local capsule, reasoning is removed, and long completed tool I/O is aggressively pruned. Net-negative or over-cap turns remain unchanged.
+- Maximum token savings — Old assistant prose is represented once in a validated per-turn capsule, reasoning is removed, and long completed tool I/O is aggressively pruned. Net-negative turns remain unchanged.
 - No cache churn — Compaction happens once and is cache friendly, whereas DCP may invalidate entire conversations multiple times within one request.
 - Zero assistant overhead — No prompt injections asking the assistant to compact. Your assistant stay focused on its task.
 
-If you want model-driven compaction with increased cache invalidations and token burn, consider using DCP instead.
+If you want runtime model-driven compaction initiated by the assistant rather than explicit user-driven compaction, consider using DCP instead.
 
 ## Vs Magic Context (OpenCode)
 
@@ -146,7 +146,7 @@ Magic Compact Offers:
 - Efficiency — One explicit compaction command, no background summarization loop, no always-on memory RAG, and no recurring prompt injections.
 - Lower token burn — Context reduction happens once on demand instead of continuously consuming tokens across every turn.
 - Fewer cache invalidations — The session is rewritten once, then stays stable, instead of repeatedly re-rendering volatile background state.
-- Lossless conversation shape — User messages stay verbatim, tool structure is preserved, all eligible assistant text is recoverable from the capsule, and omitted tool I/O remains retrievable. Assistant prose is never stored in the omission cache.
+- Lossless conversation shape — User messages stay verbatim, tool structure is preserved, required unresolved state is validated, preserve-mode final responses can stay exact, and omitted tool I/O remains retrievable. Assistant prose is never stored in the omission cache.
 - Focused compaction — The plugin does one job: compress the conversation without turning the runtime into a memory subsystem.
 
 If you want a lightweight, user-driven compaction tool with minimal ongoing overhead, Magic Compact is the better fit. If you want a full long-term memory system with background maintenance, Magic Context is the heavier alternative.
