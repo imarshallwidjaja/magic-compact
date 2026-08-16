@@ -16,7 +16,7 @@ Magic Compact takes a different approach: preserve the conversation skeleton, as
 
 Instead of collapsing an entire session into a single generic summary, Magic Compact replaces old assistant turns with validated per-turn agentic capsules while leaving user messages and tool calls in place.
 
-Exact user messages remain in context. For each candidate turn, Magic Compact sends one complete untruncated ordered trace to a hidden scratch session: user messages, assistant text/reasoning/subtask/file/patch/snapshot parts, tool names, inputs, statuses, outputs, errors, MCP calls, and stable record refs. The model returns a canonical JSON result that is host-framed as `Outcome: <Human Status> — <outcome>` followed by `Process:` and readable Markdown. Required unresolved refs from structured tool state, assistant errors, and narrow Hive/task terminal failures must remain unresolved, and completed or analysis-only capsules cannot carry unresolved refs. Tool call skeletons stay visible; only tool input/output bytes are cached for `read_omitted_content`.
+Exact user messages remain in context. For each candidate turn, Magic Compact sends one complete untruncated ordered trace to a hidden scratch session: user messages, assistant text/reasoning/subtask/file/patch/snapshot parts, tool names, inputs, statuses, outputs, errors, MCP calls, and stable record refs. Oversized inline `data:` images in a candidate turn are redacted from that text trace and attached once as real image inputs to the same configured compaction model; every image requires substantive visual coverage. The model returns a canonical JSON result that is host-framed as `Outcome: <Human Status> — <outcome>` followed by `Process:` and readable Markdown. Required unresolved refs from structured tool state, assistant errors, and narrow Hive/task terminal failures must remain unresolved, and completed or analysis-only capsules cannot carry unresolved refs. Tool call skeletons stay visible; only tool input/output bytes are cached for `read_omitted_content`.
 
 <p align="center">
   <img src=".github/assets/visualization.png" alt="Compaction Comparison" />
@@ -31,6 +31,8 @@ Exact user messages remain in context. For each candidate turn, Magic Compact se
 - Recompactable — Run `/magic-compact` again later to compact new turns while preserving prior summaries.
 - Trim without summarizing — OpenCode can prune historical tool I/O with `/magic-trim` while preserving assistant responses.
 - Agentic capsules — Replaces each old assistant turn with one plain-language `Outcome:`/`Process:` capsule written by a hidden model request from the complete turn trace. Unresolved or failed work stays visible; contradictory, incomplete, or unsafe summaries abort unchanged instead of replacing history.
+- Media-aware capsules — When the aggregate canonical contribution of inline `data:` `image/*` parts in one candidate turn crosses a conservative internal threshold, all inline images in that turn are attached to the configured compaction model and summarized as one cohort. The model must explicitly support image input; there is no provider/model fallback and no public threshold setting.
+- Lossless media persistence — Original user file parts and exact `file.url` data remain untouched in the source, backup, API, and exports. Accepted capsules carry a versioned part-ID/MIME/SHA-256 manifest. OpenCode's transient message-transform hook replaces only exact manifest matches with declarative placeholders for future model requests; missing manifests do nothing and mismatches fail closed.
 - Useful-savings gate — A turn is replaced only when its exact projected replacement (summary plus the same planned pruning) is strictly smaller than the turn's exact source. Net-negative turns stay byte-identical. If the projected result cannot save at least 20% of the selected profitable turns' eligible removable content, Magic Compact fails unchanged before backup, mutation, or a stats increment instead of claiming weak savings.
 
 ## Installation
@@ -81,9 +83,9 @@ Examples:
 
 ### `/magic-stats`
 
-Run `/magic-stats` to show cumulative token savings for the current conversation: tokens pruned, cached tokens saved, estimated money saved, among other statistics.
+Run `/magic-stats` to show cumulative token savings for the current conversation. Net tokens physically pruned and inline-image tokens projected out of model requests are persisted and reported separately, as are their subsequent cache-read savings.
 
-Reported token counts are canonical active-content estimates, not provider usage. They include model-facing synthetic content such as the compaction boundary, exclude ignored user reporting notices including the notice that displays the count, and include ignored assistant text. OpenCode's context meter is a provider usage snapshot and can remain stale after in-place compaction until a later assistant response refreshes it. Magic Compact never mutates provider usage metadata or fabricates an after-provider count.
+Reported token counts are canonical active-content estimates, not provider usage. Model-facing before/after counts use the same pure manifest projection as OpenCode's request transform, include model-facing synthetic content such as the compaction boundary, exclude ignored user reporting notices including the notice that displays the count, and include ignored assistant text. OpenCode's context meter is a provider usage snapshot and can remain stale after in-place compaction until a later assistant response refreshes it. Magic Compact never mutates provider usage metadata or fabricates an after-provider count.
 
 ### The Omitted Content Tool
 
@@ -98,6 +100,7 @@ During `/magic-compact`, pruning applies only to summarized turns. `/magic-trim 
 Kept:
 
 - User messages (verbatim)
+- User file parts and exact inline image URLs (verbatim in persistence; accepted manifest-covered images are projected only from future model requests)
 - Per-turn summaries
 - Tool calls (structure preserved)
 - Selected high-value synthetic messages (shell wrappers, background task results, working-directory change reminders)

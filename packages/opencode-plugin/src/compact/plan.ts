@@ -107,7 +107,7 @@ async function loadMessages(
   );
 }
 
-function buildTurns(messages: MessageWithParts[]): Turn[] {
+export function buildTurns(messages: MessageWithParts[]): Turn[] {
   const turns: Turn[] = [];
   let currentTurn: Turn | null = null;
 

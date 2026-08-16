@@ -14,6 +14,8 @@ import { STATS_SUCCESS, executeMagicStats } from "./magic-stats";
 import { TRIM_NOOP, TRIM_SUCCESS, executeMagicTrim } from "./magic-trim";
 import { omissionReadDiagnostic, readOmittedContent } from "./storage/omission";
 import { handleStatsEvent } from "./stats/events";
+import { projectManifestCoveredMedia } from "./compact/media";
+import type { MessageWithParts } from "./compact/plan";
 
 const COMPACT_COMMAND = "magic-compact";
 const TRIM_COMMAND = "magic-trim";
@@ -88,6 +90,12 @@ const server: Plugin = async input => {
         );
         throw new Error(didTrim ? TRIM_SUCCESS : TRIM_NOOP);
       }
+    },
+    "experimental.chat.messages.transform": async (_input, output) => {
+      const projected = projectManifestCoveredMedia(
+        output.messages as unknown as MessageWithParts[],
+      ) as unknown as typeof output.messages;
+      output.messages.splice(0, output.messages.length, ...projected);
     },
     event: async input => {
       await handleStatsEvent(input.event);

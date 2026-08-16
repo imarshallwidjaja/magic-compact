@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 import type { Part } from "@opencode-ai/sdk/v2";
 import { countTokens } from "gpt-tokenizer";
 import { unwrap, type V2Client } from "../api";
+import { projectManifestCoveredMedia } from "../compact/media";
 import type { MessageWithParts } from "../compact/plan";
 
 const PINNED_GPT_TOKENIZER_VERSION = "3.4.0";
@@ -101,10 +102,34 @@ export async function countSessionTokens(
   v2: V2Client,
   sessionID: string,
 ): Promise<number> {
+  return (await countSessionTokenProjection(v2, sessionID)).tokens;
+}
+
+export async function countSessionTokenProjection(
+  v2: V2Client,
+  sessionID: string,
+): Promise<ModelFacingTokenCount> {
   const messages = unwrap(
     await v2.session.messages({ sessionID }),
   ) as MessageWithParts[];
-  return countCanonicalContentTokens(messages);
+  return countModelFacingContentTokens(messages);
+}
+
+export type ModelFacingTokenCount = {
+  tokens: number;
+  projectedMediaTokens: number;
+};
+
+export function countModelFacingContentTokens(
+  messages: MessageWithParts[],
+): ModelFacingTokenCount {
+  const projectedMessages = projectManifestCoveredMedia(messages);
+  const persistedTokens = countCanonicalContentTokens(messages);
+  const tokens = countCanonicalContentTokens(projectedMessages);
+  return {
+    tokens,
+    projectedMediaTokens: persistedTokens - tokens,
+  };
 }
 
 export function countCanonicalContentTokens(

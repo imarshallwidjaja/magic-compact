@@ -216,11 +216,15 @@ export async function recordPruningStats(input: {
   sessionID: string;
   sourceSessionID: string;
   tokensPruned: number;
+  mediaTokensProjected?: number;
 }): Promise<ConversationStats> {
   const stats = await copyStats(input.sourceSessionID, input.sessionID);
   const nextStats = {
     ...stats,
     totalTokensPruned: stats.totalTokensPruned + input.tokensPruned,
+    mediaTokensProjected:
+      input.mediaTokensProjected ?? stats.mediaTokensProjected ?? 0,
+    cachedMediaTokensSaved: stats.cachedMediaTokensSaved ?? 0,
   };
 
   await writeStats(input.sessionID, nextStats);

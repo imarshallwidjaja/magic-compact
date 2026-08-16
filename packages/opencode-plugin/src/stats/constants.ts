@@ -26,7 +26,8 @@ export function statsSummaryMessage(
 
   return `
 Magic Compact      | ${compactionCount} compactions performed
-Conversation Stats | Tokens pruned (canonical active content): ~${formatTokenCount(stats.totalTokensPruned)} | Total cache reads saved: ~${formatTokenCount(stats.cachedTokensSaved)} tokens
+Conversation Stats | Total tokens pruned: ~${formatTokenCount(stats.totalTokensPruned)} (Tokens physically pruned, net canonical active content) | Inline image tokens projected: ~${formatTokenCount(stats.mediaTokensProjected ?? 0)} per model request
+Cache Savings      | Physical cache reads saved: ~${formatTokenCount(stats.cachedTokensSaved)} tokens | Projected-media cache reads saved: ~${formatTokenCount(stats.cachedMediaTokensSaved ?? 0)} tokens
 Cost Savings       | ${moneySaved}
 Note               | ${PROVIDER_METER_NOTE}
 `.trim();
@@ -46,8 +47,9 @@ export function statsMessage(
 
   return `
 Magic Compaction #${compactionCount}
-Active Content (canonical estimate; ignored notice excluded) | ${formatTokenCount(beforeTokens)} → ${formatTokenCount(afterTokens)} tokens (${percent}% reduced) | ~${formatTokenCount(savedTokens)} tokens pruned
-Conversation Stats | Total tokens pruned (canonical active content): ~${formatTokenCount(stats.totalTokensPruned)} | Total cache reads saved: ~${formatTokenCount(stats.cachedTokensSaved)} tokens
+Model-facing Active Content (canonical estimate; ignored notice excluded) | ${formatTokenCount(beforeTokens)} → ${formatTokenCount(afterTokens)} tokens (${percent}% reduced) | ~${formatTokenCount(savedTokens)} tokens removed from model requests
+Conversation Stats | Total tokens pruned: ~${formatTokenCount(stats.totalTokensPruned)} (Tokens physically pruned, net canonical active content) | Inline image tokens projected: ~${formatTokenCount(stats.mediaTokensProjected ?? 0)} per model request
+Cache Savings      | Physical cache reads saved: ~${formatTokenCount(stats.cachedTokensSaved)} tokens | Projected-media cache reads saved: ~${formatTokenCount(stats.cachedMediaTokensSaved ?? 0)} tokens
 Cost Savings       | ${moneySaved}
 Note               | ${PROVIDER_METER_NOTE}
 `.trim();
@@ -66,8 +68,9 @@ export function trimStatsMessage(
 
   return `
 Magic Trim
-Active Content (canonical estimate; ignored notice excluded) | ${formatTokenCount(beforeTokens)} → ${formatTokenCount(afterTokens)} tokens (${percent}% reduced) | ~${formatTokenCount(savedTokens)} tokens pruned
-Conversation Stats | Total tokens pruned (canonical active content): ~${formatTokenCount(stats.totalTokensPruned)} | Total cache reads saved: ~${formatTokenCount(stats.cachedTokensSaved)} tokens
+Model-facing Active Content (canonical estimate; ignored notice excluded) | ${formatTokenCount(beforeTokens)} → ${formatTokenCount(afterTokens)} tokens (${percent}% reduced) | ~${formatTokenCount(savedTokens)} tokens removed from model requests
+Conversation Stats | Total tokens pruned: ~${formatTokenCount(stats.totalTokensPruned)} (Tokens physically pruned, net canonical active content) | Inline image tokens projected: ~${formatTokenCount(stats.mediaTokensProjected ?? 0)} per model request
+Cache Savings      | Physical cache reads saved: ~${formatTokenCount(stats.cachedTokensSaved)} tokens | Projected-media cache reads saved: ~${formatTokenCount(stats.cachedMediaTokensSaved ?? 0)} tokens
 Cost Savings       | ${moneySaved}
 Note               | ${PROVIDER_METER_NOTE}
 `.trim();
@@ -83,5 +86,7 @@ function moneySavedMessage(
     return `Cost savings unavailable: Model not supported: ${modelID}`;
   }
 
-  return `Est. cost saved (${modelID}): $${((stats.cachedTokensSaved / 1_000_000) * dollarsPerMillion).toFixed(4)}`;
+  const cachedTokens =
+    stats.cachedTokensSaved + (stats.cachedMediaTokensSaved ?? 0);
+  return `Est. cost saved (${modelID}): $${((cachedTokens / 1_000_000) * dollarsPerMillion).toFixed(4)}`;
 }

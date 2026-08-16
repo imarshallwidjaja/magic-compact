@@ -40,6 +40,8 @@ function applyAssistantMessageStats(
   return {
     ...stats,
     cachedTokensSaved: stats.cachedTokensSaved + stats.totalTokensPruned,
+    cachedMediaTokensSaved:
+      (stats.cachedMediaTokensSaved ?? 0) + (stats.mediaTokensProjected ?? 0),
     processedAssistantMessageIds: [
       ...stats.processedAssistantMessageIds,
       info.id,

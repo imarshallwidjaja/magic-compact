@@ -29,8 +29,9 @@ import {
   type PruneProjection,
 } from "./compact/prune";
 import {
-  countCanonicalContentTokens,
-  countSessionTokens,
+  countModelFacingContentTokens,
+  countSessionTokenProjection,
+  type ModelFacingTokenCount,
 } from "./stats/tokenize";
 import {
   BOUNDARY_METADATA,
@@ -100,7 +101,8 @@ export async function executeMagicCompact(
     );
     const currentCompactionCount = getCompactionCount(sourceSession) + 1;
     const sourceMessages = unwrap(await v2.session.messages({ sessionID }));
-    const beforeTokens = countCanonicalContentTokens(sourceMessages);
+    const before = countModelFacingContentTokens(sourceMessages);
+    const beforePhysicalTokens = before.tokens + before.projectedMediaTokens;
 
     await revalidateCompactionSource(v2, sessionID, sourcePlan);
 
@@ -135,12 +137,13 @@ export async function executeMagicCompact(
       sourcePlan,
       selection,
       sessionID,
-      beforeTokens,
+      before,
+      beforePhysicalTokens,
     );
-    const eligibleTokens = countCanonicalContentTokens(
+    const eligibleTokens = countModelFacingContentTokens(
       selection.turns.flatMap(turn => turn.assistants),
-    );
-    const projectedSavings = beforeTokens - projection.afterTokens;
+    ).tokens;
+    const projectedSavings = before.tokens - projection.afterTokens;
     const minimumSavings = Math.max(
       MINIMUM_USEFUL_SAVINGS_TOKENS,
       Math.ceil(eligibleTokens * MINIMUM_USEFUL_SAVINGS_RATIO),
@@ -185,25 +188,29 @@ export async function executeMagicCompact(
     await injectCompactStatsNotice(
       v2,
       sessionID,
-      beforeTokens,
+      before.tokens,
       projection.afterTokens,
       currentCompactionCount,
       projection.stats,
       sourceSession.model?.id ?? null,
     );
-    const afterTokens = await countSessionTokens(v2, sessionID);
-    if (afterTokens !== projection.afterTokens) {
+    const actual = await countSessionTokenProjection(v2, sessionID);
+    if (
+      actual.tokens !== projection.afterTokens
+      || actual.projectedMediaTokens !== projection.projectedMediaTokens
+    ) {
       throw new CompactionSourceDriftError(
         sessionID,
         backupSession.id,
         projection.afterTokens,
-        afterTokens,
+        actual.tokens,
       );
     }
     await recordPruningStats({
       sessionID,
       sourceSessionID: sessionID,
-      tokensPruned: beforeTokens - projection.afterTokens,
+      tokensPruned: projection.physicalTokensPruned,
+      mediaTokensProjected: projection.projectedMediaTokens,
     });
     compactedTurnCount = selection.turns.length;
   } catch (error) {
@@ -261,13 +268,14 @@ async function selectProfitableTurns(
     if (summary === undefined)
       throw new Error("Missing summary for assistant turn.");
     if (summary === null) continue;
-    const candidates = [injectProjectedSummary(turn, summary.text, sessionID)];
+    const candidates = [injectProjectedSummary(turn, summary, sessionID)];
     const pruning = await createPruneProjection(candidates, sessionID, {
       preserveAssistantPartIDs: summary.preservedPartIDs,
     });
     const projectedTurn = pruning.turns[0]!;
     if (
-      countTurnCanonicalTokens(projectedTurn) < countTurnCanonicalTokens(turn)
+      countTurnModelFacingTokens(projectedTurn)
+      < countTurnModelFacingTokens(turn)
     ) {
       selectedTurns.push(turn);
       selectedSummaries.push(summary);
@@ -284,20 +292,26 @@ async function selectProfitableTurns(
 
 function injectProjectedSummary(
   turn: Turn,
-  summary: string,
+  summary: Exclude<GeneratedCapsule, null>,
   sessionID: string,
 ): Turn {
   const projected = structuredClone(turn);
   const firstAssistant = projected.assistants[0];
   if (!firstAssistant) throw new Error("Turn missing assistant message.");
   firstAssistant.parts.push(
-    agenticCapsuleTextPart(firstAssistant.info.id, sessionID, summary),
+    agenticCapsuleTextPart(
+      firstAssistant.info.id,
+      sessionID,
+      summary.text,
+      summary.mediaManifest,
+    ),
   );
   return projected;
 }
 
-function countTurnCanonicalTokens(turn: Turn): number {
-  return countCanonicalContentTokens([...turn.user, ...turn.assistants]);
+function countTurnModelFacingTokens(turn: Turn): number {
+  return countModelFacingContentTokens([...turn.user, ...turn.assistants])
+    .tokens;
 }
 
 async function projectCompaction(
@@ -305,7 +319,8 @@ async function projectCompaction(
   plan: CompactionPlan,
   selection: CompactionSelection,
   sessionID: string,
-  beforeTokens: number,
+  before: ModelFacingTokenCount,
+  beforePhysicalTokens: number,
 ) {
   const messages = structuredClone(sourceMessages);
   const byID = new Map(messages.map(message => [message.info.id, message]));
@@ -346,13 +361,23 @@ async function projectCompaction(
   });
   if (appendedBoundary) projectedMessages.push(appendedBoundary);
   const existingStats = await readStats(sessionID);
-  const afterTokens = countCanonicalContentTokens(projectedMessages);
+  const after = countModelFacingContentTokens(projectedMessages);
+  const afterPhysicalTokens = after.tokens + after.projectedMediaTokens;
+  const physicalTokensPruned = beforePhysicalTokens - afterPhysicalTokens;
+  const newMediaTokensProjected =
+    after.projectedMediaTokens - before.projectedMediaTokens;
+  if (newMediaTokensProjected < 0) {
+    throw new Error("Magic Compact media projection unexpectedly decreased.");
+  }
   return {
-    afterTokens,
+    afterTokens: after.tokens,
+    projectedMediaTokens: after.projectedMediaTokens,
+    physicalTokensPruned,
     stats: nextConversationStats(
       existingStats,
       sessionID,
-      beforeTokens - afterTokens,
+      physicalTokensPruned,
+      after.projectedMediaTokens,
     ),
   };
 }
@@ -361,6 +386,7 @@ function nextConversationStats(
   current: ConversationStats | null,
   sessionID: string,
   tokensPruned: number,
+  projectedMediaTokens: number,
 ): ConversationStats {
   return {
     version: 1,
@@ -368,6 +394,8 @@ function nextConversationStats(
     rootSessionId: current?.rootSessionId ?? sessionID,
     totalTokensPruned: (current?.totalTokensPruned ?? 0) + tokensPruned,
     cachedTokensSaved: current?.cachedTokensSaved ?? 0,
+    mediaTokensProjected: projectedMediaTokens,
+    cachedMediaTokensSaved: current?.cachedMediaTokensSaved ?? 0,
     processedAssistantMessageIds: current?.processedAssistantMessageIds ?? [],
   };
 }

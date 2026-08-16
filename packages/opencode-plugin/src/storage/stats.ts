@@ -8,6 +8,8 @@ const ConversationStatsSchema = z.object({
   rootSessionId: z.string(),
   totalTokensPruned: z.number(),
   cachedTokensSaved: z.number(),
+  mediaTokensProjected: z.number().optional(),
+  cachedMediaTokensSaved: z.number().optional(),
   processedAssistantMessageIds: z.array(z.string()),
 });
 
@@ -25,6 +27,8 @@ function createEmptyStats(input: {
     rootSessionId: input.rootSessionID,
     totalTokensPruned: 0,
     cachedTokensSaved: 0,
+    mediaTokensProjected: 0,
+    cachedMediaTokensSaved: 0,
     processedAssistantMessageIds: [],
   };
 }

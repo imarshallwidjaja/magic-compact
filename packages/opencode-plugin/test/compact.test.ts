@@ -1,9 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runInNewContext } from "node:vm";
 import type { Config, PluginInput } from "@opencode-ai/plugin";
+import type { AssistantMessage, Event } from "@opencode-ai/sdk";
 import type {
   Message,
   Part,
@@ -15,6 +17,7 @@ import type { V2Client } from "../src/api";
 import {
   generateCompactionCapsules,
   injectSummaries,
+  INLINE_IMAGE_TOKEN_THRESHOLD,
   type AgenticCapsuleResult,
   type CapsuleGenerationOptions,
 } from "../src/compact/compact";
@@ -35,6 +38,7 @@ import {
 } from "../src/compact/plan";
 import { applyBackup, createBackup } from "../src/compact/session";
 import { COMPACT_NOOP, executeMagicCompact } from "../src/magic-compact";
+import { executeMagicStats } from "../src/magic-stats";
 import server from "../src/index";
 import {
   allocateOmission,
@@ -45,7 +49,10 @@ import {
 } from "../src/storage/omission";
 import { deleteStats, readStats, writeStats } from "../src/storage/stats";
 import { statsMessage } from "../src/stats/constants";
-import { countCanonicalContentTokens } from "../src/stats/tokenize";
+import {
+  countCanonicalContentTokens,
+  countGptTokens,
+} from "../src/stats/tokenize";
 import { incidentSemanticSessionFixture } from "./fixtures/incident-session";
 
 let storageDirectory: string;
@@ -4092,6 +4099,528 @@ describe("magic compact", () => {
       injectSummaries(requests.v2, "source", plan.summarizedTurns, []),
     ).rejects.toThrow("Missing summary");
   });
+
+  test("activates media above the aggregate threshold and attaches the full image cohort once", async () => {
+    const boundaryURL = inlineImageDataURL(1_129, 1);
+    expect(countGptTokens(boundaryURL)).toBe(INLINE_IMAGE_TOKEN_THRESHOLD);
+    const boundary = await generatedAgenticCandidate(
+      mediaCandidateTurn("media-boundary", [boundaryURL]),
+      { modelResults: [modelResult()] },
+    );
+    expect(
+      promptFileParts(boundary.requests.scratchPrompts[0]!.request),
+    ).toEqual([]);
+    expect(boundary.requests.scratchPrompts[0]!.prompt).toContain(boundaryURL);
+
+    const firstURL = inlineImageDataURL(600, 2);
+    const secondURL = inlineImageDataURL(600, 3);
+    const cohortURL = inlineImageDataURL(3, 4);
+    expect(countGptTokens(firstURL)).toBeLessThan(INLINE_IMAGE_TOKEN_THRESHOLD);
+    expect(countGptTokens(secondURL)).toBeLessThan(
+      INLINE_IMAGE_TOKEN_THRESHOLD,
+    );
+    expect(
+      countGptTokens(firstURL) + countGptTokens(secondURL),
+    ).toBeGreaterThan(INLINE_IMAGE_TOKEN_THRESHOLD);
+
+    const generated = await generatedAgenticCandidate(
+      mediaCandidateTurn("media-cohort", [firstURL, secondURL, cohortURL]),
+      { modelResults: [mediaModelResult(3)] },
+    );
+    const request = generated.requests.scratchPrompts[0]!;
+    const files = promptFileParts(request.request);
+    expect(files.map(file => file.url)).toEqual([
+      firstURL,
+      secondURL,
+      cohortURL,
+    ]);
+    expect(
+      files.map(file => file.url).filter(url => url === cohortURL),
+    ).toHaveLength(1);
+    for (const url of [firstURL, secondURL, cohortURL]) {
+      expect(request.prompt).not.toContain(url);
+      expect(request.prompt).not.toContain(url.slice(url.indexOf(",") + 1));
+      expect(generated.summaries[0]!.text).not.toContain(
+        url.slice(url.indexOf(",") + 1),
+      );
+    }
+    expect(request.prompt).not.toContain(";base64,");
+    expect(request.prompt).toContain("magic-compact-image:1");
+    expect(request.prompt).toContain("magic-compact-image:2");
+    expect(request.prompt).toContain("magic-compact-image:3");
+    expect(generated.summaries[0]!.text).toContain("Image 1:");
+    expect(generated.summaries[0]!.text).toContain("Image 3:");
+    expect(generated.summaries[0]!.text).not.toContain(";base64,");
+  });
+
+  test("keeps retained-tail inline images live and byte-identical", async () => {
+    await deleteCache("source");
+    await deleteStats("source");
+    const retainedURL = inlineImageDataURL(1_130, 1);
+    const messages = [
+      ...compactableTurn("media-tail-candidate", "Compact old work"),
+      ...mediaSessionTurn("media-tail-retained", [retainedURL]),
+    ];
+    const retained = structuredClone(messages.at(-2)!);
+    const requests = createCommandHarness(messages);
+
+    await executeMagicCompact(requests.v2, "source", 1);
+
+    expect(
+      messages
+        .find(item => item.info.id === retained.info.id)!
+        .parts.find(part => part.type === "file"),
+    ).toEqual(retained.parts.find(part => part.type === "file"));
+    const projected = await projectThroughHook(messages);
+    expect(
+      projected
+        .find(item => item.info.id === retained.info.id)!
+        .parts.find(part => part.type === "file"),
+    ).toMatchObject({ url: retainedURL });
+  });
+
+  test("rejects non-vision models and malformed qualifying media before mutation", async () => {
+    await deleteCache("source");
+    await deleteStats("source");
+    const validURL = inlineImageDataURL(1_130, 1);
+    const unsupportedMessages = mediaSessionTurn("media-no-vision", [validURL]);
+    const unsupported = createCommandHarness(unsupportedMessages, {
+      modelSupportsImages: false,
+      modelResults: [mediaModelResult(1)],
+    });
+
+    await expect(
+      executeMagicCompact(unsupported.v2, "source", 0),
+    ).rejects.toThrow("image input");
+    expect(unsupported.scratchCreates).toEqual([]);
+    expect(unsupported.backupForks).toEqual([]);
+    expect(unsupported.partUpdates).toEqual([]);
+    expect(await readStats("source")).toBeNull();
+
+    const comma = validURL.indexOf(",");
+    const malformedURL = `${validURL.slice(0, comma + 2)}*${validURL.slice(comma + 3)}`;
+    expect(countGptTokens(malformedURL)).toBeGreaterThan(
+      INLINE_IMAGE_TOKEN_THRESHOLD,
+    );
+    const malformedMessages = mediaSessionTurn("media-malformed", [
+      malformedURL,
+    ]);
+    const malformed = createCommandHarness(malformedMessages, {
+      modelResults: [mediaModelResult(1)],
+    });
+
+    await expect(
+      executeMagicCompact(malformed.v2, "source", 0),
+    ).rejects.toThrow("malformed inline image");
+    expect(malformed.scratchCreates).toEqual([]);
+    expect(malformed.backupForks).toEqual([]);
+    expect(malformed.partUpdates).toEqual([]);
+    expect(malformedMessages[0]!.parts[1]).toMatchObject({ url: malformedURL });
+
+    const rejectedMessages = mediaSessionTurn("media-provider-rejected", [
+      validURL,
+    ]);
+    const rejectedSource = structuredClone(rejectedMessages);
+    const rejected = createCommandHarness(rejectedMessages, {
+      modelResults: [new Error("provider rejected image input")],
+    });
+    await expect(executeMagicCompact(rejected.v2, "source", 0)).rejects.toThrow(
+      "capsule generation failed",
+    );
+    expect(rejected.backupForks).toEqual([]);
+    expect(rejected.partUpdates).toEqual([]);
+    expect(rejectedMessages).toEqual(rejectedSource);
+  });
+
+  test("rejects missing, empty, and marker-only visual coverage", async () => {
+    const turn = mediaCandidateTurn("media-coverage", [
+      inlineImageDataURL(1_130, 1),
+    ]);
+    const cases = [
+      {
+        name: "missing",
+        result: modelResult(),
+        expected: "invalid keys",
+      },
+      {
+        name: "empty",
+        result: mediaModelResult(0),
+        expected: "every attached image",
+      },
+      {
+        name: "marker-only",
+        result: mediaModelResult(1, ["Image 1"]),
+        expected: "substantive visual coverage",
+      },
+    ];
+
+    for (const item of cases) {
+      const rejected = await rejectedAgenticGeneration(turn, {
+        modelResults: [item.result],
+      });
+      expect(
+        nestedErrorMessages(rejected.error).join("\n"),
+        item.name,
+      ).toContain(item.expected);
+      expect(rejected.requests.scratchDeletes).toEqual(["scratch-1"]);
+      expect(rejected.requests.backupForks).toEqual([]);
+    }
+  });
+
+  test("persists a hash-bound manifest and uses media projection for profitability, final counts, and stats", async () => {
+    await deleteCache("source");
+    await deleteStats("source");
+    await writeStats("source", {
+      version: 1,
+      sourceSessionId: null,
+      rootSessionId: "source",
+      totalTokensPruned: 0,
+      cachedTokensSaved: 0,
+      mediaTokensProjected: 7,
+      cachedMediaTokensSaved: 0,
+      processedAssistantMessageIds: [],
+    });
+    const imageURL = inlineImageDataURL(1_130, 1);
+    const mediaTurn = mediaSessionTurn("media-incident", [imageURL]);
+    const originalUser = structuredClone(mediaTurn[0]!);
+    const messages = [
+      ...mediaTurn,
+      ...compactableTurn("media-physical-support", "Finish the incident"),
+    ];
+    const beforePhysical = countCanonicalContentTokens(messages);
+    const requests = createCommandHarness(messages, {
+      modelResults: [
+        mediaModelResult(1),
+        modelResult({
+          outcome: "Finished the supporting incident work and verified it",
+          capsule: "Finished the supporting incident work and verified it.",
+        }),
+      ],
+    });
+
+    await executeMagicCompact(requests.v2, "source", 0);
+
+    expect(
+      messages.find(item => item.info.id === originalUser.info.id),
+    ).toEqual(originalUser);
+    expect(
+      requests.backupMessages?.find(
+        item => item.info.id === originalUser.info.id,
+      ),
+    ).toEqual(originalUser);
+    expect(
+      requests.partDeletes.some(
+        request => request.partID === "media-incident-image-1",
+      ),
+    ).toBeFalse();
+    const summary = summaryParts(messages, "media-incident-assistant")[0]!;
+    expect(summary.metadata?.magicCompact).toMatchObject({
+      summary: true,
+      capsule: true,
+      agentic: true,
+      version: 2,
+      mediaManifest: {
+        version: 1,
+        images: [
+          {
+            ordinal: 1,
+            partId: "media-incident-image-1",
+            mime: "image/png",
+            urlSha256: createHash("sha256").update(imageURL).digest("hex"),
+          },
+        ],
+      },
+    });
+    expect(summary.text).not.toContain(imageURL);
+    expect(summary.text).not.toContain(
+      imageURL.slice(imageURL.indexOf(",") + 1),
+    );
+
+    const afterPhysical = countCanonicalContentTokens(messages);
+    const stats = await readStats("source");
+    expect(stats?.totalTokensPruned).toBe(beforePhysical - afterPhysical);
+    expect(stats?.mediaTokensProjected).toBeGreaterThan(0);
+    const modelFacing = await projectThroughHook(messages);
+    expect(stats?.mediaTokensProjected).toBe(
+      afterPhysical - countCanonicalContentTokens(modelFacing),
+    );
+    expect(stats?.cachedMediaTokensSaved).toBe(0);
+    expect(summaryParts(messages, "media-incident-assistant")).toHaveLength(1);
+    const notice = messages
+      .at(-1)!
+      .parts.find((part): part is TextPart => part.type === "text")!;
+    expect(notice.text).toContain("physically pruned");
+    expect(notice.text).toContain("Inline image tokens projected");
+  });
+
+  test("projects exact manifest-covered images into the retained array and fails closed on mismatch without mutation", async () => {
+    const imageURL = inlineImageDataURL(1_130, 1);
+    const source = persistedMediaCapsuleTurn("media-project", imageURL);
+    const originalFilePart = source[0]!.parts[1];
+
+    const projected = await projectThroughHook(source);
+
+    expect(projected).toBe(source);
+    expect(source[0]!.parts[1]).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("Historical inline image 1"),
+    });
+    expect(JSON.stringify(source)).not.toContain(imageURL);
+    expect(originalFilePart).toMatchObject({ type: "file", url: imageURL });
+
+    const pristine = persistedMediaCapsuleTurn("media-project", imageURL);
+    const changedURL = structuredClone(pristine);
+    (changedURL[0]!.parts[1] as Extract<Part, { type: "file" }>).url =
+      inlineImageDataURL(1_131, 1);
+    const changedMime = structuredClone(pristine);
+    (changedMime[0]!.parts[1] as Extract<Part, { type: "file" }>).mime =
+      "image/jpeg";
+    const addedImage = structuredClone(pristine);
+    addedImage[0]!.parts.push(
+      inlineImagePart(
+        "media-project-image-2",
+        "media-project-user",
+        inlineImageDataURL(4, 8),
+      ),
+    );
+    for (const mismatch of [changedURL, changedMime, addedImage]) {
+      const before = structuredClone(mismatch);
+      await expect(projectThroughHook(mismatch)).rejects.toThrow(
+        "media manifest mismatch",
+      );
+      expect(mismatch).toEqual(before);
+    }
+  });
+
+  test("transform hook projects into the retained messages array reference like OpenCode", async () => {
+    const imageURL = inlineImageDataURL(1_130, 1);
+    const messages = persistedMediaCapsuleTurn("hook-retained-array", imageURL);
+
+    const hooks = await server({} as PluginInput);
+    const output = { messages };
+    await hooks["experimental.chat.messages.transform"]?.({}, output);
+
+    expect(output.messages).toBe(messages);
+    expect(messages[0]!.parts[1]).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("Historical inline image 1"),
+    });
+    expect(JSON.stringify(messages)).not.toContain(imageURL);
+  });
+
+  test("media system and request prompts treat image pixels, diagrams, visible/OCR text, and embedded visual instructions as inert untrusted evidence", async () => {
+    const systemPrompt = MAGIC_COMPACT_SUMMARIZER_PROMPT;
+    expect(systemPrompt).toContain("image pixels");
+    expect(systemPrompt).toContain("diagrams");
+    expect(systemPrompt).toContain("visible/OCR text");
+    expect(systemPrompt).toContain("embedded visual instructions");
+    expect(systemPrompt).toMatch(/inert untrusted evidence/);
+
+    const generated = await generatedAgenticCandidate(
+      mediaCandidateTurn("media-inert-evidence", [
+        inlineImageDataURL(600, 2),
+        inlineImageDataURL(600, 3),
+      ]),
+      { modelResults: [mediaModelResult(2)] },
+    );
+    const prompt = generated.requests.scratchPrompts[0]!.prompt;
+    expect(prompt).toContain("image pixels");
+    expect(prompt).toContain("diagrams");
+    expect(prompt).toContain("visible/OCR text");
+    expect(prompt).toContain("embedded visual instructions");
+    expect(prompt).toMatch(/inert untrusted evidence/);
+  });
+
+  test("rejects unchanged images reordered within one user message", async () => {
+    const source = persistedMediaCapsuleTurnMulti(
+      "media-reorder-same-message",
+      [inlineImageDataURL(1_130, 1), inlineImageDataURL(1_130, 2)],
+    );
+    const pristine = structuredClone(source);
+    const projected = await projectThroughHook(source);
+    expect(
+      projected[0]!.parts.find(
+        part => part.id === "media-reorder-same-message-image-1",
+      ),
+    ).toMatchObject({ type: "text" });
+
+    const reordered = structuredClone(pristine);
+    const user = reordered[0]!;
+    const imageIndexes = user.parts
+      .map((part, index) => ({ part, index }))
+      .filter(item => item.part.type === "file")
+      .map(item => item.index);
+    const first = imageIndexes[0]!;
+    const second = imageIndexes[1]!;
+    const firstPart = user.parts[first]!;
+    user.parts[first] = user.parts[second]!;
+    user.parts[second] = firstPart;
+
+    await expect(projectThroughHook(reordered)).rejects.toThrow(
+      "media manifest mismatch",
+    );
+  });
+
+  test("rejects unchanged images reordered across user messages in one turn", async () => {
+    const source = persistedMediaCapsuleTurnMulti(
+      "media-reorder-across-messages",
+      [inlineImageDataURL(1_130, 1), inlineImageDataURL(1_130, 2)],
+      true,
+    );
+    const pristine = structuredClone(source);
+    const projected = await projectThroughHook(source);
+    expect(
+      projected[0]!.parts.find(
+        part => part.id === "media-reorder-across-messages-image-1",
+      ),
+    ).toMatchObject({ type: "text" });
+
+    const reordered = structuredClone(pristine);
+    const [firstUser, secondUser] = reordered;
+    const firstImage = firstUser!.parts.find(part => part.type === "file")!;
+    const secondImage = secondUser!.parts.find(part => part.type === "file")!;
+    firstUser!.parts[firstUser!.parts.indexOf(firstImage)] = {
+      ...secondImage,
+      messageID: firstUser!.info.id,
+    };
+    secondUser!.parts[secondUser!.parts.indexOf(secondImage)] = {
+      ...firstImage,
+      messageID: secondUser!.info.id,
+    };
+
+    await expect(projectThroughHook(reordered)).rejects.toThrow(
+      "media manifest mismatch",
+    );
+  });
+
+  test("leaves manifest-free capsules unchanged and keeps media-aware capsules opaque on recompaction", async () => {
+    const imageURL = inlineImageDataURL(1_130, 1);
+    const withoutManifest = persistedMediaCapsuleTurn(
+      "media-legacy",
+      imageURL,
+      false,
+    );
+    expect(await projectThroughHook(withoutManifest)).toEqual(withoutManifest);
+
+    const mediaAware = persistedMediaCapsuleTurn("media-opaque", imageURL);
+    const requests = createCommandHarness(mediaAware);
+    const summaries = await generateCompactionCapsules(
+      requests.v2,
+      session("source"),
+      generationPlan([
+        { user: [mediaAware[0]!], assistants: [mediaAware[1]!] },
+      ]),
+    );
+    expect(summaries).toEqual([null]);
+    expect(requests.scratchPrompts).toEqual([]);
+    const projected = await projectThroughHook(mediaAware);
+    expect(projected[0]!.parts[1]).toMatchObject({ type: "text" });
+  });
+
+  test("reads legacy stats and reports projected media separately in magic-stats", async () => {
+    const sessionID = "legacy-media-stats";
+    await deleteStats(sessionID);
+    await writeStats(sessionID, {
+      version: 1,
+      sourceSessionId: null,
+      rootSessionId: sessionID,
+      totalTokensPruned: 41,
+      cachedTokensSaved: 82,
+      processedAssistantMessageIds: [],
+    });
+    const legacy = await readStats(sessionID);
+    expect(legacy?.mediaTokensProjected ?? 0).toBe(0);
+    expect(legacy?.cachedMediaTokensSaved ?? 0).toBe(0);
+
+    await writeStats(sessionID, {
+      ...legacy!,
+      mediaTokensProjected: 512,
+      cachedMediaTokensSaved: 1_024,
+    });
+    const messages = withSessionID(
+      completedTurn("legacy-media-stats-source", "Show stats"),
+      sessionID,
+    );
+    const requests = createCommandHarness(messages);
+    await executeMagicStats(requests.v2, sessionID);
+    const notice = (
+      requests.sourcePrompts[0]!.parts as Array<{ text?: string }>
+    )[0]!.text!;
+    expect(notice).toContain("Tokens physically pruned");
+    expect(notice).toContain("Inline image tokens projected: ~512");
+    expect(notice).toContain("Projected-media cache reads saved: ~1K tokens");
+  });
+
+  test("assistant completion events increment cached media savings once and deduplicate repeats", async () => {
+    const sessionID = "event-accounting";
+    await deleteStats(sessionID);
+    await writeStats(sessionID, {
+      version: 1,
+      sourceSessionId: null,
+      rootSessionId: sessionID,
+      totalTokensPruned: 100,
+      cachedTokensSaved: 0,
+      mediaTokensProjected: 7,
+      cachedMediaTokensSaved: 0,
+      processedAssistantMessageIds: [],
+    });
+    const hooks = await server({} as PluginInput);
+    const event = (id: string, completed = true): Event => ({
+      type: "message.updated",
+      properties: {
+        info: {
+          id,
+          sessionID,
+          role: "assistant",
+          time: { created: 1, ...(completed ? { completed: 2 } : {}) },
+          parentID: "parent",
+          modelID: "test-model",
+          providerID: "test-provider",
+          mode: "primary",
+          path: { cwd: "/workspace", root: "/workspace" },
+          cost: 0,
+          tokens: {
+            input: 0,
+            output: 0,
+            reasoning: 0,
+            cache: { read: 0, write: 0 },
+          },
+        } as AssistantMessage,
+      },
+    });
+
+    await hooks.event?.({ event: event("assistant-1") });
+    const afterFirst = await readStats(sessionID);
+    expect(afterFirst?.cachedTokensSaved).toBe(100);
+    expect(afterFirst?.cachedMediaTokensSaved).toBe(7);
+    expect(afterFirst?.processedAssistantMessageIds).toEqual(["assistant-1"]);
+
+    await hooks.event?.({ event: event("assistant-1") });
+    const afterDuplicate = await readStats(sessionID);
+    expect(afterDuplicate?.cachedTokensSaved).toBe(100);
+    expect(afterDuplicate?.cachedMediaTokensSaved).toBe(7);
+    expect(afterDuplicate?.processedAssistantMessageIds).toEqual([
+      "assistant-1",
+    ]);
+
+    await hooks.event?.({ event: event("assistant-2") });
+    const afterSecond = await readStats(sessionID);
+    expect(afterSecond?.cachedTokensSaved).toBe(200);
+    expect(afterSecond?.cachedMediaTokensSaved).toBe(14);
+    expect(afterSecond?.processedAssistantMessageIds).toEqual([
+      "assistant-1",
+      "assistant-2",
+    ]);
+
+    await hooks.event?.({ event: event("assistant-3", false) });
+    const afterIncomplete = await readStats(sessionID);
+    expect(afterIncomplete?.cachedTokensSaved).toBe(200);
+    expect(afterIncomplete?.cachedMediaTokensSaved).toBe(14);
+    expect(afterIncomplete?.processedAssistantMessageIds).toEqual([
+      "assistant-1",
+      "assistant-2",
+    ]);
+  });
 });
 
 function exactTextMessages(): MessageWithParts[] {
@@ -4175,6 +4704,7 @@ type HarnessOptions = {
   scratchAbortErrors?: Array<Error | undefined>;
   scratchAbortEnvelopeErrors?: Array<RequestEnvelopeError | undefined>;
   scratchAbortFactories?: Array<() => Promise<unknown> | unknown>;
+  modelSupportsImages?: boolean;
   modelDelayMs?: number;
   modelResults?: Array<AgenticCapsuleResult | string | Error>;
   modelEnvelopeErrors?: Array<RequestEnvelopeError | undefined>;
@@ -4245,6 +4775,27 @@ function createCommandHarness(
           ],
         };
       },
+    },
+    provider: {
+      list: async () => ({
+        data: {
+          all: [
+            {
+              id: "test-provider",
+              models: {
+                "test-model": {
+                  id: "test-model",
+                  capabilities: {
+                    input: { image: options.modelSupportsImages ?? true },
+                  },
+                },
+              },
+            },
+          ],
+          default: {},
+          connected: ["test-provider"],
+        },
+      }),
     },
     session: {
       messages: async () => {
@@ -4585,6 +5136,9 @@ function createCommandHarness(
     get maxConcurrentModelPrompts() {
       return maxConcurrentModelPrompts;
     },
+    get backupMessages() {
+      return backupMessages;
+    },
   };
 }
 
@@ -4613,6 +5167,179 @@ function textPart(
   text: string,
 ): TextPart {
   return { id, sessionID, messageID, type: "text", text };
+}
+
+function inlineImageDataURL(byteLength: number, seed: number): string {
+  const bytes = Buffer.alloc(byteLength);
+  let state = seed | 0;
+  for (let index = 0; index < byteLength; index += 1) {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    bytes[index] = state & 0xff;
+  }
+  return `data:image/png;base64,${bytes.toString("base64")}`;
+}
+
+function inlineImagePart(
+  id: string,
+  messageID: string,
+  url: string,
+): Extract<Part, { type: "file" }> {
+  return {
+    id,
+    sessionID: "source",
+    messageID,
+    type: "file",
+    mime: "image/png",
+    filename: `${id}.png`,
+    url,
+  };
+}
+
+function mediaSessionTurn(id: string, urls: string[]): MessageWithParts[] {
+  const userID = `${id}-user`;
+  const assistantID = `${id}-assistant`;
+  return [
+    message(userID, "user", [
+      textPart(`${id}-user-text`, "source", userID, "Review the images."),
+      ...urls.map((url, index) =>
+        inlineImagePart(`${id}-image-${index + 1}`, userID, url),
+      ),
+    ]),
+    message(assistantID, "assistant", [
+      textPart(
+        `${id}-assistant-text`,
+        "source",
+        assistantID,
+        "Reviewed the attached images.",
+      ),
+    ]),
+  ];
+}
+
+function mediaCandidateTurn(id: string, urls: string[]): Turn {
+  const messages = mediaSessionTurn(id, urls);
+  return { user: [messages[0]!], assistants: [messages[1]!] };
+}
+
+function mediaModelResult(
+  count: number,
+  descriptions: string[] = Array.from(
+    { length: count },
+    (_, index) =>
+      `The captured interface shows verified visual result ${index + 1} with readable status details.`,
+  ),
+): AgenticCapsuleResult & {
+  mediaCoverage: Array<{ ordinal: number; description: string }>;
+} {
+  return {
+    ...modelResult(),
+    mediaCoverage: descriptions.map((description, index) => ({
+      ordinal: index + 1,
+      description,
+    })),
+  };
+}
+
+function promptFileParts(request: Record<string, unknown>): Array<{
+  type: "file";
+  mime: string;
+  filename?: string;
+  url: string;
+}> {
+  return ((request.parts as Array<{ type: string }> | undefined) ?? []).filter(
+    (
+      part,
+    ): part is {
+      type: "file";
+      mime: string;
+      filename?: string;
+      url: string;
+    } => part.type === "file",
+  );
+}
+
+function persistedMediaCapsuleTurn(
+  id: string,
+  url: string,
+  includeManifest = true,
+): MessageWithParts[] {
+  return persistedMediaCapsuleTurnMulti(id, [url], false, includeManifest);
+}
+
+function persistedMediaCapsuleTurnMulti(
+  id: string,
+  urls: string[],
+  splitAcrossUserMessages = false,
+  includeManifest = true,
+): MessageWithParts[] {
+  const userID = `${id}-user`;
+  const assistantID = `${id}-assistant`;
+  const userMessages = splitAcrossUserMessages
+    ? urls.map((url, index) =>
+        message(`${userID}-${index + 1}`, "user", [
+          textPart(
+            `${id}-user-text-${index + 1}`,
+            "source",
+            `${userID}-${index + 1}`,
+            `Review image ${index + 1}.`,
+          ),
+          inlineImagePart(
+            `${id}-image-${index + 1}`,
+            `${userID}-${index + 1}`,
+            url,
+          ),
+        ]),
+      )
+    : [
+        message(userID, "user", [
+          textPart(`${id}-user-text`, "source", userID, "Review the images."),
+          ...urls.map((url, index) =>
+            inlineImagePart(`${id}-image-${index + 1}`, userID, url),
+          ),
+        ]),
+      ];
+  const assistant = message(assistantID, "assistant", [
+    {
+      id: agenticCapsulePartID(assistantID),
+      sessionID: "source",
+      messageID: assistantID,
+      type: "text",
+      text: "Outcome: Completed — Reviewed the historical images successfully\nProcess:\nImage 1: The interface shows a successful verified result.\nImage 2: The interface shows a second verified result.",
+      metadata: {
+        magicCompact: {
+          summary: true,
+          capsule: true,
+          agentic: true,
+          version: 2,
+          ...(includeManifest
+            ? {
+                mediaManifest: {
+                  version: 1,
+                  images: urls.map((url, index) => ({
+                    ordinal: index + 1,
+                    partId: `${id}-image-${index + 1}`,
+                    mime: "image/png",
+                    urlSha256: createHash("sha256").update(url).digest("hex"),
+                  })),
+                },
+              }
+            : {}),
+        },
+      },
+    },
+  ]);
+  return [...userMessages, assistant];
+}
+
+async function projectThroughHook(
+  messages: MessageWithParts[],
+): Promise<MessageWithParts[]> {
+  const hooks = await server({} as PluginInput);
+  const output = { messages };
+  await hooks["experimental.chat.messages.transform"]?.({}, output);
+  return messages;
 }
 
 function completedTurn(id: string, text: string): MessageWithParts[] {
