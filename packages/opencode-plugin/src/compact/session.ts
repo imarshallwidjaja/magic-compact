@@ -6,9 +6,12 @@ import {
   boundaryPartID,
 } from "./constants";
 import {
+  assertCompactionSourceAfterInsertions,
   assertCompactionSourceUnchanged,
+  CompactionPruneSourceDriftError,
   NativeCheckpointChangedError,
   type CompactionPlan,
+  type CompactionSourceInsertion,
   type MessageWithParts,
   type Turn,
 } from "./plan";
@@ -160,9 +163,9 @@ export async function injectPostCompactionNotice(
   v2: V2Client,
   sessionID: string,
   nextTurn: Turn | null,
-): Promise<void> {
+): Promise<CompactionSourceInsertion> {
   if (!nextTurn) {
-    unwrap(
+    const inserted = unwrap(
       await v2.session.prompt({
         sessionID,
         noReply: true,
@@ -176,7 +179,11 @@ export async function injectPostCompactionNotice(
         ],
       }),
     );
-    return;
+    return {
+      type: "message",
+      messageID: inserted.info.id,
+      parts: inserted.parts,
+    };
   }
 
   const firstUser = nextTurn.user[0];
@@ -202,6 +209,7 @@ export async function injectPostCompactionNotice(
       part,
     }),
   );
+  return { type: "part", messageID: firstUser.info.id, part };
 }
 
 export async function recordPruningStats(input: {
@@ -274,30 +282,6 @@ export async function injectTrimStatsNotice(
   );
 }
 
-export async function reloadTurns(
-  v2: V2Client,
-  sessionID: string,
-  turns: Turn[],
-): Promise<Turn[]> {
-  const messages: MessageWithParts[] = unwrap(
-    await v2.session.messages({
-      sessionID,
-    }),
-  );
-  const messageByID = new Map(
-    messages.map(message => [message.info.id, message]),
-  );
-
-  return turns.map(turn => ({
-    user: turn.user.map(message =>
-      requireMessage(messageByID, message.info.id),
-    ),
-    assistants: turn.assistants.map(message =>
-      requireMessage(messageByID, message.info.id),
-    ),
-  }));
-}
-
 export async function revalidateCompactionSource(
   v2: V2Client,
   sessionID: string,
@@ -318,14 +302,19 @@ export async function revalidateCompactionSource(
   }
 }
 
-function requireMessage(
-  messageByID: Map<string, MessageWithParts>,
-  messageID: string,
-): MessageWithParts {
-  const message = messageByID.get(messageID);
-  if (!message) {
-    throw new Error(`Message not found while reloading turn: ${messageID}`);
+export async function revalidateCompactionSourceAfterInsertions(
+  v2: V2Client,
+  sessionID: string,
+  plan: CompactionPlan,
+  insertions: CompactionSourceInsertion[],
+): Promise<void> {
+  try {
+    const messages: MessageWithParts[] = unwrap(
+      await v2.session.messages({ sessionID }),
+    );
+    assertCompactionSourceAfterInsertions(messages, plan, insertions);
+  } catch (error) {
+    if (error instanceof CompactionPruneSourceDriftError) throw error;
+    throw new CompactionPruneSourceDriftError(error);
   }
-
-  return message;
 }

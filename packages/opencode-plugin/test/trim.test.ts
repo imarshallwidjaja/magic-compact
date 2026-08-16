@@ -239,10 +239,11 @@ describe("magic trim", () => {
   test("preserves an existing unversioned v0 summary through recompaction planning and trim", async () => {
     const legacyText =
       "Legacy v0 summary text that must remain byte-identical.";
+    const legacyAssistantID = "ast_legacy";
     const legacySummary = {
-      id: "legacy-summary",
+      id: v0SummaryPartID(legacyAssistantID),
       sessionID: "session",
-      messageID: "ast_legacy",
+      messageID: legacyAssistantID,
       type: "text",
       text: legacyText,
       metadata: { magicCompact: { summary: true } },
@@ -261,10 +262,10 @@ describe("magic trim", () => {
       "todowrite",
       "verbose legacy output",
     );
-    legacyTool.messageID = "ast_legacy";
+    legacyTool.messageID = legacyAssistantID;
     const messages = [
       message("usr_legacy", "user", []),
-      message("ast_legacy", "assistant", [legacySummary, legacyTool]),
+      message(legacyAssistantID, "assistant", [legacySummary, legacyTool]),
       message("usr_suffix", "user", [boundary]),
       message("ast_suffix", "assistant", []),
     ];
@@ -283,6 +284,7 @@ describe("magic trim", () => {
       ),
     ).toEqual(["ast_suffix"]);
     expect(legacySummary.text).toBe(legacyText);
+    expect(legacySummary.id).toBe(v0SummaryPartID(legacyAssistantID));
     expect(legacySummary.metadata).toEqual({
       magicCompact: { summary: true },
     });
@@ -328,4 +330,8 @@ function completedTool(id: string, tool: string, output: string): ToolPart {
       time: { start: 1, end: 2 },
     },
   };
+}
+
+function v0SummaryPartID(messageID: string): string {
+  return `prt_-magic_summary_${messageID}`;
 }

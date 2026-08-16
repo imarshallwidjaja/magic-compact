@@ -17,8 +17,26 @@ type PruneContext = {
 
 export type PruneProjection = {
   turns: Turn[];
-  omissions: PlannedOmission[];
+  mutations: PruneMutation[];
 };
+
+export type PruneMutation =
+  | {
+      type: "delete-part";
+      messageID: string;
+      partID: string;
+    }
+  | {
+      type: "update-part";
+      messageID: string;
+      partID: string;
+      replacement: ToolPart;
+      omissions: PlannedOmission[];
+    }
+  | {
+      type: "delete-message";
+      messageID: string;
+    };
 
 const DEFAULT_OUTPUT_DESCRIPTION =
   "Output omitted due to a compaction operation.";
@@ -28,30 +46,42 @@ const TASK_OUTPUT_LIMIT = { words: 512, chars: 4096 };
 
 export async function pruneSummarizedTurns(
   context: PruneContext,
-  turns: Turn[],
-  plannedOmissions: PlannedOmission[],
+  projection: PruneProjection,
 ): Promise<void> {
-  assertNoNativeArtifacts(turns);
-  let omissionIndex = 0;
-  const allocate = async (entry: { content: string }) => {
-    const omission = plannedOmissions[omissionIndex++];
-    if (!omission || omission.content !== entry.content) {
-      throw new Error("Planned omission order changed before pruning.");
+  for (const mutation of projection.mutations) {
+    if (mutation.type === "delete-part") {
+      unwrap(
+        await context.v2.part.delete({
+          sessionID: context.sessionID,
+          messageID: mutation.messageID,
+          partID: mutation.partID,
+        }),
+      );
+      continue;
     }
-    await commitPlannedOmission(context.sessionID, omission);
-    return omission.contentID;
-  };
-  for (const turn of turns) {
-    for (const user of turn.user) {
-      await pruneUserParts(context, user);
+    if (mutation.type === "delete-message") {
+      unwrap(
+        await context.v2.session.deleteMessage({
+          sessionID: context.sessionID,
+          messageID: mutation.messageID,
+        }),
+      );
+      continue;
     }
-
-    for (const assistant of turn.assistants) {
-      await pruneAssistantParts(context, assistant, allocate);
+    for (const omission of mutation.omissions) {
+      await commitPlannedOmission(context.sessionID, omission);
     }
-  }
-  if (omissionIndex !== plannedOmissions.length) {
-    throw new Error("Not every planned omission was consumed during pruning.");
+    unwrap(
+      await context.v2.part.update({
+        sessionID: context.sessionID,
+        messageID: mutation.messageID,
+        partID: mutation.partID,
+        part: {
+          ...mutation.replacement,
+          sessionID: context.sessionID,
+        },
+      }),
+    );
   }
 }
 
@@ -61,39 +91,74 @@ export async function createPruneProjection(
 ): Promise<PruneProjection> {
   assertNoNativeArtifacts(turns);
   const projected = structuredClone(turns);
-  const omissions: PlannedOmission[] = [];
-  const allocate = async (entry: { content: string }) => {
-    const omission = planOmission(sessionID, entry);
-    omissions.push(omission);
-    return omission.contentID;
-  };
+  const mutations: PruneMutation[] = [];
 
   for (const turn of projected) {
     for (const user of turn.user) {
-      user.parts = user.parts.filter(
-        part =>
-          part.type !== "text"
-          || part.synthetic !== true
-          || isImportantSyntheticPart(part),
-      );
+      const kept: Part[] = [];
+      for (const part of user.parts) {
+        if (
+          part.type === "text"
+          && part.synthetic === true
+          && !isImportantSyntheticPart(part)
+        ) {
+          mutations.push({
+            type: "delete-part",
+            messageID: user.info.id,
+            partID: part.id,
+          });
+        } else {
+          kept.push(part);
+        }
+      }
+      user.parts = kept;
     }
     const assistants: MessageWithParts[] = [];
     for (const assistant of turn.assistants) {
       const kept: Part[] = [];
+      const partMutations: PruneMutation[] = [];
       for (const part of assistant.parts) {
         if (isSummaryPart(part)) {
           kept.push(part);
         } else if (part.type === "tool") {
-          await prepareToolPart(part, allocate);
+          const partOmissions: PlannedOmission[] = [];
+          const changed = await prepareToolPart(part, async entry => {
+            const omission = planOmission(sessionID, entry);
+            partOmissions.push(omission);
+            return omission.contentID;
+          });
           kept.push(part);
+          if (changed) {
+            partMutations.push({
+              type: "update-part",
+              messageID: assistant.info.id,
+              partID: part.id,
+              replacement: structuredClone(part),
+              omissions: partOmissions,
+            });
+          }
+        } else {
+          partMutations.push({
+            type: "delete-part",
+            messageID: assistant.info.id,
+            partID: part.id,
+          });
         }
       }
       assistant.parts = kept;
-      if (kept.length > 0) assistants.push(assistant);
+      if (kept.length > 0) {
+        assistants.push(assistant);
+        mutations.push(...partMutations);
+      } else {
+        mutations.push({
+          type: "delete-message",
+          messageID: assistant.info.id,
+        });
+      }
     }
     turn.assistants = assistants;
   }
-  return { turns: projected, omissions };
+  return { turns: projected, mutations };
 }
 
 function assertNoNativeArtifacts(turns: Turn[]): void {
@@ -132,73 +197,6 @@ export async function trimToolParts(
     }
   }
   return trimmed;
-}
-
-async function pruneUserParts(
-  context: PruneContext,
-  message: MessageWithParts,
-): Promise<void> {
-  for (const part of message.parts) {
-    if (part.type !== "text" || part.synthetic !== true) {
-      // If not text (attachment) or is text but not synthetic, don't prune
-      continue;
-    }
-
-    if (isImportantSyntheticPart(part)) {
-      // If is an important synthetic part, don't prune
-      continue;
-    }
-
-    // Prune useless synthetic part
-    unwrap(
-      await context.v2.part.delete({
-        sessionID: context.sessionID,
-        messageID: message.info.id,
-        partID: part.id,
-      }),
-    );
-  }
-}
-
-async function pruneAssistantParts(
-  context: PruneContext,
-  message: MessageWithParts,
-  allocate: (entry: { content: string }) => Promise<string>,
-): Promise<void> {
-  let keptParts = 0;
-
-  for (const part of message.parts) {
-    // If is compaction summary, leave alone
-    if (isSummaryPart(part)) {
-      keptParts += 1;
-      continue;
-    }
-
-    // If it is a tool call, prune but keep
-    if (part.type === "tool") {
-      await pruneToolPart(context, part, allocate);
-      keptParts += 1;
-      continue;
-    }
-
-    // Otherwise, delete part (reasoning / text)
-    unwrap(
-      await context.v2.part.delete({
-        sessionID: context.sessionID,
-        messageID: message.info.id,
-        partID: part.id,
-      }),
-    );
-  }
-
-  if (keptParts === 0) {
-    unwrap(
-      await context.v2.session.deleteMessage({
-        sessionID: context.sessionID,
-        messageID: message.info.id,
-      }),
-    );
-  }
 }
 
 async function pruneToolPart(

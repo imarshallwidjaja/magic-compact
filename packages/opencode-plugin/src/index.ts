@@ -2,11 +2,6 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { getV2Client } from "./api";
 import {
-  MAGIC_COMPACT_SUMMARIZER_AGENT,
-  MAGIC_COMPACT_SUMMARIZER_PROMPT,
-  MAX_SUMMARY_OUTPUT_TOKENS,
-} from "./compact/constants";
-import {
   COMPACT_NOOP,
   COMPACT_SUCCESS,
   executeMagicCompact,
@@ -19,21 +14,10 @@ import { handleStatsEvent } from "./stats/events";
 const COMPACT_COMMAND = "magic-compact";
 const TRIM_COMMAND = "magic-trim";
 const STATS_COMMAND = "magic-stats";
-const SUMMARIZER_PERMISSION = { "*": "deny" } as const;
 
 const server: Plugin = async input => {
   return {
     config: async config => {
-      config.agent ??= {};
-      config.agent[MAGIC_COMPACT_SUMMARIZER_AGENT] = {
-        description:
-          "Faithful per-turn plain-JSON summarizer for Magic Compact",
-        mode: "subagent",
-        hidden: true,
-        prompt: MAGIC_COMPACT_SUMMARIZER_PROMPT,
-        // Pinned plugin types omit the runtime-supported wildcard deny key.
-        permission: SUMMARIZER_PERMISSION as never,
-      };
       config.command ??= {};
       config.command[COMPACT_COMMAND] = {
         template: "",
@@ -94,17 +78,6 @@ const server: Plugin = async input => {
     },
     event: async input => {
       await handleStatsEvent(input.event);
-    },
-    "chat.params": async (input, output) => {
-      if (input.agent !== MAGIC_COMPACT_SUMMARIZER_AGENT) return;
-      const current = output.maxOutputTokens;
-      if (
-        typeof current === "number"
-        && Number.isFinite(current)
-        && current > 0
-      ) {
-        output.maxOutputTokens = Math.min(current, MAX_SUMMARY_OUTPUT_TOKENS);
-      }
     },
     tool: {
       read_omitted_content: tool({

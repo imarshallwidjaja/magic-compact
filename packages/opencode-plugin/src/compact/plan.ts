@@ -19,6 +19,10 @@ export type CompactionPlan = {
   sourceSnapshot: SourceSnapshot;
 };
 
+export type CompactionSourceInsertion =
+  | { type: "part"; messageID: string; part: Part }
+  | { type: "message"; messageID: string; parts: Part[] };
+
 type SourceSnapshot = Array<{ info: unknown; parts: unknown[] }>;
 
 export class NativeCheckpointChangedError extends Error {
@@ -26,6 +30,17 @@ export class NativeCheckpointChangedError extends Error {
     const detail = cause instanceof Error ? ` ${cause.message}` : "";
     super(`OpenCode source changed during Magic Compact.${detail}`, { cause });
     this.name = "NativeCheckpointChangedError";
+  }
+}
+
+export class CompactionPruneSourceDriftError extends Error {
+  constructor(cause?: unknown) {
+    const detail = cause instanceof Error ? ` ${cause.message}` : "";
+    super(
+      `OpenCode source changed after capsule insertion and before pruning.${detail}`,
+      { cause },
+    );
+    this.name = "CompactionPruneSourceDriftError";
   }
 }
 
@@ -127,16 +142,73 @@ export function assertCompactionSourceUnchanged(
   }
 }
 
+export function assertCompactionSourceAfterInsertions(
+  messages: MessageWithParts[],
+  plan: CompactionPlan,
+  insertions: CompactionSourceInsertion[],
+): void {
+  const remaining = structuredClone(messages);
+  for (const insertion of insertions) {
+    if (insertion.type === "message") {
+      const matches = remaining
+        .map((message, index) => ({ message, index }))
+        .filter(item => item.message.info.id === insertion.messageID);
+      if (
+        matches.length !== 1
+        || matches[0]!.message.info.role !== "user"
+        || !isDeepStrictEqual(
+          matches[0]!.message.parts.map(sourcePart),
+          insertion.parts.map(sourcePart),
+        )
+      ) {
+        throw new CompactionPruneSourceDriftError();
+      }
+      remaining.splice(matches[0]!.index, 1);
+      continue;
+    }
+
+    const messageMatches = remaining.filter(
+      message => message.info.id === insertion.messageID,
+    );
+    if (messageMatches.length !== 1) {
+      throw new CompactionPruneSourceDriftError();
+    }
+    const message = messageMatches[0]!;
+    const partMatches = message.parts
+      .map((part, index) => ({ part, index }))
+      .filter(item => item.part.id === insertion.part.id);
+    if (
+      partMatches.length !== 1
+      || !isDeepStrictEqual(
+        sourcePart(partMatches[0]!.part),
+        sourcePart(insertion.part),
+      )
+    ) {
+      throw new CompactionPruneSourceDriftError();
+    }
+    message.parts.splice(partMatches[0]!.index, 1);
+  }
+  try {
+    assertCompactionSourceUnchanged(remaining, plan);
+  } catch (error) {
+    throw new CompactionPruneSourceDriftError(error);
+  }
+}
+
 function captureSourceSnapshot(messages: MessageWithParts[]): SourceSnapshot {
   try {
     inspectNativeCheckpoints(messages);
   } catch (error) {
     throw new NativeCheckpointChangedError(error);
   }
-  return messages.map(message => ({
+  return messages.map(sourceMessage);
+}
+
+function sourceMessage(message: MessageWithParts): SourceSnapshot[number] {
+  return {
     info: sourceMessageInfo(message.info),
     parts: message.parts.map(sourcePart),
-  }));
+  };
 }
 
 function sourceMessageInfo(info: Message): unknown {

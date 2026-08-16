@@ -1,7 +1,8 @@
 import type { Message, Session, TextPart } from "@opencode-ai/sdk/v2";
 import { unwrap, type V2Client } from "./api";
 import {
-  generateCompactionSummaries,
+  generateCompactionCapsules,
+  type GeneratedCapsule,
   injectSummaries,
 } from "./compact/compact";
 import {
@@ -11,8 +12,8 @@ import {
   injectPostCompactionNotice,
   injectCompactStatsNotice,
   recordPruningStats,
-  reloadTurns,
   revalidateCompactionSource,
+  revalidateCompactionSourceAfterInsertions,
   updateCompactionMetadata,
 } from "./compact/session";
 import {
@@ -35,11 +36,9 @@ import {
   BOUNDARY_METADATA,
   POST_COMPACTION_NOTICE,
   boundaryPartID,
-  summaryMetadata,
-  summaryPartID,
+  capsuleSummaryTextPart,
 } from "./compact/constants";
 import { readStats, type ConversationStats } from "./storage/stats";
-import type { PlannedOmission } from "./storage/omission";
 
 export const COMPACT_SUCCESS = "Magic compaction successful.";
 export const COMPACT_NOOP = "No assistant turns are old enough to compact.";
@@ -105,17 +104,27 @@ export async function executeMagicCompact(
 
     await revalidateCompactionSource(v2, sessionID, sourcePlan);
 
-    const summaries = await generateCompactionSummaries(
-      v2,
-      sourceSession,
-      sourcePlan,
-    );
+    const summaries = generateCompactionCapsules(sourcePlan);
 
     const selection = await selectProfitableTurns(
       sourcePlan,
       summaries,
       sessionID,
     );
+    if (
+      selection.turns.length === 0
+      && summaries.every(summary => summary === null)
+    ) {
+      unwrap(
+        await v2.tui.showToast({
+          title: "Magic Compact",
+          message: COMPACT_NOOP,
+          variant: "info",
+          duration: 5000,
+        }),
+      );
+      return false;
+    }
 
     const projection = await projectCompaction(
       sourceMessages,
@@ -143,19 +152,30 @@ export async function executeMagicCompact(
     );
     await revalidateCompactionSource(v2, sessionID, sourcePlan);
 
-    await injectSummaries(v2, sessionID, selection.turns, selection.summaries);
+    const insertedSummaries = await injectSummaries(
+      v2,
+      sessionID,
+      selection.turns,
+      selection.summaries,
+    );
 
     // Mark the new compaction boundary for future recompactions
     // Message placed outside of summarization range so unaffected by pruning
-    await injectPostCompactionNotice(v2, sessionID, sourcePlan.nextTurn);
-
-    // Prune messages & tool calls
-    const summarizedTurns = await reloadTurns(v2, sessionID, selection.turns);
-    await pruneSummarizedTurns(
-      { v2, sessionID },
-      summarizedTurns,
-      projection.omissions,
+    const boundaryInsertion = await injectPostCompactionNotice(
+      v2,
+      sessionID,
+      sourcePlan.nextTurn,
     );
+
+    await revalidateCompactionSourceAfterInsertions(v2, sessionID, sourcePlan, [
+      ...insertedSummaries.map(part => ({
+        type: "part" as const,
+        messageID: part.messageID,
+        part,
+      })),
+      boundaryInsertion,
+    ]);
+    await pruneSummarizedTurns({ v2, sessionID }, selection.pruning);
 
     await updateCompactionMetadata(v2, sourceSession, currentCompactionCount);
     await injectCompactStatsNotice(
@@ -225,18 +245,19 @@ export async function executeMagicCompact(
 
 async function selectProfitableTurns(
   plan: CompactionPlan,
-  summaries: string[],
+  summaries: GeneratedCapsule[],
   sessionID: string,
 ): Promise<CompactionSelection> {
   const selectedTurns: Turn[] = [];
   const selectedSummaries: string[] = [];
   const projectedTurns: Turn[] = [];
-  const omissions: PlannedOmission[] = [];
+  const mutations: PruneProjection["mutations"] = [];
   for (const [index, turn] of plan.summarizedTurns.entries()) {
     const summary = summaries[index];
     if (summary === undefined)
       throw new Error("Missing summary for assistant turn.");
-    const candidates = injectProjectedSummaries([turn], [summary], sessionID);
+    if (summary === null) continue;
+    const candidates = [injectProjectedSummary(turn, summary, sessionID)];
     const pruning = await createPruneProjection(candidates, sessionID);
     const projectedTurn = pruning.turns[0]!;
     if (
@@ -245,38 +266,28 @@ async function selectProfitableTurns(
       selectedTurns.push(turn);
       selectedSummaries.push(summary);
       projectedTurns.push(projectedTurn);
-      omissions.push(...pruning.omissions);
+      mutations.push(...pruning.mutations);
     }
   }
   return {
     turns: selectedTurns,
     summaries: selectedSummaries,
-    pruning: { turns: projectedTurns, omissions },
+    pruning: { turns: projectedTurns, mutations },
   };
 }
 
-function injectProjectedSummaries(
-  turns: Turn[],
-  summaries: string[],
+function injectProjectedSummary(
+  turn: Turn,
+  summary: string,
   sessionID: string,
-): Turn[] {
-  return turns.map((turn, index) => {
-    const projected = structuredClone(turn);
-    const firstAssistant = projected.assistants[0];
-    if (!firstAssistant) throw new Error("Turn missing assistant message.");
-    const summary = summaries[index];
-    if (summary === undefined)
-      throw new Error("Missing summary for assistant turn.");
-    firstAssistant.parts.push({
-      id: summaryPartID(firstAssistant.info.id),
-      sessionID,
-      messageID: firstAssistant.info.id,
-      type: "text",
-      text: summary,
-      metadata: summaryMetadata(),
-    } satisfies TextPart);
-    return projected;
-  });
+): Turn {
+  const projected = structuredClone(turn);
+  const firstAssistant = projected.assistants[0];
+  if (!firstAssistant) throw new Error("Turn missing assistant message.");
+  firstAssistant.parts.push(
+    capsuleSummaryTextPart(firstAssistant.info.id, sessionID, summary),
+  );
+  return projected;
 }
 
 function countTurnCanonicalTokens(turn: Turn): number {
@@ -332,7 +343,6 @@ async function projectCompaction(
   const afterTokens = countCanonicalContentTokens(projectedMessages);
   return {
     afterTokens,
-    omissions: selection.pruning.omissions,
     stats: nextConversationStats(
       existingStats,
       sessionID,
