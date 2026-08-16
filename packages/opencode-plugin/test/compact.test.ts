@@ -112,6 +112,9 @@ describe("magic compact", () => {
     expect(config.agent?.["magic-compact-summarizer"]?.prompt).toContain(
       "Reply only with the JSON object required by each Magic Compact request",
     );
+    expect(config.agent?.["magic-compact-summarizer"]?.prompt).toContain(
+      "Host code owns the capsule Outcome and section framing",
+    );
   });
 
   test("clamps only existing positive finite summarizer limits at the provider boundary", async () => {
@@ -318,7 +321,13 @@ describe("magic compact", () => {
     expect(promptText).toContain(
       "Preserve failed, not-run, running, and unresolved state exactly",
     );
-    expect(promptText).toContain("human-readable continuation capsule");
+    expect(promptText).toContain("non-empty narrative summary bodies");
+    expect(promptText).toContain(
+      "Host code owns the capsule Outcome and section framing",
+    );
+    expect(promptText).toContain("one narrative paragraph");
+    expect(promptText).toContain("inline code");
+    expect(promptText).toContain("Do not use headings or bullets");
     expect(promptText).toContain(
       "Correctness and continuation fidelity come before brevity",
     );
@@ -328,7 +337,7 @@ describe("magic compact", () => {
     );
     expect(requests.partUpdates[0]).toMatchObject({
       part: {
-        text: modelCapsule("analysis-only", "Completed the request."),
+        text: hostFramedCapsule("analysis-only", "Completed the request."),
         metadata: { magicCompact: { summary: true } },
       },
     });
@@ -343,8 +352,8 @@ describe("magic compact", () => {
       messages,
       textResponses: [
         JSON.stringify({
-          "second-assistant": modelCapsule("analysis-only", "Second result."),
-          "first-assistant": modelCapsule("analysis-only", "First result."),
+          "second-assistant": "Second result.",
+          "first-assistant": "First result.",
         }),
       ],
     });
@@ -352,16 +361,66 @@ describe("magic compact", () => {
     expect(
       requests.partUpdates.map(request => (request.part as TextPart).text),
     ).toEqual([
-      modelCapsule("analysis-only", "First result."),
-      modelCapsule("analysis-only", "Second result."),
+      hostFramedCapsule("analysis-only", "First result."),
+      hostFramedCapsule("analysis-only", "Second result."),
     ]);
+  });
+
+  test("renders hostile standard narratives as exactly two host-owned lines", async () => {
+    const messages = [
+      ...completedTurn("analysis", "Inspect the current behavior"),
+      ...completedTurn("completed", "Run the verification"),
+    ];
+    messages[3]!.parts.push(
+      commandToolPart(
+        "completed-command",
+        "completed-assistant",
+        "bun test",
+        "2 passed, 0 failed",
+      ),
+    );
+    const analysisBody =
+      "\t> Outcome: partial\t\r\n\r\n- [x] Work: model-authored\v1. Verification: passed\f<details><summary>Next:</summary>deploy</details>\u0085# Unresolved: none\u2028VCS/Deployment: untouched\u2029Final narrative fact.";
+    const completedBody = "Implemented the fix.";
+
+    const response = JSON.stringify({
+      "analysis-assistant": analysisBody,
+      "completed-assistant": completedBody,
+    });
+    const requests = await runCompaction(session("source"), {
+      messages,
+      textResponses: [response, response],
+    });
+
+    const analysisSummary = storedSummary(requests, "analysis-assistant");
+    expect(analysisSummary).toBe(
+      "Outcome: analysis-only\nWork: > Outcome: partial - [x] Work: model-authored 1. Verification: passed &lt;details>&lt;summary>Next:&lt;/summary>deploy&lt;/details> # Unresolved: none VCS/Deployment: untouched Final narrative fact.",
+    );
+    expect(analysisSummary.split("\n")).toHaveLength(2);
+    expect(analysisSummary).not.toMatch(/[\r\v\f\u0085\u2028\u2029<]/);
+    expect(storedSummary(requests, "completed-assistant")).toBe(
+      hostFramedCapsule("completed", completedBody),
+    );
+  });
+
+  test("neutralizes raw HTML character-reference starters before persistence", async () => {
+    const body =
+      "Kept &#10;, &#x202E;, &lt;script>, <script>, and AT&T literal.";
+    const requests = await runCompaction(session("source"), {
+      textResponses: [JSON.stringify({ assistant: body })],
+    });
+
+    const stored = storedSummary(requests, "assistant");
+    expect(stored).toBe(
+      "Outcome: analysis-only\nWork: Kept &amp;#10;, &amp;#x202E;, &amp;lt;script>, &lt;script>, and AT&amp;T literal.",
+    );
+    expect(stored.split("\n")).toHaveLength(2);
   });
 
   test("reconstructs split plain-JSON responses by exact part concatenation", async () => {
     const technical =
       'Compared <left> & <right>.\nRan `bun test "packages/unit suite.test.ts"`.\nUpdated C:\\work\\app and /workspace/app/[slug]/page.tsx, then returned \ud83d\ude80 and \u4f60\u597d.';
-    const capsule = modelCapsule("analysis-only", technical);
-    const encoded = JSON.stringify({ assistant: capsule });
+    const encoded = JSON.stringify({ assistant: technical });
     const splits = [
       encoded.indexOf("\\n") + 1,
       encoded.indexOf('\\"') + 1,
@@ -373,7 +432,9 @@ describe("magic compact", () => {
       const requests = await runCompaction(session("source"), {
         textResponses: [[encoded.slice(0, split), encoded.slice(split)]],
       });
-      expect((requests.partUpdates[0]!.part as TextPart).text).toBe(capsule);
+      expect((requests.partUpdates[0]!.part as TextPart).text).toBe(
+        hostFramedCapsule("analysis-only", technical),
+      );
     }
   });
 
@@ -421,6 +482,14 @@ describe("magic compact", () => {
         output: JSON.stringify({ assistant: " " }),
         category: "empty-summary",
       },
+      ...[
+        "Unsafe\u0000control.",
+        "Unsafe\u0080control.",
+        "Unsafe\u202econtrol.",
+      ].map(output => ({
+        output: JSON.stringify({ assistant: output }),
+        category: "unsafe-presentation-control",
+      })),
       {
         output: JSON.stringify({
           assistant: "oversized ".repeat(MAX_SUMMARY_OUTPUT_TOKENS + 1),
@@ -467,6 +536,8 @@ describe("magic compact", () => {
         batch: 1,
         batchCount: 1,
         attempt: 2,
+        sourceSessionID: "source",
+        turnID: "assistant",
       });
       expect(String(error)).toContain(
         `category=${category}, batch=1/1, attempt=2/2`,
@@ -478,46 +549,110 @@ describe("magic compact", () => {
   });
 
   test.each([
-    ["Completed the request.", "invalid-capsule-shape"],
-    [
-      "Outcome: completed\nWork: Claimed completion without source evidence.",
-      "outcome-mismatch",
-    ],
-    [
-      '{"kind":"assistant-text","sourceBytes":42,"windows":["raw"]}',
-      "machine-evidence-summary",
-    ],
-    [
-      'Outcome: analysis-only\nWork: {"sourceBytes":42,"windows":["raw"]}',
-      "machine-evidence-summary",
-    ],
-    [
-      'Outcome: analysis-only\nWork: sourceBytes=42; windows=["raw"]',
-      "machine-evidence-summary",
-    ],
-    [
-      'Outcome: analysis-only\nWork: "kind": "tool"',
-      "machine-evidence-summary",
-    ],
-    [
-      "Outcome: analysis-only\nWork: sourceBytes = 128",
-      "machine-evidence-summary",
-    ],
-    [
-      "Outcome: analysis-only\nWork: Reviewed the request.\n- omitted-record-count=2",
-      "machine-evidence-summary",
-    ],
-    [
-      "Outcome: analysis-only\nWork: Reviewed the request.\nevidence-records\nomitted-record-count=2",
-      "machine-evidence-summary",
-    ],
-    [
-      "Outcome: analysis-only\nWork: Reviewed the work.\nVerification:",
-      "invalid-capsule-shape",
-    ],
-  ])(
-    "rejects a visible model summary outside the readable capsule contract: %s",
-    async (summary, category) => {
+    ["lone high surrogate", "Unsafe \ud800control."],
+    ["lone low surrogate", "Unsafe \udc00control."],
+    ["high surrogate followed by a non-low code unit", "Unsafe \ud800x."],
+  ])("rejects %s in a raw model body", async (_name, summary) => {
+    const partUpdates: Record<string, unknown>[] = [];
+    const response = JSON.stringify({ assistant: summary });
+    let error: unknown;
+    try {
+      await runCompaction(session("source"), {
+        textResponses: [response, response],
+        partUpdates,
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toMatchObject({
+      name: "SummaryContractError",
+      category: "unsafe-presentation-control",
+      attempt: 2,
+    });
+    expect(String(error)).not.toContain(summary);
+    expect(partUpdates).toEqual([]);
+  });
+
+  test("keeps closed producer-schema rejection aligned with emitted evidence", async () => {
+    const assistantID = "producer-canary-assistant";
+    const assistant = message(assistantID, "assistant", [
+      textPart(
+        "producer-canary-text",
+        "source",
+        assistantID,
+        "Representative producer evidence.",
+      ),
+      genericToolPart("producer-status", assistantID, "custom-status", {
+        status: "completed",
+        input: { operation: "inspect" },
+        output: "status complete",
+        title: "Status",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      }),
+    ]);
+    const emittedEvidence = renderStandardTurnEvidence({
+      user: [message("producer-canary-user", "user", [])],
+      assistants: [assistant],
+    });
+    const emittedRecords = machineEvidenceRecords(emittedEvidence);
+    const assistantRecord = emittedRecords.find(
+      record => record["kind"] === "assistant-text",
+    );
+    const toolStatusRecord = emittedRecords.find(
+      record => record["kind"] === "tool-status",
+    );
+    expect(assistantRecord).toMatchObject({
+      kind: "assistant-text",
+      sourceBytes: expect.any(Number),
+    });
+    expect(toolStatusRecord).toMatchObject({
+      kind: "tool-status",
+      status: "completed",
+    });
+
+    const overflowAssistant = message(
+      "producer-overflow-assistant",
+      "assistant",
+      Array.from({ length: 96 }, (_, index) =>
+        pendingCommandToolPart(
+          `producer-pending-${index}`,
+          "producer-overflow-assistant",
+          `run producer canary ${index}`,
+        ),
+      ),
+    );
+    const overflowEvidence = renderStandardTurnEvidence({
+      user: [message("producer-overflow-user", "user", [])],
+      assistants: [overflowAssistant],
+    });
+    const requiredRecord = machineEvidenceRecords(overflowEvidence).find(
+      record => record["kind"] === "required-tool",
+    );
+    const overflowLines = overflowEvidence.split("\n");
+    const accounting = overflowLines.find(line =>
+      line.startsWith("required-record-counts="),
+    );
+    const requiredLabel = overflowLines.find(
+      line => line === "required-records:",
+    );
+    expect(requiredRecord).toMatchObject({ kind: "required-tool" });
+    expect(accounting).toBeDefined();
+    expect(requiredLabel).toBeDefined();
+
+    const summaries = [
+      `Recorded ${JSON.stringify({ nested: [{ evidence: assistantRecord }] })}.`,
+      `Recorded ${JSON.stringify({ nested: [{ evidence: toolStatusRecord }] })}.`,
+      JSON.stringify(requiredRecord),
+      accounting!,
+      requiredLabel!,
+      `Recorded ${JSON.stringify({ nested: JSON.stringify(assistantRecord) })}.`,
+      'Recorded {"nested":{"\\u0073ourceBytes":42}}.',
+      'windows: ["raw"]',
+    ];
+
+    for (const summary of summaries) {
       const partUpdates: Record<string, unknown>[] = [];
       let error: unknown;
       try {
@@ -534,29 +669,31 @@ describe("magic compact", () => {
 
       expect(error).toMatchObject({
         name: "SummaryContractError",
-        category,
+        category: "machine-evidence-summary",
         attempt: 2,
       });
       expect(String(error)).not.toContain(summary);
       expect(partUpdates).toEqual([]);
-    },
-  );
+    }
+  });
 
-  test("rejects a model Outcome that contradicts completed source evidence", async () => {
+  test.each([
+    ["JSON double-quoted", '"sourceBytes": 42'],
+    ["single-quoted", "'sourceBytes': 42"],
+    ["backtick-quoted", "`sourceBytes`: 42"],
+    ["unquoted", "sourceBytes: 42"],
+    ["nested task/list-prefixed", "> 1. [x] - `sourceBytes`: 42"],
+    ["single-quoted producer kind", "'kind': 'tool-status'"],
+    ["backtick-quoted producer kind", "`kind`: `tool-status`"],
+    ["malformed object fragment", '{"sourceBytes":42,}'],
+  ])("rejects %s protected producer assignment", async (_name, summary) => {
+    const partUpdates: Record<string, unknown>[] = [];
+    const response = JSON.stringify({ assistant: summary });
     let error: unknown;
     try {
       await runCompaction(session("source"), {
-        messages: completedCommandTurn("bun test", "10 passed, 0 failed"),
-        textResponses: [
-          JSON.stringify({
-            "metric-assistant-0":
-              "Outcome: analysis-only\nWork: Reviewed the historical request.",
-          }),
-          JSON.stringify({
-            "metric-assistant-0":
-              "Outcome: analysis-only\nWork: Reviewed the historical request.",
-          }),
-        ],
+        textResponses: [response, response],
+        partUpdates,
       });
     } catch (caught) {
       error = caught;
@@ -564,9 +701,29 @@ describe("magic compact", () => {
 
     expect(error).toMatchObject({
       name: "SummaryContractError",
-      category: "outcome-mismatch",
+      category: "machine-evidence-summary",
       attempt: 2,
     });
+    expect(String(error)).not.toContain(summary);
+    expect(partUpdates).toEqual([]);
+  });
+
+  test.each([
+    "Documented sourceBytes, windows, evidence-records, and omitted-record-count as ordinary field names.",
+    'Documented the JSON field "kind": "tool".',
+    "Set sourceBytes = 128.",
+    "> - [x] Set sourceBytes = 128.",
+    '{"kind":"ticket","payload":{"items":[1,2],"status":"ok"}}',
+    "Kept arr[0], [notes](./notes.md), and app/[slug]/page.tsx.",
+    "Preserved valid UTF-16 pair \ud83d\ude80 and ordinary Unicode \u4f60\u597d.",
+  ])("accepts ordinary technical narrative: %s", async summary => {
+    const requests = await runCompaction(session("source"), {
+      textResponses: [JSON.stringify({ assistant: summary })],
+    });
+
+    expect(storedSummary(requests, "assistant")).toBe(
+      hostFramedCapsule("analysis-only", summary),
+    );
   });
 
   test("does not retry a contract failure when scratch cleanup fails", async () => {
@@ -765,17 +922,17 @@ describe("magic compact", () => {
       lifecycle,
       textResponses: [
         JSON.stringify({
-          assistant: modelCapsule("analysis-only", "Completed the request."),
+          assistant: "Completed the request.",
         }),
         JSON.stringify({
-          assistant: modelCapsule("analysis-only", "Probe summary."),
+          assistant: "Probe summary.",
         }),
       ],
     });
 
     expect(requests.prompts[0]).not.toHaveProperty("format");
     expect((requests.partUpdates[0]!.part as TextPart).text).toBe(
-      modelCapsule("analysis-only", "Completed the request."),
+      hostFramedCapsule("analysis-only", "Completed the request."),
     );
     expect(lifecycle.filter(event => event === "messages")).toHaveLength(1);
 
@@ -801,7 +958,7 @@ describe("magic compact", () => {
       textResponses: [
         failedOutput,
         JSON.stringify({
-          assistant: modelCapsule("analysis-only", "Recovered summary."),
+          assistant: "Recovered summary.",
         }),
       ],
       lifecycle,
@@ -812,7 +969,7 @@ describe("magic compact", () => {
     expect(lifecycle.filter(event => event === "prompt")).toHaveLength(2);
     expect(lifecycle.filter(event => event === "delete")).toHaveLength(2);
     expect((requests.partUpdates[0]!.part as TextPart).text).toBe(
-      modelCapsule("analysis-only", "Recovered summary."),
+      hostFramedCapsule("analysis-only", "Recovered summary."),
     );
   });
 
@@ -820,36 +977,23 @@ describe("magic compact", () => {
     "Indexed arr[0] after parse.",
     "See [docs](https://example.com/path) for setup.",
     'Returned ["ok","pending"] from the parser.',
-    "Updated app/[slug]/page.tsx route handler.",
     "Implemented the parser [add details].",
     "Implemented the parser. TODO: add evidence.",
     "TBD after validation.",
     "[waiting for details]",
+    "> Reviewed the historical request and confirmed the fix.",
+    "1. Completed the analysis.\n2. Ran the verification.",
+    "> - Reviewed the completed work.",
   ])("accepts substantive standard summary text: %s", async text => {
-    const summary = modelCapsule("analysis-only", text);
     const requests = await runCompaction(session("source"), {
       messages: compactableMessages(),
-      textResponses: [JSON.stringify({ assistant: summary })],
+      textResponses: [JSON.stringify({ assistant: text })],
     });
 
-    expect((requests.partUpdates[0]!.part as TextPart).text).toBe(summary);
+    expect((requests.partUpdates[0]!.part as TextPart).text).toBe(
+      hostFramedCapsule("analysis-only", text),
+    );
   });
-
-  test.each([
-    "Documented sourceBytes, windows, evidence-records, and omitted-record-count as ordinary field names.",
-    'Documented the JSON field "kind": "tool".',
-    "Set sourceBytes = 128.",
-  ])(
-    "accepts machine-field syntax inside ordinary capsule prose: %s",
-    async text => {
-      const summary = `Outcome: analysis-only\nWork: ${text}`;
-      const requests = await runCompaction(session("source"), {
-        textResponses: [JSON.stringify({ assistant: summary })],
-      });
-
-      expect((requests.partUpdates[0]!.part as TextPart).text).toBe(summary);
-    },
-  );
 
   test("serializes user previews as JSON", () => {
     const turn = {
@@ -1458,10 +1602,8 @@ describe("magic compact", () => {
     const command = createCommandHarness(messages, {
       summaryTextOutputs: [
         JSON.stringify({
-          "weak-assistant": modelCapsule(
-            "analysis-only",
+          "weak-assistant":
             "A replacement that cannot provide useful net context reduction.",
-          ),
         }),
       ],
     });
@@ -1594,10 +1736,7 @@ describe("magic compact", () => {
     const command = createCommandHarness(messages, {
       summaryTextOutputs: [
         JSON.stringify({
-          "provider-usage-assistant": modelCapsule(
-            "completed",
-            "Compacted the resolved read turn.",
-          ),
+          "provider-usage-assistant": "Compacted the resolved read turn.",
         }),
       ],
     });
@@ -1655,14 +1794,8 @@ describe("magic compact", () => {
     const command = createCommandHarness(messages, {
       summaryTextOutputs: [
         JSON.stringify({
-          "profitable-assistant": modelCapsule(
-            "completed",
-            "Trimmed the bulky tool output.",
-          ),
-          "net-negative-assistant": modelCapsule(
-            "analysis-only",
-            verboseReplacement,
-          ),
+          "profitable-assistant": "Trimmed the bulky tool output.",
+          "net-negative-assistant": verboseReplacement,
         }),
       ],
     });
@@ -1670,7 +1803,7 @@ describe("magic compact", () => {
     expect(await executeMagicCompact(command.v2, "source", 0)).toBe(true);
 
     expect(summaryText(messages, "profitable-assistant")).toBe(
-      modelCapsule("completed", "Trimmed the bulky tool output."),
+      hostFramedCapsule("completed", "Trimmed the bulky tool output."),
     );
     expect(
       messages.filter(message =>
@@ -1757,10 +1890,7 @@ describe("magic compact", () => {
     const command = createCommandHarness(messages, {
       summaryTextOutputs: [
         JSON.stringify({
-          "profitable-assistant": modelCapsule(
-            "completed",
-            "Trimmed the bulky tool output.",
-          ),
+          "profitable-assistant": "Trimmed the bulky tool output.",
         }),
       ],
     });
@@ -1772,7 +1902,7 @@ describe("magic compact", () => {
       "profitable-assistant",
     ]);
     expect(summaryText(messages, "profitable-assistant")).toBe(
-      modelCapsule("completed", "Trimmed the bulky tool output."),
+      hostFramedCapsule("completed", "Trimmed the bulky tool output."),
     );
     expect(
       messages.filter(message =>
@@ -1850,7 +1980,10 @@ describe("magic compact", () => {
       }
     }
     expect(summaryText(messages, "bulky-a-assistant")).toBe(
-      modelCapsule("completed", "Preserved."),
+      hostFramedCapsule(
+        "completed",
+        "Preserved the completed historical work.",
+      ),
     );
   });
 
@@ -2230,14 +2363,8 @@ describe("magic compact", () => {
       messages,
       textResponses: [
         JSON.stringify({
-          "ordinary-before-assistant": modelCapsule(
-            "analysis-only",
-            "Before summary.",
-          ),
-          "ordinary-after-assistant": modelCapsule(
-            "analysis-only",
-            "After summary.",
-          ),
+          "ordinary-before-assistant": "Before summary.",
+          "ordinary-after-assistant": "After summary.",
         }),
       ],
     });
@@ -2415,10 +2542,7 @@ describe("magic compact", () => {
     const command = createCommandHarness(messages, {
       summaryTextOutputs: [
         JSON.stringify({
-          "ignored-standard-assistant": modelCapsule(
-            "analysis-only",
-            `Preserved ${standardMarker}.`,
-          ),
+          "ignored-standard-assistant": `Preserved ${standardMarker}.`,
         }),
       ],
     });
@@ -6968,7 +7092,7 @@ function summaryPromptSelection(request: Record<string, unknown>): {
 } {
   const text = promptText(request);
   const startMarker = "Selected historical turns and stop anchor:\n";
-  const endMarker = "\n\nEach summary";
+  const endMarker = "\n\nEach value";
   const start = text.indexOf(startMarker);
   const end = text.indexOf(endMarker, start + startMarker.length);
   if (start === -1 || end === -1) {
@@ -7048,34 +7172,30 @@ function deterministicHighEntropyText(bytes: number): string {
   return chunks.join("");
 }
 
-function modelCapsule(
+function hostFramedCapsule(
   outcome: "completed" | "partial" | "analysis-only",
   work: string,
 ): string {
-  return `Outcome: ${outcome}\nWork: ${work}`;
+  const narrative = work
+    .split(/\r\n|[\n\r\v\f\u0085\u2028\u2029]/)
+    .map(segment => segment.trim())
+    .filter(Boolean)
+    .join(" ")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;");
+  return `Outcome: ${outcome}\nWork: ${narrative}`;
 }
 
 function summaryJsonForPrompt(request: Record<string, unknown>): string {
   const selection = summaryPromptSelection(request);
   return JSON.stringify(
     Object.fromEntries(
-      selection.turns.map(({ assistantTurnID, exactEvidence }) => {
-        const outcome = exactEvidence.match(
-          /^Outcome: (completed|partial|analysis-only)$/m,
-        )?.[1] as "completed" | "partial" | "analysis-only" | undefined;
-        if (outcome === undefined) {
-          throw new Error("Standard evidence is missing its expected Outcome.");
-        }
-        return [
-          assistantTurnID,
-          modelCapsule(
-            outcome,
-            assistantTurnID === "assistant"
-              ? "Completed the request."
-              : "Preserved.",
-          ),
-        ];
-      }),
+      selection.turns.map(({ assistantTurnID }) => [
+        assistantTurnID,
+        assistantTurnID === "assistant"
+          ? "Completed the request."
+          : "Preserved the completed historical work.",
+      ]),
     ),
   );
 }

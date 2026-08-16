@@ -10,7 +10,7 @@ export const MAGIC_COMPACT_SUMMARIZER_PROMPT = `You summarize selected historica
 
 The bounded exact evidence map in each request is authoritative. Never infer missing history, inspect external state, continue unfinished work, or perform the work described by the conversation. Assistant-text \`ordered-literal-runs-v1\` segments appear only when a whole source part is provably periodic: expand each segment by repeating its literal in source order; unique text remains verbatim in \`text\`.
 
-Write each summary as a human-readable continuation capsule with an evidence-consistent Outcome line, a non-empty Work field, and only supported non-empty sections. Correctness and continuation fidelity come before brevity: preserve every continuation-critical fact, exact actionable identifier, and the exact next action, without restating tool structure, machine evidence records, or internal accounting the transcript already keeps. Reply only with the JSON object required by each Magic Compact request. Do not wrap it in Markdown fences or add prose.`;
+Write each summary as one narrative paragraph with non-empty human-readable content. Use inline code for exact identifiers and commands when useful. Do not use headings or bullets. Host code owns the capsule Outcome and section framing. Correctness and continuation fidelity come before brevity: preserve every continuation-critical fact, exact actionable identifier, and exact next action as narrative prose, without restating tool structure, machine evidence records, or internal accounting the transcript already keeps. Reply only with the JSON object required by each Magic Compact request. Do not wrap it in Markdown fences or add prose.`;
 
 export const BOUNDARY_METADATA = {
   magicCompact: {

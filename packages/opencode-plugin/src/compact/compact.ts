@@ -27,6 +27,7 @@ export { MAX_SUMMARY_INPUT_TOKENS } from "./constants";
 export const MAX_CONCURRENT_SUMMARY_REQUESTS = 2;
 export const SUMMARY_REQUEST_TIMEOUT_MS = 90_000;
 const MAX_SUMMARY_ATTEMPTS = 2;
+const SUMMARY_SEGMENT_BREAK = /\r\n|[\n\r\v\f\u0085\u2028\u2029]/;
 const SCRATCH_PERMISSION: PermissionRuleset = [
   { permission: "*", pattern: "*", action: "deny" },
 ];
@@ -40,10 +41,20 @@ type SummaryContractCategory =
   | "invalid-summary-type"
   | "empty-summary"
   | "placeholder-summary"
-  | "invalid-capsule-shape"
-  | "outcome-mismatch"
   | "machine-evidence-summary"
+  | "unsafe-presentation-control"
   | "response-too-large";
+
+type SummaryAttemptDiagnostic = {
+  batch: number;
+  batchCount: number;
+  attempt: number;
+};
+
+type SummaryDiagnostic = SummaryAttemptDiagnostic & {
+  sourceSessionID: string;
+  turnID: string;
+};
 
 class SummaryContractError extends Error {
   constructor(
@@ -51,9 +62,11 @@ class SummaryContractError extends Error {
     readonly batch: number,
     readonly batchCount: number,
     readonly attempt: number,
+    readonly sourceSessionID: string,
+    readonly turnID: string,
   ) {
     super(
-      `Summary contract failure (category=${category}, batch=${batch}/${batchCount}, attempt=${attempt}/${MAX_SUMMARY_ATTEMPTS}).`,
+      `Summary contract failure (category=${category}, batch=${batch}/${batchCount}, attempt=${attempt}/${MAX_SUMMARY_ATTEMPTS}, sourceSession=${sourceSessionID}, turn=${turnID}).`,
     );
     this.name = "SummaryContractError";
   }
@@ -218,8 +231,13 @@ async function runScratchPrompt(
   getSettings: () => Promise<CompactionSettings>,
   promptText: string,
   turns: Turn[],
-  diagnostic: { batch: number; batchCount: number; attempt: number },
+  diagnostic: SummaryAttemptDiagnostic,
 ): Promise<string[]> {
+  const contractDiagnostic: SummaryDiagnostic = {
+    ...diagnostic,
+    sourceSessionID: sourceSession.id,
+    turnID: turns.map(turnID).join(","),
+  };
   const route = {
     directory: sourceSession.directory,
     ...(sourceSession.workspaceID
@@ -297,9 +315,9 @@ async function runScratchPrompt(
     if (promptError !== undefined) throw promptError;
 
     result = validateSummaries(
-      parseSummaryOutput(body!.parts, diagnostic),
+      parseSummaryOutput(body!.parts, contractDiagnostic),
       turns,
-      diagnostic,
+      contractDiagnostic,
     );
   } catch (error) {
     operationError = error;
@@ -370,7 +388,7 @@ async function resolveCompactionSettings(
 
 function parseSummaryOutput(
   parts: Array<{ type: string }>,
-  diagnostic: { batch: number; batchCount: number; attempt: number },
+  diagnostic: SummaryDiagnostic,
 ): unknown {
   const responseText = parts
     .filter((part): part is TextPart => part.type === "text")
@@ -394,7 +412,7 @@ function parseSummaryOutput(
 function validateSummaries(
   output: unknown,
   turns: Turn[],
-  diagnostic: { batch: number; batchCount: number; attempt: number },
+  diagnostic: SummaryDiagnostic,
 ): string[] {
   if (output === null || typeof output !== "object" || Array.isArray(output)) {
     throw contractError("invalid-output-shape", diagnostic);
@@ -411,144 +429,346 @@ function validateSummaries(
   }
 
   return expected.map((id, index) => {
+    const turnDiagnostic = { ...diagnostic, turnID: id };
     const value = byID[id];
     if (typeof value !== "string") {
-      throw contractError("invalid-summary-type", diagnostic);
+      throw contractError("invalid-summary-type", turnDiagnostic);
     }
-    const summary = value.trim();
-    if (!summary) throw contractError("empty-summary", diagnostic);
-    if (isNonSubstantiveMarker(summary)) {
-      throw contractError("placeholder-summary", diagnostic);
+    if (containsMachineEvidence(value)) {
+      throw contractError("machine-evidence-summary", turnDiagnostic);
     }
-    validateReadableCapsule(
-      summary,
-      classifyTurnOutcome(turns[index]!),
-      diagnostic,
-    );
-    return summary;
+    if (containsUnsafePresentationControl(value)) {
+      throw contractError("unsafe-presentation-control", turnDiagnostic);
+    }
+    const body = foldSummaryBody(value);
+    if (!body) throw contractError("empty-summary", turnDiagnostic);
+    if (isNonSubstantiveMarker(body)) {
+      throw contractError("placeholder-summary", turnDiagnostic);
+    }
+    return frameSummaryBody(body, classifyTurnOutcome(turns[index]!));
   });
 }
 
-function validateReadableCapsule(
-  summary: string,
-  expectedOutcome: CapsuleOutcome,
-  diagnostic: { batch: number; batchCount: number; attempt: number },
-): void {
-  if (containsMachineEvidence(summary)) {
-    throw contractError("machine-evidence-summary", diagnostic);
-  }
-  const lines = summary.split(/\r?\n/);
-  const outcome = lines[0]?.match(
-    /^Outcome: (completed|partial|analysis-only)$/,
-  )?.[1] as CapsuleOutcome | undefined;
-  if (outcome === undefined) {
-    throw contractError("invalid-capsule-shape", diagnostic);
-  }
-  if (outcome !== expectedOutcome) {
-    throw contractError("outcome-mismatch", diagnostic);
-  }
-
-  const seen = new Set<string>();
-  const hasContent = new Map<string, boolean>();
-  let current: "Work" | "Verification" | "VCS" | "Unresolved" | "Next" | null =
-    null;
-  let workContent = false;
-  for (const line of lines.slice(1)) {
-    if (!line.trim()) continue;
-    const work = line.match(/^Work:(?:\s+(\S.*))?$/);
-    if (work) {
-      if (seen.has("Work")) {
-        throw contractError("invalid-capsule-shape", diagnostic);
-      }
-      seen.add("Work");
-      current = "Work";
-      workContent = Boolean(work[1]);
-      hasContent.set("Work", workContent);
-      continue;
-    }
-    const section = line.match(/^(Verification|VCS|Unresolved|Next):$/)?.[1] as
-      | "Verification"
-      | "VCS"
-      | "Unresolved"
-      | "Next"
-      | undefined;
-    if (section !== undefined) {
-      if (seen.has(section)) {
-        throw contractError("invalid-capsule-shape", diagnostic);
-      }
-      seen.add(section);
-      current = section;
-      hasContent.set(section, false);
-      continue;
-    }
-    if (current === null || /^[A-Z][A-Za-z /-]+:$/.test(line)) {
-      throw contractError("invalid-capsule-shape", diagnostic);
-    }
-    hasContent.set(current, true);
-    if (current === "Work") workContent = true;
-  }
-  if (
-    !seen.has("Work")
-    || !workContent
-    || [...seen].some(section => hasContent.get(section) !== true)
-  ) {
-    throw contractError("invalid-capsule-shape", diagnostic);
-  }
-  if (
-    (outcome === "analysis-only" && seen.size > 1)
-    || (outcome === "completed" && (seen.has("Unresolved") || seen.has("Next")))
-    || (outcome === "partial" && !seen.has("Unresolved") && !seen.has("Next"))
-  ) {
-    throw contractError("outcome-mismatch", diagnostic);
-  }
+function containsUnsafePresentationControl(body: string): boolean {
+  return body
+    .split(SUMMARY_SEGMENT_BREAK)
+    .some(segment => hasUnsafePresentationControl(segment.trim()));
 }
 
-function containsMachineEvidence(summary: string): boolean {
-  return summary.split(/\r?\n/).some(rawLine => {
-    const line = rawLine
-      .trim()
-      .replace(/^Work:\s*/, "")
-      .replace(/^-\s+/, "")
-      .trim();
-    if (!line) return false;
+function hasUnsafePresentationControl(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (!(low >= 0xdc00 && low <= 0xdfff)) return true;
+      index += 1;
+      continue;
+    }
     if (
-      /^(?:assistant-text-records|evidence-records|required-records:|required-record-[a-z-]+\s*=|omitted-record-count\s*=\s*\d+|sourceBytes\s*=\s*\d+|windows\s*=\s*\[|Required deterministic evidence overflow capsule:|Historical assistant text \(authoritative\):|Historical terminal evidence \(authoritative\):)/.test(
-        line,
-      )
-      || /^"(?:kind|sourceBytes|windows|assistant-text-records|evidence-records|omitted-record-count|required-record-[a-z-]+)"\s*:/.test(
-        line,
-      )
+      (codeUnit >= 0xdc00 && codeUnit <= 0xdfff)
+      || codeUnit <= 0x1f
+      || (codeUnit >= 0x7f && codeUnit <= 0x9f)
+      || (codeUnit >= 0x202a && codeUnit <= 0x202e)
+      || (codeUnit >= 0x2066 && codeUnit <= 0x2069)
     ) {
       return true;
     }
-    if (!line.startsWith("{") || !line.endsWith("}")) return false;
-    try {
-      const parsed = JSON.parse(line) as unknown;
-      return (
-        parsed !== null
-        && typeof parsed === "object"
-        && !Array.isArray(parsed)
-        && Object.keys(parsed).some(key =>
-          /^(?:kind|sourceBytes|windows|assistant-text-records|evidence-records|omitted-record-count|required-record-[a-z-]+)$/.test(
-            key,
-          ),
-        )
-      );
-    } catch {
-      return false;
+  }
+  return false;
+}
+
+function foldSummaryBody(body: string): string {
+  return body
+    .split(SUMMARY_SEGMENT_BREAK)
+    .map(segment => segment.trim())
+    .filter(Boolean)
+    .join(" ")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;");
+}
+
+function frameSummaryBody(body: string, outcome: CapsuleOutcome): string {
+  const capsule = `Outcome: ${outcome}\nWork: ${body}`;
+  assertHostFramedCapsule(capsule, outcome);
+  return capsule;
+}
+
+function assertHostFramedCapsule(
+  capsule: string,
+  outcome: CapsuleOutcome,
+): void {
+  const lines = capsule.split("\n");
+  const work = lines[1]?.slice("Work: ".length) ?? "";
+  if (
+    lines.length !== 2
+    || lines[0] !== `Outcome: ${outcome}`
+    || !lines[1]?.startsWith("Work: ")
+    || !work.trim()
+    || isNonSubstantiveMarker(work)
+    || /[\r\v\f\u0085\u2028\u2029]/.test(capsule)
+    || hasUnsafePresentationControl(lines.join(""))
+    || capsule.includes("<")
+    || /&(?!(?:amp|lt);)/.test(capsule)
+  ) {
+    throw new Error("Host-framed summary capsule invariant failed.");
+  }
+}
+
+const PROTECTED_PRODUCER_FIELDS = new Set([
+  "sourceBytes",
+  "textEncoding",
+  "textSegments",
+  "assistant-text-records",
+  "evidence-records",
+  "required-records",
+  "required-record-counts",
+  "required-record-total",
+  "required-record-overflow",
+  "required-record-omitted-disclosure",
+  "omitted-record-count",
+]);
+const PRODUCER_RECORD_KINDS = new Set([
+  "assistant-text",
+  "required-assistant-text",
+  "tool-terminal",
+  "tool-mutation",
+  "tool-status",
+  "required-tool",
+  "assistant-evidence",
+  "required-assistant-evidence",
+  "assistant-message-status",
+  "required-assistant-message-status",
+]);
+const PRODUCER_LINE_LABELS = [
+  "assistant-text-records",
+  "evidence-records",
+  "required-records",
+  "Required deterministic evidence overflow capsule",
+  "Historical assistant text (authoritative)",
+  "Historical terminal evidence (authoritative)",
+];
+
+function containsMachineEvidence(summary: string): boolean {
+  const pending = [summary];
+  const inspected = new Set<string>();
+  while (pending.length > 0) {
+    const text = pending.pop()!;
+    if (inspected.has(text)) continue;
+    inspected.add(text);
+    if (
+      text
+        .split(SUMMARY_SEGMENT_BREAK)
+        .some(segment => containsProducerAssignment(segment))
+    ) {
+      return true;
     }
-  });
+    for (const value of embeddedJsonValues(text)) {
+      if (containsProducerSchema(value, pending)) return true;
+    }
+    if (text.includes('\\"')) pending.push(text.replaceAll('\\"', '"'));
+  }
+  return false;
+}
+
+function containsProducerAssignment(segment: string): boolean {
+  const line = stripNonProsePrefix(segment);
+  if (!line) return false;
+  if (
+    PRODUCER_LINE_LABELS.some(
+      label => line === label || line.startsWith(`${label}:`),
+    )
+  ) {
+    return true;
+  }
+  const assignment = leadingAssignment(line);
+  if (!assignment) return false;
+  if (PROTECTED_PRODUCER_FIELDS.has(assignment.key)) {
+    return true;
+  }
+  if (assignment.key === "windows") {
+    return assignment.value.startsWith("[");
+  }
+  return (
+    assignment.key === "kind"
+    && PRODUCER_RECORD_KINDS.has(leadingStringValue(assignment.value) ?? "")
+  );
+}
+
+function stripNonProsePrefix(segment: string): string {
+  let line = segment.trim();
+  while (line) {
+    const prefix = line.match(
+      /^(?:[>#*+-]+|\d+[.)]|\(\d+\)|\[[ xX]\]|\{)[ \t]*/,
+    )?.[0];
+    if (!prefix) break;
+    line = line.slice(prefix.length).trimStart();
+  }
+  return line;
+}
+
+function leadingAssignment(
+  line: string,
+): { key: string; value: string } | null {
+  let key: string;
+  let end: number;
+  if (line[0] === '"' || line[0] === "'" || line[0] === "`") {
+    const quoted = leadingQuotedValue(line);
+    if (!quoted) return null;
+    key = quoted.text;
+    end = quoted.end;
+  } else {
+    const match = line.match(/^[A-Za-z][A-Za-z0-9-]*/)?.[0];
+    if (!match) return null;
+    key = match;
+    end = match.length;
+  }
+  while (line[end] === " " || line[end] === "\t") end += 1;
+  if (line[end] !== ":" && line[end] !== "=") return null;
+  return { key, value: line.slice(end + 1).trim() };
+}
+
+function leadingStringValue(value: string): string | null {
+  if (value[0] === '"' || value[0] === "'" || value[0] === "`") {
+    return leadingQuotedValue(value)?.text ?? null;
+  }
+  return value.match(/^[A-Za-z][A-Za-z0-9-]*/)?.[0] ?? null;
+}
+
+function leadingQuotedValue(
+  value: string,
+): { text: string; end: number } | null {
+  const quote = value[0];
+  if (quote !== '"' && quote !== "'" && quote !== "`") return null;
+  const end = quotedStringEnd(value, 0, quote);
+  if (end < 0) return null;
+  if (quote === '"') {
+    try {
+      const parsed = JSON.parse(value.slice(0, end)) as unknown;
+      return typeof parsed === "string" ? { text: parsed, end } : null;
+    } catch {
+      return null;
+    }
+  }
+  return { text: value.slice(1, end - 1), end };
+}
+
+function quotedStringEnd(value: string, start: number, quote: string): number {
+  let escaped = false;
+  for (let index = start + 1; index < value.length; index += 1) {
+    const character = value[index]!;
+    if (escaped) {
+      escaped = false;
+    } else if (character === "\\") {
+      escaped = true;
+    } else if (character === quote) {
+      return index + 1;
+    }
+  }
+  return -1;
+}
+
+function embeddedJsonValues(text: string): unknown[] {
+  const values: unknown[] = [];
+  for (let index = 0; index < text.length; index += 1) {
+    const opener = text[index];
+    if (opener !== "{" && opener !== "[") continue;
+    if (opener === "{" && !couldStartJsonObject(text, index)) continue;
+    const end = jsonValueEnd(text, index);
+    if (end < 0) continue;
+    try {
+      values.push(JSON.parse(text.slice(index, end)) as unknown);
+      index = end - 1;
+    } catch {
+      continue;
+    }
+  }
+  return values;
+}
+
+function couldStartJsonObject(text: string, start: number): boolean {
+  let index = start + 1;
+  while (
+    text[index] === " "
+    || text[index] === "\t"
+    || text[index] === "\n"
+    || text[index] === "\r"
+  ) {
+    index += 1;
+  }
+  return text[index] === '"' || text[index] === "}";
+}
+
+function jsonValueEnd(text: string, start: number): number {
+  const stack = [text[start]!];
+  let inString = false;
+  let escaped = false;
+  for (let index = start + 1; index < text.length; index += 1) {
+    const character = text[index]!;
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+    } else if (character === "{" || character === "[") {
+      stack.push(character);
+    } else if (character === "}" || character === "]") {
+      const expected = character === "}" ? "{" : "[";
+      if (stack.pop() !== expected) return -1;
+      if (stack.length === 0) return index + 1;
+    }
+  }
+  return -1;
+}
+
+function containsProducerSchema(value: unknown, pending: string[]): boolean {
+  const values: unknown[] = [value];
+  while (values.length > 0) {
+    const current = values.pop();
+    if (typeof current === "string") {
+      pending.push(current);
+      continue;
+    }
+    if (Array.isArray(current)) {
+      values.push(...current);
+      continue;
+    }
+    if (current === null || typeof current !== "object") continue;
+    for (const [key, field] of Object.entries(
+      current as Record<string, unknown>,
+    )) {
+      if (
+        PROTECTED_PRODUCER_FIELDS.has(key)
+        || (key === "windows" && Array.isArray(field))
+        || (key === "kind"
+          && typeof field === "string"
+          && PRODUCER_RECORD_KINDS.has(field))
+      ) {
+        return true;
+      }
+      values.push(field);
+    }
+  }
+  return false;
 }
 
 function contractError(
   category: SummaryContractCategory,
-  diagnostic: { batch: number; batchCount: number; attempt: number },
+  diagnostic: SummaryDiagnostic,
 ): SummaryContractError {
   return new SummaryContractError(
     category,
     diagnostic.batch,
     diagnostic.batchCount,
     diagnostic.attempt,
+    diagnostic.sourceSessionID,
+    diagnostic.turnID,
   );
 }
 
