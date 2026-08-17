@@ -16,6 +16,7 @@ export type Turn = {
 export type CompactionPlan = {
   summarizedTurns: Turn[];
   nextTurn: Turn | null;
+  sourceTurnStartIndex: number;
   sourceSnapshot: SourceSnapshot;
 };
 
@@ -37,7 +38,7 @@ export class CompactionPruneSourceDriftError extends Error {
   constructor(cause?: unknown) {
     const detail = cause instanceof Error ? ` ${cause.message}` : "";
     super(
-      `OpenCode source changed after capsule insertion and before pruning.${detail}`,
+      `OpenCode source changed after summary insertion and before pruning.${detail}`,
       { cause },
     );
     this.name = "CompactionPruneSourceDriftError";
@@ -54,6 +55,7 @@ export async function createCompactionPlan(
   keepTurns: number,
 ): Promise<CompactionPlan> {
   const messages = await loadMessages(v2, sessionID);
+  const sourceTurns = buildTurns(messages);
   const native = inspectNativeCheckpoints(messages);
   const suffixStart =
     native.summaryIndex === null ? 0 : native.summaryIndex + 1;
@@ -74,10 +76,20 @@ export async function createCompactionPlan(
   const summarizedTurns = turns.slice(compactionStartIndex, compactionEndIndex);
 
   const nextTurn = turns[compactionEndIndex] ?? null;
+  const firstPlannedTurn = summarizedTurns[0] ?? nextTurn;
+  const sourceTurnStartIndex = firstPlannedTurn
+    ? sourceTurns.findIndex(
+        turn => turn.user[0]?.info.id === firstPlannedTurn.user[0]?.info.id,
+      )
+    : sourceTurns.length;
+  if (sourceTurnStartIndex < 0) {
+    throw new Error("Compaction plan turn is missing from source order.");
+  }
 
   return {
     summarizedTurns,
     nextTurn,
+    sourceTurnStartIndex,
     sourceSnapshot: captureSourceSnapshot(messages),
   };
 }
@@ -139,6 +151,30 @@ export function assertCompactionSourceUnchanged(
   const current = captureSourceSnapshot(messages);
   if (!isDeepStrictEqual(current, plan.sourceSnapshot)) {
     throw new NativeCheckpointChangedError();
+  }
+}
+
+export function assertForkMessageShape(
+  messages: MessageWithParts[],
+  plan: CompactionPlan,
+): void {
+  if (messages.length !== plan.sourceSnapshot.length) {
+    throw new Error("Compaction generation fork history shape mismatch.");
+  }
+  for (const [index, message] of messages.entries()) {
+    const source = plan.sourceSnapshot[index];
+    if (
+      !source
+      || !isRecord(source.info)
+      || source.info["role"] !== message.info.role
+      || source.parts.length !== message.parts.length
+      || source.parts.some(
+        (part, partIndex) =>
+          !isRecord(part) || part["type"] !== message.parts[partIndex]?.type,
+      )
+    ) {
+      throw new Error("Compaction generation fork history shape mismatch.");
+    }
   }
 }
 

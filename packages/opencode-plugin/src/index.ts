@@ -27,7 +27,7 @@ const server: Plugin = async input => {
     config: async config => {
       config.agent ??= {};
       config.agent[MAGIC_COMPACT_SUMMARIZER_AGENT] = {
-        description: "Per-turn agentic capsule summarizer for Magic Compact",
+        description: "Per-turn continuation summarizer for Magic Compact",
         mode: "subagent",
         hidden: true,
         prompt: MAGIC_COMPACT_SUMMARIZER_PROMPT,

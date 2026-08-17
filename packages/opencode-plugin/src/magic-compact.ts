@@ -1,12 +1,11 @@
 import type { Message, Session, TextPart } from "@opencode-ai/sdk/v2";
 import { unwrap, type V2Client } from "./api";
 import {
-  generateCompactionCapsules,
-  type GeneratedCapsule,
+  generateCompactionSummaries,
+  type GeneratedSummary,
   injectSummaries,
 } from "./compact/compact";
 import {
-  applyBackup,
   createBackup,
   getCompactionCount,
   injectPostCompactionNotice,
@@ -20,7 +19,6 @@ import {
   createCompactionPlan,
   type CompactionPlan,
   type MessageWithParts,
-  NativeCheckpointChangedError,
   type Turn,
 } from "./compact/plan";
 import {
@@ -36,8 +34,8 @@ import {
 import {
   BOUNDARY_METADATA,
   POST_COMPACTION_NOTICE,
-  agenticCapsuleTextPart,
   boundaryPartID,
+  summaryEnvelopeTextPart,
 } from "./compact/constants";
 import { readStats, type ConversationStats } from "./storage/stats";
 import { attemptWithinDeadline, CONTROL_OPERATION_TIMEOUT_MS } from "./util";
@@ -51,7 +49,7 @@ const MINIMUM_USEFUL_SAVINGS_TOKENS = 32;
 
 type CompactionSelection = {
   turns: Turn[];
-  summaries: Exclude<GeneratedCapsule, null>[];
+  summaries: Exclude<GeneratedSummary, null>[];
   pruning: PruneProjection;
 };
 
@@ -66,22 +64,6 @@ type MagicCompactToast = {
   duration?: number;
 };
 
-class CompactionSourceDriftError extends Error {
-  constructor(
-    readonly sourceSessionID: string,
-    readonly backupSessionID: string,
-    readonly projectedTokens: number,
-    readonly actualTokens: number,
-    cause?: unknown,
-  ) {
-    super(
-      `Compaction token projection mismatch after source writes: projected ${projectedTokens}, counted ${actualTokens}. The partially mutated source session ${sourceSessionID} and backup session ${backupSessionID} were both preserved; inspect both and recover manually from backup ${backupSessionID}.`,
-      { cause },
-    );
-    this.name = "CompactionSourceDriftError";
-  }
-}
-
 export async function executeMagicCompact(
   v2: V2Client,
   sessionID: string,
@@ -95,6 +77,7 @@ export async function executeMagicCompact(
   }
   let backupSession: Session | null = null;
   let sourceSession: Session | null = null;
+  let sourceWritesStarted = false;
   let compactedTurnCount: number;
 
   try {
@@ -126,7 +109,7 @@ export async function executeMagicCompact(
 
     await revalidateCompactionSource(v2, sessionID, sourcePlan);
 
-    const summaries = await generateCompactionCapsules(
+    const summaries = await generateCompactionSummaries(
       v2,
       sourceSession,
       sourcePlan,
@@ -182,6 +165,7 @@ export async function executeMagicCompact(
     );
     await revalidateCompactionSource(v2, sessionID, sourcePlan);
 
+    sourceWritesStarted = true;
     const insertedSummaries = await injectSummaries(
       v2,
       sessionID,
@@ -222,11 +206,8 @@ export async function executeMagicCompact(
       actual.tokens !== projection.afterTokens
       || actual.projectedMediaTokens !== projection.projectedMediaTokens
     ) {
-      throw new CompactionSourceDriftError(
-        sessionID,
-        backupSession.id,
-        projection.afterTokens,
-        actual.tokens,
+      throw new Error(
+        "Compaction token projection mismatch after source writes.",
       );
     }
     await recordPruningStats({
@@ -239,32 +220,23 @@ export async function executeMagicCompact(
   } catch (error) {
     let failure = error;
     if (
-      !(error instanceof NativeCheckpointChangedError)
-      && !(error instanceof CompactionSourceDriftError)
-      && sourceSession
-      && backupSession
+      sourceWritesStarted
+      && sourceSession !== null
+      && backupSession !== null
     ) {
-      try {
-        await applyBackup(v2, sourceSession, backupSession);
-      } catch (rollbackError) {
-        failure = combineErrors(failure, rollbackError);
-      }
+      failure = postWriteFailure(sourceSession.id, backupSession.id);
     }
 
-    try {
-      await showMagicCompactToast(
-        v2,
-        {
-          title: "Magic Compact Failed",
-          message: String(error),
-          variant: "error",
-          duration: 8000,
-        },
-        controlTimeoutMs,
-      );
-    } catch (notificationError) {
-      failure = combineErrors(failure, notificationError);
-    }
+    await showMagicCompactToast(
+      v2,
+      {
+        title: "Magic Compact Failed",
+        message: String(failure),
+        variant: "error",
+        duration: 8000,
+      },
+      controlTimeoutMs,
+    );
     throw failure;
   }
 
@@ -281,25 +253,33 @@ export async function executeMagicCompact(
   return true;
 }
 
+function postWriteFailure(
+  sourceSessionID: string,
+  backupSessionID: string,
+): Error {
+  return new Error(
+    `Magic Compact failed after source writes began. The live source session ${sourceSessionID} and backup session ${backupSessionID} were both preserved; inspect both and recover manually from backup ${backupSessionID}.`,
+  );
+}
+
 async function showMagicCompactToast(
   v2: V2Client,
   toast: MagicCompactToast,
   controlTimeoutMs: number,
 ): Promise<void> {
-  const outcome = await attemptWithinDeadline(
+  await attemptWithinDeadline(
     signal => v2.tui.showToast(toast, { signal }).then(unwrap),
     controlTimeoutMs,
   );
-  if (outcome.kind === "failed") throw outcome.error;
 }
 
 async function selectProfitableTurns(
   plan: CompactionPlan,
-  summaries: GeneratedCapsule[],
+  summaries: GeneratedSummary[],
   sessionID: string,
 ): Promise<CompactionSelection> {
   const selectedTurns: Turn[] = [];
-  const selectedSummaries: Exclude<GeneratedCapsule, null>[] = [];
+  const selectedSummaries: Exclude<GeneratedSummary, null>[] = [];
   const projectedTurns: Turn[] = [];
   const mutations: PruneProjection["mutations"] = [];
   for (const [index, turn] of plan.summarizedTurns.entries()) {
@@ -308,9 +288,7 @@ async function selectProfitableTurns(
       throw new Error("Missing summary for assistant turn.");
     if (summary === null) continue;
     const candidates = [injectProjectedSummary(turn, summary, sessionID)];
-    const pruning = await createPruneProjection(candidates, sessionID, {
-      preserveAssistantPartIDs: summary.preservedPartIDs,
-    });
+    const pruning = await createPruneProjection(candidates, sessionID);
     const projectedTurn = pruning.turns[0]!;
     if (
       countTurnModelFacingTokens(projectedTurn)
@@ -331,14 +309,14 @@ async function selectProfitableTurns(
 
 function injectProjectedSummary(
   turn: Turn,
-  summary: Exclude<GeneratedCapsule, null>,
+  summary: Exclude<GeneratedSummary, null>,
   sessionID: string,
 ): Turn {
   const projected = structuredClone(turn);
   const firstAssistant = projected.assistants[0];
   if (!firstAssistant) throw new Error("Turn missing assistant message.");
   firstAssistant.parts.push(
-    agenticCapsuleTextPart(
+    summaryEnvelopeTextPart(
       firstAssistant.info.id,
       sessionID,
       summary.text,
@@ -459,45 +437,4 @@ function projectedNoticeMessage(
       } satisfies TextPart,
     ],
   };
-}
-
-function combineErrors(primary: unknown, secondary: unknown): Error {
-  if (primary instanceof NativeCheckpointChangedError) {
-    const causes =
-      primary.cause instanceof AggregateError
-        ? [...primary.cause.errors, secondary]
-        : primary.cause === undefined
-          ? [secondary]
-          : [primary.cause, secondary];
-    return new NativeCheckpointChangedError(
-      new AggregateError(
-        causes,
-        "Native checkpoint state changed while another operation also failed.",
-      ),
-    );
-  }
-
-  if (primary instanceof CompactionSourceDriftError) {
-    const causes =
-      primary.cause instanceof AggregateError
-        ? [...primary.cause.errors, secondary]
-        : primary.cause === undefined
-          ? [secondary]
-          : [primary.cause, secondary];
-    return new CompactionSourceDriftError(
-      primary.sourceSessionID,
-      primary.backupSessionID,
-      primary.projectedTokens,
-      primary.actualTokens,
-      new AggregateError(
-        causes,
-        "Source drift and another recovery or notification operation failed.",
-      ),
-    );
-  }
-
-  return new AggregateError(
-    [primary, secondary],
-    "Magic Compact operation and a secondary recovery or notification operation both failed.",
-  );
 }

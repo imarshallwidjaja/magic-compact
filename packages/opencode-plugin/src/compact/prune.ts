@@ -1,6 +1,10 @@
 import type { Part, ToolPart } from "@opencode-ai/sdk/v2";
 import { unwrap, type V2Client } from "../api";
-import { inputOmissionNotice, outputOmissionNotice } from "./constants";
+import {
+  inputOmissionNotice,
+  isPersistedSummaryPart,
+  outputOmissionNotice,
+} from "./constants";
 import type { MessageWithParts, Turn } from "./plan";
 import {
   allocateOmission,
@@ -9,6 +13,7 @@ import {
   type PlannedOmission,
 } from "../storage/omission";
 import { isRecord, unwrapString } from "../util";
+import { coveredAssistantImagePartIDs } from "./media";
 
 type PruneContext = {
   v2: V2Client;
@@ -88,14 +93,13 @@ export async function pruneSummarizedTurns(
 export async function createPruneProjection(
   turns: Turn[],
   sessionID: string,
-  options: { preserveAssistantPartIDs?: Iterable<string> } = {},
 ): Promise<PruneProjection> {
   assertNoNativeArtifacts(turns);
   const projected = structuredClone(turns);
   const mutations: PruneMutation[] = [];
-  const preservedAssistantPartIDs = new Set(options.preserveAssistantPartIDs);
 
   for (const turn of projected) {
+    const coveredAssistantImages = coveredAssistantImagePartIDs(turn);
     for (const user of turn.user) {
       const kept: Part[] = [];
       for (const part of user.parts) {
@@ -120,9 +124,12 @@ export async function createPruneProjection(
       const kept: Part[] = [];
       const partMutations: PruneMutation[] = [];
       for (const part of assistant.parts) {
-        if (isSummaryPart(part)) {
+        if (isPersistedSummaryPart(part)) {
           kept.push(part);
-        } else if (preservedAssistantPartIDs.has(part.id)) {
+        } else if (
+          part.type === "file"
+          && coveredAssistantImages.has(part.id)
+        ) {
           kept.push(part);
         } else if (part.type === "tool") {
           const partOmissions: PlannedOmission[] = [];
@@ -389,20 +396,6 @@ async function applyOutputOmissions(
     Buffer.byteLength(output),
     contentID,
   );
-}
-
-function isSummaryPart(part: Part): boolean {
-  if (part.type !== "text") {
-    return false;
-  }
-
-  const metadata = part.metadata;
-  if (!isRecord(metadata)) {
-    return false;
-  }
-
-  const magicCompact = metadata["magicCompact"];
-  return isRecord(magicCompact) && magicCompact["summary"] === true;
 }
 
 function isImportantSyntheticPart(part: Part): boolean {

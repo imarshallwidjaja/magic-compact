@@ -1,85 +1,39 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import type { Part, TextPart } from "@opencode-ai/sdk/v2";
+import { countGptTokens } from "../stats/tokenize";
 import { buildTurns, type MessageWithParts, type Turn } from "./plan";
 
-export const INLINE_IMAGE_TOKEN_THRESHOLD = 1_024;
 export const MEDIA_MANIFEST_VERSION = 1;
 
 type FilePart = Extract<Part, { type: "file" }>;
+
+type InlineImage = {
+  message: MessageWithParts;
+  partIndex: number;
+  part: FilePart;
+};
 
 export type MediaManifest = {
   version: typeof MEDIA_MANIFEST_VERSION;
   images: Array<{
     ordinal: number;
-    partId: string;
     mime: string;
     urlSha256: string;
   }>;
 };
 
-export type InlineImageCohort = {
-  images: Array<{
-    ordinal: number;
-    part: FilePart;
-  }>;
-  manifest: MediaManifest;
-};
-
-export function collectInlineImageCohort(
-  turn: Turn,
-  countTokens: (value: string) => number,
-): InlineImageCohort | null {
-  const parts = turn.user.flatMap(message =>
-    message.parts.filter(
-      (part): part is FilePart =>
-        part.type === "file"
-        && part.mime.startsWith("image/")
-        && part.url.startsWith("data:"),
-    ),
-  );
-  const contribution = parts.reduce(
-    (tokens, part) => tokens + countTokens(part.url),
-    0,
-  );
-  if (contribution <= INLINE_IMAGE_TOKEN_THRESHOLD) return null;
-
-  const images = parts.map((part, index) => {
-    assertValidInlineImage(part);
-    return { ordinal: index + 1, part };
-  });
+export function createMediaManifest(turn: Turn): MediaManifest | undefined {
+  const images = inlineImages(turn, 3).map(image => image.part);
+  if (images.length === 0) return undefined;
+  images.forEach(assertValidInlineImage);
   return {
-    images,
-    manifest: {
-      version: MEDIA_MANIFEST_VERSION,
-      images: images.map(image => ({
-        ordinal: image.ordinal,
-        partId: image.part.id,
-        mime: image.part.mime,
-        urlSha256: hashURL(image.part.url),
-      })),
-    },
-  };
-}
-
-export function redactInlineImagesForTrace(
-  turn: Turn,
-  cohort: InlineImageCohort,
-): Turn {
-  const ordinals = new Map(
-    cohort.images.map(image => [image.part.id, image.ordinal]),
-  );
-  const redact = (message: MessageWithParts): MessageWithParts => ({
-    ...message,
-    parts: message.parts.map(part => {
-      const ordinal = ordinals.get(part.id);
-      if (ordinal === undefined || part.type !== "file") return part;
-      return { ...part, url: `magic-compact-image:${ordinal}` };
-    }),
-  });
-  return {
-    user: turn.user.map(redact),
-    assistants: turn.assistants,
+    version: MEDIA_MANIFEST_VERSION,
+    images: images.map((part, index) => ({
+      ordinal: index + 1,
+      mime: part.mime,
+      urlSha256: hashURL(part.url),
+    })),
   };
 }
 
@@ -92,42 +46,69 @@ export function projectManifestCoveredMedia(
   }));
 
   for (const turn of buildTurns(messages)) {
-    const manifests = turn.assistants.flatMap(message =>
-      message.parts.flatMap(part => {
-        const manifest = capsuleManifest(part);
-        return manifest === undefined ? [] : [manifest];
-      }),
-    );
-    if (manifests.length === 0) continue;
-    if (manifests.length !== 1) throw manifestMismatch();
-    const manifest = parseManifest(manifests[0]);
-    const images = turn.user.flatMap(message =>
-      message.parts.flatMap((part, partIndex) =>
-        part.type === "file"
-        && part.mime.startsWith("image/")
-        && part.url.startsWith("data:")
-          ? [{ message, partIndex, part }]
-          : [],
-      ),
-    );
-    if (images.length !== manifest.images.length) throw manifestMismatch();
-    for (const [index, image] of images.entries()) {
-      const entry = manifest.images[index]!;
-      if (
-        image.part.id !== entry.partId
-        || image.part.mime !== entry.mime
-        || hashURL(image.part.url) !== entry.urlSha256
-      ) {
-        throw manifestMismatch();
+    const coverage = manifestCoverage(turn);
+    if (coverage === undefined) continue;
+    for (const { image, entry } of coverage) {
+      const placeholder = mediaPlaceholder(image.part, entry);
+      if (countGptTokens(placeholder.text) < countGptTokens(image.part.url)) {
+        image.message.parts[image.partIndex] = placeholder;
       }
-      image.message.parts[image.partIndex] = mediaPlaceholder(
-        image.part,
-        entry,
-      );
     }
   }
 
   return messages;
+}
+
+export function coveredAssistantImagePartIDs(turn: Turn): Set<string> {
+  return new Set(
+    (manifestCoverage(turn) ?? []).flatMap(({ image }) =>
+      image.message.info.role === "assistant" ? [image.part.id] : [],
+    ),
+  );
+}
+
+function inlineImages(turn: Turn, summaryVersion: 2 | 3): InlineImage[] {
+  const messages =
+    summaryVersion === 2 ? turn.user : [...turn.user, ...turn.assistants];
+  return messages.flatMap(message =>
+    message.parts.flatMap((part, partIndex) =>
+      part.type === "file"
+      && part.mime.startsWith("image/")
+      && part.url.startsWith("data:")
+        ? [{ message, partIndex, part }]
+        : [],
+    ),
+  );
+}
+
+function manifestCoverage(turn: Turn):
+  | Array<{
+      image: InlineImage;
+      entry: MediaManifest["images"][number];
+    }>
+  | undefined {
+  const manifests = turn.assistants.flatMap(message =>
+    message.parts.flatMap(part => {
+      const envelope = summaryManifest(part);
+      return envelope === undefined ? [] : [envelope];
+    }),
+  );
+  if (manifests.length === 0) return undefined;
+  if (manifests.length !== 1) throw manifestMismatch();
+  const envelope = manifests[0]!;
+  const manifest = parseManifest(envelope.manifest, envelope.version);
+  const images = inlineImages(turn, envelope.version);
+  if (images.length !== manifest.images.length) throw manifestMismatch();
+  return images.map((image, index) => {
+    const entry = manifest.images[index]!;
+    if (
+      image.part.mime !== entry.mime
+      || hashURL(image.part.url) !== entry.urlSha256
+    ) {
+      throw manifestMismatch();
+    }
+    return { image, entry };
+  });
 }
 
 function assertValidInlineImage(part: FilePart): void {
@@ -135,7 +116,6 @@ function assertValidInlineImage(part: FilePart): void {
   const payload = match?.[2];
   if (
     match?.[1] !== part.mime
-    || !match[1].startsWith("image/")
     || payload === undefined
     || payload.length === 0
     || payload.length % 4 !== 0
@@ -149,7 +129,9 @@ function hashURL(url: string): string {
   return createHash("sha256").update(url).digest("hex");
 }
 
-function capsuleManifest(part: Part): unknown | undefined {
+function summaryManifest(
+  part: Part,
+): { version: 2 | 3; manifest: unknown } | undefined {
   if (part.type !== "text" || !isPlainRecord(part.metadata)) return undefined;
   const metadata = part.metadata["magicCompact"];
   if (
@@ -157,15 +139,18 @@ function capsuleManifest(part: Part): unknown | undefined {
     || metadata["summary"] !== true
     || metadata["capsule"] !== true
     || metadata["agentic"] !== true
-    || metadata["version"] !== 2
+    || (metadata["version"] !== 2 && metadata["version"] !== 3)
     || !("mediaManifest" in metadata)
   ) {
     return undefined;
   }
-  return metadata["mediaManifest"];
+  return {
+    version: metadata["version"],
+    manifest: metadata["mediaManifest"],
+  };
 }
 
-function parseManifest(value: unknown): MediaManifest {
+function parseManifest(value: unknown, summaryVersion: 2 | 3): MediaManifest {
   if (
     !isPlainRecord(value)
     || !exactKeys(value, ["images", "version"])
@@ -175,15 +160,20 @@ function parseManifest(value: unknown): MediaManifest {
   ) {
     throw manifestMismatch();
   }
-  const seen = new Set<string>();
+  const seenPartIDs = new Set<string>();
   const images = value["images"].map((entry, index) => {
+    const expectedKeys =
+      summaryVersion === 2
+        ? ["mime", "ordinal", "partId", "urlSha256"]
+        : ["mime", "ordinal", "urlSha256"];
     if (
       !isPlainRecord(entry)
-      || !exactKeys(entry, ["mime", "ordinal", "partId", "urlSha256"])
+      || !exactKeys(entry, expectedKeys)
       || entry["ordinal"] !== index + 1
-      || typeof entry["partId"] !== "string"
-      || entry["partId"].length === 0
-      || seen.has(entry["partId"])
+      || (summaryVersion === 2
+        && (typeof entry["partId"] !== "string"
+          || entry["partId"].length === 0
+          || seenPartIDs.has(entry["partId"])))
       || typeof entry["mime"] !== "string"
       || !entry["mime"].startsWith("image/")
       || typeof entry["urlSha256"] !== "string"
@@ -191,10 +181,9 @@ function parseManifest(value: unknown): MediaManifest {
     ) {
       throw manifestMismatch();
     }
-    seen.add(entry["partId"]);
+    if (summaryVersion === 2) seenPartIDs.add(entry["partId"] as string);
     return {
       ordinal: entry["ordinal"],
-      partId: entry["partId"],
       mime: entry["mime"],
       urlSha256: entry["urlSha256"],
     };

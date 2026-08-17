@@ -31,7 +31,7 @@ Magic Compact performs per-turn conversation compaction while preserving the con
 
 - Preserve the current conversation structure while reducing context size.
 - Preserve user messages exactly.
-- Replace old assistant turns with validated per-turn agentic capsules.
+- Replace old assistant turns with validated per-turn continuation summaries.
 - Keep useful tool calls visible while removing bulky tool I/O.
 - Store omitted tool I/O outside context but make it retrievable.
 - Keep a recovery path available on failure.

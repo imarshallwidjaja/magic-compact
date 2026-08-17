@@ -10,15 +10,17 @@ Lossless context compression for OpenCode.
 
 OpenCode's built-in compaction replaces an entire conversation with one summary blob. The user messages, the assistant's reasoning, tool calls, design decisions, and workflow are all flattened into a generic template (Goal, Progress, Key Decisions...). The agent wakes up with amnesia, forced to reconstruct its working state from an abstraction that captured a fraction of what mattered.
 
-Magic Compact takes a different approach: preserve the conversation skeleton, ask a hidden deny-all summarizer to write one capsule per eligible old assistant turn from the complete turn trace, and keep omitted tool I/O retrievable. Safety comes from full-trace inputs, strict result validation, exact profitability projection, source revalidation, and rollback.
+Magic Compact takes a different approach: preserve the conversation skeleton, fork the complete session once, and ask a hidden deny-all summarizer to write one continuation summary per eligible old assistant turn. Safety comes from OpenCode's native history conversion, a bounded explicit turn index, strict response ordering, exact profitability projection, source revalidation, and non-destructive backup recovery.
 
 ## How
 
-Instead of collapsing an entire session into a single generic summary, Magic Compact replaces old assistant turns with validated per-turn agentic capsules while leaving user messages and tool calls in place.
+Instead of collapsing an entire session into a single generic summary, Magic Compact replaces old assistant turns with validated per-turn continuation summaries while leaving user messages and tool calls in place.
 
-Exact user messages remain in context. For each candidate turn, Magic Compact sends one complete untruncated ordered trace to a hidden scratch session: user messages, assistant text/reasoning/subtask/file/patch/snapshot parts, tool names, inputs, statuses, outputs, errors, MCP calls, and stable record refs. Oversized inline `data:` images in a candidate turn are redacted from that text trace and attached once as real image inputs to the same configured compaction model; every image requires substantive visual coverage. The model returns a canonical JSON result that is host-framed as `Outcome: <Human Status> — <outcome>` followed by `Process:` and readable Markdown. Required unresolved refs from structured tool state, assistant errors, and narrow Hive/task terminal failures must remain unresolved, and completed or analysis-only capsules cannot carry unresolved refs. Tool call skeletons stay visible; only tool input/output bytes are cached for `read_omitted_content`.
+Exact user messages remain in context. Magic Compact creates one ephemeral fork of the complete source session, changes that fork to deny-all permissions, then makes one request through the hidden Magic summarizer agent. The request uses the model and variant explicitly configured on OpenCode's native compaction agent; it never silently falls back to the source session model. OpenCode supplies the forked user, assistant, tool, and media history through its native model conversion.
 
-Each candidate remains one scratch session, one user message, one model request, and one response. Magic Compact does not impose a local wall-clock deadline on that model request; provider rejection, cancellation, or invalid response still aborts and deletes the scratch session. If timed-out scratch creation later succeeds, detached bounded cleanup aborts and deletes that scratch without changing the original failure. If the exact prompt exceeds the transport's safe per-string size, it is represented by multiple ordered text blocks in that same request whose concatenation is exactly the original JavaScript string, with image parts attached once after all text blocks. Scratch creation, abort, deletion, and toast delivery remain bounded so control-plane failures cannot hang the command.
+After forking, Magic Compact verifies the rewritten fork's chronological message/turn shape, chooses a collision-free 128-bit nonce absent from the source and fork histories, and injects nonce-bound ephemeral ordinal markers into selected fork turns. The explicit request contains only a bounded turn index: each exact marker, ordinal, escaped first ordinary user-text line capped at 300 characters, and expected user-and-assistant inline-image count, plus an optional nonce-bound stop marker and anchor. It never serializes SDK objects, tool states, assistant traces, data URLs, provider metadata, or encrypted reasoning, and it never manually attaches files. One JSON response must map every selected turn by exact marker, ordinal, and anchor with a nonempty summary; only the active generation nonce or marker token is rejected inside summaries and visual descriptions, marker nonces are validation-only and never persist in visible summaries, and useful source identifiers may remain when the model includes them. Missing, stale, spoofed, duplicate, shifted, reordered, empty, or active-marker-leaking entries fail before backup or source mutation.
+
+The model request has no local wall-clock deadline. Fork creation, permission update, marker injection, abort, deletion, and toast delivery remain bounded. Provider rejection or invalid output aborts and deletes the fork; a late fork creation receives detached bounded cleanup. If OpenCode's native request still exceeds the configured model context, Magic Compact fails loudly: run `/magic-trim` first, then retry `/magic-compact`. If the provider reports an output-length limit, retry with a larger `N` so fewer turns are selected. There are no retries, per-turn fallbacks, chunk summaries, partial writes, or model fallback.
 
 <p align="center">
   <img src=".github/assets/visualization.png" alt="Compaction Comparison" />
@@ -26,15 +28,15 @@ Each candidate remains one scratch session, one user message, one model request,
 
 ## Features
 
-- Lossless boundary — Preserve exact user messages, native checkpoint safety, required failure/not-run/unresolved evidence, and retrievable omitted tool I/O instead of flattening history into one recap.
+- Lossless boundary — Preserve exact user messages, native checkpoint safety, source ordering, and retrievable omitted tool I/O instead of flattening history into one recap.
 - On-demand compaction overhead — Model summarization happens only when you run `/magic-compact`, not during the normal agentic loop.
 - Preserved user messages — Exact requirements and guidance remain visible to the agent, verbatim.
 - Smart tool call pruning — Bulky completed tool I/O is replaced with omission notices, with original content cached and retrievable on demand via `read_omitted_content`.
 - Recompactable — Run `/magic-compact` again later to compact new turns while preserving prior summaries.
 - Trim without summarizing — OpenCode can prune historical tool I/O with `/magic-trim` while preserving assistant responses.
-- Agentic capsules — Replaces each old assistant turn with one plain-language `Outcome:`/`Process:` capsule written by a hidden model request from the complete turn trace. Unresolved or failed work stays visible; contradictory, incomplete, or unsafe summaries abort unchanged instead of replacing history.
-- Media-aware capsules — When the aggregate canonical contribution of inline `data:` `image/*` parts in one candidate turn crosses a conservative internal threshold, all inline images in that turn are attached to the configured compaction model and summarized as one cohort. The model must explicitly support image input; there is no provider/model fallback and no public threshold setting.
-- Lossless media persistence — Original user file parts and exact `file.url` data remain untouched in the source, backup, API, and exports. Accepted capsules carry a versioned part-ID/MIME/SHA-256 manifest. OpenCode's transient message-transform hook replaces only exact manifest matches with declarative placeholders for future model requests; missing manifests do nothing and mismatches fail closed.
+- One-fork summaries — One hidden request over one complete source fork produces every selected turn's continuation-focused summary. The configured native compaction model receives the full history while the explicit prompt remains proportional to the number of turns.
+- Native media handling — OpenCode's normal fork-history conversion carries user files, assistant files, and tool-result attachments as typed media. Before forking, Magic Compact scans the complete source history, including retained and opaque summary turns, and requires image capability if any image may reach the model. It does not redact, reattach, fetch, resize, OCR, or encode media in its prompt.
+- Lossless media persistence — Original user file parts and v3-covered assistant inline image parts remain untouched in the source, backup, API, and exports. New v3 summary envelopes carry a locally built user-then-assistant ordinal/MIME/SHA-256 manifest that remains valid when OpenCode rewrites IDs during forks or recovery. Persisted v2 manifests remain user-only and readable, but their historical `partId` does not override canonical content identity. Tool `state.attachments` stay on OpenCode's native media path and are not added to the persisted manifest. OpenCode's transient message-transform hook validates exact v2/v3 manifest matches and replaces each with a declarative placeholder only when the placeholder is strictly smaller than the original file URL token contribution; otherwise the exact file part stays inline and model-facing. Missing manifests do nothing and mismatches fail closed.
 - Useful-savings gate — A turn is replaced only when its exact projected replacement (summary plus the same planned pruning) is strictly smaller than the turn's exact source. Net-negative turns stay byte-identical. If the projected result cannot save at least 20% of the selected profitable turns' eligible removable content, Magic Compact fails unchanged before backup, mutation, or a stats increment instead of claiming weak savings.
 
 ## Installation
@@ -59,10 +61,10 @@ This installs the package and adds it to your global OpenCode config.
 To compact, run `/magic-compact [N]` with an optional argument indicating how many turns to preserve.
 
 - `N` is the number of recent assistant turns to preserve as-is. Default: `0` (summarize everything).
-- A backup session is created before the first source write. Pre-backup failures leave the current source unchanged; later ordinary failures recover through the backup.
-- Capsule generation and the useful-savings projection run before backup creation without mutating the source. A backup still exists before the first durable compaction write.
-- After inserting its own capsules and boundary, Magic Compact revalidates the full source before executing the exact preplanned prune mutations. Unexpected drift rolls back through the backup before pruning or accounting writes.
-- If final token validation detects late source drift after writes, both the partially mutated source and its named backup are preserved for manual recovery and no successful stats increment is recorded.
+- A backup session is created before the first source write. Pre-backup failures leave the current source unchanged, and every failure after backup creation preserves both the live source and its named backup for manual recovery.
+- Summary generation and the useful-savings projection run before backup creation without mutating the source. A backup still exists before the first durable compaction write.
+- From the first summary insertion attempt onward, any failure preserves both the live source and its named backup without selecting either or deleting the live source. The surfaced error names both session IDs for manual recovery, and no successful stats increment is recorded.
+- After inserting its own summaries and boundary, Magic Compact revalidates the full source before executing the exact preplanned prune mutations. Unexpected drift preserves both sessions before pruning or accounting writes.
 
 Examples:
 
@@ -103,13 +105,14 @@ Kept:
 
 - User messages (verbatim)
 - User file parts and exact inline image URLs (verbatim in persistence; accepted manifest-covered images are projected only from future model requests)
+- Assistant inline image file parts covered by an accepted v3 manifest (verbatim in persistence; projected only from future model requests)
 - Per-turn summaries
 - Tool calls (structure preserved)
 - Selected high-value synthetic messages (shell wrappers, background task results, working-directory change reminders)
 
 Removed or condensed:
 
-- Assistant reasoning, non-preserved text, and step markers — replaced by the per-turn capsule
+- Assistant reasoning, text, and step markers — replaced by the per-turn summary; v3 manifest-covered inline image files stay persisted
 - Most synthetic/injected messages (file expansions, plan reminders, prior compaction notices, etc.)
 - Bulky completed tool I/O — replaced with an omission notice pointing to the cache
 
@@ -136,7 +139,7 @@ Magic Compact Offers:
 
 - Simplicity — One command, zero configuration.
 - Lossless quality — Turn-by-turn flow stays intact. All user commands are preserved. All past tool calls are preserved.
-- Maximum token savings — Old assistant prose is represented once in a validated per-turn capsule, reasoning is removed, and long completed tool I/O is aggressively pruned. Net-negative turns remain unchanged.
+- Maximum token savings — Old assistant prose is represented once in a validated per-turn summary, reasoning is removed, and long completed tool I/O is aggressively pruned. Net-negative turns remain unchanged.
 - No cache churn — Compaction happens once and is cache friendly, whereas DCP may invalidate entire conversations multiple times within one request.
 - Zero assistant overhead — No prompt injections asking the assistant to compact. Your assistant stay focused on its task.
 
@@ -151,7 +154,7 @@ Magic Compact Offers:
 - Efficiency — One explicit compaction command, no background summarization loop, no always-on memory RAG, and no recurring prompt injections.
 - Lower token burn — Context reduction happens once on demand instead of continuously consuming tokens across every turn.
 - Fewer cache invalidations — The session is rewritten once, then stays stable, instead of repeatedly re-rendering volatile background state.
-- Lossless conversation shape — User messages stay verbatim, tool structure is preserved, required unresolved state is validated, preserve-mode final responses can stay exact, and omitted tool I/O remains retrievable. Assistant prose is never stored in the omission cache.
+- Lossless conversation shape — User messages stay verbatim, tool structure is preserved, ordered continuation summaries remain in place, and omitted tool I/O remains retrievable. Assistant prose is never stored in the omission cache.
 - Focused compaction — The plugin does one job: compress the conversation without turning the runtime into a memory subsystem.
 
 If you want a lightweight, user-driven compaction tool with minimal ongoing overhead, Magic Compact is the better fit. If you want a full long-term memory system with background maintenance, Magic Context is the heavier alternative.
