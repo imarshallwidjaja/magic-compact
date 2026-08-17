@@ -15,6 +15,12 @@ import type { AssistantMessage, Event } from "@opencode-ai/sdk";
 import type { Message, Part, Session, TextPart } from "@opencode-ai/sdk/v2";
 import type { V2Client } from "../src/api";
 import {
+  computeNativeBatchBudget,
+  estimateNativeTurnCost,
+  NATIVE_BATCH_FIXED_RESERVE_TOKENS,
+  planNativeGenerationBatches,
+} from "../src/compact/batch";
+import {
   generateCompactionSummaries,
   injectSummaries,
 } from "../src/compact/compact";
@@ -24,7 +30,9 @@ import {
   POST_COMPACTION_NOTICE,
 } from "../src/compact/constants";
 import {
+  assertCompactionSourceUnchanged,
   createCompactionPlan,
+  NativeCheckpointChangedError,
   type CompactionPlan,
   type MessageWithParts,
   type Turn,
@@ -84,8 +92,354 @@ afterAll(async () => {
   await rm(storageDirectory, { recursive: true, force: true });
 });
 
-describe("one-fork compaction generation", () => {
-  test("registers a hidden deny-all summarizer whose prompt uses complete fork history", async () => {
+describe("native generation batch planning", () => {
+  const budget = computeNativeBatchBudget({
+    context: 1_000_000,
+    input: 500_000,
+    output: 64_000,
+  });
+  const estimate = (
+    ordinal: number,
+    inputTokens: number,
+    outputTokens = 1_000,
+  ) => ({ ordinal, inputTokens, outputTokens });
+
+  test("derives output, normal, hard-turn, and halo limits from the configured model", () => {
+    expect(budget).toEqual({
+      outputTarget: 32_000,
+      normalInputTarget: 400_000,
+      hardSingleTurnInput: 450_000,
+      haloInputLimit: 450_000,
+    });
+
+    expect(
+      computeNativeBatchBudget({ context: 400_000, output: 64_000 }),
+    ).toEqual({
+      outputTarget: 32_000,
+      normalInputTarget: 294_400,
+      hardSingleTurnInput: 331_200,
+      haloInputLimit: 331_200,
+    });
+  });
+
+  test("rejects missing or invalid context limits and uses the fallback output target", () => {
+    expect(() => computeNativeBatchBudget({} as { context: number })).toThrow(
+      "positive configured compaction model context limit",
+    );
+    expect(() =>
+      computeNativeBatchBudget({ context: 0, output: 64_000 }),
+    ).toThrow("positive configured compaction model context limit");
+    expect(computeNativeBatchBudget({ context: 400_000 })).toMatchObject({
+      outputTarget: 16_000,
+      normalInputTarget: 307_200,
+      hardSingleTurnInput: 345_600,
+      haloInputLimit: 345_600,
+    });
+  });
+
+  test("rejects a model input budget too small to fit the fixed request reserve", () => {
+    expect(() =>
+      computeNativeBatchBudget({ context: 40_889, output: 64_000 }),
+    ).toThrow(/input budget.*too small/i);
+    expect(() =>
+      computeNativeBatchBudget({
+        context: 1_000_000,
+        input: 8_889,
+        output: 64_000,
+      }),
+    ).toThrow(/input budget.*too small/i);
+    expect(
+      computeNativeBatchBudget({ context: 40_890, output: 64_000 }),
+    ).toMatchObject({ hardSingleTurnInput: 8_001 });
+  });
+
+  test("keeps below and exact 400K inputs normal and dedicates an above-target turn", () => {
+    const below = planNativeGenerationBatches(
+      [estimate(1, 400_000 - NATIVE_BATCH_FIXED_RESERVE_TOKENS - 1)],
+      budget,
+    );
+    const exact = planNativeGenerationBatches(
+      [estimate(1, 400_000 - NATIVE_BATCH_FIXED_RESERVE_TOKENS)],
+      budget,
+    );
+    const above = planNativeGenerationBatches(
+      [
+        estimate(1, 400_000 - NATIVE_BATCH_FIXED_RESERVE_TOKENS + 1),
+        estimate(2, 1),
+      ],
+      budget,
+    );
+
+    expect(below).toMatchObject([
+      { estimatedInputTokens: 399_999, candidates: [{ ordinal: 1 }] },
+    ]);
+    expect(exact).toMatchObject([
+      { estimatedInputTokens: 400_000, candidates: [{ ordinal: 1 }] },
+    ]);
+    expect(
+      above.map(batch => batch.candidates.map(item => item.ordinal)),
+    ).toEqual([[1], [2]]);
+  });
+
+  test("caps a normal batch at 12 target turns and at the output target", () => {
+    const byTurns = planNativeGenerationBatches(
+      Array.from({ length: 13 }, (_, index) => estimate(index + 1, 1)),
+      budget,
+    );
+    const byOutput = planNativeGenerationBatches(
+      [estimate(1, 1, 17_000), estimate(2, 1, 17_000)],
+      budget,
+    );
+
+    expect(byTurns.map(batch => batch.candidates.length)).toEqual([12, 1]);
+    expect(byOutput.map(batch => batch.candidates.length)).toEqual([1, 1]);
+  });
+
+  test("allows one dedicated oversized turn but rejects a turn beyond the hard limit", () => {
+    expect(
+      planNativeGenerationBatches(
+        [estimate(1, 430_000 - NATIVE_BATCH_FIXED_RESERVE_TOKENS)],
+        budget,
+      ),
+    ).toMatchObject([
+      { estimatedInputTokens: 430_000, candidates: [{ ordinal: 1 }] },
+    ]);
+    expect(() =>
+      planNativeGenerationBatches(
+        [estimate(1, 450_000 - NATIVE_BATCH_FIXED_RESERVE_TOKENS + 1)],
+        budget,
+      ),
+    ).toThrow(/magic-trim.*first/i);
+  });
+
+  test("requires more model output capacity when one turn exceeds the output target", () => {
+    expect(() =>
+      planNativeGenerationBatches([estimate(1, 1, 32_001)], budget),
+    ).toThrow(/single compaction turn.*more output capacity/i);
+  });
+
+  test.each([
+    [
+      "nested input",
+      (dataURL: string) => ({
+        status: "completed",
+        input: { request: { screenshot: dataURL } },
+        output: "inspected",
+        title: "Inspect",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      }),
+    ],
+    [
+      "completed output",
+      (dataURL: string) => ({
+        status: "completed",
+        input: { path: "/tmp/result" },
+        output: dataURL,
+        title: "Read",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      }),
+    ],
+    [
+      "error output",
+      (dataURL: string) => ({
+        status: "error",
+        input: { path: "/tmp/result" },
+        error: dataURL,
+        metadata: {},
+        time: { start: 1, end: 2 },
+      }),
+    ],
+    [
+      "interrupted metadata output",
+      (dataURL: string) => ({
+        status: "error",
+        input: { path: "/tmp/result" },
+        error: "interrupted",
+        metadata: { interrupted: true, output: dataURL },
+        time: { start: 1, end: 2 },
+      }),
+    ],
+  ])(
+    "charges a multi-megabyte data URL in %s as model-visible text",
+    (_name, state) => {
+      const dataURL = `data:application/octet-stream;base64,${"A".repeat(2_000_000)}`;
+      const turn = candidateTurn(`estimate-${_name}`, "inspect", [
+        toolPart(
+          `estimate-${_name}-tool`,
+          `estimate-${_name}-assistant`,
+          state(dataURL),
+        ),
+      ]);
+      const cost = estimateNativeTurnCost(turn);
+
+      expect(cost.inputTokens).toBeGreaterThan(dataURL.length);
+      expect(() =>
+        planNativeGenerationBatches([{ ordinal: 1, ...cost }], budget),
+      ).toThrow(/magic-trim.*first/i);
+    },
+  );
+
+  test("mirrors compacted, interrupted, error, pending, and running tool output visibility", () => {
+    const hiddenDataURL = `data:image/png;base64,${"A".repeat(2_000_000)}`;
+    const cost = (id: string, state: Record<string, unknown>) =>
+      estimateNativeTurnCost(
+        candidateTurn(id, "inspect", [
+          toolPart(`${id}-tool`, `${id}-assistant`, state),
+        ]),
+      );
+    const compactedLarge = cost("compacted-large", {
+      status: "completed",
+      input: {},
+      output: hiddenDataURL,
+      title: "Read",
+      metadata: {},
+      time: { start: 1, end: 2, compacted: 3 },
+      attachments: [{ mime: "image/png", url: hiddenDataURL }],
+    });
+    const compactedSmall = cost("compacted-small", {
+      status: "completed",
+      input: {},
+      output: "small",
+      title: "Read",
+      metadata: {},
+      time: { start: 1, end: 2, compacted: 3 },
+    });
+    const completedEmpty = cost("completed-empty", {
+      status: "completed",
+      input: {},
+      output: "",
+      title: "Read",
+      metadata: {},
+      time: { start: 1, end: 2 },
+    });
+    const normalError = cost("normal-error", {
+      status: "error",
+      input: {},
+      error: "visible error",
+      metadata: { interrupted: false, output: hiddenDataURL },
+      time: { start: 1, end: 2 },
+    });
+    const pending = cost("pending", {
+      status: "pending",
+      input: {},
+      metadata: { output: hiddenDataURL },
+    });
+    const running = cost("running", {
+      status: "running",
+      input: {},
+      title: "Read",
+      metadata: { output: hiddenDataURL },
+      time: { start: 1 },
+    });
+
+    expect(compactedLarge).toEqual(compactedSmall);
+    expect(normalError.inputTokens).toBeLessThan(10_000);
+    expect(pending.inputTokens).toBeLessThan(10_000);
+    expect(pending.inputTokens).toBeGreaterThan(completedEmpty.inputTokens);
+    expect(running.inputTokens).toEqual(pending.inputTokens);
+  });
+
+  test("keeps typed files and completed tool attachments on fixed media charges", () => {
+    const cost = (id: string, url: string) =>
+      estimateNativeTurnCost(
+        candidateTurn(id, "inspect", [
+          imagePart(`${id}-image`, `${id}-user`, url),
+          toolPart(`${id}-tool`, `${id}-assistant`, {
+            status: "completed",
+            input: { path: "/tmp/result" },
+            output: "inspected",
+            title: "Inspect",
+            metadata: {},
+            time: { start: 1, end: 2 },
+            attachments: [{ mime: "application/pdf", url }],
+          }),
+        ]),
+      );
+    const small = cost("fixed-small", "data:image/png;base64,QQ==");
+    const large = cost(
+      "fixed-large",
+      `data:image/png;base64,${"A".repeat(2_000_000)}`,
+    );
+
+    expect(large).toEqual(small);
+    expect(large.inputTokens).toBeGreaterThanOrEqual(16_000);
+    expect(large.inputTokens).toBeLessThan(30_000);
+  });
+
+  test("estimates non-media data URL file parts by encoded length instead of a flat media charge", () => {
+    const dataURL = `data:application/octet-stream;base64,${"A".repeat(1_000_000)}`;
+    const turn = candidateTurn("text-data-url", "inspect", [
+      imagePart(
+        "text-data-url-file",
+        "text-data-url-user",
+        dataURL,
+        "application/octet-stream",
+      ),
+    ]);
+    const cost = estimateNativeTurnCost(turn);
+
+    expect(cost.inputTokens).toBeGreaterThan(dataURL.length);
+    expect(cost.inputTokens).toBeLessThan(dataURL.length + 5_000);
+  });
+
+  test("does not charge ignored text/plain or directory file parts", () => {
+    const textPlain = estimateNativeTurnCost(
+      candidateTurn("text-plain", "inspect", [
+        imagePart(
+          "text-plain-file",
+          "text-plain-user",
+          `data:text/plain;base64,${"A".repeat(1_000_000)}`,
+          "text/plain",
+        ),
+      ]),
+    );
+    const directory = estimateNativeTurnCost(
+      candidateTurn("directory", "inspect", [
+        imagePart(
+          "directory-file",
+          "directory-user",
+          "file:///tmp/directory",
+          "application/x-directory",
+        ),
+      ]),
+    );
+
+    expect(textPlain.inputTokens).toBeLessThan(2_000);
+    expect(directory.inputTokens).toBeLessThan(2_000);
+  });
+
+  test("charges ordinary image and PDF file parts the fixed media charge", () => {
+    const image = estimateNativeTurnCost(
+      candidateTurn("plain-image", "inspect", [
+        imagePart(
+          "plain-image-file",
+          "plain-image-user",
+          "data:image/png;base64,QQ==",
+        ),
+      ]),
+    );
+    const pdf = estimateNativeTurnCost(
+      candidateTurn("plain-pdf", "inspect", [
+        imagePart(
+          "plain-pdf-file",
+          "plain-pdf-user",
+          "data:application/pdf;base64,QQ==",
+          "application/pdf",
+        ),
+      ]),
+    );
+
+    expect(image.inputTokens).toBeGreaterThanOrEqual(8_000);
+    expect(image.inputTokens).toBeLessThan(9_000);
+    expect(pdf.inputTokens).toBeGreaterThanOrEqual(8_000);
+    expect(pdf.inputTokens).toBeLessThan(9_000);
+  });
+});
+
+describe("bounded native compaction generation", () => {
+  test("registers a hidden deny-all summarizer whose prompt uses retained native fork history", async () => {
     const hooks = await server({} as PluginInput);
     const config = {} as Config;
 
@@ -97,9 +451,9 @@ describe("one-fork compaction generation", () => {
       permission: { "*": "deny" },
     });
     expect(MAGIC_COMPACT_SUMMARIZER_PROMPT).toContain(
-      "complete source-session history",
+      "bounded retained source history",
     );
-    expect(MAGIC_COMPACT_SUMMARIZER_PROMPT).toContain("full forked history");
+    expect(MAGIC_COMPACT_SUMMARIZER_PROMPT).toContain("retained fork history");
     expect(config.command?.["magic-compact"]).toBeDefined();
     expect(config.command?.["magic-trim"]).toBeDefined();
     expect(config.command?.["magic-stats"]).toBeDefined();
@@ -167,8 +521,10 @@ describe("one-fork compaction generation", () => {
     expect(summaries).toHaveLength(3);
     expect(harness.events).toEqual([
       "agents",
+      "providers",
       "fork",
       "deny",
+      "messages",
       "messages",
       "marker",
       "marker",
@@ -201,6 +557,228 @@ describe("one-fork compaction generation", () => {
       },
     ]);
     expect(harness.deletes).toEqual(["generation-fork"]);
+  });
+
+  test("isolates 15 targets across distinct forks with global ordinals and bounded whole-turn halos", async () => {
+    const turns = Array.from({ length: 15 }, (_, index) =>
+      candidateTurn(`batch-${index + 1}`, `anchor ${index + 1}`, []),
+    );
+    const harness = generationHarness(turns, responseFor(turns), {
+      providerDelayByFirstOrdinal: { 1: 20 },
+    });
+
+    const summaries = await generateCompactionSummaries(
+      harness.v2,
+      sourceSession(),
+      generationPlan(turns),
+    );
+
+    expect(summaries.map(summary => summary?.text)).toEqual(
+      turns.map(
+        (_, index) => `Turn ${index + 1} outcome and continuation details.`,
+      ),
+    );
+    expect(harness.providerCalls).toBe(1);
+    expect(harness.deletes).toEqual(["generation-fork-2", "generation-fork"]);
+    expect(harness.completedPromptFirstOrdinals).toEqual([13, 1]);
+    expect(
+      harness.prompts
+        .map(generationPromptIndex)
+        .map(index => index.turns.map(turn => turn.ordinal)),
+    ).toEqual([
+      Array.from({ length: 12 }, (_, index) => index + 1),
+      [13, 14, 15],
+    ]);
+    expect(
+      harness.promptHistories.map(history => history.messages.length),
+    ).toEqual([26, 8]);
+    expect(
+      harness.messageDeletes.filter(
+        request => request.sessionID === "generation-fork",
+      ),
+    ).toHaveLength(4);
+    expect(
+      harness.messageDeletes.filter(
+        request => request.sessionID === "generation-fork-2",
+      ),
+    ).toHaveLength(22);
+    expect(harness.partDeletes).toEqual([]);
+    const noncesByFork = new Map<string, Set<string>>();
+    for (const update of harness.markerUpdates) {
+      const nonce = update.part.text.match(/nonce="([A-Za-z0-9_-]{22})"/u)?.[1];
+      expect(nonce).toBeDefined();
+      const nonces = noncesByFork.get(update.sessionID) ?? new Set<string>();
+      nonces.add(nonce!);
+      noncesByFork.set(update.sessionID, nonces);
+    }
+    expect([...noncesByFork.values()].map(nonces => nonces.size)).toEqual([
+      1, 1,
+    ]);
+    expect(
+      new Set([...noncesByFork.values()].flatMap(nonces => [...nonces])).size,
+    ).toBe(2);
+  });
+
+  test("runs independent generation batches with exactly five prompts and forks in flight", async () => {
+    const turns = Array.from({ length: 61 }, (_, index) =>
+      candidateTurn(`concurrent-${index + 1}`, `anchor ${index + 1}`, []),
+    );
+    const harness = generationHarness(turns, responseFor(turns), {
+      providerDelayMs: 20,
+    });
+
+    const summaries = await generateCompactionSummaries(
+      harness.v2,
+      sourceSession(),
+      generationPlan(turns),
+    );
+
+    expect(summaries).toHaveLength(61);
+    expect(harness.prompts).toHaveLength(6);
+    expect(harness.forks).toHaveLength(6);
+    expect(harness.peakActivePrompts).toBe(5);
+    expect(harness.peakActiveForks).toBe(5);
+    expect(harness.deletes).toHaveLength(6);
+  });
+
+  test("uses more chronological batches when the configured model has smaller limits", async () => {
+    const turns = Array.from({ length: 4 }, (_, index) =>
+      candidateTurn(`small-model-${index + 1}`, `anchor ${index + 1}`, [
+        toolPart(
+          `small-model-${index + 1}-tool`,
+          `small-model-${index + 1}-assistant`,
+          {
+            status: "completed",
+            input: {
+              payload: `data:application/octet-stream;base64,${"A".repeat(40_000)}`,
+            },
+            output: "done",
+            title: "Process",
+            metadata: {},
+            time: { start: 1, end: 2 },
+          },
+        ),
+      ]),
+    );
+    const harness = generationHarness(turns, responseFor(turns), {
+      modelLimits: { context: 120_000, input: 120_000, output: 32_000 },
+    });
+
+    await generateCompactionSummaries(
+      harness.v2,
+      sourceSession(),
+      generationPlan(turns),
+    );
+
+    expect(
+      harness.prompts
+        .map(generationPromptIndex)
+        .map(index => index.turns.map(turn => turn.ordinal))
+        .sort((left, right) => left[0]! - right[0]!),
+    ).toEqual([[1], [2], [3], [4]]);
+  });
+
+  test("excludes oversized neighboring summary turns without splitting their messages", async () => {
+    const media = (prefix: string) =>
+      Array.from({ length: 63 }, (_, index) =>
+        imagePart(
+          `${prefix}-image-${index}`,
+          `${prefix}-user`,
+          "data:image/png;base64,Zm9v",
+        ),
+      );
+    const opaque = candidateTurn("halo-opaque", "opaque", media("halo-opaque"));
+    opaque.assistants[0]!.parts.push({
+      ...textPart("halo-opaque-summary", "halo-opaque-assistant", "summary"),
+      metadata: { magicCompact: { summary: true, version: 2 } },
+    });
+    const target = candidateTurn("halo-target", "target", []);
+    const next = candidateTurn("halo-next", "next", media("halo-next"));
+    const harness = generationHarness(
+      [opaque, target],
+      { turns: [result(1, "target", "Target summary.")] },
+      { nextTurn: next },
+    );
+
+    await generateCompactionSummaries(
+      harness.v2,
+      sourceSession(),
+      generationPlan([opaque, target], next),
+    );
+
+    expect(harness.promptHistories[0]!.messages).toHaveLength(2);
+    expect(
+      harness.promptHistories[0]!.messages.map(message => message.info.role),
+    ).toEqual(["user", "assistant"]);
+    expect(harness.messageDeletes).toHaveLength(4);
+    expect(harness.partDeletes).toEqual([]);
+  });
+
+  test("keeps an opaque summary halo complete and removes a native checkpoint only by whole message", async () => {
+    const messages = [
+      ...candidateMessages("checkpoint-before", "before", []),
+      nativeMarker("checkpoint-marker"),
+      nativeSummary("checkpoint-summary", "checkpoint-marker"),
+      ...persistedSummaryTurn("checkpoint-opaque", 2),
+      ...candidateMessages("checkpoint-fresh", "fresh", []),
+    ];
+    const planClient = {
+      session: { messages: async () => ({ data: messages }) },
+    } as unknown as V2Client;
+    const plan = await createCompactionPlan(planClient, "source", 0);
+    const harness = generationHarness(
+      plan.summarizedTurns,
+      { turns: [result(1, "fresh", "Fresh summary.")] },
+      { sourceMessages: messages },
+    );
+
+    await generateCompactionSummaries(harness.v2, sourceSession(), plan);
+
+    expect(
+      harness.promptHistories[0]!.messages.map(message => ({
+        role: message.info.role,
+        parts: message.parts.map(part => part.type),
+      })),
+    ).toEqual([
+      { role: "user", parts: ["text"] },
+      { role: "assistant", parts: ["text"] },
+      { role: "user", parts: ["text", "text"] },
+      { role: "assistant", parts: ["reasoning"] },
+    ]);
+    expect(harness.messageDeletes).toHaveLength(4);
+    expect(harness.partDeletes).toEqual([]);
+  });
+
+  test("excludes a native checkpoint halo whose tail references deleted history", async () => {
+    const messages = [
+      ...candidateMessages("checkpoint-tail", "tail", []),
+      nativeMarker("checkpoint-halo-marker", "checkpoint-tail-assistant"),
+      nativeSummary("checkpoint-halo-summary", "checkpoint-halo-marker"),
+      ...candidateMessages("checkpoint-halo-target", "target", []),
+    ];
+    const planClient = {
+      session: { messages: async () => ({ data: messages }) },
+    } as unknown as V2Client;
+    const plan = await createCompactionPlan(planClient, "source", 0);
+    const harness = generationHarness(
+      plan.summarizedTurns,
+      { turns: [result(1, "target", "Target summary.")] },
+      { sourceMessages: messages },
+    );
+
+    await generateCompactionSummaries(harness.v2, sourceSession(), plan);
+
+    expect(
+      harness.promptHistories[0]!.messages.map(message => ({
+        role: message.info.role,
+        summary: "summary" in message.info ? message.info.summary : undefined,
+        parts: message.parts.map(part => part.type),
+      })),
+    ).toEqual([
+      { role: "user", summary: undefined, parts: ["text", "text"] },
+      { role: "assistant", summary: undefined, parts: ["reasoning"] },
+    ]);
+    expect(harness.messageDeletes).toHaveLength(4);
   });
 
   test("keeps cross-provider reasoning on OpenCode's native fork conversion path", async () => {
@@ -828,6 +1406,106 @@ describe("one-fork compaction generation", () => {
   });
 
   test.each([
+    [
+      "substituted message and part IDs",
+      (messages: MessageWithParts[]) => {
+        const user = messages[0]!;
+        const replacementID = `${user.info.id}-replacement`;
+        Object.assign(user.info, { id: replacementID });
+        user.parts = user.parts.map((part, index) => ({
+          ...part,
+          id: index === 0 ? `${part.id}-replacement` : part.id,
+          messageID: replacementID,
+        })) as Part[];
+        Object.assign(messages[1]!.info, { parentID: replacementID });
+      },
+    ],
+    [
+      "reordered same-shape records",
+      (messages: MessageWithParts[]) => {
+        messages.splice(
+          0,
+          messages.length,
+          messages[2]!,
+          messages[3]!,
+          messages[0]!,
+          messages[1]!,
+        );
+      },
+    ],
+    [
+      "changed parent link",
+      (messages: MessageWithParts[]) => {
+        Object.assign(messages[1]!.info, {
+          parentID: messages[2]!.info.id,
+        });
+      },
+    ],
+  ] as const)(
+    "rejects %s after retained fork isolation",
+    async (_name, mutate) => {
+      const turns = Array.from({ length: 13 }, (_, index) =>
+        candidateTurn(
+          `retained-identity-${index + 1}`,
+          `anchor ${index + 1}`,
+          [],
+        ),
+      );
+      for (const turn of turns) {
+        Object.assign(turn.assistants[0]!.info, {
+          parentID: turn.user[0]!.info.id,
+        });
+      }
+      const harness = generationHarness(turns, responseFor(turns), {
+        mutateRetainedMessages: (messages, sessionID) => {
+          if (sessionID === "generation-fork-2") mutate(messages);
+        },
+      });
+
+      await expect(
+        generateCompactionSummaries(
+          harness.v2,
+          sourceSession(),
+          generationPlan(turns),
+        ),
+      ).rejects.toThrow("fork history shape verification failed");
+      expect(
+        harness.markerUpdates.filter(
+          update => update.sessionID === "generation-fork-2",
+        ),
+      ).toEqual([]);
+      expect(
+        harness.prompts.filter(
+          prompt => prompt.sessionID === "generation-fork-2",
+        ),
+      ).toEqual([]);
+    },
+  );
+
+  test.each([
+    ["missing", null],
+    ["invalid", { context: 0, input: 0, output: 0 }],
+  ] as const)(
+    "rejects a %s configured model limit before fork creation",
+    async (_name, modelLimits) => {
+      const turn = candidateTurn("model-limit", "summarize", []);
+      const harness = generationHarness([turn], responseFor([turn]), {
+        modelLimits,
+      });
+
+      await expect(
+        generateCompactionSummaries(
+          harness.v2,
+          sourceSession(),
+          generationPlan([turn]),
+        ),
+      ).rejects.toThrow(/model (?:descriptor|context limit)/i);
+      expect(harness.forks).toEqual([]);
+      expect(harness.prompts).toEqual([]);
+    },
+  );
+
+  test.each([
     ["a non-vision model", false],
     ["a missing configured model", undefined],
   ])(
@@ -972,6 +1650,79 @@ describe("one-fork compaction generation", () => {
       expect(source).toEqual(before);
     },
   );
+
+  test("does not require vision when the only tool attachment is compacted", async () => {
+    const turn = candidateTurn("compacted-attachment", "inspect attachment", [
+      toolPart("compacted-attachment-tool", "compacted-attachment-assistant", {
+        status: "completed",
+        input: {},
+        output: "attached result",
+        title: "Attachment",
+        metadata: {},
+        time: { start: 1, end: 2, compacted: 3 },
+        attachments: [{ mime: "image/png", url: "data:image/png;base64,Zm9v" }],
+      }),
+    ]);
+    const harness = generationHarness([turn], responseFor([turn]), {
+      modelImageCapability: false,
+    });
+
+    const summaries = await generateCompactionSummaries(
+      harness.v2,
+      sourceSession(),
+      generationPlan([turn]),
+    );
+
+    expect(summaries).toHaveLength(1);
+    expect(harness.forks.length).toBe(1);
+    expect(harness.prompts.length).toBe(1);
+  });
+
+  test("keeps a completed compacted tool attachment non-visible and compacted-costed through the real plan path", async () => {
+    const hiddenDataURL = `data:image/png;base64,${"A".repeat(2_000_000)}`;
+    const messages = [
+      ...candidateMessages("compacted-attachment", "inspect attachment", [
+        toolPart(
+          "compacted-attachment-tool",
+          "compacted-attachment-assistant",
+          {
+            status: "completed",
+            input: {},
+            output: hiddenDataURL,
+            title: "Attachment",
+            metadata: {},
+            time: { start: 1, end: 2, compacted: 3 },
+            attachments: [{ mime: "image/png", url: hiddenDataURL }],
+          },
+        ),
+      ]),
+    ];
+    const planClient = {
+      session: { messages: async () => ({ data: messages }) },
+    } as unknown as V2Client;
+    const plan = await createCompactionPlan(planClient, "source", 0);
+    const harness = generationHarness(
+      plan.summarizedTurns,
+      responseFor(plan.summarizedTurns),
+      {
+        sourceMessages: messages,
+        modelImageCapability: false,
+      },
+    );
+
+    const summaries = await generateCompactionSummaries(
+      harness.v2,
+      sourceSession(),
+      plan,
+    );
+
+    expect(summaries).toHaveLength(1);
+    expect(
+      estimateNativeTurnCost(plan.summarizedTurns[0]!).inputTokens,
+    ).toBeLessThan(10_000);
+    expect(harness.forks.length).toBe(1);
+    expect(harness.prompts.length).toBe(1);
+  });
 
   test.each([
     ["missing", "missing"],
@@ -1131,7 +1882,7 @@ describe("one-fork compaction generation", () => {
       },
     ],
   ])(
-    "surfaces increase-N guidance for provider %s signals",
+    "surfaces higher-output-capacity guidance for a single-turn provider %s signal",
     async (_name, options) => {
       const turn = candidateTurn("truncated", "truncate request", []);
       const harness = generationHarness([turn], { turns: [] }, options);
@@ -1142,11 +1893,29 @@ describe("one-fork compaction generation", () => {
           sourceSession(),
           generationPlan([turn]),
         ),
-      ).rejects.toThrow(/larger N.*fewer turns/i);
+      ).rejects.toThrow(/single turn.*more output capacity/i);
       expect(harness.aborts).toEqual(["generation-fork"]);
       expect(harness.deletes).toEqual(["generation-fork"]);
     },
   );
+
+  test("keeps larger-N guidance when a multi-turn batch reaches the provider output limit", async () => {
+    const turns = [
+      candidateTurn("multi-output-one", "one", []),
+      candidateTurn("multi-output-two", "two", []),
+    ];
+    const harness = generationHarness(turns, responseFor(turns), {
+      responseFinish: "length",
+    });
+
+    await expect(
+      generateCompactionSummaries(
+        harness.v2,
+        sourceSession(),
+        generationPlan(turns),
+      ),
+    ).rejects.toThrow(/larger N.*fewer turns/i);
+  });
 
   test("preserves trim-first overflow guidance through one sanitized nested cause", async () => {
     const turn = candidateTurn("nested-overflow", "overflow request", []);
@@ -1372,6 +2141,61 @@ describe("compaction orchestration", () => {
     expect(plan.summarizedTurns).toHaveLength(1);
     expect(plan.summarizedTurns[0]!.user[0]!.info.id).toBe("suffix-user");
     expect(plan.nextTurn).toBeNull();
+  });
+
+  test("treats a concurrent compacted-bit change as source drift", async () => {
+    const messages = [
+      ...candidateMessages("drift-compacted", "inspect", [
+        toolPart("drift-compacted-tool", "drift-compacted-assistant", {
+          status: "completed",
+          input: {},
+          output: "result",
+          title: "Read",
+          metadata: {},
+          time: { start: 1, end: 2 },
+        }),
+      ]),
+    ];
+    const planClient = {
+      session: { messages: async () => ({ data: messages }) },
+    } as unknown as V2Client;
+    const plan = await createCompactionPlan(planClient, "source", 0);
+
+    const tool = messages[1]!.parts.find(
+      part => part.type === "tool",
+    ) as unknown as { state: { time: Record<string, unknown> } };
+    tool.state.time.compacted = 3;
+
+    expect(() => assertCompactionSourceUnchanged(messages, plan)).toThrow(
+      NativeCheckpointChangedError,
+    );
+  });
+
+  test("ignores volatile tool timing changes in source revalidation", async () => {
+    const messages = [
+      ...candidateMessages("drift-timing", "inspect", [
+        toolPart("drift-timing-tool", "drift-timing-assistant", {
+          status: "completed",
+          input: {},
+          output: "result",
+          title: "Read",
+          metadata: {},
+          time: { start: 1, end: 2, compacted: 3 },
+        }),
+      ]),
+    ];
+    const planClient = {
+      session: { messages: async () => ({ data: messages }) },
+    } as unknown as V2Client;
+    const plan = await createCompactionPlan(planClient, "source", 0);
+
+    const tool = messages[1]!.parts.find(
+      part => part.type === "tool",
+    ) as unknown as { state: { time: Record<string, unknown> } };
+    tool.state.time.start = 100;
+    tool.state.time.end = 200;
+
+    expect(() => assertCompactionSourceUnchanged(messages, plan)).not.toThrow();
   });
 
   test("keeps unprofitable turns exact while compacting profitable turns", async () => {
@@ -1731,6 +2555,102 @@ describe("compaction orchestration", () => {
     expect(boundaryParts(messages)).toEqual([]);
     expect(harness.selectedSessions).toEqual([]);
     expect(harness.deletedSessions).toEqual(["generation-fork"]);
+  });
+
+  test("discards completed batches when a later batch fails before backup, source writes, or stats", async () => {
+    const messages = Array.from({ length: 13 }, (_, index) =>
+      compactableCommandMessages(
+        `atomic-batch-${index + 1}`,
+        `large output ${index + 1} `.repeat(1_000),
+      ),
+    ).flat();
+    const before = structuredClone(messages);
+    const harness = commandHarness(messages, {
+      generationResponse: {
+        turns: Array.from({ length: 13 }, (_, index) =>
+          result(
+            index + 1,
+            `atomic-batch-${index + 1} request`,
+            `Summary ${index + 1}.`,
+          ),
+        ),
+      },
+      generationErrorForFirstOrdinal: 13,
+    });
+
+    await expect(executeMagicCompact(harness.v2, "source", 0)).rejects.toThrow(
+      "model request failed",
+    );
+
+    expect(messages).toEqual(before);
+    expect(harness.forks).toEqual(["generation-fork", "generation-fork-2"]);
+    expect(harness.deletedSessions).toEqual(
+      expect.arrayContaining(["generation-fork", "generation-fork-2"]),
+    );
+    expect(harness.forks).not.toContain("backup");
+    expect(harness.partUpdates).toEqual([]);
+    expect(boundaryParts(messages)).toEqual([]);
+    expect(await readStats("source")).toBeNull();
+  });
+
+  test("aggregates every active batch failure in batch order before any durable mutation", async () => {
+    const messages = Array.from({ length: 13 }, (_, index) =>
+      compactableCommandMessages(
+        `aggregate-batch-${index + 1}`,
+        `large output ${index + 1} `.repeat(1_000),
+      ),
+    ).flat();
+    const before = structuredClone(messages);
+    const harness = commandHarness(messages, {
+      generationResponse: {
+        turns: Array.from({ length: 13 }, (_, index) =>
+          result(
+            index + 1,
+            `aggregate-batch-${index + 1} request`,
+            `Summary ${index + 1}.`,
+          ),
+        ),
+      },
+      generationErrorsByFirstOrdinal: {
+        1: new Error("raw first provider payload"),
+        13: new Error("raw second provider payload"),
+      },
+      generationAbortErrorForFirstOrdinal: 13,
+      generationDeleteErrorForFirstOrdinal: 13,
+      holdGenerationPromptsUntil: 2,
+    });
+    let failure: unknown;
+
+    try {
+      await executeMagicCompact(harness.v2, "source", 0);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    const failures = (failure as AggregateError).errors as Error[];
+    expect(failures).toHaveLength(2);
+    expect(nestedErrorMessages(failures[0])).toContain(
+      "Compaction generation model request failed.",
+    );
+    expect(nestedErrorMessages(failures[1])).toEqual(
+      expect.arrayContaining([
+        "Compaction generation model request failed.",
+        "Compaction generation fork abort failed.",
+        "Compaction generation fork deletion failed.",
+      ]),
+    );
+    expect(nestedErrorMessages(failure).join(" ")).not.toContain("raw");
+    expect(messages).toEqual(before);
+    expect(harness.forks).toEqual(["generation-fork", "generation-fork-2"]);
+    expect(harness.deletedSessions).toEqual(
+      expect.arrayContaining(["generation-fork", "generation-fork-2"]),
+    );
+    expect(harness.activeGenerationForks).toEqual(["generation-fork-2"]);
+    expect(harness.partUpdates).toEqual([]);
+    expect(boundaryParts(messages)).toEqual([]);
+    expect(await readStats("source")).toBeNull();
+    expect(await readStats("backup")).toBeNull();
   });
 
   test("rejects an active marker leaked into a summary before backup or source writes", async () => {
@@ -2298,6 +3218,19 @@ function generationHarness(
     deleteError?: Error;
     compactionAgent?: "missing" | "disabled" | "model-missing";
     responseMarkerOrder?: number[];
+    providerDelayByFirstOrdinal?: Record<number, number>;
+    providerErrorForFirstOrdinal?: number;
+    holdPromptsUntil?: number;
+    modelLimits?: {
+      context: number;
+      input?: number;
+      output?: number;
+    } | null;
+    sourceMessages?: MessageWithParts[];
+    mutateRetainedMessages?: (
+      messages: MessageWithParts[],
+      sessionID: string,
+    ) => void;
   } = {},
 ) {
   const events: string[] = [];
@@ -2309,15 +3242,41 @@ function generationHarness(
   const deletes: string[] = [];
   const abortRequests: Record<string, unknown>[] = [];
   const deleteRequests: Record<string, unknown>[] = [];
-  const markerUpdates: Array<{ messageID: string; part: TextPart }> = [];
-  const sourceMessages = [
+  const markerUpdates: Array<{
+    sessionID: string;
+    messageID: string;
+    part: TextPart;
+  }> = [];
+  const messageDeletes: Array<{ sessionID: string; messageID: string }> = [];
+  const partDeletes: Array<{
+    sessionID: string;
+    messageID: string;
+    partID: string;
+  }> = [];
+  const promptHistories: Array<{
+    sessionID: string;
+    messages: MessageWithParts[];
+  }> = [];
+  const completedPromptFirstOrdinals: number[] = [];
+  const forkMessagesByID = new Map<string, MessageWithParts[]>();
+  const messageLoadsByFork = new Map<string, number>();
+  let providerCalls = 0;
+  let activeForks = 0;
+  let peakActiveForks = 0;
+  let activePrompts = 0;
+  let peakActivePrompts = 0;
+  let releasePromptGate: (() => void) | undefined;
+  const promptGate = options.holdPromptsUntil
+    ? new Promise<void>(resolve => {
+        releasePromptGate = resolve;
+      })
+    : undefined;
+  const sourceMessages = options.sourceMessages ?? [
     ...turns.flatMap(turn => [...turn.user, ...turn.assistants]),
     ...(options.nextTurn
       ? [...options.nextTurn.user, ...options.nextTurn.assistants]
       : []),
   ];
-  const forkMessages =
-    options.forkMessages ?? rewriteForkMessages(sourceMessages);
   const modelImageCapability =
     "modelImageCapability" in options ? options.modelImageCapability : true;
   const configuredAgent = {
@@ -2347,27 +3306,39 @@ function generationHarness(
       },
     },
     provider: {
-      list: async () => ({
-        data: {
-          all: [
-            {
-              id: "configured-provider",
-              models:
-                modelImageCapability === undefined
-                  ? {}
-                  : {
-                      "configured-model": {
-                        capabilities: {
-                          input: { image: modelImageCapability },
+      list: async () => {
+        providerCalls += 1;
+        events.push("providers");
+        return {
+          data: {
+            all: [
+              {
+                id: "configured-provider",
+                models:
+                  modelImageCapability === undefined
+                    ? {}
+                    : {
+                        "configured-model": {
+                          capabilities: {
+                            input: { image: modelImageCapability },
+                          },
+                          limit:
+                            "modelLimits" in options
+                              ? options.modelLimits
+                              : {
+                                  context: 1_000_000,
+                                  input: 500_000,
+                                  output: 64_000,
+                                },
                         },
                       },
-                    },
-            },
-          ],
-          connected: ["configured-provider"],
-          default: {},
-        },
-      }),
+              },
+            ],
+            connected: ["configured-provider"],
+            default: {},
+          },
+        };
+      },
     },
     session: {
       create: async (request: Record<string, unknown>) => {
@@ -2381,7 +3352,19 @@ function generationHarness(
         await options.forkGate;
         forks.push(request);
         events.push("fork");
-        return { data: { ...sourceSession(), id: "generation-fork" } };
+        const forkID =
+          forks.length === 1
+            ? "generation-fork"
+            : `generation-fork-${forks.length}`;
+        forkMessagesByID.set(
+          forkID,
+          forks.length === 1 && options.forkMessages
+            ? structuredClone(options.forkMessages)
+            : rewriteForkMessages(sourceMessages, forkID),
+        );
+        activeForks += 1;
+        peakActiveForks = Math.max(peakActiveForks, activeForks);
+        return { data: { ...sourceSession(), id: forkID } };
       },
       update: async (request: Record<string, unknown>) => {
         updates.push(request);
@@ -2389,40 +3372,75 @@ function generationHarness(
         if (options.permissionError) throw options.permissionError;
         return { data: { ...sourceSession(), id: String(request.sessionID) } };
       },
-      messages: async () => {
+      messages: async (request: { sessionID: string }) => {
         events.push("messages");
-        return { data: forkMessages };
+        const loads = (messageLoadsByFork.get(request.sessionID) ?? 0) + 1;
+        messageLoadsByFork.set(request.sessionID, loads);
+        const stored = forkMessagesByID.get(request.sessionID) ?? [];
+        if (loads === 2) {
+          options.mutateRetainedMessages?.(stored, request.sessionID);
+        }
+        return {
+          data: structuredClone(stored),
+        };
       },
       prompt: async (request: Record<string, unknown>) => {
         prompts.push(request);
         events.push("prompt");
-        if (options.providerDelayMs) {
-          await new Promise(resolve =>
-            setTimeout(resolve, options.providerDelayMs),
-          );
+        const sessionID = String(request.sessionID);
+        promptHistories.push({
+          sessionID,
+          messages: structuredClone(forkMessagesByID.get(sessionID) ?? []),
+        });
+        const index = generationPromptIndex(request);
+        const firstOrdinal = index.turns[0]!.ordinal;
+        activePrompts += 1;
+        peakActivePrompts = Math.max(peakActivePrompts, activePrompts);
+        if (
+          options.holdPromptsUntil
+          && activePrompts >= options.holdPromptsUntil
+        ) {
+          releasePromptGate?.();
         }
-        if (options.providerError) throw options.providerError;
-        const text = JSON.stringify(
-          responseWithPromptMarkers(
-            request,
-            response,
-            options.responseMarkerOrder,
-          ),
-        );
-        return {
-          data: {
-            info: {
-              id: "response",
-              ...(options.responseFinish
-                ? { finish: options.responseFinish }
-                : {}),
-              ...(options.responseError
-                ? { error: options.responseError }
-                : {}),
+        try {
+          await promptGate;
+          const delay =
+            options.providerDelayByFirstOrdinal?.[firstOrdinal]
+            ?? options.providerDelayMs;
+          if (delay) {
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
+          if (
+            options.providerError
+            || options.providerErrorForFirstOrdinal === firstOrdinal
+          ) {
+            throw options.providerError ?? new Error("batch provider failure");
+          }
+          const text = JSON.stringify(
+            responseWithPromptMarkers(
+              request,
+              response,
+              options.responseMarkerOrder,
+            ),
+          );
+          completedPromptFirstOrdinals.push(firstOrdinal);
+          return {
+            data: {
+              info: {
+                id: "response",
+                ...(options.responseFinish
+                  ? { finish: options.responseFinish }
+                  : {}),
+                ...(options.responseError
+                  ? { error: options.responseError }
+                  : {}),
+              },
+              parts: [textPart("response-text", "response", text)],
             },
-            parts: [textPart("response-text", "response", text)],
-          },
-        };
+          };
+        } finally {
+          activePrompts -= 1;
+        }
       },
       abort: async (request: Record<string, unknown>) => {
         abortRequests.push(request);
@@ -2434,22 +3452,49 @@ function generationHarness(
       },
       delete: async (request: Record<string, unknown>) => {
         deleteRequests.push(request);
-        deletes.push(String(request.sessionID));
+        const sessionID = String(request.sessionID);
+        deletes.push(sessionID);
         events.push("delete");
         if (options.deleteError) throw options.deleteError;
+        if (forkMessagesByID.delete(sessionID)) activeForks -= 1;
+        return { data: true };
+      },
+      deleteMessage: async (request: {
+        sessionID: string;
+        messageID: string;
+      }) => {
+        events.push("message-delete");
+        messageDeletes.push(request);
+        const messages = forkMessagesByID.get(request.sessionID);
+        const index =
+          messages?.findIndex(message => message.info.id === request.messageID)
+          ?? -1;
+        if (messages && index >= 0) messages.splice(index, 1);
         return { data: true };
       },
     },
     part: {
-      update: async (request: { messageID: string; part: TextPart }) => {
+      update: async (request: {
+        sessionID: string;
+        messageID: string;
+        part: TextPart;
+      }) => {
         events.push("marker");
         if (options.markerError) throw options.markerError;
         markerUpdates.push(request);
-        const target = forkMessages.find(
-          message => message.info.id === request.messageID,
-        );
+        const target = forkMessagesByID
+          .get(request.sessionID)
+          ?.find(message => message.info.id === request.messageID);
         target?.parts.push(request.part);
         return { data: request.part };
+      },
+      delete: async (request: {
+        sessionID: string;
+        messageID: string;
+        partID: string;
+      }) => {
+        partDeletes.push(request);
+        return { data: true };
       },
     },
   } as unknown as V2Client;
@@ -2465,6 +3510,19 @@ function generationHarness(
     abortRequests,
     deleteRequests,
     markerUpdates,
+    messageDeletes,
+    partDeletes,
+    promptHistories,
+    completedPromptFirstOrdinals,
+    get providerCalls() {
+      return providerCalls;
+    },
+    get peakActiveForks() {
+      return peakActiveForks;
+    },
+    get peakActivePrompts() {
+      return peakActivePrompts;
+    },
   };
 }
 
@@ -2526,8 +3584,12 @@ function nativeCompactionPart(id: string, messageID: string): Part {
   } as unknown as Part;
 }
 
-function nativeMarker(id: string): MessageWithParts {
-  return message(id, "user", [nativeCompactionPart(`${id}-part`, id)]);
+function nativeMarker(id: string, tailStartID?: string): MessageWithParts {
+  const part = nativeCompactionPart(`${id}-part`, id);
+  if (tailStartID) {
+    Object.assign(part, { tail_start_id: tailStartID });
+  }
+  return message(id, "user", [part]);
 }
 
 function nativeSummary(
@@ -2697,17 +3759,24 @@ function responseWithPromptMarkers(
   response: GenerationResponse,
   markerOrder?: number[],
 ): GenerationResponse {
-  const index = JSON.parse(promptText(request).split("\n").at(-1)!) as {
-    turns: Array<{ marker: string }>;
-  };
+  const index = generationPromptIndex(request);
+  const ordinals = new Set(index.turns.map(turn => turn.ordinal));
   return {
-    turns: response.turns.map((turn, turnIndex) => ({
-      ...turn,
-      marker:
-        turn.marker
-        ?? index.turns[markerOrder?.[turnIndex] ?? turnIndex]?.marker
-        ?? "",
-    })),
+    turns: response.turns
+      .filter(turn => ordinals.has(turn.ordinal))
+      .map((turn, turnIndex) => ({
+        ...turn,
+        marker:
+          turn.marker
+          ?? index.turns[markerOrder?.[turnIndex] ?? turnIndex]?.marker
+          ?? "",
+      })),
+  };
+}
+
+function generationPromptIndex(request: Record<string, unknown>) {
+  return JSON.parse(promptText(request).split("\n").at(-1)!) as {
+    turns: Array<{ ordinal: number; marker: string }>;
   };
 }
 
@@ -2797,6 +3866,11 @@ async function settleWithin<T>(promise: Promise<T>, timeoutMs: number) {
 
 type CommandHarnessOptions = {
   generationResponse: GenerationResponse;
+  generationErrorForFirstOrdinal?: number;
+  generationErrorsByFirstOrdinal?: Record<number, Error>;
+  generationAbortErrorForFirstOrdinal?: number;
+  generationDeleteErrorForFirstOrdinal?: number;
+  holdGenerationPromptsUntil?: number;
   transformGenerationResponse?: (
     response: GenerationResponse,
   ) => GenerationResponse;
@@ -2826,7 +3900,17 @@ function commandHarness(
   const selectedSessions: string[] = [];
   const deletedSessions: string[] = [];
   let backupMessages: MessageWithParts[] | undefined;
-  let generationForkMessages: MessageWithParts[] | undefined;
+  const generationForkMessages = new Map<string, MessageWithParts[]>();
+  const activeGenerationForks = new Set<string>();
+  const generationFirstOrdinalByFork = new Map<string, number>();
+  let generationPromptCount = 0;
+  let activeGenerationPrompts = 0;
+  let releaseGenerationPromptGate: (() => void) | undefined;
+  const generationPromptGate = options.holdGenerationPromptsUntil
+    ? new Promise<void>(resolve => {
+        releaseGenerationPromptGate = resolve;
+      })
+    : undefined;
   let backupCreated = false;
   let boundaryInserted = false;
   let statsInserted = false;
@@ -2879,6 +3963,11 @@ function commandHarness(
               models: {
                 "configured-model": {
                   capabilities: { input: { image: true } },
+                  limit: {
+                    context: 1_000_000,
+                    input: 500_000,
+                    output: 64_000,
+                  },
                 },
               },
             },
@@ -2891,8 +3980,12 @@ function commandHarness(
     session: {
       get: async () => ({ data: sourceSession() }),
       messages: async (request: { sessionID: string }) => {
-        if (request.sessionID === "generation-fork") {
-          return { data: generationForkMessages ?? [] };
+        if (request.sessionID.startsWith("generation-fork")) {
+          return {
+            data: structuredClone(
+              generationForkMessages.get(request.sessionID) ?? [],
+            ),
+          };
         }
         if (options.driftAfterBackup && backupCreated && !backupDriftApplied) {
           backupDriftApplied = true;
@@ -2945,11 +4038,19 @@ function commandHarness(
         return { data: messages };
       },
       fork: async () => {
-        if (forks.length === 0) {
-          forks.push("generation-fork");
+        if (generationPromptCount === 0 || activeGenerationForks.size > 0) {
+          const forkID =
+            generationForkMessages.size === 0
+              ? "generation-fork"
+              : `generation-fork-${generationForkMessages.size + 1}`;
+          forks.push(forkID);
           events.push("generation-fork");
-          generationForkMessages = rewriteForkMessages(messages);
-          return { data: { ...sourceSession(), id: "generation-fork" } };
+          generationForkMessages.set(
+            forkID,
+            rewriteForkMessages(messages, forkID),
+          );
+          activeGenerationForks.add(forkID);
+          return { data: { ...sourceSession(), id: forkID } };
         }
         forks.push("backup");
         events.push("backup-fork");
@@ -2970,26 +4071,52 @@ function commandHarness(
       },
       prompt: async (request: Record<string, unknown>) => {
         if (request.noReply !== true) {
+          generationPromptCount += 1;
           events.push("generation-prompt");
-          const response = responseWithPromptMarkers(
-            request,
-            options.generationResponse,
+          const firstOrdinal = generationPromptIndex(request).turns[0]!.ordinal;
+          generationFirstOrdinalByFork.set(
+            String(request.sessionID),
+            firstOrdinal,
           );
-          const transformedResponse = options.transformGenerationResponse
-            ? options.transformGenerationResponse(response)
-            : response;
-          return {
-            data: {
-              info: { id: "generation-response" },
-              parts: [
-                textPart(
-                  "generation-response-text",
-                  "generation-response",
-                  JSON.stringify(transformedResponse),
-                ),
-              ],
-            },
-          };
+          activeGenerationPrompts += 1;
+          if (
+            options.holdGenerationPromptsUntil
+            && activeGenerationPrompts >= options.holdGenerationPromptsUntil
+          ) {
+            releaseGenerationPromptGate?.();
+          }
+          try {
+            await generationPromptGate;
+            const configuredError =
+              options.generationErrorsByFirstOrdinal?.[firstOrdinal];
+            if (
+              configuredError
+              || options.generationErrorForFirstOrdinal === firstOrdinal
+            ) {
+              throw configuredError ?? new Error("generation batch failed");
+            }
+            const response = responseWithPromptMarkers(
+              request,
+              options.generationResponse,
+            );
+            const transformedResponse = options.transformGenerationResponse
+              ? options.transformGenerationResponse(response)
+              : response;
+            return {
+              data: {
+                info: { id: "generation-response" },
+                parts: [
+                  textPart(
+                    "generation-response-text",
+                    "generation-response",
+                    JSON.stringify(transformedResponse),
+                  ),
+                ],
+              },
+            };
+          } finally {
+            activeGenerationPrompts -= 1;
+          }
         }
 
         noticeIndex += 1;
@@ -3034,12 +4161,25 @@ function commandHarness(
       },
       abort: async (request: { sessionID: string }) => {
         abortedSessions.push(request.sessionID);
+        if (
+          generationFirstOrdinalByFork.get(request.sessionID)
+          === options.generationAbortErrorForFirstOrdinal
+        ) {
+          throw new Error("raw generation abort payload");
+        }
         return { data: true };
       },
       delete: async (request: { sessionID: string }) => {
         deletedSessions.push(request.sessionID);
-        if (request.sessionID === "generation-fork") {
+        if (request.sessionID.startsWith("generation-fork")) {
           events.push("generation-delete");
+          if (
+            generationFirstOrdinalByFork.get(request.sessionID)
+            === options.generationDeleteErrorForFirstOrdinal
+          ) {
+            throw new Error("raw generation delete payload");
+          }
+          activeGenerationForks.delete(request.sessionID);
         }
         if (request.sessionID === "source" && backupMessages) {
           messages.splice(
@@ -3050,12 +4190,19 @@ function commandHarness(
         }
         return { data: true };
       },
-      deleteMessage: async (request: { messageID: string }) => {
+      deleteMessage: async (request: {
+        sessionID: string;
+        messageID: string;
+      }) => {
         messageDeletes.push(request.messageID);
-        const index = messages.findIndex(
-          message => message.info.id === request.messageID,
-        );
-        if (index !== -1) messages.splice(index, 1);
+        const targetMessages = request.sessionID.startsWith("generation-fork")
+          ? generationForkMessages.get(request.sessionID)
+          : messages;
+        const index =
+          targetMessages?.findIndex(
+            message => message.info.id === request.messageID,
+          ) ?? -1;
+        if (targetMessages && index !== -1) targetMessages.splice(index, 1);
         return { data: true };
       },
     },
@@ -3065,10 +4212,10 @@ function commandHarness(
         messageID: string;
         part: Part;
       }) => {
-        if (request.sessionID === "generation-fork") {
-          const target = generationForkMessages?.find(
-            message => message.info.id === request.messageID,
-          );
+        if (request.sessionID?.startsWith("generation-fork")) {
+          const target = generationForkMessages
+            .get(request.sessionID)
+            ?.find(message => message.info.id === request.messageID);
           target?.parts.push(request.part);
           return { data: request.part };
         }
@@ -3144,6 +4291,9 @@ function commandHarness(
     },
     get statsInserted() {
       return statsInserted;
+    },
+    get activeGenerationForks() {
+      return [...activeGenerationForks];
     },
   };
 }

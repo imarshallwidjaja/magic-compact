@@ -262,7 +262,12 @@ function sourcePart(part: Part): unknown {
   delete snapshot["cost"];
   if (part.type === "tool") {
     const state = snapshot["state"] as Record<string, unknown>;
-    delete state["time"];
+    const time = state["time"];
+    if (isRecord(time) && time["compacted"] !== undefined) {
+      state["time"] = { compacted: time["compacted"] };
+    } else {
+      delete state["time"];
+    }
   }
   return snapshot;
 }

@@ -18,6 +18,15 @@ import {
   summaryEnvelopeTextPart,
   turnHasPersistedSummary,
 } from "./constants";
+import {
+  computeNativeBatchBudget,
+  estimateNativeTurnCost,
+  NATIVE_BATCH_MAX_CONCURRENCY,
+  planNativeGenerationBatches,
+  toolAttachmentsModelVisible,
+  type NativeBatchBudget,
+  type NativeGenerationBatch,
+} from "./batch";
 import { createMediaManifest, type MediaManifest } from "./media";
 import {
   assertForkMessageShape,
@@ -37,14 +46,41 @@ const GENERATION_NONCE_PATTERN = /^[A-Za-z0-9_-]{22}$/u;
 type CompactionSettings = {
   model: { providerID: string; modelID: string };
   variant?: string;
+  descriptor: {
+    limit: { context: number; input?: number; output?: number };
+    capabilities?: { input?: { image?: boolean } };
+  };
 };
 
 type GenerationCandidate = {
   planIndex: number;
+  sourceTurnIndex: number;
   ordinal: number;
   anchor: string;
   marker: string;
+  inputTokens: number;
+  outputTokens: number;
   mediaManifest?: MediaManifest;
+};
+
+type GenerationBatch = NativeGenerationBatch<GenerationCandidate> & {
+  retainedMessageIndexes: number[];
+  targetUserMessageIndexes: number[];
+  followingHalo?: { turn: Turn; userMessageIndex: number };
+};
+
+type ForkMessageIdentity = {
+  id: string;
+  sessionID: string | undefined;
+  role: "user" | "assistant";
+  parentID: string | undefined;
+  parts: Array<{
+    id: string;
+    sessionID: string;
+    messageID: string;
+    type: string;
+    tailStartID: string | undefined;
+  }>;
 };
 
 type GenerationTurnResult = {
@@ -66,6 +102,7 @@ type GenerationStage =
   | "fork"
   | "permission"
   | "history"
+  | "isolation"
   | "marker"
   | "provider"
   | "validation"
@@ -94,12 +131,15 @@ export async function generateCompactionSummaries(
   const candidates = plan.summarizedTurns.flatMap((turn, planIndex) => {
     if (turnHasPersistedSummary(turn)) return [];
     const mediaManifest = createMediaManifest(turn);
+    const cost = estimateNativeTurnCost(turn);
     return [
       {
         planIndex,
+        sourceTurnIndex: plan.sourceTurnStartIndex + planIndex,
         ordinal: 0,
         anchor: firstOrdinaryUserLine(turn),
         marker: "",
+        ...cost,
         ...(mediaManifest ? { mediaManifest } : {}),
       },
     ];
@@ -109,15 +149,32 @@ export async function generateCompactionSummaries(
   });
   if (candidates.length === 0) return generated;
 
-  const settings = await resolveCompactionSettings(v2, session);
-  if (historyMayExposeImages(plan.sourceSnapshot)) {
-    await assertConfiguredModelSupportsImages(v2, session, settings);
+  const settings = await resolveCompactionSettings(
+    v2,
+    session,
+    historyMayExposeImages(plan.sourceSnapshot),
+  );
+  const budget = computeNativeBatchBudget(settings.descriptor.limit);
+  const batches = planNativeGenerationBatches(candidates, budget).map(batch =>
+    createGenerationBatch(batch, plan, budget),
+  );
+  const retainedMessageIndexes = new Set(
+    batches.flatMap(batch => batch.retainedMessageIndexes),
+  );
+  if (
+    historyMayExposeImages(
+      plan.sourceSnapshot.filter((_, index) =>
+        retainedMessageIndexes.has(index),
+      ),
+    )
+  ) {
+    assertConfiguredModelSupportsImages(settings);
   }
-  const results = await requestCompactionGeneration(
+  const results = await requestCompactionGenerationBatches(
     v2,
     session,
     settings,
-    candidates,
+    batches,
     plan,
     controlTimeoutMs,
     options.nonceFactory ?? createGenerationNonce,
@@ -167,15 +224,192 @@ export async function injectSummaries(
   return inserted;
 }
 
-async function requestCompactionGeneration(
+function createGenerationBatch(
+  batch: NativeGenerationBatch<GenerationCandidate>,
+  plan: CompactionPlan,
+  budget: NativeBatchBudget,
+): GenerationBatch {
+  const sourceMessages = plan.sourceSnapshot as MessageWithParts[];
+  const sourceTurns = buildTurns(sourceMessages);
+  const retainedTurnIndexes = new Set(
+    batch.candidates.map(candidate => candidate.sourceTurnIndex),
+  );
+  const firstTurnIndex = batch.candidates[0]!.sourceTurnIndex;
+  const lastTurnIndex = batch.candidates.at(-1)!.sourceTurnIndex;
+  if (
+    [...retainedTurnIndexes].some(turnIndex =>
+      turnHasNativeCheckpointArtifact(sourceTurns[turnIndex]),
+    )
+  ) {
+    throw new Error(
+      "Compaction generation cannot safely isolate a native checkpoint target.",
+    );
+  }
+  let retainedInput = batch.estimatedInputTokens;
+  let followingHalo: GenerationBatch["followingHalo"];
+  const followingTurn = sourceTurns[lastTurnIndex + 1];
+  if (
+    followingTurn
+    && !retainedTurnIndexes.has(lastTurnIndex + 1)
+    && !turnHasNativeCheckpointArtifact(followingTurn)
+  ) {
+    const followingCost = estimateNativeTurnCost(followingTurn).inputTokens;
+    if (retainedInput + followingCost <= budget.haloInputLimit) {
+      const userMessageIndex = sourceMessages.indexOf(followingTurn.user[0]!);
+      if (userMessageIndex < 0) {
+        throw new Error(
+          "Compaction generation halo is missing from source order.",
+        );
+      }
+      retainedInput += followingCost;
+      retainedTurnIndexes.add(lastTurnIndex + 1);
+      followingHalo = { turn: followingTurn, userMessageIndex };
+    }
+  }
+  const precedingTurn = sourceTurns[firstTurnIndex - 1];
+  if (
+    precedingTurn
+    && !retainedTurnIndexes.has(firstTurnIndex - 1)
+    && !turnHasNativeCheckpointArtifact(precedingTurn)
+  ) {
+    const precedingCost = estimateNativeTurnCost(precedingTurn).inputTokens;
+    if (retainedInput + precedingCost <= budget.haloInputLimit) {
+      retainedTurnIndexes.add(firstTurnIndex - 1);
+    }
+  }
+
+  const retainedMessages = new Set(
+    [...retainedTurnIndexes].flatMap(turnIndex => {
+      const turn = sourceTurns[turnIndex];
+      if (!turn) {
+        throw new Error(
+          "Compaction generation target turn is missing from source order.",
+        );
+      }
+      return [...turn.user, ...turn.assistants];
+    }),
+  );
+  const retainedMessageIndexes = sourceMessages.flatMap((message, index) =>
+    retainedMessages.has(message) ? [index] : [],
+  );
+  const targetUserMessageIndexes = batch.candidates.map(candidate => {
+    const message = sourceTurns[candidate.sourceTurnIndex]?.user[0];
+    const index = message ? sourceMessages.indexOf(message) : -1;
+    if (index < 0) {
+      throw new Error(
+        "Compaction generation target message is missing from source order.",
+      );
+    }
+    return index;
+  });
+  return {
+    ...batch,
+    retainedMessageIndexes,
+    targetUserMessageIndexes,
+    ...(followingHalo ? { followingHalo } : {}),
+  };
+}
+
+function turnHasNativeCheckpointArtifact(turn: Turn | undefined): boolean {
+  if (!turn) return false;
+  return [...turn.user, ...turn.assistants].some(
+    message =>
+      (message.info.role === "assistant" && message.info.summary === true)
+      || message.parts.some(part => part.type === "compaction"),
+  );
+}
+
+async function requestCompactionGenerationBatches(
   v2: V2Client,
   sourceSession: Session,
   settings: CompactionSettings,
-  candidates: GenerationCandidate[],
+  batches: GenerationBatch[],
   plan: CompactionPlan,
   controlTimeoutMs: number,
   nonceFactory: () => string,
 ): Promise<GenerationTurnResult[]> {
+  const results: Array<GenerationTurnResult[] | undefined> = Array.from({
+    length: batches.length,
+  });
+  const failures: Array<Error | undefined> = Array.from({
+    length: batches.length,
+  });
+  const generationNonces = new Set<string>();
+  let nextBatchIndex = 0;
+  let stopAdmission = false;
+  const worker = async () => {
+    while (!stopAdmission) {
+      const batchIndex = nextBatchIndex;
+      nextBatchIndex += 1;
+      const batch = batches[batchIndex];
+      if (!batch) return;
+      try {
+        const batchResults = await requestCompactionGeneration(
+          v2,
+          sourceSession,
+          settings,
+          batch,
+          plan,
+          controlTimeoutMs,
+          nonceFactory,
+          generationNonces,
+        );
+        if (batchResults.length !== batch.candidates.length) {
+          throw validationFailure();
+        }
+        results[batchIndex] = batchResults;
+      } catch (error) {
+        failures[batchIndex] = sanitizeGenerationFailure(
+          sourceSession.id,
+          error,
+        );
+        stopAdmission = true;
+      }
+    }
+  };
+  await Promise.all(
+    Array.from(
+      { length: Math.min(NATIVE_BATCH_MAX_CONCURRENCY, batches.length) },
+      worker,
+    ),
+  );
+  const orderedFailures = failures.filter(
+    (failure): failure is Error => failure !== undefined,
+  );
+  if (orderedFailures.length === 1) throw orderedFailures[0];
+  if (orderedFailures.length > 1) {
+    throw new AggregateError(
+      orderedFailures,
+      "Multiple compaction generation batches failed.",
+      { cause: orderedFailures[0] },
+    );
+  }
+
+  const candidates = batches.flatMap(batch => batch.candidates);
+  const orderedResults = results.flatMap(batchResults => batchResults ?? []);
+  if (
+    orderedResults.length !== candidates.length
+    || candidates.some(
+      (candidate, index) =>
+        candidate.ordinal !== index + 1 || !orderedResults[index],
+    )
+  ) {
+    throw validationFailure();
+  }
+  return orderedResults;
+}
+
+async function requestCompactionGeneration(
+  v2: V2Client,
+  sourceSession: Session,
+  settings: CompactionSettings,
+  batch: GenerationBatch,
+  plan: CompactionPlan,
+  controlTimeoutMs: number,
+  nonceFactory: () => string,
+  generationNonces: Set<string>,
+): Promise<GenerationTurnResult[]> {
+  const candidates = batch.candidates;
   const route: GenerationRoute = {
     directory: sourceSession.directory,
     ...(sourceSession.workspaceID
@@ -213,6 +447,7 @@ async function requestCompactionGeneration(
   let results: GenerationTurnResult[] | undefined;
   let generationNonce = "";
   let stopMarker = "";
+  let retainedIdentity: ForkMessageIdentity[] | undefined;
   const permissionOutcome = await attemptWithinDeadline(
     signal =>
       v2.session
@@ -254,54 +489,10 @@ async function requestCompactionGeneration(
     } else {
       try {
         assertForkMessageShape(messagesOutcome.value, plan);
-        generationNonce = selectGenerationNonce(
-          [plan.sourceSnapshot, messagesOutcome.value],
-          nonceFactory,
+        assertForkRecordIdentity(messagesOutcome.value, fork.id);
+        retainedIdentity = batch.retainedMessageIndexes.map(index =>
+          forkMessageIdentity(messagesOutcome.value[index]!),
         );
-        candidates.forEach(candidate => {
-          candidate.marker = generationTurnMarker(
-            generationNonce,
-            candidate.ordinal,
-          );
-        });
-        stopMarker = generationStopMarker(
-          generationNonce,
-          candidates.length + 1,
-        );
-        const markerTargets = generationMarkerTargets(
-          messagesOutcome.value,
-          fork.id,
-          plan,
-          candidates,
-          stopMarker,
-        );
-        for (const target of markerTargets) {
-          const markerOutcome = await attemptWithinDeadline(
-            signal =>
-              v2.part
-                .update(
-                  {
-                    sessionID: fork.id,
-                    messageID: target.message.info.id,
-                    partID: target.part.id,
-                    ...route,
-                    part: target.part,
-                  },
-                  { signal },
-                )
-                .then(unwrapLifecycleResponse),
-            controlTimeoutMs,
-          );
-          if (markerOutcome.kind !== "success") {
-            operationError = lifecycleFailure(
-              sourceSession.id,
-              "marker",
-              markerOutcome.kind === "timed-out" ? "timeout" : "rejection",
-              markerOutcome.kind === "failed" ? markerOutcome.error : undefined,
-            );
-            break;
-          }
-        }
       } catch (error) {
         operationError = lifecycleFailure(
           sourceSession.id,
@@ -309,6 +500,130 @@ async function requestCompactionGeneration(
           "rejection",
           error,
         );
+      }
+
+      if (!operationError) {
+        const retained = new Set(batch.retainedMessageIndexes);
+        for (const [index, message] of messagesOutcome.value.entries()) {
+          if (retained.has(index)) continue;
+          const isolationOutcome = await attemptWithinDeadline(
+            signal =>
+              v2.session
+                .deleteMessage(
+                  {
+                    sessionID: fork.id,
+                    messageID: message.info.id,
+                    ...route,
+                  },
+                  { signal },
+                )
+                .then(unwrapLifecycleResponse),
+            controlTimeoutMs,
+          );
+          if (isolationOutcome.kind === "success") continue;
+          operationError = lifecycleFailure(
+            sourceSession.id,
+            "isolation",
+            isolationOutcome.kind === "timed-out" ? "timeout" : "rejection",
+            isolationOutcome.kind === "failed"
+              ? isolationOutcome.error
+              : undefined,
+          );
+          break;
+        }
+      }
+
+      if (!operationError) {
+        const retainedOutcome = await attemptWithinDeadline(
+          signal =>
+            v2.session
+              .messages({ sessionID: fork.id, ...route }, { signal })
+              .then(unwrapLifecycleResponse),
+          controlTimeoutMs,
+        );
+        if (retainedOutcome.kind !== "success") {
+          operationError = lifecycleFailure(
+            sourceSession.id,
+            "history",
+            retainedOutcome.kind === "timed-out" ? "timeout" : "rejection",
+            retainedOutcome.kind === "failed"
+              ? retainedOutcome.error
+              : undefined,
+          );
+        } else {
+          try {
+            if (!retainedIdentity) {
+              throw new Error(
+                "Compaction generation fork history shape mismatch.",
+              );
+            }
+            assertRetainedForkMessageShape(
+              retainedOutcome.value,
+              plan,
+              batch.retainedMessageIndexes,
+            );
+            assertForkRecordIdentity(retainedOutcome.value, fork.id);
+            assertRetainedForkIdentity(retainedOutcome.value, retainedIdentity);
+            generationNonce = selectGenerationNonce(
+              [plan.sourceSnapshot, retainedOutcome.value],
+              nonceFactory,
+              generationNonces,
+            );
+            candidates.forEach(candidate => {
+              candidate.marker = generationTurnMarker(
+                generationNonce,
+                candidate.ordinal,
+              );
+            });
+            if (batch.followingHalo) {
+              stopMarker = generationStopMarker(
+                generationNonce,
+                candidates.at(-1)!.ordinal + 1,
+              );
+            }
+            const markerTargets = generationMarkerTargets(
+              retainedOutcome.value,
+              fork.id,
+              batch,
+              stopMarker,
+            );
+            for (const target of markerTargets) {
+              const markerOutcome = await attemptWithinDeadline(
+                signal =>
+                  v2.part
+                    .update(
+                      {
+                        sessionID: fork.id,
+                        messageID: target.message.info.id,
+                        partID: target.part.id,
+                        ...route,
+                        part: target.part,
+                      },
+                      { signal },
+                    )
+                    .then(unwrapLifecycleResponse),
+                controlTimeoutMs,
+              );
+              if (markerOutcome.kind === "success") continue;
+              operationError = lifecycleFailure(
+                sourceSession.id,
+                "marker",
+                markerOutcome.kind === "timed-out" ? "timeout" : "rejection",
+                markerOutcome.kind === "failed"
+                  ? markerOutcome.error
+                  : undefined,
+              );
+              break;
+            }
+          } catch (error) {
+            operationError = lifecycleFailure(
+              sourceSession.id,
+              "history",
+              "rejection",
+              error,
+            );
+          }
+        }
       }
     }
   }
@@ -326,7 +641,11 @@ async function requestCompactionGeneration(
           parts: [
             {
               type: "text",
-              text: buildGenerationPrompt(candidates, plan, stopMarker),
+              text: buildGenerationPrompt(
+                candidates,
+                batch.followingHalo?.turn,
+                stopMarker,
+              ),
             },
           ],
         }),
@@ -351,6 +670,7 @@ async function requestCompactionGeneration(
         stage,
         "rejection",
         error,
+        candidates.length === 1,
       );
       const abortOutcome = await attemptWithinDeadline(
         signal =>
@@ -419,20 +739,128 @@ async function cleanupLateGenerationFork(
   );
 }
 
+function assertRetainedForkMessageShape(
+  messages: MessageWithParts[],
+  plan: CompactionPlan,
+  retainedMessageIndexes: number[],
+): void {
+  if (messages.length !== retainedMessageIndexes.length) {
+    throw new Error("Compaction generation fork history shape mismatch.");
+  }
+  for (const [index, message] of messages.entries()) {
+    const source = plan.sourceSnapshot[retainedMessageIndexes[index]!];
+    if (
+      !source
+      || !isRecord(source.info)
+      || source.info["role"] !== message.info.role
+      || source.parts.length !== message.parts.length
+      || source.parts.some(
+        (part, partIndex) =>
+          !isRecord(part) || part["type"] !== message.parts[partIndex]?.type,
+      )
+    ) {
+      throw new Error("Compaction generation fork history shape mismatch.");
+    }
+  }
+}
+
+function forkMessageIdentity(message: MessageWithParts): ForkMessageIdentity {
+  return {
+    id: message.info.id,
+    sessionID: "sessionID" in message.info ? message.info.sessionID : undefined,
+    role: message.info.role,
+    parentID:
+      "parentID" in message.info && typeof message.info.parentID === "string"
+        ? message.info.parentID
+        : undefined,
+    parts: message.parts.map(part => ({
+      id: part.id,
+      sessionID: part.sessionID,
+      messageID: part.messageID,
+      type: part.type,
+      tailStartID:
+        part.type === "compaction" && typeof part.tail_start_id === "string"
+          ? part.tail_start_id
+          : undefined,
+    })),
+  };
+}
+
+function assertRetainedForkIdentity(
+  messages: MessageWithParts[],
+  expected: ForkMessageIdentity[],
+): void {
+  if (messages.length !== expected.length) {
+    throw new Error("Compaction generation fork history shape mismatch.");
+  }
+  for (const [index, message] of messages.entries()) {
+    const actual = forkMessageIdentity(message);
+    const identity = expected[index];
+    if (
+      !identity
+      || actual.id !== identity.id
+      || actual.sessionID !== identity.sessionID
+      || actual.role !== identity.role
+      || actual.parentID !== identity.parentID
+      || actual.parts.length !== identity.parts.length
+      || actual.parts.some((part, partIndex) => {
+        const expectedPart = identity.parts[partIndex];
+        return (
+          !expectedPart
+          || part.id !== expectedPart.id
+          || part.sessionID !== expectedPart.sessionID
+          || part.messageID !== expectedPart.messageID
+          || part.type !== expectedPart.type
+          || part.tailStartID !== expectedPart.tailStartID
+        );
+      })
+    ) {
+      throw new Error("Compaction generation fork history shape mismatch.");
+    }
+  }
+}
+
+function assertForkRecordIdentity(
+  messages: MessageWithParts[],
+  forkSessionID: string,
+): void {
+  const messageIDs = new Set<string>();
+  const partIDs = new Set<string>();
+  for (const message of messages) {
+    if (
+      !message.info.id
+      || message.info.sessionID !== forkSessionID
+      || messageIDs.has(message.info.id)
+    ) {
+      throw new Error("Compaction generation fork history shape mismatch.");
+    }
+    messageIDs.add(message.info.id);
+    for (const part of message.parts) {
+      if (
+        !part.id
+        || part.sessionID !== forkSessionID
+        || part.messageID !== message.info.id
+        || partIDs.has(part.id)
+      ) {
+        throw new Error("Compaction generation fork history shape mismatch.");
+      }
+      partIDs.add(part.id);
+    }
+  }
+}
+
 function generationMarkerTargets(
   messages: MessageWithParts[],
   forkSessionID: string,
-  plan: CompactionPlan,
-  candidates: GenerationCandidate[],
+  batch: GenerationBatch,
   stopMarker: string,
 ): Array<{ message: MessageWithParts; part: TextPart }> {
-  const turns = buildTurns(messages);
-  const targets = candidates.map(candidate => {
-    const turn = turns[plan.sourceTurnStartIndex + candidate.planIndex];
-    const message = turn?.user[0];
-    if (!message) {
-      throw new Error("Compaction generation fork history shape mismatch.");
-    }
+  const targets = batch.candidates.map((candidate, index) => {
+    const message = retainedForkMessage(
+      messages,
+      batch,
+      batch.targetUserMessageIndexes[index]!,
+    );
     return {
       message,
       part: generationMarkerPart(
@@ -444,19 +872,19 @@ function generationMarkerTargets(
       ),
     };
   });
-  if (plan.nextTurn) {
-    const turn = turns[plan.sourceTurnStartIndex + plan.summarizedTurns.length];
-    const message = turn?.user[0];
-    if (!message) {
-      throw new Error("Compaction generation fork history shape mismatch.");
-    }
+  if (batch.followingHalo) {
+    const message = retainedForkMessage(
+      messages,
+      batch,
+      batch.followingHalo.userMessageIndex,
+    );
     targets.push({
       message,
       part: generationMarkerPart(
         forkSessionID,
         message.info.id,
         stopMarker,
-        candidates.length + 1,
+        batch.candidates.at(-1)!.ordinal + 1,
         true,
       ),
     });
@@ -467,6 +895,20 @@ function generationMarkerTargets(
     }
   }
   return targets;
+}
+
+function retainedForkMessage(
+  messages: MessageWithParts[],
+  batch: GenerationBatch,
+  sourceMessageIndex: number,
+): MessageWithParts {
+  const retainedIndex =
+    batch.retainedMessageIndexes.indexOf(sourceMessageIndex);
+  const message = messages[retainedIndex];
+  if (retainedIndex < 0 || !message || message.info.role !== "user") {
+    throw new Error("Compaction generation fork history shape mismatch.");
+  }
+  return message;
 }
 
 function generationMarkerPart(
@@ -508,13 +950,18 @@ function createGenerationNonce(): string {
 function selectGenerationNonce(
   histories: unknown[],
   nonceFactory: () => string,
+  generationNonces: Set<string>,
 ): string {
   for (let attempt = 0; attempt < GENERATION_NONCE_ATTEMPTS; attempt += 1) {
     const nonce = nonceFactory();
     if (!GENERATION_NONCE_PATTERN.test(nonce)) {
       throw new Error("Compaction generation marker nonce is invalid.");
     }
-    if (!histories.some(history => containsString(history, nonce))) {
+    if (
+      !generationNonces.has(nonce)
+      && !histories.some(history => containsString(history, nonce))
+    ) {
+      generationNonces.add(nonce);
       return nonce;
     }
   }
@@ -548,6 +995,7 @@ function containsString(value: unknown, needle: string): boolean {
 async function resolveCompactionSettings(
   v2: V2Client,
   sourceSession: Session,
+  requiresImages: boolean,
 ): Promise<CompactionSettings> {
   let agents: Agent[];
   try {
@@ -584,17 +1032,6 @@ async function resolveCompactionSettings(
       "Magic Compact requires an explicit model on the native compaction agent.",
     );
   }
-  return {
-    model: compactionAgent.model,
-    ...(compactionAgent.variant ? { variant: compactionAgent.variant } : {}),
-  };
-}
-
-async function assertConfiguredModelSupportsImages(
-  v2: V2Client,
-  sourceSession: Session,
-  settings: CompactionSettings,
-): Promise<void> {
   let catalog: ReturnType<typeof unwrap>;
   try {
     catalog = unwrap(
@@ -607,28 +1044,69 @@ async function assertConfiguredModelSupportsImages(
     );
   } catch {
     throw new Error(
-      "Magic Compact could not verify an image-capable configured compaction model.",
+      requiresImages
+        ? "Magic Compact could not verify an image-capable configured compaction model."
+        : "Magic Compact could not resolve the configured compaction model descriptor.",
     );
   }
+  const provider =
+    isRecord(catalog) && Array.isArray(catalog["all"])
+      ? catalog["all"].find(
+          value =>
+            isRecord(value)
+            && value["id"] === compactionAgent.model!.providerID,
+        )
+      : undefined;
+  const models = isRecord(provider) ? provider["models"] : undefined;
+  const descriptor = isRecord(models)
+    ? models[compactionAgent.model.modelID]
+    : undefined;
+  const limit = isRecord(descriptor) ? descriptor["limit"] : undefined;
   if (
-    !isRecord(catalog)
-    || !Array.isArray(catalog["all"])
-    || !catalog["all"].some(provider => {
-      if (!isRecord(provider) || provider["id"] !== settings.model.providerID) {
-        return false;
-      }
-      const models = provider["models"];
-      if (!isRecord(models)) return false;
-      const model = models[settings.model.modelID];
-      if (!isRecord(model)) return false;
-      const capabilities = model["capabilities"];
-      if (!isRecord(capabilities)) return false;
-      const input = capabilities["input"];
-      return isRecord(input) && input["image"] === true;
-    })
+    !isRecord(descriptor)
+    || !isRecord(limit)
+    || typeof limit["context"] !== "number"
   ) {
     throw new Error(
-      "Magic Compact requires an image-capable configured compaction model for complete fork history containing images.",
+      requiresImages
+        ? "Magic Compact requires an image-capable configured compaction model for retained fork history containing images."
+        : "Magic Compact could not resolve the configured compaction model descriptor.",
+    );
+  }
+  const capabilities = descriptor["capabilities"];
+  const inputCapabilities = isRecord(capabilities)
+    ? capabilities["input"]
+    : undefined;
+  return {
+    model: compactionAgent.model,
+    ...(compactionAgent.variant ? { variant: compactionAgent.variant } : {}),
+    descriptor: {
+      limit: {
+        context: limit["context"],
+        ...(typeof limit["input"] === "number"
+          ? { input: limit["input"] }
+          : {}),
+        ...(typeof limit["output"] === "number"
+          ? { output: limit["output"] }
+          : {}),
+      },
+      ...(isRecord(inputCapabilities)
+        ? {
+            capabilities: {
+              input: { image: inputCapabilities["image"] === true },
+            },
+          }
+        : {}),
+    },
+  };
+}
+
+function assertConfiguredModelSupportsImages(
+  settings: CompactionSettings,
+): void {
+  if (settings.descriptor.capabilities?.input?.image !== true) {
+    throw new Error(
+      "Magic Compact requires an image-capable configured compaction model for retained fork history containing images.",
     );
   }
 }
@@ -651,6 +1129,7 @@ function historyMayExposeImages(sourceSnapshot: unknown): boolean {
         return true;
       }
       if (part["type"] !== "tool" || !isRecord(part["state"])) return false;
+      if (!toolAttachmentsModelVisible(part)) return false;
       const attachments = part["state"]["attachments"];
       return (
         Array.isArray(attachments)
@@ -667,11 +1146,11 @@ function historyMayExposeImages(sourceSnapshot: unknown): boolean {
 
 function buildGenerationPrompt(
   candidates: GenerationCandidate[],
-  plan: CompactionPlan,
+  nextTurn: Turn | undefined,
   stopMarker: string,
 ): string {
   return [
-    "Generate one continuation summary for each indexed turn using the complete forked source history.",
+    "Generate one continuation summary for each indexed turn using the retained native fork history.",
     "Return only the JSON object required by your system prompt.",
     "Use the ephemeral markers only as ordering guides. Echo each exact marker token, public ordinal, and anchor; marker echo is allowed. Never include the active generation nonce or marker token in summaries or visual descriptions; useful source identifiers may remain when you include them.",
     JSON.stringify({
@@ -681,11 +1160,11 @@ function buildGenerationPrompt(
         anchor: candidate.anchor,
         expectedInlineImages: candidate.mediaManifest?.images.length ?? 0,
       })),
-      ...(plan.nextTurn
+      ...(nextTurn
         ? {
             nextTurn: {
               marker: stopMarker,
-              anchor: firstOrdinaryUserLine(plan.nextTurn),
+              anchor: firstOrdinaryUserLine(nextTurn),
             },
           }
         : {}),
@@ -878,6 +1357,7 @@ function lifecycleFailure(
   stage: GenerationStage,
   kind: LifecycleFailureKind,
   error?: unknown,
+  singleTurn = false,
 ): GenerationLifecycleError {
   const status = safeStatus(error);
   const overflow = stage === "provider" && isContextOverflow(error, status);
@@ -888,7 +1368,9 @@ function lifecycleFailure(
       : overflow
         ? "The complete forked session exceeded the configured compaction model context. Run /magic-trim first, then retry /magic-compact."
         : truncated
-          ? "The compaction model reached its output limit. Retry /magic-compact with a larger N so fewer turns are selected."
+          ? singleTurn
+            ? "The compaction model reached its output limit while summarizing a single turn. Configure a compaction model with more output capacity."
+            : "The compaction model reached its output limit. Retry /magic-compact with a larger N so fewer turns are selected."
           : lifecycleMessage(stage, kind);
   return new GenerationLifecycleError(
     sourceSessionID,
@@ -897,6 +1379,26 @@ function lifecycleFailure(
     status,
     message,
   );
+}
+
+function sanitizeGenerationFailure(
+  sourceSessionID: string,
+  error: unknown,
+): Error {
+  if (error instanceof GenerationLifecycleError) return error;
+  if (error instanceof AggregateError) {
+    const errors = error.errors.map(item =>
+      sanitizeGenerationFailure(sourceSessionID, item),
+    );
+    if (errors.length > 0) {
+      return new AggregateError(
+        errors,
+        "Compaction generation batch and fork cleanup failed.",
+        { cause: errors[0] },
+      );
+    }
+  }
+  return lifecycleFailure(sourceSessionID, "validation", "rejection");
 }
 
 function lifecycleMessage(
@@ -917,6 +1419,11 @@ function lifecycleMessage(
     return kind === "timeout"
       ? "Compaction generation fork history verification timed out."
       : "Compaction generation fork history shape verification failed.";
+  }
+  if (stage === "isolation") {
+    return kind === "timeout"
+      ? "Compaction generation fork message isolation timed out."
+      : "Compaction generation fork message isolation failed.";
   }
   if (stage === "marker") {
     return kind === "timeout"
