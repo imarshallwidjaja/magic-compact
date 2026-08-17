@@ -6,6 +6,7 @@ import type {
 } from "@opencode-ai/sdk/v2";
 import { randomBytes } from "node:crypto";
 import { unwrap, type V2Client } from "../api";
+import { countGptTokens } from "../stats/tokenize";
 import {
   attemptWithinDeadline,
   CONTROL_OPERATION_TIMEOUT_MS,
@@ -22,8 +23,10 @@ import {
   computeNativeBatchBudget,
   estimateNativeTurnCost,
   NATIVE_BATCH_MAX_CONCURRENCY,
+  NATIVE_BATCH_PLANNING_NONCE,
   planNativeGenerationBatches,
   toolAttachmentsModelVisible,
+  type NativeBatchProtocol,
   type NativeBatchBudget,
   type NativeGenerationBatch,
 } from "./batch";
@@ -39,7 +42,8 @@ import {
 const GENERATION_PERMISSION: PermissionRuleset = [
   { permission: "*", pattern: "*", action: "deny" },
 ];
-const ANCHOR_CHARACTER_LIMIT = 300;
+const TARGET_ANCHOR_CHARACTER_LIMIT = 300;
+const GLOBAL_ANCHOR_CHARACTER_LIMIT = 160;
 const GENERATION_NONCE_ATTEMPTS = 8;
 const GENERATION_NONCE_PATTERN = /^[A-Za-z0-9_-]{22}$/u;
 
@@ -58,15 +62,22 @@ type GenerationCandidate = {
   ordinal: number;
   anchor: string;
   marker: string;
+  expectedInlineImages: number;
   inputTokens: number;
   outputTokens: number;
   mediaManifest?: MediaManifest;
 };
 
-type GenerationBatch = NativeGenerationBatch<GenerationCandidate> & {
+type GenerationBatchPlan = NativeGenerationBatch<GenerationCandidate> & {
   retainedMessageIndexes: number[];
   targetUserMessageIndexes: number[];
   followingHalo?: { turn: Turn; userMessageIndex: number };
+};
+
+type GenerationBatch = GenerationBatchPlan & {
+  generationNonce: string;
+  stopMarker: string;
+  prompt: string;
 };
 
 type ForkMessageIdentity = {
@@ -127,6 +138,7 @@ export async function generateCompactionSummaries(
   }
 
   assertGeneratedPartIDsAvailable(plan);
+  const globalTurnIndexPrompt = buildGlobalTurnIndexPrompt(plan);
   const generated: GeneratedSummary[] = plan.summarizedTurns.map(() => null);
   const candidates = plan.summarizedTurns.flatMap((turn, planIndex) => {
     if (turnHasPersistedSummary(turn)) return [];
@@ -137,8 +149,9 @@ export async function generateCompactionSummaries(
         planIndex,
         sourceTurnIndex: plan.sourceTurnStartIndex + planIndex,
         ordinal: 0,
-        anchor: firstOrdinaryUserLine(turn),
+        anchor: firstOrdinaryUserLine(turn, TARGET_ANCHOR_CHARACTER_LIMIT),
         marker: "",
+        expectedInlineImages: mediaManifest?.images.length ?? 0,
         ...cost,
         ...(mediaManifest ? { mediaManifest } : {}),
       },
@@ -146,6 +159,10 @@ export async function generateCompactionSummaries(
   });
   candidates.forEach((candidate, index) => {
     candidate.ordinal = index + 1;
+    candidate.marker = generationTurnMarker(
+      NATIVE_BATCH_PLANNING_NONCE,
+      candidate.ordinal,
+    );
   });
   if (candidates.length === 0) return generated;
 
@@ -155,8 +172,33 @@ export async function generateCompactionSummaries(
     historyMayExposeImages(plan.sourceSnapshot),
   );
   const budget = computeNativeBatchBudget(settings.descriptor.limit);
-  const batches = planNativeGenerationBatches(candidates, budget).map(batch =>
-    createGenerationBatch(batch, plan, budget),
+  const protocol: NativeBatchProtocol<GenerationCandidate> = {
+    explicitRequestTokens: batchCandidates =>
+      estimateGenerationExplicitRequestTokens(
+        batchCandidates,
+        undefined,
+        "",
+        globalTurnIndexPrompt,
+      ),
+    responseProtocolTokens: estimateGenerationResponseProtocolTokens,
+  };
+  const batchPlans = planNativeGenerationBatches(
+    candidates,
+    budget,
+    protocol,
+  ).map(batch =>
+    createGenerationBatch(batch, plan, budget, globalTurnIndexPrompt),
+  );
+  const generationNonces = new Set<string>();
+  const batches = batchPlans.map(batch =>
+    finalizeGenerationBatch(
+      batch,
+      plan,
+      budget,
+      globalTurnIndexPrompt,
+      options.nonceFactory ?? createGenerationNonce,
+      generationNonces,
+    ),
   );
   const retainedMessageIndexes = new Set(
     batches.flatMap(batch => batch.retainedMessageIndexes),
@@ -177,7 +219,6 @@ export async function generateCompactionSummaries(
     batches,
     plan,
     controlTimeoutMs,
-    options.nonceFactory ?? createGenerationNonce,
   );
   for (const [index, candidate] of candidates.entries()) {
     const result = results[index]!;
@@ -228,7 +269,8 @@ function createGenerationBatch(
   batch: NativeGenerationBatch<GenerationCandidate>,
   plan: CompactionPlan,
   budget: NativeBatchBudget,
-): GenerationBatch {
+  globalTurnIndexPrompt: string,
+): GenerationBatchPlan {
   const sourceMessages = plan.sourceSnapshot as MessageWithParts[];
   const sourceTurns = buildTurns(sourceMessages);
   const retainedTurnIndexes = new Set(
@@ -246,7 +288,9 @@ function createGenerationBatch(
     );
   }
   let retainedInput = batch.estimatedInputTokens;
-  let followingHalo: GenerationBatch["followingHalo"];
+  let estimatedExplicitRequestTokens = batch.estimatedExplicitRequestTokens;
+  let inputLimit = batch.inputLimit;
+  let followingHalo: GenerationBatchPlan["followingHalo"];
   const followingTurn = sourceTurns[lastTurnIndex + 1];
   if (
     followingTurn
@@ -254,14 +298,32 @@ function createGenerationBatch(
     && !turnHasNativeCheckpointArtifact(followingTurn)
   ) {
     const followingCost = estimateNativeTurnCost(followingTurn).inputTokens;
-    if (retainedInput + followingCost <= budget.haloInputLimit) {
+    const stopMarker = generationStopMarker(
+      NATIVE_BATCH_PLANNING_NONCE,
+      batch.candidates.at(-1)!.ordinal + 1,
+    );
+    const followingExplicitRequestTokens =
+      estimateGenerationExplicitRequestTokens(
+        batch.candidates,
+        firstOrdinaryUserLine(followingTurn, TARGET_ANCHOR_CHARACTER_LIMIT),
+        stopMarker,
+        globalTurnIndexPrompt,
+      );
+    const followingInput =
+      retainedInput
+      - estimatedExplicitRequestTokens
+      + followingExplicitRequestTokens
+      + followingCost;
+    if (followingInput <= budget.haloInputLimit) {
       const userMessageIndex = sourceMessages.indexOf(followingTurn.user[0]!);
       if (userMessageIndex < 0) {
         throw new Error(
           "Compaction generation halo is missing from source order.",
         );
       }
-      retainedInput += followingCost;
+      retainedInput = followingInput;
+      estimatedExplicitRequestTokens = followingExplicitRequestTokens;
+      inputLimit = budget.haloInputLimit;
       retainedTurnIndexes.add(lastTurnIndex + 1);
       followingHalo = { turn: followingTurn, userMessageIndex };
     }
@@ -274,6 +336,8 @@ function createGenerationBatch(
   ) {
     const precedingCost = estimateNativeTurnCost(precedingTurn).inputTokens;
     if (retainedInput + precedingCost <= budget.haloInputLimit) {
+      retainedInput += precedingCost;
+      inputLimit = budget.haloInputLimit;
       retainedTurnIndexes.add(firstTurnIndex - 1);
     }
   }
@@ -304,9 +368,91 @@ function createGenerationBatch(
   });
   return {
     ...batch,
+    estimatedInputTokens: retainedInput,
+    estimatedExplicitRequestTokens,
+    inputLimit,
     retainedMessageIndexes,
     targetUserMessageIndexes,
     ...(followingHalo ? { followingHalo } : {}),
+  };
+}
+
+function finalizeGenerationBatch(
+  batch: GenerationBatchPlan,
+  plan: CompactionPlan,
+  budget: NativeBatchBudget,
+  globalTurnIndexPrompt: string,
+  nonceFactory: () => string,
+  generationNonces: Set<string>,
+): GenerationBatch {
+  const generationNonce = selectGenerationNonce(
+    [plan.sourceSnapshot],
+    nonceFactory,
+    generationNonces,
+  );
+  const candidates = batch.candidates.map(candidate => ({
+    ...candidate,
+    marker: generationTurnMarker(generationNonce, candidate.ordinal),
+  }));
+  const stopMarker = batch.followingHalo
+    ? generationStopMarker(generationNonce, candidates.at(-1)!.ordinal + 1)
+    : "";
+  const nextTurnAnchor = batch.followingHalo
+    ? firstOrdinaryUserLine(
+        batch.followingHalo.turn,
+        TARGET_ANCHOR_CHARACTER_LIMIT,
+      )
+    : undefined;
+  const prompt = buildGenerationPrompt(
+    candidates,
+    nextTurnAnchor,
+    stopMarker,
+    globalTurnIndexPrompt,
+  );
+  const exactExplicitRequestTokens = estimateGenerationExplicitRequestTokens(
+    candidates,
+    nextTurnAnchor,
+    stopMarker,
+    globalTurnIndexPrompt,
+  );
+  const exactInputTokens =
+    batch.estimatedInputTokens
+    - batch.estimatedExplicitRequestTokens
+    + exactExplicitRequestTokens;
+  const exactOutputTokens =
+    candidates.reduce(
+      (total, candidate) => total + Math.ceil(candidate.outputTokens),
+      0,
+    ) + estimateGenerationResponseProtocolTokens(candidates);
+  if (exactInputTokens > batch.estimatedInputTokens) {
+    throw new Error(
+      "Magic Compact exact generation request exceeds its conservative pre-fork token estimate.",
+    );
+  }
+  if (
+    exactInputTokens > batch.inputLimit
+    || exactInputTokens > budget.usableInput
+  ) {
+    throw new Error(
+      "Magic Compact exact generation request cannot fit the configured model input. Run /magic-trim first and retry.",
+    );
+  }
+  if (
+    exactOutputTokens > batch.estimatedOutputTokens
+    || exactOutputTokens > budget.outputTarget
+  ) {
+    throw new Error(
+      batch.candidates.length === 1
+        ? `A single compaction turn cannot fit the configured ${budget.outputTarget}-token output target. Configure a compaction model with more output capacity.`
+        : `A compaction generation batch cannot fit the configured ${budget.outputTarget}-token output target. Keep more recent turns unchanged and retry.`,
+    );
+  }
+  return {
+    ...batch,
+    candidates,
+    generationNonce,
+    stopMarker,
+    prompt,
   };
 }
 
@@ -326,7 +472,6 @@ async function requestCompactionGenerationBatches(
   batches: GenerationBatch[],
   plan: CompactionPlan,
   controlTimeoutMs: number,
-  nonceFactory: () => string,
 ): Promise<GenerationTurnResult[]> {
   const results: Array<GenerationTurnResult[] | undefined> = Array.from({
     length: batches.length,
@@ -334,7 +479,6 @@ async function requestCompactionGenerationBatches(
   const failures: Array<Error | undefined> = Array.from({
     length: batches.length,
   });
-  const generationNonces = new Set<string>();
   let nextBatchIndex = 0;
   let stopAdmission = false;
   const worker = async () => {
@@ -351,8 +495,6 @@ async function requestCompactionGenerationBatches(
           batch,
           plan,
           controlTimeoutMs,
-          nonceFactory,
-          generationNonces,
         );
         if (batchResults.length !== batch.candidates.length) {
           throw validationFailure();
@@ -406,8 +548,6 @@ async function requestCompactionGeneration(
   batch: GenerationBatch,
   plan: CompactionPlan,
   controlTimeoutMs: number,
-  nonceFactory: () => string,
-  generationNonces: Set<string>,
 ): Promise<GenerationTurnResult[]> {
   const candidates = batch.candidates;
   const route: GenerationRoute = {
@@ -445,8 +585,8 @@ async function requestCompactionGeneration(
 
   let operationError: Error | undefined;
   let results: GenerationTurnResult[] | undefined;
-  let generationNonce = "";
-  let stopMarker = "";
+  const generationNonce = batch.generationNonce;
+  const stopMarker = batch.stopMarker;
   let retainedIdentity: ForkMessageIdentity[] | undefined;
   const permissionOutcome = await attemptWithinDeadline(
     signal =>
@@ -564,22 +704,8 @@ async function requestCompactionGeneration(
             );
             assertForkRecordIdentity(retainedOutcome.value, fork.id);
             assertRetainedForkIdentity(retainedOutcome.value, retainedIdentity);
-            generationNonce = selectGenerationNonce(
-              [plan.sourceSnapshot, retainedOutcome.value],
-              nonceFactory,
-              generationNonces,
-            );
-            candidates.forEach(candidate => {
-              candidate.marker = generationTurnMarker(
-                generationNonce,
-                candidate.ordinal,
-              );
-            });
-            if (batch.followingHalo) {
-              stopMarker = generationStopMarker(
-                generationNonce,
-                candidates.at(-1)!.ordinal + 1,
-              );
+            if (containsString(retainedOutcome.value, generationNonce)) {
+              throw new GenerationMarkerNonceCollisionError();
             }
             const markerTargets = generationMarkerTargets(
               retainedOutcome.value,
@@ -641,11 +767,7 @@ async function requestCompactionGeneration(
           parts: [
             {
               type: "text",
-              text: buildGenerationPrompt(
-                candidates,
-                batch.followingHalo?.turn,
-                stopMarker,
-              ),
+              text: batch.prompt,
             },
           ],
         }),
@@ -1146,29 +1268,89 @@ function historyMayExposeImages(sourceSnapshot: unknown): boolean {
 
 function buildGenerationPrompt(
   candidates: GenerationCandidate[],
-  nextTurn: Turn | undefined,
+  nextTurnAnchor: string | undefined,
   stopMarker: string,
+  globalTurnIndexPrompt: string,
 ): string {
   return [
     "Generate one continuation summary for each indexed turn using the retained native fork history.",
     "Return only the JSON object required by your system prompt.",
-    "Use the ephemeral markers only as ordering guides. Echo each exact marker token, public ordinal, and anchor; marker echo is allowed. Never include the active generation nonce or marker token in summaries or visual descriptions; useful source identifiers may remain when you include them.",
+    globalTurnIndexPrompt,
+    "Use the ephemeral markers only as ordering guides. Echo each exact marker token, target ordinal, and target anchor; marker echo is allowed. Never include the active generation nonce or marker token in summaries or visual descriptions; useful source identifiers may remain when you include them.",
     JSON.stringify({
       turns: candidates.map(candidate => ({
         ordinal: candidate.ordinal,
         marker: candidate.marker,
         anchor: candidate.anchor,
-        expectedInlineImages: candidate.mediaManifest?.images.length ?? 0,
+        expectedInlineImages: candidate.expectedInlineImages,
       })),
-      ...(nextTurn
+      ...(nextTurnAnchor !== undefined
         ? {
             nextTurn: {
               marker: stopMarker,
-              anchor: firstOrdinaryUserLine(nextTurn),
+              anchor: nextTurnAnchor,
             },
           }
         : {}),
     }),
+  ].join("\n");
+}
+
+function estimateGenerationExplicitRequestTokens(
+  candidates: GenerationCandidate[],
+  nextTurnAnchor: string | undefined,
+  stopMarker: string,
+  globalTurnIndexPrompt: string,
+): number {
+  return (
+    countGptTokens(
+      buildGenerationPrompt(
+        candidates,
+        nextTurnAnchor,
+        stopMarker,
+        globalTurnIndexPrompt,
+      ),
+    )
+    + candidates.reduce(
+      (total, candidate) => total + countGptTokens(candidate.marker),
+      0,
+    )
+    + (nextTurnAnchor === undefined ? 0 : countGptTokens(stopMarker))
+  );
+}
+
+function estimateGenerationResponseProtocolTokens(
+  candidates: GenerationCandidate[],
+): number {
+  return countGptTokens(
+    JSON.stringify({
+      turns: candidates.map(candidate => ({
+        ordinal: candidate.ordinal,
+        marker: candidate.marker,
+        anchor: candidate.anchor,
+        summary: "",
+        visualDescriptions: Array.from(
+          { length: candidate.expectedInlineImages },
+          (_, index) => ({ ordinal: index + 1, description: "" }),
+        ),
+      })),
+    }),
+  );
+}
+
+function buildGlobalTurnIndexPrompt(plan: CompactionPlan): string {
+  const sourceTurns = buildTurns(
+    plan.sourceSnapshot as unknown as MessageWithParts[],
+  );
+  const globalTurnIndex = sourceTurns
+    .slice(plan.effectiveSourceTurnStartIndex, plan.effectiveSourceTurnEndIndex)
+    .map((turn, index) => ({
+      sourceOrdinal: plan.effectiveSourceTurnStartIndex + index + 1,
+      anchor: firstOrdinaryUserLine(turn, GLOBAL_ANCHOR_CHARACTER_LIMIT),
+    }));
+  return [
+    "The globalTurnIndex is an orientation-only user-anchor map. Its sourceOrdinal values are immutable source-history positions, not target ordinals, and it does not supply distant assistant or tool detail. Each entry contains only its sourceOrdinal and bounded user anchor:",
+    JSON.stringify({ globalTurnIndex }),
   ].join("\n");
 }
 
@@ -1268,7 +1450,7 @@ function frameSummary(result: GenerationTurnResult): string {
   ].join("\n");
 }
 
-function firstOrdinaryUserLine(turn: Turn): string {
+function firstOrdinaryUserLine(turn: Turn, characterLimit: number): string {
   const text = turn.user
     .flatMap(message => message.parts)
     .find(
@@ -1278,7 +1460,7 @@ function firstOrdinaryUserLine(turn: Turn): string {
         && part.ignored !== true,
     )?.text;
   const firstLine = (text ?? "").split(/\r\n|\r|\n/u, 1)[0] ?? "";
-  return Array.from(firstLine).slice(0, ANCHOR_CHARACTER_LIMIT).join("");
+  return Array.from(firstLine).slice(0, characterLimit).join("");
 }
 
 function assertGeneratedPartIDsAvailable(plan: CompactionPlan): void {

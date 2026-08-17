@@ -17,6 +17,8 @@ export type CompactionPlan = {
   summarizedTurns: Turn[];
   nextTurn: Turn | null;
   sourceTurnStartIndex: number;
+  effectiveSourceTurnStartIndex: number;
+  effectiveSourceTurnEndIndex: number;
   sourceSnapshot: SourceSnapshot;
 };
 
@@ -68,6 +70,18 @@ export async function createCompactionPlan(
 
   removeTrailingAssistantlessTurn(turns);
 
+  const firstEffectiveTurn = turns[0];
+  const effectiveSourceTurnStartIndex = firstEffectiveTurn
+    ? sourceTurns.findIndex(
+        turn => turn.user[0]?.info.id === firstEffectiveTurn.user[0]?.info.id,
+      )
+    : sourceTurns.length;
+  if (effectiveSourceTurnStartIndex < 0) {
+    throw new Error("Compaction effective turn is missing from source order.");
+  }
+  const effectiveSourceTurnEndIndex =
+    effectiveSourceTurnStartIndex + turns.length;
+
   const compactionEndIndex =
     keepTurns <= 0
       ? turns.length
@@ -76,20 +90,15 @@ export async function createCompactionPlan(
   const summarizedTurns = turns.slice(compactionStartIndex, compactionEndIndex);
 
   const nextTurn = turns[compactionEndIndex] ?? null;
-  const firstPlannedTurn = summarizedTurns[0] ?? nextTurn;
-  const sourceTurnStartIndex = firstPlannedTurn
-    ? sourceTurns.findIndex(
-        turn => turn.user[0]?.info.id === firstPlannedTurn.user[0]?.info.id,
-      )
-    : sourceTurns.length;
-  if (sourceTurnStartIndex < 0) {
-    throw new Error("Compaction plan turn is missing from source order.");
-  }
+  const sourceTurnStartIndex =
+    effectiveSourceTurnStartIndex + compactionStartIndex;
 
   return {
     summarizedTurns,
     nextTurn,
     sourceTurnStartIndex,
+    effectiveSourceTurnStartIndex,
+    effectiveSourceTurnEndIndex,
     sourceSnapshot: captureSourceSnapshot(messages),
   };
 }

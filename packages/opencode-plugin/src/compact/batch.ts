@@ -5,19 +5,22 @@ import type { Turn } from "./plan";
 
 export const NATIVE_BATCH_MAX_CONCURRENCY = 5;
 export const NATIVE_BATCH_NORMAL_INPUT_TARGET = 400_000;
-export const NATIVE_BATCH_MAX_TARGET_TURNS = 12;
+export const NATIVE_BATCH_MAX_TARGET_TURNS = 32;
 export const NATIVE_BATCH_FIXED_RESERVE_TOKENS = 8_000;
 export const NATIVE_BATCH_MEDIA_TOKEN_CHARGE = 8_000;
 export const NATIVE_BATCH_MAX_OUTPUT_TARGET = 32_000;
 export const NATIVE_BATCH_MAX_HALO_INPUT = 500_000;
+// The pinned tokenizer emits one token per byte here, the maximum for a valid 22-byte nonce body.
+export const NATIVE_BATCH_PLANNING_NONCE = "uB_4fLx2Xv5Tz7E1M-8vQn";
 
 const NATIVE_BATCH_FALLBACK_OUTPUT_LIMIT = 32_000;
-const NATIVE_BATCH_MIN_TURN_OUTPUT = 1_000;
+const NATIVE_BATCH_MIN_TURN_OUTPUT = 512;
 const NATIVE_BATCH_MAX_TURN_TEXT_OUTPUT = 8_000;
 const NATIVE_BATCH_MEDIA_DESCRIPTION_OUTPUT = 512;
 
 export type NativeBatchBudget = {
   outputTarget: number;
+  usableInput: number;
   normalInputTarget: number;
   hardSingleTurnInput: number;
   haloInputLimit: number;
@@ -28,10 +31,17 @@ export type NativeTurnCost = {
   outputTokens: number;
 };
 
+export type NativeBatchProtocol<T extends NativeTurnCost> = {
+  explicitRequestTokens: (candidates: T[]) => number;
+  responseProtocolTokens: (candidates: T[]) => number;
+};
+
 export type NativeGenerationBatch<T extends NativeTurnCost> = {
   candidates: T[];
   estimatedInputTokens: number;
+  estimatedExplicitRequestTokens: number;
   estimatedOutputTokens: number;
+  inputLimit: number;
 };
 
 export function computeNativeBatchBudget(limit: {
@@ -68,11 +78,12 @@ export function computeNativeBatchBudget(limit: {
   const hardSingleTurnInput = Math.floor(usableInput * 0.9);
   if (hardSingleTurnInput <= NATIVE_BATCH_FIXED_RESERVE_TOKENS) {
     throw new Error(
-      "Magic Compact configured compaction model input budget is too small to fit the fixed request reserve.",
+      "Magic Compact configured compaction model input budget is too small to fit the fixed host reserve.",
     );
   }
   return {
     outputTarget,
+    usableInput,
     normalInputTarget: Math.min(
       NATIVE_BATCH_NORMAL_INPUT_TARGET,
       Math.floor(usableInput * 0.8),
@@ -112,56 +123,84 @@ export function estimateNativeTurnCost(turn: Turn): NativeTurnCost {
 export function planNativeGenerationBatches<T extends NativeTurnCost>(
   candidates: T[],
   budget: NativeBatchBudget,
+  protocol: NativeBatchProtocol<T>,
 ): NativeGenerationBatch<T>[] {
   const batches: NativeGenerationBatch<T>[] = [];
+  const emptyRequestTokens = Math.ceil(protocol.explicitRequestTokens([]));
+  if (
+    NATIVE_BATCH_FIXED_RESERVE_TOKENS + emptyRequestTokens
+    > budget.usableInput
+  ) {
+    throw new Error(
+      "Magic Compact explicit request and global turn index cannot fit the configured model input budget. Run /magic-trim first or configure a compaction model with more input capacity.",
+    );
+  }
   let current: NativeGenerationBatch<T> | undefined;
   const flush = () => {
     if (current) batches.push(current);
     current = undefined;
   };
+  const estimateBatch = (
+    batchCandidates: T[],
+    inputLimit: number,
+  ): NativeGenerationBatch<T> => {
+    const estimatedExplicitRequestTokens = Math.ceil(
+      protocol.explicitRequestTokens(batchCandidates),
+    );
+    return {
+      candidates: batchCandidates,
+      estimatedInputTokens:
+        NATIVE_BATCH_FIXED_RESERVE_TOKENS
+        + estimatedExplicitRequestTokens
+        + batchCandidates.reduce(
+          (total, candidate) => total + Math.ceil(candidate.inputTokens),
+          0,
+        ),
+      estimatedExplicitRequestTokens,
+      estimatedOutputTokens:
+        Math.ceil(protocol.responseProtocolTokens(batchCandidates))
+        + batchCandidates.reduce(
+          (total, candidate) => total + Math.ceil(candidate.outputTokens),
+          0,
+        ),
+      inputLimit,
+    };
+  };
 
   for (const candidate of candidates) {
-    const singleInput =
-      NATIVE_BATCH_FIXED_RESERVE_TOKENS + Math.ceil(candidate.inputTokens);
-    const singleOutput = Math.ceil(candidate.outputTokens);
-    if (singleInput > budget.hardSingleTurnInput) {
+    const single = estimateBatch([candidate], budget.normalInputTarget);
+    if (single.estimatedInputTokens > budget.hardSingleTurnInput) {
       throw new Error(
         "A single compaction turn cannot fit the configured model input. Run /magic-trim first and retry.",
       );
     }
-    if (singleOutput > budget.outputTarget) {
+    if (single.estimatedOutputTokens > budget.outputTarget) {
       throw new Error(
         `A single compaction turn cannot fit the configured ${budget.outputTarget}-token output target. Configure a compaction model with more output capacity.`,
       );
     }
-    if (singleInput > budget.normalInputTarget) {
+    if (single.estimatedInputTokens > budget.normalInputTarget) {
       flush();
-      batches.push({
-        candidates: [candidate],
-        estimatedInputTokens: singleInput,
-        estimatedOutputTokens: singleOutput,
-      });
+      single.inputLimit = budget.hardSingleTurnInput;
+      batches.push(single);
       continue;
     }
 
-    if (
-      current
-      && current.candidates.length < NATIVE_BATCH_MAX_TARGET_TURNS
-      && current.estimatedInputTokens + candidate.inputTokens
-        <= budget.normalInputTarget
-      && current.estimatedOutputTokens + singleOutput <= budget.outputTarget
-    ) {
-      current.candidates.push(candidate);
-      current.estimatedInputTokens += Math.ceil(candidate.inputTokens);
-      current.estimatedOutputTokens += singleOutput;
-      continue;
+    if (current && current.candidates.length < NATIVE_BATCH_MAX_TARGET_TURNS) {
+      const tentative = estimateBatch(
+        [...current.candidates, candidate],
+        budget.normalInputTarget,
+      );
+      if (
+        tentative.estimatedInputTokens <= budget.normalInputTarget
+        && tentative.estimatedOutputTokens <= budget.outputTarget
+      ) {
+        current = tentative;
+        continue;
+      }
     }
     flush();
-    current = {
-      candidates: [candidate],
-      estimatedInputTokens: singleInput,
-      estimatedOutputTokens: singleOutput,
-    };
+    current = single;
   }
   flush();
   return batches;
