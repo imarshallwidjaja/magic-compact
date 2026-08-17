@@ -8,7 +8,11 @@ import { Buffer } from "node:buffer";
 import { types as nodeTypes } from "node:util";
 import { unwrap, type V2Client } from "../api";
 import { countGptTokens } from "../stats/tokenize";
-import { isRecord } from "../util";
+import {
+  attemptWithinDeadline,
+  CONTROL_OPERATION_TIMEOUT_MS,
+  isRecord,
+} from "../util";
 import {
   analyzeAgenticTurnEvidence,
   type AgenticTurnEvidence,
@@ -30,9 +34,7 @@ import { type CompactionPlan, type Turn } from "./plan";
 export { INLINE_IMAGE_TOKEN_THRESHOLD } from "./media";
 
 export const MAX_CONCURRENT_SUMMARY_REQUESTS = 2;
-export const SUMMARY_REQUEST_TIMEOUT_MS = 90_000;
-export const ABORT_DEADLINE_MS = 30_000;
-export const DELETE_DEADLINE_MS = 30_000;
+const MAX_PROMPT_TEXT_PART_LENGTH = 8_000_000;
 
 const SCRATCH_PERMISSION: PermissionRuleset = [
   { permission: "*", pattern: "*", action: "deny" },
@@ -95,10 +97,8 @@ type CandidateFailure = {
   error: unknown;
 };
 
-export type CapsuleGenerationOptions = {
-  requestTimeoutMs?: number;
-  abortTimeoutMs?: number;
-  deleteTimeoutMs?: number;
+type CapsuleGenerationOptions = {
+  controlTimeoutMs?: number;
   onResourceState?: (state: {
     residentPrompts: number;
     activeDeadlineTimers: number;
@@ -106,9 +106,7 @@ export type CapsuleGenerationOptions = {
 };
 
 type RequestOptions = {
-  requestTimeoutMs: number;
-  abortTimeoutMs: number;
-  deleteTimeoutMs: number;
+  controlTimeoutMs: number;
   onDeadlineTimerChange: (change: 1 | -1) => void;
 };
 
@@ -118,25 +116,10 @@ export async function generateCompactionCapsules(
   plan: CompactionPlan,
   options: CapsuleGenerationOptions = {},
 ): Promise<GeneratedCapsule[]> {
-  const requestTimeoutMs =
-    options.requestTimeoutMs ?? SUMMARY_REQUEST_TIMEOUT_MS;
-  const abortTimeoutMs =
-    options.abortTimeoutMs ?? Math.min(ABORT_DEADLINE_MS, requestTimeoutMs);
-  const deleteTimeoutMs =
-    options.deleteTimeoutMs ?? Math.min(DELETE_DEADLINE_MS, requestTimeoutMs);
-  for (const [name, value] of [
-    ["request", requestTimeoutMs],
-    ["abort", abortTimeoutMs],
-    ["delete", deleteTimeoutMs],
-  ] as const) {
-    if (!Number.isFinite(value) || value <= 0) {
-      throw new Error(`Agentic capsule ${name} deadline must be positive.`);
-    }
-  }
-  if (abortTimeoutMs > requestTimeoutMs || deleteTimeoutMs > requestTimeoutMs) {
-    throw new Error(
-      "Agentic capsule cleanup deadlines cannot exceed the request deadline.",
-    );
+  const controlTimeoutMs =
+    options.controlTimeoutMs ?? CONTROL_OPERATION_TIMEOUT_MS;
+  if (!Number.isFinite(controlTimeoutMs) || controlTimeoutMs <= 0) {
+    throw new Error("Agentic capsule control deadline must be positive.");
   }
   const generated: GeneratedCapsule[] = plan.summarizedTurns.map(() => null);
   for (const turn of [
@@ -175,9 +158,7 @@ export async function generateCompactionCapsules(
   const reportResourceState = () =>
     options.onResourceState?.({ residentPrompts, activeDeadlineTimers });
   const requestOptions: RequestOptions = {
-    requestTimeoutMs,
-    abortTimeoutMs,
-    deleteTimeoutMs,
+    controlTimeoutMs,
     onDeadlineTimerChange(change) {
       activeDeadlineTimers += change;
       reportResourceState();
@@ -224,7 +205,9 @@ export async function generateCompactionCapsules(
       worker,
     ),
   );
-  if (failures.length > 0) throw aggregateCandidateFailures(failures);
+  if (failures.length > 0) {
+    throw aggregateCandidateFailures(failures, session.id);
+  }
   return generated;
 }
 
@@ -275,129 +258,163 @@ async function requestAgenticCapsule(
       ? { workspace: sourceSession.workspaceID }
       : {}),
   };
-  let scratch: Session;
-  try {
-    scratch = unwrap(
-      await v2.session.create({
-        ...route,
-        ...(sourceSession.workspaceID
-          ? { workspaceID: sourceSession.workspaceID }
-          : {}),
-        title: `[TEMP] ${sourceSession.title}`,
-        permission: SCRATCH_PERMISSION,
-      }),
+  let createPromise: Promise<Session> | undefined;
+  const createOutcome = await attemptWithinDeadline(
+    signal => {
+      createPromise = v2.session
+        .create(
+          {
+            ...route,
+            ...(sourceSession.workspaceID
+              ? { workspaceID: sourceSession.workspaceID }
+              : {}),
+            title: `[TEMP] ${sourceSession.title}`,
+            permission: SCRATCH_PERMISSION,
+          },
+          { signal },
+        )
+        .then(unwrapLifecycleResponse);
+      return createPromise;
+    },
+    options.controlTimeoutMs,
+    options.onDeadlineTimerChange,
+  );
+  if (createOutcome.kind !== "success") {
+    if (createOutcome.kind === "timed-out") {
+      if (createPromise !== undefined) {
+        void createPromise
+          .then(scratch =>
+            cleanupLateCreatedScratch(v2, scratch, route, options),
+          )
+          .catch(() => undefined);
+      }
+      throw lifecycleFailure(
+        sourceSession.id,
+        candidate.index,
+        "create",
+        "timeout",
+      );
+    }
+    throw lifecycleFailure(
+      sourceSession.id,
+      candidate.index,
+      "create",
+      "rejection",
+      createOutcome.error,
     );
-  } catch {
-    throw new Error("Agentic capsule scratch creation failed.");
   }
+  const scratch = createOutcome.value;
 
-  let operationError: unknown;
+  let operationError: Error | undefined;
   let capsule: Exclude<GeneratedCapsule, null> | undefined;
   try {
-    const promptOutcome = await attemptWithinDeadline(
-      signal =>
-        v2.session
-          .prompt(
-            {
-              sessionID: scratch.id,
-              ...route,
-              agent: MAGIC_COMPACT_SUMMARIZER_AGENT,
-              ...(settings.model ? { model: settings.model } : {}),
-              ...(settings.variant ? { variant: settings.variant } : {}),
-              parts: [
-                { type: "text", text: promptText },
-                ...(candidate.media?.images.map(image => ({
-                  type: "file" as const,
-                  mime: image.part.mime,
-                  ...(image.part.filename
-                    ? { filename: image.part.filename }
-                    : {}),
-                  url: image.part.url,
-                })) ?? []),
-              ],
-            },
-            { signal },
-          )
-          .then(unwrap),
-      options.requestTimeoutMs,
-      "Agentic capsule request timed out.",
-      options.onDeadlineTimerChange,
-    );
-    let promptError: unknown;
-    if (promptOutcome.kind === "success") {
-      const body = promptOutcome.value;
-      if (body?.info.error) {
-        promptError = new Error("Agentic capsule provider request failed.");
-      } else {
-        const result = validateAgenticCapsuleResult(
-          parseAgenticOutput(body.parts),
-          candidate.evidence,
-          candidate.media,
-        );
-        const text = frameAgenticCapsule(result);
-        assertVisibleCapsule(result, candidate.evidence, text);
-        capsule = {
-          text,
-          preservedPartIDs:
-            result.finalResponse === "preserve"
-              ? candidate.evidence.preservedFinalTextParts.map(part => part.id)
-              : [],
-          ...(candidate.media
-            ? { mediaManifest: candidate.media.manifest }
-            : {}),
-        };
-      }
-    } else {
-      promptError =
-        promptOutcome.kind === "timed-out"
-          ? promptOutcome.error
-          : new Error("Agentic capsule provider request failed.");
-    }
-
-    if (promptError !== undefined) {
+    let failureStage: Extract<
+      CapsuleLifecycleStage,
+      "provider" | "validation"
+    > = "provider";
+    try {
+      const body = unwrapLifecycleResponse(
+        await v2.session.prompt({
+          sessionID: scratch.id,
+          ...route,
+          agent: MAGIC_COMPACT_SUMMARIZER_AGENT,
+          ...(settings.model ? { model: settings.model } : {}),
+          ...(settings.variant ? { variant: settings.variant } : {}),
+          parts: [
+            ...promptTextInputParts(promptText),
+            ...(candidate.media?.images.map(image => ({
+              type: "file" as const,
+              mime: image.part.mime,
+              ...(image.part.filename ? { filename: image.part.filename } : {}),
+              url: image.part.url,
+            })) ?? []),
+          ],
+        }),
+      );
+      if (body?.info.error) throw body.info.error;
+      failureStage = "validation";
+      const result = validateAgenticCapsuleResult(
+        parseAgenticOutput(body.parts),
+        candidate.evidence,
+        candidate.media,
+      );
+      const text = frameAgenticCapsule(result);
+      assertVisibleCapsule(result, candidate.evidence, text);
+      capsule = {
+        text,
+        preservedPartIDs:
+          result.finalResponse === "preserve"
+            ? candidate.evidence.preservedFinalTextParts.map(part => part.id)
+            : [],
+        ...(candidate.media ? { mediaManifest: candidate.media.manifest } : {}),
+      };
+    } catch (error) {
+      const promptError = lifecycleFailure(
+        sourceSession.id,
+        candidate.index,
+        failureStage,
+        "rejection",
+        error,
+        failureStage === "validation" ? safeValidationReason(error) : undefined,
+      );
       const abortOutcome = await attemptWithinDeadline(
         signal =>
           v2.session
             .abort({ sessionID: scratch.id, ...route }, { signal })
-            .then(unwrap),
-        options.abortTimeoutMs,
-        "Agentic capsule session abort timed out.",
+            .then(unwrapLifecycleResponse),
+        options.controlTimeoutMs,
         options.onDeadlineTimerChange,
       );
       if (abortOutcome.kind !== "success") {
         operationError = combineRequestErrors(
           promptError,
-          abortOutcome.kind === "timed-out"
-            ? abortOutcome.error
-            : new Error("Agentic capsule session abort failed."),
+          lifecycleFailure(
+            sourceSession.id,
+            candidate.index,
+            "abort",
+            abortOutcome.kind === "timed-out" ? "timeout" : "rejection",
+            abortOutcome.kind === "failed" ? abortOutcome.error : undefined,
+          ),
         );
       } else {
         operationError = promptError;
       }
     }
   } catch (error) {
-    operationError = error;
+    operationError = sanitizeCandidateError(
+      error,
+      sourceSession.id,
+      candidate.index,
+    );
   }
 
-  let deleteError: unknown;
+  let deleteError: Error | undefined;
   try {
     const deleteOutcome = await attemptWithinDeadline(
       signal =>
         v2.session
           .delete({ sessionID: scratch.id, ...route }, { signal })
-          .then(unwrap),
-      options.deleteTimeoutMs,
-      "Agentic capsule scratch deletion timed out.",
+          .then(unwrapLifecycleResponse),
+      options.controlTimeoutMs,
       options.onDeadlineTimerChange,
     );
     if (deleteOutcome.kind !== "success") {
-      deleteError =
-        deleteOutcome.kind === "timed-out"
-          ? deleteOutcome.error
-          : new Error("Agentic capsule scratch deletion failed.");
+      deleteError = lifecycleFailure(
+        sourceSession.id,
+        candidate.index,
+        "delete",
+        deleteOutcome.kind === "timed-out" ? "timeout" : "rejection",
+        deleteOutcome.kind === "failed" ? deleteOutcome.error : undefined,
+      );
     }
   } catch (error) {
-    deleteError = error;
+    deleteError = lifecycleFailure(
+      sourceSession.id,
+      candidate.index,
+      "delete",
+      "rejection",
+      error,
+    );
   }
 
   if (operationError !== undefined && deleteError !== undefined) {
@@ -408,41 +425,208 @@ async function requestAgenticCapsule(
   return capsule!;
 }
 
-type DeadlineAttempt<T> =
-  | { kind: "success"; value: T }
-  | { kind: "timed-out"; error: Error }
-  | { kind: "failed"; error: unknown };
+async function cleanupLateCreatedScratch(
+  v2: V2Client,
+  scratch: Session,
+  route: { directory: string; workspace?: string },
+  options: RequestOptions,
+): Promise<void> {
+  await attemptWithinDeadline(
+    signal =>
+      v2.session
+        .abort({ sessionID: scratch.id, ...route }, { signal })
+        .then(unwrapLifecycleResponse),
+    options.controlTimeoutMs,
+    options.onDeadlineTimerChange,
+  );
+  await attemptWithinDeadline(
+    signal =>
+      v2.session
+        .delete({ sessionID: scratch.id, ...route }, { signal })
+        .then(unwrapLifecycleResponse),
+    options.controlTimeoutMs,
+    options.onDeadlineTimerChange,
+  );
+}
 
-async function attemptWithinDeadline<T>(
-  attempt: (signal: AbortSignal) => Promise<T>,
-  deadlineMs: number,
-  timeoutMessage: string,
-  onDeadlineTimerChange: (change: 1 | -1) => void,
-): Promise<DeadlineAttempt<T>> {
-  const controller = new AbortController();
-  const timeoutError = new Error(timeoutMessage);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      controller.abort(timeoutError);
-      reject(timeoutError);
-    }, deadlineMs);
-    onDeadlineTimerChange(1);
-  });
-  const operation = Promise.resolve().then(() => attempt(controller.signal));
-  void operation.catch(() => undefined);
-  try {
-    const value = await Promise.race([operation, deadline]);
-    return { kind: "success", value };
-  } catch (error) {
-    if (error === timeoutError) {
-      return { kind: "timed-out", error: timeoutError };
-    }
-    return { kind: "failed", error };
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-    onDeadlineTimerChange(-1);
+function promptTextInputParts(
+  promptText: string,
+): Array<{ type: "text"; text: string }> {
+  if (promptText.length <= MAX_PROMPT_TEXT_PART_LENGTH) {
+    return [{ type: "text", text: promptText }];
   }
+  const parts: Array<{ type: "text"; text: string }> = [];
+  let start = 0;
+  while (start < promptText.length) {
+    let end = Math.min(start + MAX_PROMPT_TEXT_PART_LENGTH, promptText.length);
+    if (
+      end < promptText.length
+      && isHighSurrogate(promptText.charCodeAt(end - 1))
+      && isLowSurrogate(promptText.charCodeAt(end))
+    ) {
+      end -= 1;
+    }
+    parts.push({ type: "text", text: promptText.slice(start, end) });
+    start = end;
+  }
+  return parts;
+}
+
+function isHighSurrogate(value: number): boolean {
+  return value >= 0xd800 && value <= 0xdbff;
+}
+
+function isLowSurrogate(value: number): boolean {
+  return value >= 0xdc00 && value <= 0xdfff;
+}
+
+type CapsuleLifecycleStage =
+  | "create"
+  | "provider"
+  | "validation"
+  | "abort"
+  | "delete";
+
+type CapsuleLifecycleFailureKind = "timeout" | "rejection";
+
+type SafeErrorMetadata = {
+  status?: number;
+};
+
+class CapsuleLifecycleError extends Error {
+  readonly status: number | undefined;
+
+  constructor(
+    readonly sourceSessionID: string,
+    readonly candidateIndex: number,
+    readonly stage: CapsuleLifecycleStage,
+    readonly kind: CapsuleLifecycleFailureKind,
+    metadata: SafeErrorMetadata,
+    validationReason?: string,
+  ) {
+    super(lifecycleFailureMessage(stage, kind, validationReason));
+    this.name = "CapsuleLifecycleError";
+    this.status = metadata.status;
+  }
+}
+
+function lifecycleFailure(
+  sourceSessionID: string,
+  candidateIndex: number,
+  stage: CapsuleLifecycleStage,
+  kind: CapsuleLifecycleFailureKind,
+  error?: unknown,
+  validationReason?: string,
+): CapsuleLifecycleError {
+  return new CapsuleLifecycleError(
+    sourceSessionID,
+    candidateIndex,
+    stage,
+    kind,
+    safeErrorMetadata(error),
+    validationReason,
+  );
+}
+
+function lifecycleFailureMessage(
+  stage: CapsuleLifecycleStage,
+  kind: CapsuleLifecycleFailureKind,
+  validationReason?: string,
+): string {
+  if (stage === "create") {
+    return kind === "timeout"
+      ? "Agentic capsule scratch creation timed out."
+      : "Agentic capsule scratch creation failed.";
+  }
+  if (stage === "provider") return "Agentic capsule provider request failed.";
+  if (stage === "validation") {
+    return validationReason === undefined
+      ? "Agentic capsule response validation failed."
+      : `Agentic capsule response validation failed: ${validationReason}`;
+  }
+  if (stage === "abort") {
+    return kind === "timeout"
+      ? "Agentic capsule session abort timed out."
+      : "Agentic capsule session abort failed.";
+  }
+  return kind === "timeout"
+    ? "Agentic capsule scratch deletion timed out."
+    : "Agentic capsule scratch deletion failed.";
+}
+
+function safeErrorMetadata(error: unknown): SafeErrorMetadata {
+  if ((typeof error !== "object" && typeof error !== "function") || !error) {
+    return {};
+  }
+  const statusValue = ownDataProperty(error, "status");
+  const status =
+    typeof statusValue === "number"
+    && Number.isInteger(statusValue)
+    && statusValue >= 100
+    && statusValue <= 599
+      ? statusValue
+      : undefined;
+  return status === undefined ? {} : { status };
+}
+
+function ownDataProperty(value: object, key: string): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && "value" in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const SAFE_VALIDATION_REASONS = new Set([
+  "Agentic capsule media coverage must cover every attached image in ordinal order.",
+  "Agentic capsule media coverage must cover every attached image.",
+  "Agentic capsule outcome must be one trimmed physical line without controls.",
+  "Agentic capsule outcome needs a substantive result phrase beyond status.",
+  "Agentic capsule preserve mode requires substantive final assistant text.",
+  "Agentic capsule requires substantive visual coverage for every image.",
+  "Agentic capsule result cited an unknown evidence ref.",
+  "Agentic capsule result completed/analysis-only cannot have unresolved refs.",
+  "Agentic capsule result contains a duplicate JSON key.",
+  "Agentic capsule result has duplicate evidence refs.",
+  "Agentic capsule result has duplicate unresolved refs.",
+  "Agentic capsule result has invalid capsule.",
+  "Agentic capsule result has invalid finalResponse.",
+  "Agentic capsule result has invalid keys.",
+  "Agentic capsule result has invalid outcome.",
+  "Agentic capsule result has invalid status.",
+  "Agentic capsule result is not valid JSON.",
+  "Agentic capsule result must be a JSON object.",
+  "Agentic capsule result omitted a required unresolved ref.",
+  "Agentic capsule result partial/blocked needs human unresolved or next content.",
+  "Agentic capsule result partial/blocked needs unresolved refs.",
+  "Agentic capsule result refs must be string arrays.",
+  "Agentic capsule result requires exactly one substantive text part.",
+  "Agentic capsule text cannot inject host capsule framing.",
+  "Agentic capsule text must be readable and nonempty.",
+  "Agentic capsule unresolved refs must be evidence refs.",
+  "Agentic visible capsule contains an imperative omitted-content retrieval instruction.",
+  "Agentic visible capsule duplicated final response text.",
+  "Agentic visible capsule exposed a source identifier.",
+  "Agentic visible capsule exposed internal evidence.",
+  "Agentic visible capsule exposed internal scaffolding.",
+  "Invalid JSON string.",
+  "Invalid JSON token stream.",
+]);
+
+function safeValidationReason(error: unknown): string | undefined {
+  if ((typeof error !== "object" && typeof error !== "function") || !error) {
+    return undefined;
+  }
+  const message = ownDataProperty(error, "message");
+  return typeof message === "string" && SAFE_VALIDATION_REASONS.has(message)
+    ? message
+    : undefined;
+}
+
+function unwrapLifecycleResponse<T, E>(response: { data?: T; error?: E }): T {
+  if ("error" in response && response.error) throw response.error;
+  return response.data as T;
 }
 
 async function resolveCompactionSettings(
@@ -1709,19 +1893,75 @@ function arraysEqual(left: string[], right: string[]): boolean {
 const REQUEST_FAILURE_MESSAGE =
   "Agentic capsule request and cleanup failed alongside one another.";
 
-function combineRequestErrors(primary: unknown, secondary: unknown): Error {
-  const errors = [primary, secondary].flatMap(error =>
-    error instanceof AggregateError && error.message === REQUEST_FAILURE_MESSAGE
-      ? error.errors
-      : [error],
-  );
-  return new AggregateError(errors, REQUEST_FAILURE_MESSAGE);
+class CapsuleRequestError extends AggregateError {
+  constructor(errors: Error[]) {
+    super(errors, REQUEST_FAILURE_MESSAGE);
+    this.name = "CapsuleRequestError";
+  }
 }
 
-function aggregateCandidateFailures(failures: CandidateFailure[]): Error {
-  const ordered = failures.toSorted((left, right) => left.index - right.index);
-  return new AggregateError(
-    ordered.map(failure => failure.error),
-    `Magic Compact capsule generation failed for ${ordered.length} candidate turn${ordered.length === 1 ? "" : "s"}.`,
+function combineRequestErrors(primary: Error, secondary: Error): Error {
+  const errors = [primary, secondary].flatMap(error =>
+    error instanceof CapsuleRequestError ? error.errors : [error],
   );
+  return new CapsuleRequestError(errors);
+}
+
+function sanitizeCandidateError(
+  error: unknown,
+  sourceSessionID: string,
+  candidateIndex: number,
+): Error {
+  if (
+    error instanceof CapsuleLifecycleError
+    || error instanceof CapsuleRequestError
+  ) {
+    return error;
+  }
+  return lifecycleFailure(
+    sourceSessionID,
+    candidateIndex,
+    "validation",
+    "rejection",
+    error,
+    safeValidationReason(error),
+  );
+}
+
+function aggregateCandidateFailures(
+  failures: CandidateFailure[],
+  sourceSessionID: string,
+): Error {
+  const ordered = failures.toSorted((left, right) => left.index - right.index);
+  const sanitized = ordered.map(failure => ({
+    index: failure.index,
+    error: sanitizeCandidateError(
+      failure.error,
+      sourceSessionID,
+      failure.index,
+    ),
+  }));
+  const diagnostics = sanitized.map(
+    failure =>
+      `candidate ${failure.index + 1}: ${failureDiagnostics(failure.error).join("; ")}`,
+  );
+  return new AggregateError(
+    sanitized.map(failure => failure.error),
+    `Magic Compact capsule generation failed for ${ordered.length} candidate turn${ordered.length === 1 ? "" : "s"} in source session ${sourceSessionID}: ${diagnostics.join(" | ")}`,
+  );
+}
+
+function failureDiagnostics(error: Error): string[] {
+  if (error instanceof CapsuleRequestError) {
+    return error.errors.flatMap(failureDiagnostics);
+  }
+  if (error instanceof CapsuleLifecycleError) {
+    const metadata = [
+      ...(error.status === undefined ? [] : [`status=${error.status}`]),
+    ];
+    return [
+      `${error.stage} ${error.kind}: ${error.message}${metadata.length === 0 ? "" : ` (${metadata.join(", ")})`}`,
+    ];
+  }
+  return ["validation rejection: Agentic capsule response validation failed."];
 }

@@ -19,7 +19,6 @@ import {
   injectSummaries,
   INLINE_IMAGE_TOKEN_THRESHOLD,
   type AgenticCapsuleResult,
-  type CapsuleGenerationOptions,
 } from "../src/compact/compact";
 import {
   analyzeAgenticTurnEvidence,
@@ -57,6 +56,7 @@ import { incidentSemanticSessionFixture } from "./fixtures/incident-session";
 
 let storageDirectory: string;
 const originalDataHome = process.env.XDG_DATA_HOME;
+const SAFE_PROMPT_TEXT_PART_LENGTH = 8_000_000;
 
 beforeAll(async () => {
   storageDirectory = await mkdtemp(join(tmpdir(), "magic-compact-test-"));
@@ -147,6 +147,9 @@ describe("magic compact", () => {
       },
     });
     expect(requests.scratchPrompts).toHaveLength(1);
+    expect(promptTextParts(requests.scratchPrompts[0]!.request)).toHaveLength(
+      1,
+    );
     const trace = traceFromPrompt(requests.scratchPrompts[0]!.prompt);
     expect(trace.turn.user.map(item => item.info.id)).toEqual([
       "hard-cut-user",
@@ -171,6 +174,73 @@ describe("magic compact", () => {
       ]),
     );
   });
+
+  test("blocks oversized prompt text exactly once without splitting surrogate pairs or duplicating media", async () => {
+    const marker = "transport-boundary-marker";
+    const firstURL = inlineImageDataURL(600, 101);
+    const secondURL = inlineImageDataURL(600, 102);
+    const probe = await generatedAgenticCandidate(
+      mediaTraceValueTurn("blocked-transport", marker, [firstURL, secondURL]),
+      { modelResults: [mediaModelResult(2)] },
+    );
+    const markerOffset =
+      probe.requests.scratchPrompts[0]!.prompt.indexOf(marker);
+    expect(markerOffset).toBeGreaterThan(0);
+    const paddingLength = SAFE_PROMPT_TEXT_PART_LENGTH - markerOffset - 1;
+    expect(paddingLength).toBeGreaterThan(0);
+    const payload = `${"x".repeat(paddingLength)}😀tail`;
+    const requests = createCommandHarness([], {
+      modelResults: [mediaModelResult(2)],
+    });
+
+    const summaries = await generateCompactionCapsules(
+      requests.v2,
+      session("source"),
+      generationPlan([
+        mediaTraceValueTurn("blocked-transport", payload, [
+          firstURL,
+          secondURL,
+        ]),
+      ]),
+    );
+
+    expect(requests.scratchCreates).toHaveLength(1);
+    expect(requests.scratchPrompts).toHaveLength(1);
+    expect(requests.scratchDeletes).toEqual(["scratch-1"]);
+    expect(requests.scratchAborts).toEqual([]);
+    expect(summaries).toHaveLength(1);
+    const request = requests.scratchPrompts[0]!;
+    const textParts = promptTextParts(request.request);
+    expect(textParts.length).toBeGreaterThan(1);
+    expect(
+      textParts.every(part => part.text.length <= SAFE_PROMPT_TEXT_PART_LENGTH),
+    ).toBeTrue();
+    expect(textParts.map(part => part.text).join("")).toBe(request.prompt);
+    expect(textParts[0]!.text.length).toBe(SAFE_PROMPT_TEXT_PART_LENGTH - 1);
+    expect(textParts[1]!.text.startsWith("😀")).toBeTrue();
+    for (let index = 0; index < textParts.length - 1; index += 1) {
+      const current = textParts[index]!.text;
+      const next = textParts[index + 1]!.text;
+      expect(
+        isHighSurrogate(current.charCodeAt(current.length - 1)),
+      ).toBeFalse();
+      expect(isLowSurrogate(next.charCodeAt(0))).toBeFalse();
+    }
+    const trace = traceFromPrompt(request.prompt);
+    const state = (trace.turn.assistants[0]!.parts[1] as ToolPart)
+      .state as unknown as { input: { value: string } };
+    expect(state.input.value).toBe(payload);
+    const requestParts = request.request.parts as Array<{ type: string }>;
+    const firstFileIndex = requestParts.findIndex(part => part.type === "file");
+    expect(firstFileIndex).toBe(textParts.length);
+    expect(
+      requestParts.slice(0, firstFileIndex).every(part => part.type === "text"),
+    ).toBeTrue();
+    expect(promptFileParts(request.request).map(part => part.url)).toEqual([
+      firstURL,
+      secondURL,
+    ]);
+  }, 30_000);
 
   test("sends large MCP and non-text assistant parts without truncation or chunking", async () => {
     const large = `large-mcp-output:${" payload".repeat(12_000)}`;
@@ -1059,8 +1129,11 @@ describe("magic compact", () => {
       residentPrompts: number;
       activeDeadlineTimers: number;
     }> = [];
-    const options: CapsuleGenerationOptions = {
-      onResourceState: state => resourceStates.push({ ...state }),
+    const options = {
+      onResourceState: (state: {
+        residentPrompts: number;
+        activeDeadlineTimers: number;
+      }) => resourceStates.push({ ...state }),
     };
 
     await generateCompactionCapsules(
@@ -1138,21 +1211,29 @@ describe("magic compact", () => {
     }
 
     expect(failure).toBeInstanceOf(AggregateError);
-    expect((failure as Error).message).toBe(
-      "Magic Compact capsule generation failed for 3 candidate turns.",
+    expect((failure as Error).message).toContain(
+      `failed for 3 candidate turns in source session ${sourceID}`,
+    );
+    expect((failure as Error).message).toContain("provider rejection");
+    expect((failure as Error).message).toContain("unknown evidence ref");
+    expect((failure as Error).message).toContain("scratch deletion failed");
+    expect(errorGraphText(failure)).not.toContain("primary provider failure");
+    expect(errorGraphText(failure)).not.toContain(
+      "tertiary scratch delete failure",
     );
     const failures = nestedErrorMessages(failure);
     expect(failures).toHaveLength(3);
     expect(failures[0]).toBe("Agentic capsule provider request failed.");
     expect(failures[1]).toContain("unknown evidence ref");
     expect(failures[2]).toBe("Agentic capsule scratch deletion failed.");
-    expect((failure as Error).message).not.toContain("provider");
     expect((failure as Error).message).not.toContain("model-supplied");
     expect(messages).toEqual(before);
     expect(requests.maxConcurrentModelPrompts).toBe(2);
     expect(requests.scratchCreates).toHaveLength(5);
     expect(requests.scratchPrompts).toHaveLength(5);
-    expect(requests.scratchAborts).toEqual(["scratch-1"]);
+    expect(new Set(requests.scratchAborts)).toEqual(
+      new Set(["scratch-1", "scratch-2"]),
+    );
     expect(requests.scratchDeletes).toHaveLength(5);
     expect(new Set(requests.scratchDeletes)).toEqual(
       new Set([
@@ -1170,155 +1251,382 @@ describe("magic compact", () => {
     expect(await readStats(sourceID)).toBeNull();
   });
 
-  test("times out a hung prompt, drains all candidates, then aborts and deletes in order", async () => {
-    const turns = Array.from({ length: 3 }, (_, index) =>
-      traceValueTurn(
-        `deadline-${index}`,
-        `trace content must stay private ${index}`,
-      ),
-    );
+  test("lets a model request outlive the injected control timeout and resolve without request abort", async () => {
+    let resolveModel!: (result: AgenticCapsuleResult) => void;
     const requests = createCommandHarness([], {
       modelResultFactories: [
-        () => new Promise(() => {}),
-        async () => {
-          throw new Error("provider trace content must stay private");
-        },
-        async () =>
-          modelResult({
-            outcome: "Completed the third request after another request failed",
-            capsule: "Processed the third request and completed its cleanup.",
+        () =>
+          new Promise(resolve => {
+            resolveModel = resolve;
           }),
-      ],
-      scratchAbortErrors: [
-        new Error("abort trace content must stay private"),
-        new Error("second abort trace content must stay private"),
-      ],
-      scratchDeleteErrors: [
-        new Error("delete trace content must stay private"),
-        new Error("second delete trace content must stay private"),
       ],
     });
     const resourceStates: Array<{
       residentPrompts: number;
       activeDeadlineTimers: number;
     }> = [];
-    let failure: unknown;
-    const started = performance.now();
-    try {
-      await settleWithin(
-        generateCompactionCapsules(
+    const generation = generateCompactionCapsules(
+      requests.v2,
+      session("deadline-free-source-1234"),
+      generationPlan([
+        traceValueTurn("deadline-free", "model request remains pending"),
+      ]),
+      {
+        controlTimeoutMs: 10,
+        onResourceState: state => resourceStates.push({ ...state }),
+      },
+    );
+
+    await new Promise(resolve => setTimeout(resolve, 30));
+    const pendingState = { ...resourceStates.at(-1)! };
+    resolveModel(
+      modelResult({
+        outcome: "Completed after the control timeout elapsed",
+        capsule: "The provider completed normally without a local deadline.",
+      }),
+    );
+    const summaries = await settleWithin(generation, 500);
+
+    expect(pendingState).toEqual({
+      residentPrompts: 1,
+      activeDeadlineTimers: 0,
+    });
+    expect(summaries[0]).not.toBeNull();
+    expect(requests.scratchPromptSignals).toEqual([undefined]);
+    expect(requests.scratchAborts).toEqual([]);
+    expect(requests.scratchDeletes).toEqual(["scratch-1"]);
+  });
+
+  test.each([
+    ["rejection", new Error("OpenAI rejected the request string as too large")],
+    ["cancellation", new Error("Provider cancelled the in-flight request")],
+  ])(
+    "provider %s aborts and deletes scratch with sanitized stage diagnostics",
+    async (_kind, providerError) => {
+      const sourceID = "provider-failure-source-1234";
+      const requests = createCommandHarness([], {
+        modelResults: [providerError],
+      });
+      let failure: unknown;
+
+      try {
+        await generateCompactionCapsules(
           requests.v2,
-          session("source"),
-          generationPlan(turns),
-          {
-            requestTimeoutMs: 20,
-            onResourceState: state => resourceStates.push({ ...state }),
-          },
-        ),
-        1_000,
+          session(sourceID),
+          generationPlan([
+            traceValueTurn("provider-failure", "private prompt body"),
+          ]),
+          { controlTimeoutMs: 10 },
+        );
+      } catch (error) {
+        failure = error;
+      }
+
+      expect(String(failure)).toContain(sourceID);
+      expect(String(failure)).toContain("candidate 1");
+      expect(String(failure)).toContain("provider rejection");
+      expect(errorGraphText(failure)).not.toContain(providerError.message);
+      expect(String(failure)).not.toContain("private prompt body");
+      expect(String(failure).length).toBeLessThan(1_000);
+      expect(stageDiagnostics(failure)).toContainEqual({
+        sourceSessionID: sourceID,
+        candidateIndex: 0,
+        stage: "provider",
+        kind: "rejection",
+      });
+      expect(requests.scratchAborts).toEqual(["scratch-1"]);
+      expect(requests.scratchDeletes).toEqual(["scratch-1"]);
+    },
+  );
+
+  test("removes short and wrapped prompt excerpts from the complete surfaced error graph", async () => {
+    const sourceID = "provider-redaction-source-1234";
+    const shortExcerpt = "Q7v9";
+    const wrappedExcerpt = "WRAPPED_PROMPT_EXCERPT_7843";
+    const requests = createCommandHarness([], {
+      modelResultFactories: [
+        async () => {
+          const error = payloadEchoError(shortExcerpt);
+          Object.defineProperty(error, "cause", {
+            configurable: true,
+            value: {
+              body: {
+                excerpt: `provider wrapper <<<${wrappedExcerpt}>>>`,
+              },
+            },
+          });
+          throw error;
+        },
+      ],
+    });
+    let failure: unknown;
+
+    try {
+      await generateCompactionCapsules(
+        requests.v2,
+        session(sourceID),
+        generationPlan([
+          traceValueTurn("provider-redaction", {
+            shortExcerpt,
+            wrappedExcerpt,
+          }),
+        ]),
+        { controlTimeoutMs: 10 },
       );
     } catch (error) {
       failure = error;
     }
 
-    expect(performance.now() - started).toBeLessThan(2_000);
-    expect(failure).toBeInstanceOf(AggregateError);
-    expect(nestedErrorMessages(failure)).toEqual([
-      "Agentic capsule request timed out.",
-      "Agentic capsule session abort failed.",
-      "Agentic capsule scratch deletion failed.",
-      "Agentic capsule provider request failed.",
-      "Agentic capsule session abort failed.",
-      "Agentic capsule scratch deletion failed.",
-    ]);
-    expect(nestedErrorMessages(failure).join("\n")).not.toContain(
-      "trace content",
-    );
-    expect(requests.scratchCreates).toHaveLength(3);
-    expect(requests.scratchPrompts).toHaveLength(3);
-    expect(requests.scratchPromptSignals.every(Boolean)).toBeTrue();
-    expect(requests.scratchDeletes).toHaveLength(3);
-    expect(requests.scratchAborts).toEqual(["scratch-2", "scratch-1"]);
-    expect(
-      requests.scratchLifecycle
-        .filter(item => item.sessionID === "scratch-1")
-        .map(item => item.action),
-    ).toEqual(["create", "prompt", "abort", "delete"]);
-    expect(resourceStates.at(-1)).toEqual({
-      residentPrompts: 0,
-      activeDeadlineTimers: 0,
+    expect(String(failure)).toContain(sourceID);
+    expect(String(failure)).toContain("provider rejection");
+    const graph = errorGraphText(failure);
+    expect(graph).not.toContain(shortExcerpt);
+    expect(graph).not.toContain(wrappedExcerpt);
+    expect(graph).not.toContain("raw provider payload");
+    expect(stageDiagnostics(failure)).toContainEqual({
+      sourceSessionID: sourceID,
+      candidateIndex: 0,
+      stage: "provider",
+      kind: "rejection",
+      status: 413,
     });
   });
 
-  test("clears the safety deadline timer after a prompt settles", async () => {
-    const requests = createCommandHarness([]);
-    const resourceStates: Array<{
-      residentPrompts: number;
-      activeDeadlineTimers: number;
-    }> = [];
-
-    await generateCompactionCapsules(
-      requests.v2,
-      session("source"),
-      generationPlan([
-        traceValueTurn("deadline-cleared", "successful prompt payload"),
-      ]),
-      {
-        requestTimeoutMs: 60_000,
-        onResourceState: state => resourceStates.push({ ...state }),
-      },
-    );
-
-    expect(resourceStates.some(state => state.activeDeadlineTimers === 1)).toBe(
-      true,
-    );
-    expect(resourceStates.at(-1)).toEqual({
-      residentPrompts: 0,
-      activeDeadlineTimers: 0,
-    });
-    expect(requests.scratchAborts).toEqual([]);
-  });
-
-  test("does not await or leak a late prompt rejection after timeout cleanup", async () => {
+  test("does not propagate upstream error name or code excerpts into the surfaced error graph", async () => {
+    const sourceID = "name-code-redaction-source-1234";
+    const excerpt = "Q7v9";
     const requests = createCommandHarness([], {
       modelResultFactories: [
-        () =>
-          new Promise((_, reject) => {
-            setTimeout(
-              () => reject(new Error("late provider trace content")),
-              50,
-            );
-          }),
+        async () => {
+          const error = new Error("provider rejected the capsule request");
+          error.name = excerpt;
+          (error as Error & { code: string }).code = excerpt;
+          throw error;
+        },
       ],
     });
     let failure: unknown;
+
+    try {
+      await generateCompactionCapsules(
+        requests.v2,
+        session(sourceID),
+        generationPlan([
+          traceValueTurn("name-code-redaction", "ordinary trace content"),
+        ]),
+        { controlTimeoutMs: 10 },
+      );
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(String(failure)).toContain(sourceID);
+    expect(String(failure)).toContain("provider rejection");
+    const graph = errorGraphText(failure);
+    expect(graph).not.toContain(excerpt);
+    expect(stageDiagnostics(failure)).toContainEqual({
+      sourceSessionID: sourceID,
+      candidateIndex: 0,
+      stage: "provider",
+      kind: "rejection",
+    });
+    expect(requests.scratchAborts).toEqual(["scratch-1"]);
+    expect(requests.scratchDeletes).toEqual(["scratch-1"]);
+  });
+
+  test.each(["create", "abort", "delete"] as const)(
+    "removes %s payload echoes from the complete surfaced error graph",
+    async stage => {
+      const sourceID = `payload-${stage}-source-1234`;
+      const payloadSecret = `${stage.toUpperCase()}_PAYLOAD_ECHO_7843`;
+      const primarySecret = `PRIMARY_PROVIDER_ECHO_${stage}_7843`;
+      const payloadError = payloadEchoError(payloadSecret);
+      const options: HarnessOptions =
+        stage === "create"
+          ? { scratchCreateError: payloadError }
+          : stage === "abort"
+            ? {
+                modelResults: [payloadEchoError(primarySecret)],
+                scratchAbortError: payloadError,
+              }
+            : { scratchDeleteError: payloadError };
+      const requests = createCommandHarness([], options);
+      const source = {
+        ...session(sourceID),
+        title: payloadSecret,
+        directory: `/workspace/${payloadSecret}`,
+      };
+      let failure: unknown;
+
+      try {
+        await generateCompactionCapsules(
+          requests.v2,
+          source,
+          generationPlan([
+            traceValueTurn(`payload-${stage}`, "ordinary trace content"),
+          ]),
+          { controlTimeoutMs: 10 },
+        );
+      } catch (error) {
+        failure = error;
+      }
+
+      const graph = errorGraphText(failure);
+      expect(graph).toContain(sourceID);
+      expect(graph).not.toContain(payloadSecret);
+      expect(graph).not.toContain("raw provider payload");
+      if (stage === "abort") expect(graph).not.toContain(primarySecret);
+      expect(stageDiagnostics(failure)).toContainEqual({
+        sourceSessionID: sourceID,
+        candidateIndex: 0,
+        stage,
+        kind: "rejection",
+        status: 413,
+      });
+      expect(requests.scratchAborts).toEqual(
+        stage === "abort" ? ["scratch-1"] : [],
+      );
+      expect(requests.scratchDeletes).toEqual(
+        stage === "create" ? [] : ["scratch-1"],
+      );
+    },
+  );
+
+  test("removes malformed model output from the complete validation error graph", async () => {
+    const sourceID = "model-output-redaction-source-1234";
+    const modelOutput = "MODEL_OUTPUT_SECRET_7843";
+    const requests = createCommandHarness([], { modelResults: [modelOutput] });
+    let failure: unknown;
+
+    try {
+      await generateCompactionCapsules(
+        requests.v2,
+        session(sourceID),
+        generationPlan([
+          traceValueTurn("model-output-redaction", "ordinary trace content"),
+        ]),
+        { controlTimeoutMs: 10 },
+      );
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(errorGraphText(failure)).not.toContain(modelOutput);
+    expect(stageDiagnostics(failure)).toContainEqual({
+      sourceSessionID: sourceID,
+      candidateIndex: 0,
+      stage: "validation",
+      kind: "rejection",
+    });
+    expect(requests.scratchAborts).toEqual(["scratch-1"]);
+    expect(requests.scratchDeletes).toEqual(["scratch-1"]);
+  });
+
+  test("times out scratch creation before prompting or mutating the source", async () => {
+    const sourceID = "scratch-create-timeout-source-1234";
+    const messages = withSessionID(
+      compactableTurn("scratch-create-timeout", "Create scratch"),
+      sourceID,
+    );
+    const before = structuredClone(messages);
+    const requests = createCommandHarness(messages, {
+      scratchCreateFactory: () => new Promise(() => {}),
+    });
+    let failure: unknown;
+
     try {
       await settleWithin(
-        generateCompactionCapsules(
-          requests.v2,
-          session("source"),
-          generationPlan([
-            traceValueTurn("late-rejection", "private prompt payload"),
-          ]),
-          { requestTimeoutMs: 10 },
-        ),
+        executeMagicCompact(requests.v2, sourceID, 0, {
+          controlTimeoutMs: 10,
+        }),
         500,
       );
     } catch (error) {
       failure = error;
     }
 
-    expect(nestedErrorMessages(failure)).toEqual([
-      "Agentic capsule request timed out.",
-    ]);
-    expect(requests.scratchAborts).toEqual(["scratch-1"]);
-    expect(requests.scratchDeletes).toEqual(["scratch-1"]);
-    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(String(failure)).toContain(sourceID);
+    expect(String(failure)).toContain("scratch creation timed out");
+    expect(messages).toEqual(before);
+    expect(requests.scratchCreates).toHaveLength(1);
+    expect(requests.scratchPrompts).toEqual([]);
+    expect(requests.scratchAborts).toEqual([]);
+    expect(requests.scratchDeletes).toEqual([]);
+    expect(requests.backupForks).toEqual([]);
+    expect(requests.partUpdates).toEqual([]);
+    expect(requests.sourcePrompts).toEqual([]);
+  });
+
+  test("detaches a timed-out create and cleans a scratch that fulfills late without unhandled rejections", async () => {
+    const unhandled: unknown[] = [];
+    const listener = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", listener);
+    try {
+      let resolveCreate!: () => void;
+      const requests = createCommandHarness([], {
+        scratchCreateFactory: () =>
+          new Promise<void>(resolve => {
+            resolveCreate = resolve;
+          }),
+        scratchAbortFactories: [
+          () =>
+            new Promise((_, reject) => {
+              setTimeout(
+                () => reject(payloadEchoError("LATE_ABORT_ECHO_7843")),
+                40,
+              );
+            }),
+        ],
+        scratchDeleteFactories: [
+          () =>
+            new Promise((_, reject) => {
+              setTimeout(
+                () => reject(payloadEchoError("LATE_DELETE_ECHO_7843")),
+                40,
+              );
+            }),
+        ],
+      });
+      const terminal = await settleWithin(
+        generateCompactionCapsules(
+          requests.v2,
+          session("late-create-source-1234"),
+          generationPlan([
+            traceValueTurn("late-create", "late create trace content"),
+          ]),
+          { controlTimeoutMs: 10 },
+        ).then(
+          () => undefined,
+          error => error,
+        ),
+        500,
+      );
+      const terminalGraph = errorGraphText(terminal);
+
+      expect(terminal).toBeDefined();
+      expect(terminalGraph).toContain("create timeout");
+      expect(requests.scratchPrompts).toEqual([]);
+      expect(requests.scratchAborts).toEqual([]);
+      expect(requests.scratchDeletes).toEqual([]);
+
+      resolveCreate();
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(errorGraphText(terminal)).toBe(terminalGraph);
+      expect(requests.scratchPrompts).toEqual([]);
+      expect(requests.scratchAborts).toEqual(["scratch-1"]);
+      expect(requests.scratchDeletes).toEqual(["scratch-1"]);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", listener);
+    }
   });
 
   test("bounds a never-settling abort and still attempts deletion", async () => {
     const requests = createCommandHarness([], {
-      modelResults: [new Error("provider failure content must stay private")],
+      modelResults: [new Error("provider rejected the capsule request")],
       scratchAbortFactories: [() => new Promise(() => {})],
     });
     const resourceStates: Array<{
@@ -1336,9 +1644,7 @@ describe("magic compact", () => {
             traceValueTurn("never-settling-abort", "abort hang trace content"),
           ]),
           {
-            requestTimeoutMs: 20,
-            abortTimeoutMs: 10,
-            deleteTimeoutMs: 10,
+            controlTimeoutMs: 10,
             onResourceState: state => resourceStates.push({ ...state }),
           },
         ),
@@ -1385,7 +1691,7 @@ describe("magic compact", () => {
               "delete hang trace content",
             ),
           ]),
-          { requestTimeoutMs: 20, abortTimeoutMs: 10, deleteTimeoutMs: 10 },
+          { controlTimeoutMs: 10 },
         ),
         500,
       );
@@ -1401,57 +1707,6 @@ describe("magic compact", () => {
     expect(requests.scratchDeletes).toEqual(["scratch-1"]);
   });
 
-  test("bounds prompt, abort, and delete when all hang", async () => {
-    const requests = createCommandHarness([], {
-      modelResultFactories: [() => new Promise(() => {})],
-      scratchAbortFactories: [() => new Promise(() => {})],
-      scratchDeleteFactories: [() => new Promise(() => {})],
-    });
-    const resourceStates: Array<{
-      residentPrompts: number;
-      activeDeadlineTimers: number;
-    }> = [];
-    let failure: unknown;
-    const started = performance.now();
-    try {
-      await settleWithin(
-        generateCompactionCapsules(
-          requests.v2,
-          session("source"),
-          generationPlan([
-            traceValueTurn("triple-hang", "all hang trace content"),
-          ]),
-          {
-            requestTimeoutMs: 15,
-            abortTimeoutMs: 10,
-            deleteTimeoutMs: 10,
-            onResourceState: state => resourceStates.push({ ...state }),
-          },
-        ),
-        1_000,
-      );
-    } catch (error) {
-      failure = error;
-    }
-
-    expect(performance.now() - started).toBeLessThan(700);
-    expect(nestedErrorMessages(failure)).toEqual([
-      "Agentic capsule request timed out.",
-      "Agentic capsule session abort timed out.",
-      "Agentic capsule scratch deletion timed out.",
-    ]);
-    expect(
-      requests.scratchLifecycle
-        .filter(item => item.sessionID === "scratch-1")
-        .map(item => item.action),
-    ).toEqual(["create", "prompt", "abort", "delete"]);
-    expect(requests.scratchDeletes).toEqual(["scratch-1"]);
-    expect(resourceStates.at(-1)).toEqual({
-      residentPrompts: 0,
-      activeDeadlineTimers: 0,
-    });
-  });
-
   test("observes a late abort rejection after its deadline without an unhandled rejection", async () => {
     const unhandled: unknown[] = [];
     const listener = (reason: unknown) => {
@@ -1460,7 +1715,7 @@ describe("magic compact", () => {
     process.on("unhandledRejection", listener);
     try {
       const requests = createCommandHarness([], {
-        modelResults: [new Error("provider failure trace content")],
+        modelResults: [new Error("provider rejected the capsule request")],
         scratchAbortFactories: [
           () =>
             new Promise((_, reject) => {
@@ -1483,7 +1738,7 @@ describe("magic compact", () => {
                 "late abort trace content",
               ),
             ]),
-            { requestTimeoutMs: 20, abortTimeoutMs: 10, deleteTimeoutMs: 10 },
+            { controlTimeoutMs: 10 },
           ),
           500,
         );
@@ -1533,7 +1788,7 @@ describe("magic compact", () => {
                 "late delete trace content",
               ),
             ]),
-            { requestTimeoutMs: 20, abortTimeoutMs: 10, deleteTimeoutMs: 10 },
+            { controlTimeoutMs: 10 },
           ),
           500,
         );
@@ -1552,175 +1807,15 @@ describe("magic compact", () => {
     }
   });
 
-  test("produces one deterministic cleanup sequence when the provider settles at the request deadline", async () => {
-    const deadline = 20;
-    const atDeadline = createCommandHarness([], {
-      modelResultFactories: [
-        () =>
-          new Promise(resolve => {
-            setTimeout(
-              () =>
-                resolve(
-                  modelResult({
-                    outcome: "Settled exactly at the safety deadline",
-                    capsule: "Settled exactly at the safety deadline.",
-                  }),
-                ),
-              deadline,
-            );
-          }),
-      ],
-    });
-    let failure: unknown;
-    try {
-      await settleWithin(
-        generateCompactionCapsules(
-          atDeadline.v2,
-          session("source"),
-          generationPlan([
-            traceValueTurn("exact-deadline", "exact deadline trace content"),
-          ]),
-          {
-            requestTimeoutMs: deadline,
-            abortTimeoutMs: 10,
-            deleteTimeoutMs: 10,
-          },
-        ),
-        500,
-      );
-    } catch (error) {
-      failure = error;
-    }
-
-    expect(nestedErrorMessages(failure)).toEqual([
-      "Agentic capsule request timed out.",
-    ]);
-    expect(atDeadline.scratchAborts).toEqual(["scratch-1"]);
-    expect(atDeadline.scratchDeletes).toEqual(["scratch-1"]);
-    expect(
-      atDeadline.scratchLifecycle
-        .filter(item => item.sessionID === "scratch-1")
-        .map(item => item.action),
-    ).toEqual(["create", "prompt", "abort", "delete"]);
-    await new Promise(resolve => setTimeout(resolve, deadline + 30));
-
-    const justBefore = createCommandHarness([], {
-      modelResultFactories: [
-        () =>
-          new Promise(resolve => {
-            setTimeout(
-              () =>
-                resolve(
-                  modelResult({
-                    outcome: "Settled just before the safety deadline",
-                    capsule: "Settled just before the safety deadline.",
-                  }),
-                ),
-              deadline - 1,
-            );
-          }),
-      ],
-    });
-    const summaries = await generateCompactionCapsules(
-      justBefore.v2,
-      session("source"),
-      generationPlan([
-        traceValueTurn("just-before-deadline", "just before deadline trace"),
-      ]),
-      { requestTimeoutMs: deadline, abortTimeoutMs: 10, deleteTimeoutMs: 10 },
-    );
-    expect(summaries[0]).not.toBeNull();
-    expect(justBefore.scratchAborts).toEqual([]);
-    expect(justBefore.scratchDeletes).toEqual(["scratch-1"]);
-    expect(
-      justBefore.scratchLifecycle
-        .filter(item => item.sessionID === "scratch-1")
-        .map(item => item.action),
-    ).toEqual(["create", "prompt", "delete"]);
-  });
-
-  test("drains mixed hanging and failing candidates with bounded concurrency", async () => {
-    const requests = createCommandHarness([], {
-      modelResultFactories: [
-        () => new Promise(() => {}),
-        async () => {
-          throw new Error("second candidate provider trace content");
-        },
-        async () =>
-          modelResult({
-            outcome: "Completed the third candidate after two failures",
-            capsule: "Completed the third candidate after two failures.",
-          }),
-      ],
-      scratchDeleteFactories: [
-        undefined,
-        undefined,
-        () => new Promise(() => {}),
-      ],
-    });
-    const resourceStates: Array<{
-      residentPrompts: number;
-      activeDeadlineTimers: number;
-    }> = [];
-    let failure: unknown;
-    const started = performance.now();
-    try {
-      await settleWithin(
-        generateCompactionCapsules(
-          requests.v2,
-          session("source"),
-          generationPlan([
-            traceValueTurn("mixed-1", "mixed hang trace content"),
-            traceValueTurn("mixed-2", "mixed failure trace content"),
-            traceValueTurn("mixed-3", "mixed delete hang trace content"),
-          ]),
-          {
-            requestTimeoutMs: 15,
-            abortTimeoutMs: 10,
-            deleteTimeoutMs: 10,
-            onResourceState: state => resourceStates.push({ ...state }),
-          },
-        ),
-        1_000,
-      );
-    } catch (error) {
-      failure = error;
-    }
-
-    expect(performance.now() - started).toBeLessThan(700);
-    expect(failure).toBeInstanceOf(AggregateError);
-    expect((failure as Error).message).toBe(
-      "Magic Compact capsule generation failed for 3 candidate turns.",
-    );
-    expect(nestedErrorMessages(failure)).toEqual([
-      "Agentic capsule request timed out.",
-      "Agentic capsule provider request failed.",
-      "Agentic capsule scratch deletion timed out.",
-    ]);
-    expect(nestedErrorMessages(failure).join("\n")).not.toContain(
-      "trace content",
-    );
-    expect(requests.scratchCreates).toHaveLength(3);
-    expect(requests.scratchPrompts).toHaveLength(3);
-    expect(requests.scratchAborts).toEqual(["scratch-2", "scratch-1"]);
-    expect(requests.scratchDeletes).toHaveLength(3);
-    expect(new Set(requests.scratchDeletes)).toEqual(
-      new Set(["scratch-1", "scratch-2", "scratch-3"]),
-    );
-    expect(requests.maxConcurrentModelPrompts).toBeLessThanOrEqual(2);
-    expect(resourceStates.at(-1)).toEqual({
-      residentPrompts: 0,
-      activeDeadlineTimers: 0,
-    });
-  });
-
-  test("turns a fulfilled prompt error envelope into a content-free prompt failure with bounded abort and delete", async () => {
+  test("surfaces a bounded prompt envelope reason while still aborting and deleting", async () => {
     const requests = createCommandHarness([], {
       modelEnvelopeErrors: [
         {
           error: {
-            message:
-              "prompt raw provider detail body path session trace must stay private",
+            name: "ProviderEnvelopeError",
+            code: "PAYLOAD_TOO_LARGE",
+            status: 413,
+            message: "provider rejected the request with status 413",
           },
           request: {},
           response: {},
@@ -1742,9 +1837,7 @@ describe("magic compact", () => {
             traceValueTurn("prompt-envelope", "prompt envelope trace content"),
           ]),
           {
-            requestTimeoutMs: 20,
-            abortTimeoutMs: 10,
-            deleteTimeoutMs: 10,
+            controlTimeoutMs: 10,
             onResourceState: state => resourceStates.push({ ...state }),
           },
         ),
@@ -1758,9 +1851,11 @@ describe("magic compact", () => {
     expect(nestedErrorMessages(failure)).toEqual([
       "Agentic capsule provider request failed.",
     ]);
-    expect(nestedErrorMessages(failure).join("\n")).not.toContain(
-      "must stay private",
+    expect(String(failure)).toContain("status=413");
+    expect(errorGraphText(failure)).not.toContain(
+      "provider rejected the request",
     );
+    expect(String(failure)).not.toContain("prompt envelope trace content");
     expect(requests.scratchAborts).toEqual(["scratch-1"]);
     expect(requests.scratchDeletes).toEqual(["scratch-1"]);
     expect(
@@ -1774,13 +1869,16 @@ describe("magic compact", () => {
     });
   });
 
-  test("aggregates a fulfilled abort error envelope content-free while still deleting", async () => {
+  test("aggregates a bounded abort envelope reason while still deleting", async () => {
     const requests = createCommandHarness([], {
-      modelResults: [new Error("prompt rejection content must stay private")],
+      modelResults: [new Error("provider cancelled the request")],
       scratchAbortEnvelopeErrors: [
         {
           error: {
-            message: "abort raw body path session trace must stay private",
+            name: "AbortEnvelopeError",
+            code: "ABORT_UNAVAILABLE",
+            status: 503,
+            message: "scratch abort endpoint returned status 503",
           },
           request: {},
           response: {},
@@ -1796,7 +1894,7 @@ describe("magic compact", () => {
           generationPlan([
             traceValueTurn("abort-envelope", "abort envelope trace content"),
           ]),
-          { requestTimeoutMs: 20, abortTimeoutMs: 10, deleteTimeoutMs: 10 },
+          { controlTimeoutMs: 10 },
         ),
         500,
       );
@@ -1808,9 +1906,14 @@ describe("magic compact", () => {
       "Agentic capsule provider request failed.",
       "Agentic capsule session abort failed.",
     ]);
-    expect(nestedErrorMessages(failure).join("\n")).not.toContain(
-      "must stay private",
+    expect(String(failure)).toContain("status=503");
+    expect(errorGraphText(failure)).not.toContain(
+      "provider cancelled the request",
     );
+    expect(errorGraphText(failure)).not.toContain(
+      "abort endpoint returned status 503",
+    );
+    expect(String(failure)).not.toContain("abort envelope trace content");
     expect(requests.scratchDeletes).toEqual(["scratch-1"]);
     expect(
       requests.scratchLifecycle
@@ -1824,7 +1927,10 @@ describe("magic compact", () => {
       scratchDeleteEnvelopeErrors: [
         {
           error: {
-            message: "delete raw body session trace must stay private",
+            name: "DeleteEnvelopeError",
+            code: "DELETE_UNAVAILABLE",
+            status: 503,
+            message: "scratch delete endpoint returned status 503",
           },
           request: {},
           response: {},
@@ -1841,7 +1947,7 @@ describe("magic compact", () => {
           generationPlan([
             traceValueTurn("delete-envelope", "delete envelope trace content"),
           ]),
-          { requestTimeoutMs: 20, abortTimeoutMs: 10, deleteTimeoutMs: 10 },
+          { controlTimeoutMs: 10 },
         ),
         500,
       );
@@ -1854,134 +1960,16 @@ describe("magic compact", () => {
     expect(nestedErrorMessages(failure)).toEqual([
       "Agentic capsule scratch deletion failed.",
     ]);
-    expect(nestedErrorMessages(failure).join("\n")).not.toContain(
-      "must stay private",
+    expect(String(failure)).toContain("status=503");
+    expect(errorGraphText(failure)).not.toContain(
+      "delete endpoint returned status 503",
     );
+    expect(String(failure)).not.toContain("delete envelope trace content");
     expect(requests.scratchAborts).toEqual([]);
     expect(requests.scratchDeletes).toEqual(["scratch-1"]);
   });
 
-  test("drains mixed fulfilled envelopes, timeouts, and rejections in deterministic candidate order", async () => {
-    const requests = createCommandHarness([], {
-      modelResultFactories: [
-        () => new Promise(() => {}),
-        async () => {
-          throw new Error("rejected provider content must stay private");
-        },
-      ],
-      modelEnvelopeErrors: [
-        undefined,
-        undefined,
-        {
-          error: {
-            message: "envelope provider content must stay private",
-          },
-          request: {},
-          response: {},
-        },
-        {
-          error: {
-            message: "second envelope provider content must stay private",
-          },
-          request: {},
-          response: {},
-        },
-      ],
-      scratchAbortEnvelopeErrors: [
-        undefined,
-        undefined,
-        undefined,
-        {
-          error: {
-            message: "abort envelope content must stay private",
-          },
-          request: {},
-          response: {},
-        },
-      ],
-      scratchDeleteEnvelopeErrors: [
-        undefined,
-        undefined,
-        undefined,
-        {
-          error: {
-            message: "delete envelope content must stay private",
-          },
-          request: {},
-          response: {},
-        },
-      ],
-    });
-    const resourceStates: Array<{
-      residentPrompts: number;
-      activeDeadlineTimers: number;
-    }> = [];
-    let failure: unknown;
-    const started = performance.now();
-    try {
-      await settleWithin(
-        generateCompactionCapsules(
-          requests.v2,
-          session("source"),
-          generationPlan([
-            traceValueTurn("mixed-envelope-1", "mixed envelope timeout trace"),
-            traceValueTurn(
-              "mixed-envelope-2",
-              "mixed envelope rejection trace",
-            ),
-            traceValueTurn("mixed-envelope-3", "mixed envelope prompt trace"),
-            traceValueTurn("mixed-envelope-4", "mixed envelope cleanup trace"),
-          ]),
-          {
-            requestTimeoutMs: 15,
-            abortTimeoutMs: 10,
-            deleteTimeoutMs: 10,
-            onResourceState: state => resourceStates.push({ ...state }),
-          },
-        ),
-        1_000,
-      );
-    } catch (error) {
-      failure = error;
-    }
-
-    expect(performance.now() - started).toBeLessThan(700);
-    expect(failure).toBeInstanceOf(AggregateError);
-    expect((failure as Error).message).toBe(
-      "Magic Compact capsule generation failed for 4 candidate turns.",
-    );
-    expect(nestedErrorMessages(failure)).toEqual([
-      "Agentic capsule request timed out.",
-      "Agentic capsule provider request failed.",
-      "Agentic capsule provider request failed.",
-      "Agentic capsule provider request failed.",
-      "Agentic capsule session abort failed.",
-      "Agentic capsule scratch deletion failed.",
-    ]);
-    expect(nestedErrorMessages(failure).join("\n")).not.toContain(
-      "must stay private",
-    );
-    expect(requests.scratchCreates).toHaveLength(4);
-    expect(requests.scratchPrompts).toHaveLength(4);
-    expect(new Set(requests.scratchAborts)).toEqual(
-      new Set(["scratch-1", "scratch-2", "scratch-3", "scratch-4"]),
-    );
-    expect(new Set(requests.scratchDeletes)).toEqual(
-      new Set(["scratch-1", "scratch-2", "scratch-3", "scratch-4"]),
-    );
-    expect(
-      requests.scratchLifecycle
-        .filter(item => item.sessionID === "scratch-4")
-        .map(item => item.action),
-    ).toEqual(["create", "prompt", "abort", "delete"]);
-    expect(requests.maxConcurrentModelPrompts).toBeLessThanOrEqual(2);
-    expect(resourceStates.at(-1)).toEqual({
-      residentPrompts: 0,
-      activeDeadlineTimers: 0,
-    });
-  });
-
-  test("rejects cleanup deadlines that exceed the request deadline", async () => {
+  test("rejects a non-positive control deadline before scratch creation", async () => {
     const requests = createCommandHarness([]);
     await expect(
       generateCompactionCapsules(
@@ -1990,15 +1978,13 @@ describe("magic compact", () => {
         generationPlan([
           traceValueTurn("invalid-deadline", "invalid deadline trace content"),
         ]),
-        { requestTimeoutMs: 20, abortTimeoutMs: 30 },
+        { controlTimeoutMs: 0 },
       ),
-    ).rejects.toThrow(
-      "Agentic capsule cleanup deadlines cannot exceed the request deadline.",
-    );
+    ).rejects.toThrow("Agentic capsule control deadline must be positive.");
     expect(requests.scratchCreates).toEqual([]);
   });
 
-  test("validation failure aborts every generated capsule before backup or mutation", async () => {
+  test("validation failure aborts its scratch and deletes every scratch before backup or mutation", async () => {
     const messages = [
       ...completedTurn("valid-before-invalid", "First"),
       ...completedTurn("invalid-after-valid", "Second"),
@@ -2045,6 +2031,10 @@ describe("magic compact", () => {
     expect(requests.backupForks).toEqual([]);
     expect(requests.partUpdates).toEqual([]);
     expect(requests.scratchPrompts).toHaveLength(2);
+    expect(requests.scratchAborts).toEqual(["scratch-2"]);
+    expect(new Set(requests.scratchDeletes)).toEqual(
+      new Set(["scratch-1", "scratch-2"]),
+    );
   });
 
   test.each([
@@ -3581,6 +3571,71 @@ describe("magic compact", () => {
     ).toHaveLength(1);
   });
 
+  test("toast timeouts preserve success, no-op, and failure terminal outcomes", async () => {
+    const hangingToast = () => new Promise(() => {});
+
+    const noOp = createCommandHarness([], {
+      toastFactories: [hangingToast],
+    });
+    await expect(
+      settleWithin(
+        executeMagicCompact(noOp.v2, "toast-noop-source-1234", 0, {
+          controlTimeoutMs: 10,
+        }),
+        500,
+      ),
+    ).resolves.toBeFalse();
+    expect(noOp.toasts).toHaveLength(1);
+
+    const successID = "toast-success-source-1234";
+    const successMessages = withSessionID(
+      compactableTurn("toast-timeout-success", "Compact successfully"),
+      successID,
+    );
+    const success = createCommandHarness(successMessages, {
+      toastFactories: [hangingToast],
+    });
+    await expect(
+      settleWithin(
+        executeMagicCompact(success.v2, successID, 0, {
+          controlTimeoutMs: 10,
+        }),
+        500,
+      ),
+    ).resolves.toBeTrue();
+    expect(success.toasts).toHaveLength(1);
+    expect(
+      summaryParts(successMessages, "toast-timeout-success-assistant"),
+    ).toHaveLength(1);
+
+    const primaryFailure = new Error("primary capsule configuration failure");
+    const failed = createCommandHarness(
+      withSessionID(
+        compactableTurn("toast-timeout-failure", "Fail before mutation"),
+        "toast-failure-source-1234",
+      ),
+      {
+        appAgentsError: primaryFailure,
+        toastFactories: [hangingToast],
+      },
+    );
+    let failure: unknown;
+    try {
+      await settleWithin(
+        executeMagicCompact(failed.v2, "toast-failure-source-1234", 0, {
+          controlTimeoutMs: 10,
+        }),
+        500,
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBe(primaryFailure);
+    expect(String(failure)).not.toContain("notification timed out");
+    expect(failed.toasts).toHaveLength(1);
+    expect(failed.backupForks).toEqual([]);
+  });
+
   test("failure toast failure retains the primary failure without starting backup", async () => {
     const messages = completedTurn("toast-failure", "Small request");
     messages[1]!.parts.push(
@@ -4695,7 +4750,9 @@ type HarnessOptions = {
   selectBackupError?: Error;
   failureToastError?: Error;
   successToastError?: Error;
+  toastFactories?: Array<() => Promise<unknown> | unknown>;
   scratchCreateError?: Error;
+  scratchCreateFactory?: () => Promise<unknown> | unknown;
   scratchDeleteError?: Error;
   scratchDeleteErrors?: Array<Error | undefined>;
   scratchDeleteEnvelopeErrors?: Array<RequestEnvelopeError | undefined>;
@@ -4755,6 +4812,7 @@ function createCommandHarness(
   let firstRevalidation = true;
   let pruneReloadHookApplied = false;
   let finalCountHookApplied = false;
+  let toastIndex = 0;
   let currentSourceSession = session(sourceID);
   let backupMessages: MessageWithParts[] | null = null;
 
@@ -4832,6 +4890,7 @@ function createCommandHarness(
         scratchCreates.push(request);
         events.push("scratch-create");
         if (options.scratchCreateError) throw options.scratchCreateError;
+        await options.scratchCreateFactory?.();
         scratchSessions += 1;
         const scratchID = `scratch-${scratchSessions}`;
         scratchLifecycle.push({ action: "create", sessionID: scratchID });
@@ -4867,10 +4926,9 @@ function createCommandHarness(
         requestOptions?: { signal?: AbortSignal },
       ) => {
         if (request.noReply !== true) {
-          const prompt = String(
-            ((request.parts as Array<{ text?: unknown }> | undefined)?.[0]
-              ?.text as string | undefined) ?? "",
-          );
+          const prompt = promptTextParts(request)
+            .map(part => part.text)
+            .join("");
           scratchPrompts.push({ request, prompt });
           scratchPromptSignals.push(requestOptions?.signal);
           scratchLifecycle.push({
@@ -5094,6 +5152,9 @@ function createCommandHarness(
     tui: {
       showToast: async (request: Record<string, unknown>) => {
         toasts.push(request);
+        const toastFactory = options.toastFactories?.[toastIndex];
+        toastIndex += 1;
+        await toastFactory?.();
         if (request.title === "Magic Compact Failed") {
           events.push("failure-toast");
           if (options.failureToastError) throw options.failureToastError;
@@ -5260,6 +5321,15 @@ function promptFileParts(request: Record<string, unknown>): Array<{
   );
 }
 
+function promptTextParts(request: Record<string, unknown>): Array<{
+  type: "text";
+  text: string;
+}> {
+  return ((request.parts as Array<{ type: string }> | undefined) ?? []).filter(
+    (part): part is { type: "text"; text: string } => part.type === "text",
+  );
+}
+
 function persistedMediaCapsuleTurn(
   id: string,
   url: string,
@@ -5402,6 +5472,35 @@ function traceValueTurn(id: string, value: unknown): Turn {
       time: { start: 1, end: 2 },
     }),
   );
+}
+
+function mediaTraceValueTurn(id: string, value: unknown, urls: string[]): Turn {
+  const turn = mediaCandidateTurn(id, urls);
+  const assistant = turn.assistants[0]!;
+  assistant.parts.push(
+    genericToolPart(
+      `${id}-tool-1234`,
+      assistant.info.id,
+      "mcp__repo__inspect",
+      {
+        status: "completed",
+        input: { value },
+        output: "Inspected the complete media trace value.",
+        title: "Inspect media trace value",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    ),
+  );
+  return turn;
+}
+
+function isHighSurrogate(value: number): boolean {
+  return value >= 0xd800 && value <= 0xdbff;
+}
+
+function isLowSurrogate(value: number): boolean {
+  return value >= 0xdc00 && value <= 0xdfff;
 }
 
 function nestedTraceValue(depth: number): unknown {
@@ -5840,6 +5939,87 @@ function nestedErrorMessages(error: unknown): string[] {
     return [error.message];
   }
   return [String(error)];
+}
+
+function payloadEchoError(secret: string): Error {
+  const error = new Error(`raw provider payload ${secret}`, {
+    cause: { body: { echoed: secret } },
+  }) as Error & {
+    body: unknown;
+    code: string;
+    status: number;
+  };
+  error.name = "ProviderPayloadError";
+  error.code = "PAYLOAD_REJECTED";
+  error.status = 413;
+  error.body = { nested: { echoed: secret } };
+  return error;
+}
+
+function errorGraphValues(root: unknown): unknown[] {
+  const values: unknown[] = [];
+  const pending = [root];
+  const seen = new Set<object>();
+  while (pending.length > 0) {
+    const value = pending.pop();
+    values.push(value);
+    if ((typeof value !== "object" && typeof value !== "function") || !value) {
+      continue;
+    }
+    if (seen.has(value)) continue;
+    seen.add(value);
+    for (const key of Reflect.ownKeys(value)) {
+      values.push(typeof key === "symbol" ? key.description : key);
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor && "value" in descriptor) pending.push(descriptor.value);
+    }
+  }
+  return values;
+}
+
+function errorGraphText(error: unknown): string {
+  return errorGraphValues(error)
+    .filter(
+      (value): value is string | number | bigint | boolean =>
+        typeof value === "string"
+        || typeof value === "number"
+        || typeof value === "bigint"
+        || typeof value === "boolean",
+    )
+    .map(String)
+    .join("\n");
+}
+
+function stageDiagnostics(error: unknown): Array<{
+  sourceSessionID: string;
+  candidateIndex: number;
+  stage: string;
+  kind: string;
+  status?: number;
+}> {
+  return errorGraphValues(error).flatMap(value => {
+    if (!value || typeof value !== "object") return [];
+    const diagnostic = value as Record<string, unknown>;
+    if (
+      typeof diagnostic["sourceSessionID"] !== "string"
+      || typeof diagnostic["candidateIndex"] !== "number"
+      || typeof diagnostic["stage"] !== "string"
+      || typeof diagnostic["kind"] !== "string"
+    ) {
+      return [];
+    }
+    return [
+      {
+        sourceSessionID: diagnostic["sourceSessionID"],
+        candidateIndex: diagnostic["candidateIndex"],
+        stage: diagnostic["stage"],
+        kind: diagnostic["kind"],
+        ...(typeof diagnostic["status"] === "number"
+          ? { status: diagnostic["status"] }
+          : {}),
+      },
+    ];
+  });
 }
 
 function createBackupHarness(

@@ -40,6 +40,7 @@ import {
   boundaryPartID,
 } from "./compact/constants";
 import { readStats, type ConversationStats } from "./storage/stats";
+import { attemptWithinDeadline, CONTROL_OPERATION_TIMEOUT_MS } from "./util";
 
 export const COMPACT_SUCCESS = "Magic compaction successful.";
 export const COMPACT_NOOP = "No assistant turns are old enough to compact.";
@@ -52,6 +53,17 @@ type CompactionSelection = {
   turns: Turn[];
   summaries: Exclude<GeneratedCapsule, null>[];
   pruning: PruneProjection;
+};
+
+export type MagicCompactExecutionOptions = {
+  controlTimeoutMs?: number;
+};
+
+type MagicCompactToast = {
+  title: string;
+  message: string;
+  variant: "info" | "error";
+  duration?: number;
 };
 
 class CompactionSourceDriftError extends Error {
@@ -74,7 +86,13 @@ export async function executeMagicCompact(
   v2: V2Client,
   sessionID: string,
   keepTurns: number,
+  options: MagicCompactExecutionOptions = {},
 ): Promise<boolean> {
+  const controlTimeoutMs =
+    options.controlTimeoutMs ?? CONTROL_OPERATION_TIMEOUT_MS;
+  if (!Number.isFinite(controlTimeoutMs) || controlTimeoutMs <= 0) {
+    throw new Error("Magic Compact control deadline must be positive.");
+  }
   let backupSession: Session | null = null;
   let sourceSession: Session | null = null;
   let compactedTurnCount: number;
@@ -83,13 +101,15 @@ export async function executeMagicCompact(
     // Check if there's anything to compact
     const sourcePlan = await createCompactionPlan(v2, sessionID, keepTurns);
     if (sourcePlan.summarizedTurns.length === 0) {
-      unwrap(
-        await v2.tui.showToast({
+      await showMagicCompactToast(
+        v2,
+        {
           title: "Magic Compact",
           message: COMPACT_NOOP,
           variant: "info",
           duration: 5000,
-        }),
+        },
+        controlTimeoutMs,
       );
       return false;
     }
@@ -110,6 +130,7 @@ export async function executeMagicCompact(
       v2,
       sourceSession,
       sourcePlan,
+      { controlTimeoutMs },
     );
 
     const selection = await selectProfitableTurns(
@@ -121,13 +142,15 @@ export async function executeMagicCompact(
       selection.turns.length === 0
       && summaries.every(summary => summary === null)
     ) {
-      unwrap(
-        await v2.tui.showToast({
+      await showMagicCompactToast(
+        v2,
+        {
           title: "Magic Compact",
           message: COMPACT_NOOP,
           variant: "info",
           duration: 5000,
-        }),
+        },
+        controlTimeoutMs,
       );
       return false;
     }
@@ -229,13 +252,15 @@ export async function executeMagicCompact(
     }
 
     try {
-      unwrap(
-        await v2.tui.showToast({
+      await showMagicCompactToast(
+        v2,
+        {
           title: "Magic Compact Failed",
           message: String(error),
           variant: "error",
           duration: 8000,
-        }),
+        },
+        controlTimeoutMs,
       );
     } catch (notificationError) {
       failure = combineErrors(failure, notificationError);
@@ -243,15 +268,29 @@ export async function executeMagicCompact(
     throw failure;
   }
 
-  unwrap(
-    await v2.tui.showToast({
+  await showMagicCompactToast(
+    v2,
+    {
       title: "Magic Compact",
       message: `Compacted ${compactedTurnCount} assistant turn(s).`,
       variant: "info",
       duration: 5000,
-    }),
+    },
+    controlTimeoutMs,
   );
   return true;
+}
+
+async function showMagicCompactToast(
+  v2: V2Client,
+  toast: MagicCompactToast,
+  controlTimeoutMs: number,
+): Promise<void> {
+  const outcome = await attemptWithinDeadline(
+    signal => v2.tui.showToast(toast, { signal }).then(unwrap),
+    controlTimeoutMs,
+  );
+  if (outcome.kind === "failed") throw outcome.error;
 }
 
 async function selectProfitableTurns(
