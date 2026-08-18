@@ -52,7 +52,7 @@ export function statsMessage(
   return [
     `Magic Compaction #${compactionCount}`,
     `Context | ${contextReductionLine(beforeTokens, afterTokens)}`,
-    `Changes | ${summarizedTurnCount} assistant turn(s) summarized`,
+    `Changes | Assistant turns summarized: ${summarizedTurnCount}`,
   ].join("\n");
 }
 
@@ -64,7 +64,7 @@ export function trimStatsMessage(
   return [
     "Magic Trim",
     `Context | ${contextReductionLine(beforeTokens, afterTokens)}`,
-    `Changes | ${trimmedToolCallCount} tool call(s) trimmed`,
+    `Changes | Tool calls trimmed: ${trimmedToolCallCount}`,
   ].join("\n");
 }
 

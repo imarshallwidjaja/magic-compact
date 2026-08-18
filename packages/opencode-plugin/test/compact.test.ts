@@ -2964,7 +2964,7 @@ describe("compaction orchestration", () => {
     expect(statsNotice!.text).toContain("Context | ");
     expect(statsNotice!.text).toContain("% trimmed (");
     expect(statsNotice!.text).toContain(
-      "Changes | 1 assistant turn(s) summarized",
+      "Changes | Assistant turns summarized: 1",
     );
     expect(statsNotice!.text).not.toContain("Cache Savings");
     expect(statsNotice!.text).not.toContain("Cost Savings");

@@ -225,7 +225,7 @@ describe("magic trim", () => {
       expect(notice.text).toContain("Magic Trim");
       expect(notice.text).toContain("Context | ");
       expect(notice.text).toContain("% trimmed (");
-      expect(notice.text).toContain("Changes | 1 tool call(s) trimmed");
+      expect(notice.text).toContain("Changes | Tool calls trimmed: 1");
       expect(notice.text).not.toContain("Cache Savings");
       expect(notice.text).not.toContain("Cost Savings");
       expect(notice.text).not.toContain("Inline image tokens projected");
