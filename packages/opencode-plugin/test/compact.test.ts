@@ -44,6 +44,7 @@ import { countGptTokens } from "../src/stats/tokenize";
 import { createBackup } from "../src/compact/session";
 import {
   COMPACT_INSUFFICIENT_SAVINGS,
+  COMPACT_PENDING_REVERT,
   executeMagicCompact,
 } from "../src/magic-compact";
 import { executeMagicStats } from "../src/magic-stats";
@@ -3371,6 +3372,106 @@ describe("compaction orchestration", () => {
     expect(summaryParts(messages)).toEqual([]);
   });
 
+  test("fails before generation or writes when the session has a pending revert", async () => {
+    const messages = [
+      ...compactableCommandMessages(
+        "revert-guard",
+        "large output ".repeat(1_000),
+      ),
+      message("revert-suffix-user", "user", [
+        textPart(
+          "revert-suffix-text",
+          "revert-suffix-user",
+          "reverted suffix message",
+        ),
+      ]),
+    ];
+    const before = structuredClone(messages);
+    const harness = commandHarness(messages, {
+      generationResponse: {
+        turns: [
+          result(1, "revert-guard request", "Completed revert candidate."),
+        ],
+      },
+      sessionRevert: { messageID: "revert-suffix-user" },
+    });
+
+    await expect(executeMagicCompact(harness.v2, "source", 0)).rejects.toThrow(
+      COMPACT_PENDING_REVERT,
+    );
+
+    expect(messages).toEqual(before);
+    expect(harness.forks).toEqual([]);
+    expect(harness.partUpdates).toEqual([]);
+    expect(harness.boundaryInserted).toBeFalse();
+    expect(harness.selectedSessions).toEqual([]);
+    expect(await readStats("source")).toBeNull();
+    expect(await readStats("backup")).toBeNull();
+  });
+
+  test("rechecks the pending revert immediately before the first source write", async () => {
+    const messages = compactableCommandMessages(
+      "revert-race",
+      "large output ".repeat(1_000),
+    );
+    const before = structuredClone(messages);
+    const harness = commandHarness(messages, {
+      generationResponse: {
+        turns: [
+          result(1, "revert-race request", "Completed revert race candidate."),
+        ],
+      },
+      sessionRevert: { messageID: "revert-race-assistant" },
+      stageRevertAfterBackup: true,
+    });
+
+    await expect(executeMagicCompact(harness.v2, "source", 0)).rejects.toThrow(
+      COMPACT_PENDING_REVERT,
+    );
+
+    expect(messages).toEqual(before);
+    expect(harness.forks).toEqual(["generation-fork", "backup"]);
+    expect(harness.partUpdates).toEqual([]);
+    expect(harness.boundaryInserted).toBeFalse();
+    expect(harness.selectedSessions).toEqual([]);
+    expect(harness.deletedSessions).toEqual(["generation-fork"]);
+    expect(summaryParts(messages)).toEqual([]);
+    expect(await readStats("source")).toBeNull();
+    expect(await readStats("backup")).toEqual(
+      conversationStats({ sourceSessionId: "source" }),
+    );
+  });
+
+  test("source noReply prompt with a pending revert removes the reverted suffix and clears revert state", async () => {
+    const messages = [
+      message("revert-target-user", "user", [
+        textPart("revert-target-text", "revert-target-user", "target message"),
+      ]),
+      message("revert-suffix-assistant", "assistant", [
+        textPart(
+          "revert-suffix-text",
+          "revert-suffix-assistant",
+          "reverted suffix",
+        ),
+      ]),
+    ];
+    const harness = commandHarness(messages, {
+      generationResponse: { turns: [] },
+      sessionRevert: { messageID: "revert-target-user" },
+    });
+
+    await harness.v2.session.prompt({
+      sessionID: "source",
+      noReply: true,
+      parts: [textPart("notice-part", "notice", "notice")],
+    });
+
+    expect(messages.map(message => message.info.id)).toEqual(["notice-1"]);
+    expect(
+      (await harness.v2.session.get({ sessionID: "source" })).data.revert,
+    ).toBeUndefined();
+  });
+
   test("preserves source, backup, and a concurrent user message on post-insertion drift", async () => {
     const messages = compactableCommandMessages(
       "post-insertion-race",
@@ -4536,6 +4637,8 @@ type CommandHarnessOptions = {
   ) => GenerationResponse;
   failSummaryUpdate?: boolean;
   boundaryInsertError?: Error;
+  sessionRevert?: { messageID: string };
+  stageRevertAfterBackup?: boolean;
   statsNoticeError?: Error;
   appendConcurrentOnFailure?: boolean;
   driftAfterBackup?: boolean;
@@ -4579,6 +4682,22 @@ function commandHarness(
   let finalDriftApplied = false;
   let beforeFinalCountApplied = false;
   let noticeIndex = 0;
+  let revertCleared = false;
+  const activeRevert = () =>
+    options.sessionRevert
+    && !revertCleared
+    && (!options.stageRevertAfterBackup || backupCreated)
+      ? options.sessionRevert
+      : undefined;
+  const applyPromptRevertCleanup = () => {
+    const revert = activeRevert();
+    if (!revert) return;
+    const targetIndex = messages.findIndex(
+      item => item.info.id === revert.messageID,
+    );
+    if (targetIndex >= 0) messages.splice(targetIndex);
+    revertCleared = true;
+  };
   const appendConcurrentOnFailure = () => {
     if (
       !options.appendConcurrentOnFailure
@@ -4638,7 +4757,12 @@ function commandHarness(
       }),
     },
     session: {
-      get: async () => ({ data: sourceSession() }),
+      get: async () => ({
+        data: {
+          ...sourceSession(),
+          ...(activeRevert() ? { revert: activeRevert() } : {}),
+        },
+      }),
       messages: async (request: { sessionID: string }) => {
         if (request.sessionID.startsWith("generation-fork")) {
           return {
@@ -4816,6 +4940,7 @@ function commandHarness(
         }
         boundaryInserted ||= insertsBoundary;
         statsInserted ||= insertsStats;
+        applyPromptRevertCleanup();
         messages.push(message(messageID, "user", parts));
         return { data: { info: { id: messageID }, parts } };
       },

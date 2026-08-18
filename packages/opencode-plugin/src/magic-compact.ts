@@ -42,6 +42,8 @@ import { attemptWithinDeadline, CONTROL_OPERATION_TIMEOUT_MS } from "./util";
 
 export const COMPACT_SUCCESS = "Magic compaction successful.";
 export const COMPACT_NOOP = "No assistant turns are old enough to compact.";
+export const COMPACT_PENDING_REVERT =
+  "Magic Compact cannot run while the session has a pending revert. Resolve the pending revert first, then retry.";
 export const COMPACT_INSUFFICIENT_SAVINGS =
   "Magic Compact projected no useful canonical active-content savings; the source session was left unchanged.";
 const MINIMUM_USEFUL_SAVINGS_RATIO = 0.2;
@@ -102,6 +104,9 @@ export async function executeMagicCompact(
         sessionID,
       }),
     );
+    if (sourceSession.revert) {
+      throw new Error(COMPACT_PENDING_REVERT);
+    }
     const currentCompactionCount = getCompactionCount(sourceSession) + 1;
     const sourceMessages = unwrap(await v2.session.messages({ sessionID }));
     const before = countModelFacingContentTokens(sourceMessages);
@@ -164,6 +169,9 @@ export async function executeMagicCompact(
       currentCompactionCount,
     );
     await revalidateCompactionSource(v2, sessionID, sourcePlan);
+    if (unwrap(await v2.session.get({ sessionID })).revert) {
+      throw new Error(COMPACT_PENDING_REVERT);
+    }
 
     sourceWritesStarted = true;
     const insertedSummaries = await injectSummaries(
