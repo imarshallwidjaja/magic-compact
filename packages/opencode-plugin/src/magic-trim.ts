@@ -47,7 +47,7 @@ export async function executeMagicTrim(
     }
 
     const afterTokens = await countSessionTokens(v2, sessionID);
-    const stats = await recordPruningStats({
+    await recordPruningStats({
       sessionID,
       sourceSessionID: sessionID,
       tokensPruned: beforeTokens - afterTokens,
@@ -58,8 +58,7 @@ export async function executeMagicTrim(
       sessionID,
       beforeTokens,
       afterTokens,
-      stats,
-      sourceSession.model?.id ?? null,
+      trimmedToolCalls,
     );
     const actualAfterTokens = await countSessionTokens(v2, sessionID);
     if (actualAfterTokens !== afterTokens) {

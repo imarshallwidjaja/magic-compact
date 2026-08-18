@@ -37,7 +37,6 @@ import {
   boundaryPartID,
   summaryEnvelopeTextPart,
 } from "./compact/constants";
-import { readStats, type ConversationStats } from "./storage/stats";
 import { attemptWithinDeadline, CONTROL_OPERATION_TIMEOUT_MS } from "./util";
 
 export const COMPACT_SUCCESS = "Magic compaction successful.";
@@ -206,8 +205,7 @@ export async function executeMagicCompact(
       before.tokens,
       projection.afterTokens,
       currentCompactionCount,
-      projection.stats,
-      sourceSession.model?.id ?? null,
+      selection.turns.length,
     );
     const actual = await countSessionTokenProjection(v2, sessionID);
     if (
@@ -385,7 +383,6 @@ async function projectCompaction(
     return projected ? [projected] : [];
   });
   if (appendedBoundary) projectedMessages.push(appendedBoundary);
-  const existingStats = await readStats(sessionID);
   const after = countModelFacingContentTokens(projectedMessages);
   const afterPhysicalTokens = after.tokens + after.projectedMediaTokens;
   const physicalTokensPruned = beforePhysicalTokens - afterPhysicalTokens;
@@ -398,30 +395,6 @@ async function projectCompaction(
     afterTokens: after.tokens,
     projectedMediaTokens: after.projectedMediaTokens,
     physicalTokensPruned,
-    stats: nextConversationStats(
-      existingStats,
-      sessionID,
-      physicalTokensPruned,
-      after.projectedMediaTokens,
-    ),
-  };
-}
-
-function nextConversationStats(
-  current: ConversationStats | null,
-  sessionID: string,
-  tokensPruned: number,
-  projectedMediaTokens: number,
-): ConversationStats {
-  return {
-    version: 1,
-    sourceSessionId: sessionID,
-    rootSessionId: current?.rootSessionId ?? sessionID,
-    totalTokensPruned: (current?.totalTokensPruned ?? 0) + tokensPruned,
-    cachedTokensSaved: current?.cachedTokensSaved ?? 0,
-    mediaTokensProjected: projectedMediaTokens,
-    cachedMediaTokensSaved: current?.cachedMediaTokensSaved ?? 0,
-    processedAssistantMessageIds: current?.processedAssistantMessageIds ?? [],
   };
 }
 

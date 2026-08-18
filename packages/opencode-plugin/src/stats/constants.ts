@@ -33,47 +33,39 @@ Note               | ${PROVIDER_METER_NOTE}
 `.trim();
 }
 
-export function statsMessage(
-  compactionCount: number,
+function contextReductionLine(
   beforeTokens: number,
   afterTokens: number,
-  stats: ConversationStats,
-  modelID: string | null,
 ): string {
   const savedTokens = beforeTokens - afterTokens;
   const percent =
     beforeTokens > 0 ? Math.round((savedTokens / beforeTokens) * 100) : 0;
-  const moneySaved = moneySavedMessage(stats, modelID);
+  return `${formatTokenCount(beforeTokens)} → ${formatTokenCount(afterTokens)} tokens | ${percent}% trimmed (~${formatTokenCount(savedTokens)} removed)`;
+}
 
-  return `
-Magic Compaction #${compactionCount}
-Model-facing Active Content (canonical estimate; ignored notice excluded) | ${formatTokenCount(beforeTokens)} → ${formatTokenCount(afterTokens)} tokens (${percent}% reduced) | ~${formatTokenCount(savedTokens)} tokens removed from model requests
-Conversation Stats | Total tokens pruned: ~${formatTokenCount(stats.totalTokensPruned)} (Tokens physically pruned, net canonical active content) | Inline image tokens projected: ~${formatTokenCount(stats.mediaTokensProjected ?? 0)} per model request
-Cache Savings      | Physical cache reads saved: ~${formatTokenCount(stats.cachedTokensSaved)} tokens | Projected-media cache reads saved: ~${formatTokenCount(stats.cachedMediaTokensSaved ?? 0)} tokens
-Cost Savings       | ${moneySaved}
-Note               | ${PROVIDER_METER_NOTE}
-`.trim();
+export function statsMessage(
+  compactionCount: number,
+  beforeTokens: number,
+  afterTokens: number,
+  summarizedTurnCount: number,
+): string {
+  return [
+    `Magic Compaction #${compactionCount}`,
+    `Context | ${contextReductionLine(beforeTokens, afterTokens)}`,
+    `Changes | ${summarizedTurnCount} assistant turn(s) summarized`,
+  ].join("\n");
 }
 
 export function trimStatsMessage(
   beforeTokens: number,
   afterTokens: number,
-  stats: ConversationStats,
-  modelID: string | null,
+  trimmedToolCallCount: number,
 ): string {
-  const savedTokens = beforeTokens - afterTokens;
-  const percent =
-    beforeTokens > 0 ? Math.round((savedTokens / beforeTokens) * 100) : 0;
-  const moneySaved = moneySavedMessage(stats, modelID);
-
-  return `
-Magic Trim
-Model-facing Active Content (canonical estimate; ignored notice excluded) | ${formatTokenCount(beforeTokens)} → ${formatTokenCount(afterTokens)} tokens (${percent}% reduced) | ~${formatTokenCount(savedTokens)} tokens removed from model requests
-Conversation Stats | Total tokens pruned: ~${formatTokenCount(stats.totalTokensPruned)} (Tokens physically pruned, net canonical active content) | Inline image tokens projected: ~${formatTokenCount(stats.mediaTokensProjected ?? 0)} per model request
-Cache Savings      | Physical cache reads saved: ~${formatTokenCount(stats.cachedTokensSaved)} tokens | Projected-media cache reads saved: ~${formatTokenCount(stats.cachedMediaTokensSaved ?? 0)} tokens
-Cost Savings       | ${moneySaved}
-Note               | ${PROVIDER_METER_NOTE}
-`.trim();
+  return [
+    "Magic Trim",
+    `Context | ${contextReductionLine(beforeTokens, afterTokens)}`,
+    `Changes | ${trimmedToolCallCount} tool call(s) trimmed`,
+  ].join("\n");
 }
 
 function moneySavedMessage(

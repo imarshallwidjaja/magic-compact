@@ -32,7 +32,7 @@ OpenCode-specific runtime behavior. Core behavior and safety guarantees live in 
 17. Recheck the source session for a pending revert immediately before the first source write and fail closed without any source mutation if one appeared. Insert new v3 summary parts in source order for selected profitable turns only, then inject the post-compaction boundary. A media summary stores `metadata.magicCompact.mediaManifest` version `1`. Original file parts and URLs are not updated or deleted.
 18. Reload the full source. Remove exactly the owned summary and boundary insertions from the comparison and require every remaining message, part, field, and ordering position to match the prevalidated source snapshot. Unexpected drift preserves both the live source and backup without selecting or deleting either, before pruning or accounting mutation, and reports both session IDs for manual recovery.
 19. Execute only the precomputed part-delete, part-update, and message-delete operations by their planned IDs. Each tool update carries its ordered omission IDs; no newly discovered part is swept. Commit only those planned omission IDs, then update `compactionCount`.
-20. Compute cumulative savings from the exact pre-notice results, keeping net physical token pruning separate from current inline-image projection. Inject the ignored stats notice, then count the actual final model-facing state with the same projection. Persist successful savings only after token and projected-media counts exactly match. A mismatch preserves the partially mutated source and named backup and records no successful stats increment.
+20. Compute cumulative savings from the exact pre-notice results, keeping net physical token pruning separate from current inline-image projection. Inject a concise ignored stats notice reporting the exact pre-notice before/after context counts, the trimmed amount and percentage, and the number of summarized turns, then count the actual final model-facing state with the same projection. Persist successful savings only after token and projected-media counts exactly match. A mismatch preserves the partially mutated source and named backup and records no successful stats increment.
 21. Show a success toast. Any failure from the first summary insertion attempt onward preserves both source and backup without selecting either or deleting the live source, surfaces both session IDs for manual recovery, and records no successful stats increment.
 
 ## Summary Contract
@@ -55,7 +55,7 @@ OpenCode-specific runtime behavior. Core behavior and safety guarantees live in 
 8. Mark processed completed tool states with `state.metadata.magicCompact.trimmed === true`.
 9. Stop with a no-op toast if no tool states were processed.
 10. Measure the exact post-trim canonical active count before the ignored reporting notice and add that reduction to conversation stats.
-11. Inject a notice that reports the exact pre-notice result and explicitly says the ignored notice is excluded, then require the actual final active count to match before showing success.
+11. Inject a concise ignored notice reporting the exact pre-notice before/after context counts, the trimmed amount and percentage, and the number of trimmed tool calls, then require the actual final active count to match before showing success.
 
 `/magic-trim` does not call an LLM, generate summaries, modify ordinary user or assistant content, insert a compaction boundary, or increment `compactionCount`.
 
@@ -129,7 +129,7 @@ OpenCode-specific runtime behavior. Core behavior and safety guarantees live in 
 - Stats track root/source session IDs, net physically pruned canonical tokens, physical cached reads, projected inline-image tokens, projected-media cached reads, and processed assistant message IDs.
 - Compaction and trim add exact canonical reductions. Assistant completion events add current physical and projected-media savings once per assistant message.
 - `/magic-stats` injects an ignored stats notice, or a no-stats message if no stats exist.
-- Notices distinguish canonical model-facing estimates from provider context usage. Magic Compact never fabricates provider counts or mutates provider metadata.
+- The `/magic-stats` notice distinguishes canonical model-facing estimates from provider context usage. Compact and trim notices report only the exact canonical before/after context counts, the trimmed amount and percentage, and the operation kind. Magic Compact never fabricates provider counts or mutates provider metadata.
 
 ## Pruning
 

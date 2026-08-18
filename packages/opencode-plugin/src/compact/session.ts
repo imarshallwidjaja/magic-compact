@@ -16,7 +16,6 @@ import {
   type Turn,
 } from "./plan";
 import { copyCache, deleteCache } from "../storage/omission";
-import type { ConversationStats } from "../storage/stats";
 import { copyStats, deleteStats, writeStats } from "../storage/stats";
 import {
   STATS_METADATA,
@@ -217,7 +216,7 @@ export async function recordPruningStats(input: {
   sourceSessionID: string;
   tokensPruned: number;
   mediaTokensProjected?: number;
-}): Promise<ConversationStats> {
+}): Promise<void> {
   const stats = await copyStats(input.sourceSessionID, input.sessionID);
   const nextStats = {
     ...stats,
@@ -228,7 +227,6 @@ export async function recordPruningStats(input: {
   };
 
   await writeStats(input.sessionID, nextStats);
-  return nextStats;
 }
 
 export async function injectCompactStatsNotice(
@@ -237,8 +235,7 @@ export async function injectCompactStatsNotice(
   beforeTokens: number,
   afterTokens: number,
   compactionCount: number,
-  stats: ConversationStats,
-  modelID: string | null,
+  summarizedTurnCount: number,
 ): Promise<void> {
   unwrap(
     await v2.session.prompt({
@@ -251,8 +248,7 @@ export async function injectCompactStatsNotice(
             compactionCount,
             beforeTokens,
             afterTokens,
-            stats,
-            modelID,
+            summarizedTurnCount,
           ),
           ignored: true,
           metadata: STATS_METADATA,
@@ -267,8 +263,7 @@ export async function injectTrimStatsNotice(
   sessionID: string,
   beforeTokens: number,
   afterTokens: number,
-  stats: ConversationStats,
-  modelID: string | null,
+  trimmedToolCallCount: number,
 ): Promise<void> {
   unwrap(
     await v2.session.prompt({
@@ -277,7 +272,11 @@ export async function injectTrimStatsNotice(
       parts: [
         {
           type: "text",
-          text: trimStatsMessage(beforeTokens, afterTokens, stats, modelID),
+          text: trimStatsMessage(
+            beforeTokens,
+            afterTokens,
+            trimmedToolCallCount,
+          ),
           ignored: true,
           metadata: STATS_METADATA,
         },

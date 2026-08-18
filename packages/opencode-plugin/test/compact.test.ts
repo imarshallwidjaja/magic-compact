@@ -2950,6 +2950,26 @@ describe("compaction orchestration", () => {
     const stats = await readStats("source");
     expect(stats?.totalTokensPruned).toBeGreaterThan(0);
     expect(stats?.processedAssistantMessageIds).toEqual([]);
+    const statsNotice = messages
+      .flatMap(item => item.parts)
+      .find(part => {
+        if (part.type !== "text") return false;
+        const metadata = part.metadata?.magicCompact as
+          | Record<string, unknown>
+          | undefined;
+        return metadata?.["stats"] === true;
+      }) as TextPart | undefined;
+    expect(statsNotice).toBeDefined();
+    expect(statsNotice!.text).toContain("Magic Compaction #1");
+    expect(statsNotice!.text).toContain("Context | ");
+    expect(statsNotice!.text).toContain("% trimmed (");
+    expect(statsNotice!.text).toContain(
+      "Changes | 1 assistant turn(s) summarized",
+    );
+    expect(statsNotice!.text).not.toContain("Cache Savings");
+    expect(statsNotice!.text).not.toContain("Cost Savings");
+    expect(statsNotice!.text).not.toContain("Inline image tokens projected");
+    expect(statsNotice!.text).not.toContain("provider usage");
     expect(harness.selectedSessions).toEqual([]);
     expect(harness.deletedSessions).toEqual(["generation-fork"]);
   });

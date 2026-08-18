@@ -220,12 +220,16 @@ describe("magic trim", () => {
         .parts.find((part): part is TextPart => part.type === "text")!;
 
       expect(stats?.totalTokensPruned).toBe(999 + beforeTokens - afterTokens);
-      expect(notice.text).toBe(
-        trimStatsMessage(beforeTokens, afterTokens, stats!, null),
-      );
+      expect(notice.text).toBe(trimStatsMessage(beforeTokens, afterTokens, 1));
       expect(countCanonicalContentTokens(messages)).toBe(afterTokens);
-      expect(notice.text).toContain("ignored reporting notice is excluded");
-      expect(notice.text).toMatch(/Total tokens pruned[^\n]*~1(?:\.\d)?K/);
+      expect(notice.text).toContain("Magic Trim");
+      expect(notice.text).toContain("Context | ");
+      expect(notice.text).toContain("% trimmed (");
+      expect(notice.text).toContain("Changes | 1 tool call(s) trimmed");
+      expect(notice.text).not.toContain("Cache Savings");
+      expect(notice.text).not.toContain("Cost Savings");
+      expect(notice.text).not.toContain("Inline image tokens projected");
+      expect(notice.text).not.toContain("ignored reporting notice is excluded");
     } finally {
       await Promise.all([
         deleteCache(sessionID),
