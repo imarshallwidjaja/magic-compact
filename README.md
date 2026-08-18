@@ -73,6 +73,15 @@ Examples:
 - `/magic-compact` — summarize all old assistant turns.
 - `/magic-compact 3` — keep the 3 most recent assistant turns, summarize the rest.
 
+### Pending reverts
+
+`/magic-compact` refuses to run while the session has a pending revert left by `/undo`. OpenCode's prompt-time revert cleanup silently deletes the reverted suffix whenever the session is prompted, so Magic Compact fails closed instead of losing content you may still want.
+
+- Want the undone content back? Run `/redo` first to restore it without a model call, then compact.
+- Meant to discard it? Let OpenCode finish the revert through its normal flow — the next message you send commits it — then retry.
+
+Magic Compact does not force the cleanup itself: OpenCode exposes no session-serialized or compare-and-swap revert commit, so forcing cleanup could delete messages appended after the revert point.
+
 ### `/magic-trim` (Experimental)
 
 Run `/magic-trim [N]` to apply the same tool I/O pruning rules without summarizing or deleting ordinary user and assistant content.
