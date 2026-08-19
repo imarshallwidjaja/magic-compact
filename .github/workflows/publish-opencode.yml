@@ -4,6 +4,16 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing immutable release tag
+        required: true
+        type: string
+      release_sha:
+        description: Commit referenced by the release tag
+        required: true
+        type: string
 
 permissions:
   id-token: write
@@ -13,16 +23,91 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve release coordinates
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_RELEASE_TAG: ${{ inputs.release_tag }}
+          DISPATCH_RELEASE_SHA: ${{ inputs.release_sha }}
+          PUSH_RELEASE_TAG: ${{ github.ref_name }}
+          PUSH_RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              release_tag="$DISPATCH_RELEASE_TAG"
+              release_sha="$DISPATCH_RELEASE_SHA"
+              ;;
+            push)
+              release_tag="$PUSH_RELEASE_TAG"
+              release_sha="$PUSH_RELEASE_SHA"
+              ;;
+            *)
+              printf '%s\n' 'Unsupported release event.' >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ "$release_tag" == *$'\n'* || "$release_tag" == *$'\r'* ]] ||
+            [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf '%s\n' 'Release tag must match vX.Y.Z.' >&2
+            exit 1
+          fi
+
+          if [[ "$release_sha" == *$'\n'* || "$release_sha" == *$'\r'* ]] ||
+            [[ ! "$release_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            printf '%s\n' 'Release SHA must be 40 lowercase hexadecimal characters.' >&2
+            exit 1
+          fi
+
+          {
+            printf 'release_tag=%s\n' "$release_tag"
+            printf 'release_sha=%s\n' "$release_sha"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: ${{ steps.release.outputs.release_tag }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
+
+      - name: Validate release invariants
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          RELEASE_SHA: ${{ steps.release.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+
+          head_sha="$(git rev-parse HEAD)"
+          if ! [[ "$head_sha" == "$RELEASE_SHA" ]]; then
+            printf '%s\n' 'Checked-out HEAD does not match the release SHA.' >&2
+            exit 1
+          fi
+
+          if ! tag_sha="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}" 2>/dev/null)"; then
+            printf '%s\n' 'Release tag does not resolve to a commit.' >&2
+            exit 1
+          fi
+          if ! [[ "$tag_sha" == "$RELEASE_SHA" ]]; then
+            printf '%s\n' 'Release tag does not match the release SHA.' >&2
+            exit 1
+          fi
+
+          package_version="$(node -p "require('./packages/opencode-plugin/package.json').version")"
+          expected_version="${RELEASE_TAG#v}"
+          if ! [[ "$package_version" == "$expected_version" ]]; then
+            printf '%s\n' 'Package version does not match the release tag.' >&2
+            exit 1
+          fi
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -33,6 +118,7 @@ jobs:
         run: npm publish --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+      - run: gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes
         env:
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
           GITHUB_TOKEN: ${{ github.token }}

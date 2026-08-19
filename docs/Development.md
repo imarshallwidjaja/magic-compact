@@ -88,10 +88,22 @@ bun install
 
 Release versions are exact numeric triplets in `X.Y.Z` form. The release helper bumps the `packages/opencode-plugin/package.json` manifest when needed and creates a `vX.Y.Z` tag. GitHub Actions currently requires an `NPM_TOKEN` repository secret; npm trusted publishing is an alternative, but it must be configured separately. There is no build step because the package publishes its TypeScript source.
 
-For the first release:
+### Normal release
 
-1. Verify that `packages/opencode-plugin/package.json` is `arkive-compact@1.0.0`.
+The normal release path is the tag-triggered GitHub Actions workflow:
+
+1. Verify that `packages/opencode-plugin/package.json` has the intended `arkive-compact@X.Y.Z` version.
 2. Run the checks documented under Common Commands, including the focused test suites.
 3. Configure the `NPM_TOKEN` GitHub Actions secret or separately configure npm trusted publishing and update the workflow.
-4. Invoke `bun run release-opencode -- 1.0.0`.
+4. Invoke `bun run release-opencode -- X.Y.Z`.
 5. Monitor the tag-triggered publish and GitHub Release workflow.
+
+### Recovery-only manual dispatch
+
+Use manual dispatch only when an existing immutable tag was already pushed but GitHub created no workflow run, the corresponding npm version is still unpublished, and no GitHub Release exists. Verify all three absences before one dispatch, then use the tag's exact 40-character commit SHA:
+
+```bash
+gh workflow run publish-opencode.yml --ref main -f release_tag=vX.Y.Z -f release_sha=<40-char-tag-commit>
+```
+
+Never move, delete, or recreate the tag. Do not use this recovery path to retry a workflow run or republish an existing npm version or GitHub Release.
