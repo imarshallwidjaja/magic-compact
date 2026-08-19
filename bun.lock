@@ -18,7 +18,7 @@
     },
     "packages/opencode-plugin": {
       "name": "arkive-compact",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "dependencies": {
         "@opencode-ai/sdk": "^1.17.9",
         "gpt-tokenizer": "3.4.0",
