@@ -86,7 +86,7 @@ bun install
 
 ## Release
 
-Release versions are exact numeric triplets in `X.Y.Z` form. The release helper bumps the `packages/opencode-plugin/package.json` manifest when needed and creates a `vX.Y.Z` tag. GitHub Actions currently requires an `NPM_TOKEN` repository secret; npm trusted publishing is an alternative, but it must be configured separately. There is no build step because the package publishes its TypeScript source.
+Release versions are exact numeric triplets in `X.Y.Z` form. The release helper bumps the `packages/opencode-plugin/package.json` manifest when needed and creates a `vX.Y.Z` tag. The release workflow publishes the public `arkive-compact` package with provenance and explicit public access. GitHub Actions currently requires an `NPM_TOKEN` repository secret; npm trusted publishing is an alternative, but it must be configured separately. There is no build step because the package publishes its TypeScript source.
 
 ### Normal release
 
@@ -100,10 +100,10 @@ The normal release path is the tag-triggered GitHub Actions workflow:
 
 ### Recovery-only manual dispatch
 
-Use manual dispatch only when an existing immutable tag was already pushed but GitHub created no workflow run, the corresponding npm version is still unpublished, and no GitHub Release exists. Verify all three absences before one dispatch, then use the tag's exact 40-character commit SHA:
+Use manual dispatch only when an existing immutable tag was already pushed and either GitHub created no workflow run or the prior run reached a terminal failure that published nothing, the corresponding npm version is still unpublished, and no GitHub Release exists. Verify all three absences before one dispatch, then use the tag's exact 40-character commit SHA:
 
 ```bash
 gh workflow run publish-opencode.yml --ref main -f release_tag=vX.Y.Z -f release_sha=<40-char-tag-commit>
 ```
 
-Never move, delete, or recreate the tag. Do not use this recovery path to retry a workflow run or republish an existing npm version or GitHub Release.
+Never move, delete, or recreate the tag. Never dispatch while a prior run is active, and never dispatch after the npm version or GitHub Release exists. After a terminal failure that published nothing, a new dispatch is allowed only after the workflow fix is reviewed and pushed, and only after the operator freshly reconfirms the unchanged tag/SHA, that the npm version is absent, and that no GitHub Release exists.
