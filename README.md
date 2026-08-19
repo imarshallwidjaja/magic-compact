@@ -1,5 +1,7 @@
 # Arkive Compact
 
+[![npm](https://img.shields.io/npm/v/arkive-compact?logo=npm&label=npm)](https://www.npmjs.com/package/arkive-compact)
+
 Lossless context compression for OpenCode.
 
 <p align="center">
