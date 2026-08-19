@@ -86,7 +86,7 @@ bun install
 
 ## Release
 
-Release versions are exact numeric triplets in `X.Y.Z` form. The release helper bumps the `packages/opencode-plugin/package.json` manifest when needed and creates a `vX.Y.Z` tag. The release workflow publishes the public `arkive-compact` package with provenance and explicit public access. GitHub Actions currently requires an `NPM_TOKEN` repository secret; npm trusted publishing is an alternative, but it must be configured separately. There is no build step because the package publishes its TypeScript source.
+Release versions are exact numeric triplets in `X.Y.Z` form. The release helper bumps the `packages/opencode-plugin/package.json` manifest when needed and creates a `vX.Y.Z` tag. The release workflow publishes the public `arkive-compact` package with provenance and explicit public access. Publishing uses npm Trusted Publishing: GitHub OIDC via the workflow's `id-token: write` permission authenticates to the npm trusted publisher configured for GitHub user/repo `imarshallwidjaja/magic-compact`, workflow filename `publish-opencode.yml`, with npm publish permission and no environment. The workflow requires no long-lived npm token. The existing `NPM_TOKEN` GitHub Actions secret is now unused; delete and revoke it only after a future OIDC-backed publish succeeds, keeping rollback available until live verification. There is no build step because the package publishes its TypeScript source.
 
 ### Normal release
 
@@ -94,7 +94,7 @@ The normal release path is the tag-triggered GitHub Actions workflow:
 
 1. Verify that `packages/opencode-plugin/package.json` has the intended `arkive-compact@X.Y.Z` version.
 2. Run the checks documented under Common Commands, including the focused test suites.
-3. Configure the `NPM_TOKEN` GitHub Actions secret or separately configure npm trusted publishing and update the workflow.
+3. Confirm npm Trusted Publishing is configured for `imarshallwidjaja/magic-compact` with workflow `publish-opencode.yml`, npm publish permission, and no environment; the workflow needs no npm token.
 4. Invoke `bun run release-opencode -- X.Y.Z`.
 5. Monitor the tag-triggered publish and GitHub Release workflow.
 

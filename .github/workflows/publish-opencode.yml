@@ -116,8 +116,6 @@ jobs:
       - name: Publish OpenCode plugin
         working-directory: packages/opencode-plugin
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - run: gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes
         env:
           RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
