@@ -2,6 +2,8 @@
 
 This page covers the public setup, repository layout, and common maintenance commands for contributors.
 
+The distribution package is `arkive-compact`, the repository is `https://github.com/imarshallwidjaja/magic-compact`, and the runtime command remains `/magic-compact`.
+
 ## Requirements
 
 - Bun
@@ -81,3 +83,15 @@ bun install
 - OpenCode's native history conversion is the only generation media and reasoning path. Completed tool output/attachments, user and assistant files, and provider reasoning remain native. Gate the configured model's image capability over the union of retained batch histories. The cross-provider reasoning test remains a maintainer canary. Magic Compact must not manually serialize, redact, split, convert, or reattach those values.
 - New v3 summaries persist `magicCompact.mediaManifest` version `1`, built locally from authoritative source user then assistant inline images and binding encounter ordinal, exact MIME values, and SHA-256 hashes of exact original URLs. Tool `state.attachments` remain native tool media and omission behavior and never enter the persisted manifest. Persisted v2 manifests remain user-only; their `partId` values are parsed only for compatibility and never override canonical ordinal/MIME/hash identity after OpenCode rewrites IDs. Never trust model-supplied IDs or hashes, and never update, delete, omit-cache, or migrate user file parts or accepted v3-covered assistant image files. `projectManifestCoveredMedia` accepts persisted v2 and current v3 envelopes and remains the one pure projection used by the OpenCode message-transform hook, profitability, final token verification, and model-facing accounting. It validates every manifest-covered image by canonical ordinal/MIME/hash and replaces it with a placeholder only when the placeholder's canonical token count is strictly smaller than the original file URL token contribution; otherwise the exact file part stays inline and model-facing, so projected media token counts are non-negative by construction. Missing manifests are inert; malformed, incomplete, added, removed, reordered, MIME-changed, or hash-changed cohorts throw rather than hiding or resending media.
 - Keep `totalTokensPruned`/`cachedTokensSaved` as physical canonical-content accounting. Optional v1 stats fields `mediaTokensProjected` and `cachedMediaTokensSaved` preserve compatibility with existing files while reporting request-only media projection separately. Recompaction treats all summary-bearing turns as opaque; a valid existing media manifest still projects independently.
+
+## Release
+
+Release versions are exact numeric triplets in `X.Y.Z` form. The release helper bumps the `packages/opencode-plugin/package.json` manifest when needed and creates a `vX.Y.Z` tag. GitHub Actions currently requires an `NPM_TOKEN` repository secret; npm trusted publishing is an alternative, but it must be configured separately. There is no build step because the package publishes its TypeScript source.
+
+For the first release:
+
+1. Verify that `packages/opencode-plugin/package.json` is `arkive-compact@1.0.0`.
+2. Run the checks documented under Common Commands, including the focused test suites.
+3. Configure the `NPM_TOKEN` GitHub Actions secret or separately configure npm trusted publishing and update the workflow.
+4. Invoke `bun run release-opencode -- 1.0.0`.
+5. Monitor the tag-triggered publish and GitHub Release workflow.

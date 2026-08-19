@@ -1,6 +1,6 @@
 # Project
 
-Magic Compact is a lossless context compression plugin for OpenCode. See `README.md` for the user-facing overview, features, installation, source map, and pruning rules.
+Arkive Compact is the distribution package for the Magic Compact lossless context compression runtime for OpenCode. The runtime remains Magic Compact. See `README.md` for the user-facing overview, features, installation, source map, and pruning rules.
 
 This file is the development reference for agents working on this repo.
 

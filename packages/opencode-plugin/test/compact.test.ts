@@ -41,7 +41,10 @@ import {
   type Turn,
 } from "../src/compact/plan";
 import { countGptTokens } from "../src/stats/tokenize";
-import { createBackup } from "../src/compact/session";
+import {
+  createBackup,
+  injectPostCompactionNotice,
+} from "../src/compact/session";
 import {
   COMPACT_INSUFFICIENT_SAVINGS,
   COMPACT_PENDING_REVERT,
@@ -49,6 +52,7 @@ import {
 } from "../src/magic-compact";
 import { executeMagicStats } from "../src/magic-stats";
 import server from "../src/index";
+import tuiPlugin from "../src/tui";
 import {
   allocateOmission,
   cachePath,
@@ -626,6 +630,10 @@ describe("bounded native compaction generation", () => {
     expect(config.command?.["magic-trim"]).toBeDefined();
     expect(config.command?.["magic-stats"]).toBeDefined();
     expect(hooks.tool?.read_omitted_content).toBeDefined();
+    expect(tuiPlugin.id).toBe("magic-compact");
+    expect(
+      pluginStorageDirectory().endsWith("/opencode/storage/magic-compact"),
+    ).toBeTrue();
   });
 
   test("keeps the explicit incident-shaped prompt bounded and delegates complete history to one fork", async () => {
@@ -2877,6 +2885,31 @@ describe("compaction orchestration", () => {
     },
   );
 
+  test("uses the stable boundary part ID when the next turn already exists", async () => {
+    let insertedPart: Part | undefined;
+    const v2 = {
+      part: {
+        update: async (request: { part: Part }) => {
+          insertedPart = request.part;
+          return { data: request.part };
+        },
+      },
+    } as unknown as V2Client;
+    const firstUserMessageID = "first-user-messageID";
+    const nextTurn: Turn = {
+      user: [
+        message(firstUserMessageID, "user", [
+          textPart("first-user-text", firstUserMessageID, "Next user request"),
+        ]),
+      ],
+      assistants: [],
+    };
+
+    await injectPostCompactionNotice(v2, "source", nextTurn);
+
+    expect(insertedPart?.id).toBe("prt_-magic_boundary_first-user-messageID");
+  });
+
   test("prunes exactly, persists retrievable omissions and stats, and verifies final projection", async () => {
     const output = "large tool output ".repeat(1_000);
     const messages = compactableCommandMessages("success", output);
@@ -3596,6 +3629,28 @@ describe("compaction orchestration", () => {
     expect(await readStats("backup")).toEqual(
       conversationStats({ sourceSessionId: "source" }),
     );
+  });
+
+  test("writes the exact Magic Compact backup metadata", async () => {
+    let backupMetadata: unknown;
+    const client = {
+      session: {
+        fork: async () => ({ data: { ...sourceSession(), id: "backup" } }),
+        update: async (request: { metadata?: { magicCompact?: unknown } }) => {
+          backupMetadata = request.metadata?.magicCompact;
+          return { data: { ...sourceSession(), id: "backup" } };
+        },
+        delete: async () => ({ data: true }),
+      },
+    } as unknown as V2Client;
+
+    await createBackup(client, sourceSession(), 3);
+
+    expect(backupMetadata).toEqual({
+      sourceSessionId: "source",
+      compactedAt: expect.any(Number),
+      compactionCount: 3,
+    });
   });
 
   test("cleans a partially initialized backup and aggregates cleanup failures", async () => {

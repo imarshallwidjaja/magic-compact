@@ -1,6 +1,6 @@
 {
-  "name": "magic-compact",
-  "version": "1.2.2",
+  "name": "arkive-compact",
+  "version": "1.0.0",
   "description": "Lossless context compression plugin for OpenCode.",
   "type": "module",
   "module": "src/index.ts",
@@ -40,13 +40,13 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/aerovato/magic-compact.git"
+    "url": "git+https://github.com/imarshallwidjaja/magic-compact.git"
   },
   "bugs": {
-    "url": "https://github.com/aerovato/magic-compact/issues"
+    "url": "https://github.com/imarshallwidjaja/magic-compact/issues"
   },
-  "homepage": "https://github.com/aerovato/magic-compact#readme",
-  "author": "kevinMEH",
+  "homepage": "https://github.com/imarshallwidjaja/magic-compact#readme",
+  "author": "imarshallwidjaja",
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.17.9"
   },

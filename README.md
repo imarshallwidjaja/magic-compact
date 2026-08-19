@@ -1,9 +1,9 @@
-# Magic Compact
+# Arkive Compact
 
 Lossless context compression for OpenCode.
 
 <p align="center">
-  <img src=".github/assets/preview.png" alt="Magic Compact Preview" />
+  <img src=".github/assets/preview.png" alt="Arkive Compact Preview" />
 </p>
 
 ## Why
@@ -43,18 +43,31 @@ Model requests have no local wall-clock deadline. Fork creation, permission upda
 
 ## Installation
 
-Install from the CLI:
+Install the `arkive-compact` package by adding it to your OpenCode config:
 
-```bash
-rm -rf ~/.cache/opencode/packages/magic-compact*
-
-opencode plugin magic-compact --global
-
-# If you are encountering "No versions available":
-NPM_CONFIG_MIN_RELEASE_AGE=0 opencode plugin magic-compact --global
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["arkive-compact@latest"]
+}
 ```
 
-This installs the package and adds it to your global OpenCode config.
+The OpenCode CLI helper is optional:
+
+```bash
+opencode plugin arkive-compact --global
+```
+
+If OpenCode has cached an older package version, clear it before reinstalling:
+
+```bash
+rm -rf ~/.cache/opencode/packages/arkive-compact*
+
+# If you are encountering "No versions available":
+NPM_CONFIG_MIN_RELEASE_AGE=0 opencode plugin arkive-compact --global
+```
+
+Install `arkive-compact`; run `/magic-compact`, `/magic-trim`, and `/magic-stats`. The distribution rename does not add `/arkive-*` command aliases: the runtime remains Magic Compact.
 
 ## Usage
 

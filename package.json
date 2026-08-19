@@ -1,7 +1,7 @@
 {
-  "name": "magic-compact-base",
+  "name": "arkive-compact-base",
   "private": true,
-  "description": "Magic Compact workspace",
+  "description": "Arkive Compact workspace",
   "type": "module",
   "workspaces": [
     "packages/*"
@@ -28,13 +28,13 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/aerovato/magic-compact.git"
+    "url": "git+https://github.com/imarshallwidjaja/magic-compact.git"
   },
   "bugs": {
-    "url": "https://github.com/aerovato/magic-compact/issues"
+    "url": "https://github.com/imarshallwidjaja/magic-compact/issues"
   },
-  "homepage": "https://github.com/aerovato/magic-compact#readme",
-  "author": "kevinMEH",
+  "homepage": "https://github.com/imarshallwidjaja/magic-compact#readme",
+  "author": "imarshallwidjaja",
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/bun": "latest",
