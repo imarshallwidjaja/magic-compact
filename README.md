@@ -185,6 +185,10 @@ Magic Compact Offers:
 
 If you want a lightweight, user-driven compaction tool with minimal ongoing overhead, Magic Compact is the better fit. If you want a full long-term memory system with background maintenance, Magic Context is the heavier alternative.
 
+## License
+
+Arkive Compact is a modified distribution of [Magic Compact](https://github.com/aerovato/magic-compact). Original Magic Compact remains under the BSD 3-Clause License; the required notice is in [`NOTICE.md`](./NOTICE.md). This repository's modifications and packaging are not licensed. See [`LICENSE.md`](./LICENSE.md).
+
 ## Development
 
 See [`docs/Development.md`](./docs/Development.md) for setup and maintenance commands.

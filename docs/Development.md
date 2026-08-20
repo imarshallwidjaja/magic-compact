@@ -46,6 +46,13 @@ bun install
 - `test/omission.test.ts` - omission cache migration, integrity, legacy quarantine, backup, and concurrency tests.
 - `test/trim.test.ts` - trim planning, metadata idempotency, v0 summary preservation, and omission-format integration tests.
 - `test/tokenize.test.ts` - canonical local token-accounting tests.
+- `test/license.test.ts` - packaged no-grant notice plus verbatim upstream Magic Compact BSD-3.
+
+### License
+
+- `LICENSE.md` - no license grant for this distribution's modifications and packaging.
+- `NOTICE.md` - retained upstream Magic Compact BSD 3-Clause notice.
+- `packages/opencode-plugin/LICENSE.md` and `packages/opencode-plugin/NOTICE.md` - the same files, shipped with the published `arkive-compact` package. Keep each byte-identical to the matching root file.
 
 ### `docs/`
 

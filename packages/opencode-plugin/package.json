@@ -17,8 +17,11 @@
     }
   },
   "files": [
-    "src"
+    "src",
+    "LICENSE.md",
+    "NOTICE.md"
   ],
+  "license": "SEE LICENSE IN LICENSE.md",
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit -p ../../tsconfig.json",
