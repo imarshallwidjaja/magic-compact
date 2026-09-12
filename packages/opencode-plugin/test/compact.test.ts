@@ -53,7 +53,7 @@ import {
   executeMagicCompact,
 } from "../src/magic-compact";
 import { executeMagicStats } from "../src/magic-stats";
-import server from "../src/index";
+import plugin from "../src/index";
 import tuiPlugin from "../src/tui";
 import {
   allocateOmission,
@@ -69,6 +69,8 @@ import {
   readStats,
   writeStats,
 } from "../src/storage/stats";
+
+const server = plugin.server;
 
 type TurnResult = {
   ordinal: number;
@@ -3110,8 +3112,7 @@ describe("compaction orchestration", () => {
       .find(part => {
         if (part.type !== "text") return false;
         const metadata = part.metadata?.magicCompact as
-          | Record<string, unknown>
-          | undefined;
+          Record<string, unknown> | undefined;
         return metadata?.["stats"] === true;
       }) as TextPart | undefined;
     expect(statsNotice).toBeDefined();

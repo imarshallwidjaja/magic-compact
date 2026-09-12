@@ -49,6 +49,10 @@ test("ships a no-grant license plus verbatim upstream BSD-3 with the package", a
     join(import.meta.dir, "../NOTICE.md"),
     "utf8",
   );
+  const packagedReadme = await readFile(
+    join(import.meta.dir, "../README.md"),
+    "utf8",
+  );
 
   expect(packagedLicense).toBe(rootLicense);
   expect(packagedNotice).toBe(rootNotice);
@@ -64,8 +68,18 @@ test("ships a no-grant license plus verbatim upstream BSD-3 with the package", a
 
   const packageJson = JSON.parse(
     await readFile(join(import.meta.dir, "../package.json"), "utf8"),
-  ) as { files: string[]; license: string };
+  ) as { description: string; files: string[]; license: string };
   expect(packageJson.license).toBe("SEE LICENSE IN LICENSE.md");
+  expect(packageJson.description).toContain(
+    "Lossless persisted compaction for OpenCode V1",
+  );
+  expect(packageJson.description).toContain(
+    "request-time tool-output projection for V2",
+  );
+  expect(packageJson.description).toContain("OpenCode 2.0.2");
+  expect(packageJson.files).toContain("README.md");
   expect(packageJson.files).toContain("LICENSE.md");
   expect(packageJson.files).toContain("NOTICE.md");
+  expect(packagedReadme).toContain("OpenCode V1");
+  expect(packagedReadme).toContain("OpenCode V2 (validated against 2.0.2)");
 });

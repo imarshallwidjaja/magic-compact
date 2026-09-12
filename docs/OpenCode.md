@@ -2,7 +2,32 @@
 
 OpenCode-specific runtime behavior. Core behavior and safety guarantees live in [`Core.md`](Core.md).
 
-## Commands
+## Runtime compatibility
+
+| Host             | API and loading                                                  | Implementation                       |
+| ---------------- | ---------------------------------------------------------------- | ------------------------------------ |
+| V1 >=1.18.29, <2 | `@opencode-ai/plugin`, default object's `server()`               | Existing in-place compaction runtime |
+| V2               | `@opencode/plugin` 2.0.2, default object's `id` and `setup(ctx)` | Request-only tool-output projection  |
+
+The remaining command, compaction, trim, backup, media, and cache specifications below the V2 section are **V1-only**. The SDK path `@opencode-ai/sdk/v2` used by V1 is an SDK version, not the V2 host plugin API.
+
+## V2 request projection
+
+`setup` registers the agent-loop `context` hook plus `magic_trim`, `magic_stats`, and `read_omitted_content` through a synchronous, replayable tool transform. One-shot `generate` requests are not projected because they cannot execute `read_omitted_content`. There are no plugin-owned timers, subscriptions, or cleanup resources; the host owns registration disposal. V2 exposes these tools directly, with no Magic slash-command aliases.
+
+Projection defaults to enabled with `keepTurns: 1`. A turn starts at a user group following a non-user message. `keepTurns` protects the newest user-request turns, including the current turn, and must be a safe integer of at least 1. `magic_trim` changes the current session's durable settings for subsequent requests; `enabled: false` restores original output from retained native history. Partial updates are serialized in process per session, and every write is read back and compared before success is reported. A failed settings write or readback verification aborts the tool request; a later update can reuse the released session lock. Invalid or unrecognized stored settings, including objects with unknown fields, are treated as defaults by projection and stats. The next successful `magic_trim` update merges with those defaults and replaces the invalid stored value.
+
+Only assistant/tool-role `tool-result` parts with a string `text` result or a single-text `content` result are eligible. Outputs must exceed 1024 JavaScript characters and save tokens under the pinned local tokenizer after including the full retrieval notice. Results for `question`, `skill`, `magic_trim`, `magic_stats`, and `read_omitted_content` are protected. All user/system messages, call IDs and inputs, assistant text/reasoning, error/JSON/multipart/media results, provider-executed results, and messages with native envelopes are preserved. If the request lacks `read_omitted_content`, projection is skipped.
+
+Each content ID is `v2-` plus SHA-256 over the JSON encoding of `[sessionID, exactText]` in UTF-16LE. This preserves lone surrogates and binds retrieval to the current session. Keys in plugin-ID-scoped `ctx.storage` are `omission/{sessionID}/{contentId}`, `settings/{sessionID}`, and `stats/{sessionID}`. Retrieval never selects another session from an ID and rejects missing/corrupt entries. There is no V1 cache migration, cross-session fallback, fork copying, or automatic garbage collection.
+
+The hook builds replacement messages without mutating input objects, awaits every omission write and exact readback, records the latest projection estimate, then publishes the replacement array. Omission verification or projection-stats storage failure throws before publication and aborts that context request. It may leave unused omission records but never a partial projection. Repeated source projection uses the same content IDs. Stats record the latest successfully prepared projection, including zero savings, not successful provider delivery or cumulative billing savings. `magic_stats` returns only a strict non-negative safe-integer `{outputs, tokensSaved}` snapshot; malformed stored values produce `lastProjection: null` with an integrity diagnostic. Concurrent requests may overwrite that last-projection snapshot. Settings and omissions use independent keys. Settings serialization is scoped to one loaded plugin instance; no cross-process coordination is provided.
+
+Native `compaction` and `title` hooks are deliberately left to the host. V2 does not summarize assistant turns, rewrite persisted history, use V1 media manifests, or create backups. Native `/compact` retains its own semantics and can flatten history; the plugin does not claim lossless user-message visibility after native compaction. Disabling/removing the plugin restores original tool output only while that history remains in the host's request. Removing plugin storage can invalidate earlier omission notices; disable projection before removal.
+
+The public API fixture suite validates context-only registration, source preservation, retrieval across reload, session isolation, corruption/storage failures, concurrent settings updates, settings readback verification, and invalid-settings recovery. Installed-tarball imports and tool execution, V1 1.18.29 command registration, and V2 2.0.2 active-plugin status (via a local wrapper importing the installed package) have also been exercised. Provider-backed requests, live TUI behavior, and registry-name installation of this unreleased package remain unvalidated. No check implies identical persisted-history semantics.
+
+## Commands (V1)
 
 - `/magic-compact [N]` backs up and compacts the current OpenCode session in place.
 - `/magic-trim [N]` backs up and trims historical tool I/O without summarizing messages.

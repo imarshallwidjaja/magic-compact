@@ -7,6 +7,7 @@ The distribution package is `arkive-compact`, the repository is `https://github.
 ## Requirements
 
 - Bun
+- V1 compatibility floor: OpenCode 1.18.29. V2 development targets the published `@opencode/plugin` 2.0.2 public API. Both API dependencies ship with the package; the default object loads each implementation lazily.
 
 ## Setup
 
@@ -22,11 +23,13 @@ bun install
 
 - `packages/opencode-plugin` - OpenCode plugin implementation.
 - `src/api.ts` - OpenCode API access helpers.
-- `src/index.ts` - package export surface and slash/tool registration.
+- `src/index.ts` - combined V1 `server()` / V2 `setup()` package entrypoint.
+- `src/v1.ts` - V1 slash/tool registration and existing runtime hooks.
+- `src/v2.ts` - public V2 request projection, tool registration, and session-scoped plugin storage.
 - `src/magic-compact.ts` - `/magic-compact` command entrypoint, projection, profitability, and recovery orchestration.
 - `src/magic-trim.ts` - `/magic-trim` command entrypoint.
 - `src/magic-stats.ts` - `/magic-stats` command entrypoint.
-- `src/tui.ts` - TUI plugin wiring.
+- `src/tui.ts` - no-op TUI entrypoint with V1 `tui()` and V2 `setup()` shapes.
 - `src/util.ts` - shared local utilities.
 - `src/compact/batch.ts` - model-derived generation budgets, media-aware native input estimates, and chronological batch partitioning.
 - `src/compact/compact.ts` - command-owned generation-fork lifecycle, message isolation, ordered response validation, and v3 summary-part insertion.
@@ -47,6 +50,7 @@ bun install
 - `test/trim.test.ts` - trim planning, metadata idempotency, v0 summary preservation, and omission-format integration tests.
 - `test/tokenize.test.ts` - canonical local token-accounting tests.
 - `test/license.test.ts` - packaged no-grant notice plus verbatim upstream Magic Compact BSD-3.
+- `test/v2.test.ts` - combined loader shape, V2 registration/projection, exact retrieval, isolation, storage failures, and settings.
 
 ### License
 
@@ -67,8 +71,16 @@ bun install
 - `bun run format` - Prettier formatting.
 - `bun test packages/opencode-plugin/test/compact.test.ts` - focused compaction suite.
 - `bun test packages/opencode-plugin/test/trim.test.ts` - focused trim suite.
+- `bun test packages/opencode-plugin/test/v2.test.ts` - V2 public-API contract fixtures.
+- `bun test packages/opencode-plugin/test` - all package tests, including V1 regression coverage.
+- `npm pack --dry-run` from `packages/opencode-plugin` - inspect the source package contents. There is no build step for either implementation.
 
 ## Notes
+
+- Keep V1/V2 adapters independent. V1's `@opencode-ai/sdk/v2` client is not the V2 plugin context. Never cast V2 request messages into V1 persisted messages. The V2 plugin changes only request-local tool outputs; exact persisted-history parity is unavailable in the supported public API.
+- V2 projects only agent-loop `context` requests; one-shot `generate` requests cannot execute retrieval tools and remain unchanged. Tool transforms are replayable and must not write state. Original text must be stored and read back before publishing any projected request. Omission or projection-stats storage failure aborts the context request before publication. Serialize partial settings updates per session, verify settings writes before success, and treat schema-invalid stored settings as defaults until the next successful update repairs them. A settings verification failure aborts `magic_trim`; malformed stored projection stats are reported as invalid. Protect retrieval-tool results and skip requests where retrieval is unavailable. Native compaction remains host-owned.
+- Fixture tests validate contracts against installed API types. For release validation, install a packed tarball in a clean project and check actual plugin activation and tool execution on both the V1 floor and a matching V2 host. Record host/provider validation separately from unit/loader results. See the [official migration guide](https://opencode.ai/v2/docs/build/plugins/migrate-v1).
+- V2 2.0.2 local directory loading looks for root `server` or `index` files rather than this package's `src` exports. For an installed-tarball smoke test, configure a local plugin directory whose `index.ts` re-exports `arkive-compact`; use package-name installation for normal releases. V1 1.18.29 command registration and V2 2.0.2 active status through that wrapper have been checked. Provider-backed requests, TUI behavior, and registry installation of the unreleased artifact require separate verification.
 
 - The project uses Bun workspaces.
 - For the user-facing plugin install flow, see the main `README.md`.

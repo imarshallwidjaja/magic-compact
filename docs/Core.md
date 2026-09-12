@@ -2,7 +2,15 @@
 
 Source of truth for Magic Compact behavior and safety guarantees.
 
-## Goal
+## Version scope
+
+The per-turn compaction, mutation, backup, media, and cumulative accounting guarantees below apply to OpenCode V1 >=1.18.29 and <2. The combined package dispatches separately to V2; sharing an entrypoint does not translate data contracts or hooks.
+
+V2 provides lossless tool-output projection at the model-request boundary through the public agent-loop `context` hook. It does not project one-shot `generate` requests because those requests cannot execute omission retrieval. It stores exact session-bound output with a SHA-256 identity, verifies the write, and only then publishes profitable replacements in a new message array. Omission or projection-stats storage failure leaves the incoming array and its objects unchanged, publishes no projection, and aborts that context request. User/system messages and assistant prose/reasoning are preserved exactly by the plugin; saved history is never mutated. The newest user-request turn is always retained. Native envelopes, tool calls/inputs, errors, structured JSON, media/multipart outputs, provider-executed results, and retrieval results are preserved.
+
+V2 preserves originals in plugin-owned storage and checks integrity and current-session scope on retrieval. It serializes partial settings updates within each session and verifies each settings write before reporting success; verification failure aborts the `magic_trim` tool request. Invalid or unrecognized stored settings are treated as defaults so projection and `magic_trim` remain available; a successful update replaces the invalid value. It validates stored projection stats before returning them and reports malformed snapshots as invalid. It does not translate V1 caches or copy state across forks. Request-local tokenizer savings are separate from physical pruning and provider usage. Native generate, compaction, and title requests run unchanged; their host-owned semantics can remove earlier content from future context. V2 does not provide V1 per-turn summaries, media manifests, backups, or cumulative cost accounting. Detailed limits and tool controls are in [OpenCode.md](OpenCode.md).
+
+## Goal (V1)
 
 Compress a conversation without flattening it into a single generic recap.
 
