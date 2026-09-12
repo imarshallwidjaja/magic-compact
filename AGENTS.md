@@ -18,9 +18,7 @@ Agents MUST read these files before working on platform behavior, and MUST updat
 
 ## Architecture
 
-Keep the combined entrypoint's V1 `server()` and V2 `setup()` implementations independent. Support V1 only from 1.18.29 onward. V1's SDK `/v2` import does not denote the V2 host API; never cast V2 request messages to V1 persistence records or claim persisted-history parity. V2 projects only agent-loop `context` requests where omission retrieval is usable. Preserve user messages and source objects, serialize settings updates per session, treat invalid stored settings as defaults until a verified update repairs them, verify durable omission storage before publishing request projections, and keep native compaction semantics explicit in operator docs.
-
-On V1, Magic Compact performs per-turn conversation compaction while preserving the conversation skeleton. V2 uses request-only tool-output projection; the runtime surfaces and summary goals below describe V1.
+Magic Compact performs per-turn conversation compaction while preserving the conversation skeleton.
 
 ### Runtime Surfaces
 

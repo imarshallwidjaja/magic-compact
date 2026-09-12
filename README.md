@@ -2,41 +2,7 @@
 
 [![npm](https://img.shields.io/npm/v/arkive-compact?logo=npm&label=npm)](https://www.npmjs.com/package/arkive-compact)
 
-Lossless persisted compaction for OpenCode V1 and request-time tool-output projection for V2.
-
-## Compatibility
-
-One `arkive-compact` package contains separate implementations, following the [official V1/V2 migration guide](https://opencode.ai/v2/docs/build/plugins/migrate-v1).
-
-| Host                                          | Entrypoint   | Behavior                                                                                                                              |
-| --------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
-| OpenCode V1 >=1.18.29, <2                     | `server()`   | Existing per-turn compaction, trimming, backups, media projection, omission retrieval, and cumulative stats                           |
-| OpenCode V2 with `@opencode/plugin` 2.0.2 API | `setup(ctx)` | Automatic, reversible old tool-output projection on agent-loop context requests; session-scoped retrieval and request-local estimates |
-| V1 <1.18.29                                   | Unsupported  | Does not support the combined object entrypoint                                                                                       |
-
-The compaction workflow, slash commands, and comparisons below describe **V1**. V2 does not run V1 hooks or edit saved messages. See [V2 behavior](#v2-behavior) for its smaller native surface.
-
-### V2 behavior
-
-Configure the same package with V2's plural key:
-
-```json
-{ "plugins": ["arkive-compact@latest"] }
-```
-
-V2 automatically replaces profitable historical tool text outputs longer than 1024 characters with retrieval notices in agent-loop context requests. It preserves the current user turn by default. User and system messages, assistant prose/reasoning, tool calls and inputs, errors, JSON results, media/multipart results, provider-executed results, and native message envelopes remain intact. Outputs of `question`, `skill`, and the plugin's own tools stay visible. Projection runs only when the request exposes `read_omitted_content`; one-shot generate requests are left unchanged because they cannot execute the retrieval tool.
-
-V2 provides these tools (ask the agent to call them):
-
-- `magic_trim({enabled, keepTurns})` changes projection settings for the current session. Both fields are optional; defaults are `true` and `1`. `keepTurns` must be at least 1 and counts user-request turns including the current turn. Set `enabled: false` to restore original output on subsequent requests. Concurrent updates are serialized per session and verified after storage. Invalid or unrecognized stored settings are treated as defaults; the next successful update replaces them with valid settings.
-- `magic_stats({})` reports settings and the latest successful projection's output count and estimated tokens saved. This is neither cumulative accounting nor provider usage.
-- `read_omitted_content({contentId})` retrieves exact stale output from this session's integrity-checked plugin storage, including after plugin reload.
-
-V2 currently has no Magic slash commands or per-turn assistant summarization. Its native `/compact` remains host-owned: Magic Compact does not intercept compaction/title requests or promise that native compaction preserves user messages in future model context. The plugin itself never rewrites saved user messages or other history. V1 caches, backup operations, media manifests, and cumulative cost accounting are V1-only.
-
-Projection writes and verifies the original output in `ctx.storage` before publishing a request change. Omission or projection-stats storage failure leaves the incoming request unchanged, publishes no projection, and aborts that context request. Settings verification failure aborts the `magic_trim` tool request without reporting success. Records remain until plugin storage is removed; there is no automatic retention or fork-copy policy. Disable projection before removing its storage. Disabling or removing the plugin restores full output from saved history for requests that still include that history; it cannot undo host-native compaction.
-
-Validated: public-API fixture tests, installed-tarball imports and tool execution, V1 1.18.29 command registration, and V2 2.0.2 active-plugin status through a local wrapper importing the installed tarball. Provider-backed requests, live TUI behavior, and registry-name installation of this unreleased version have not been exercised. These checks do not establish end-to-end V1/V2 parity.
+Lossless context compression for OpenCode.
 
 <p align="center">
   <img src=".github/assets/preview.png" alt="Arkive Compact Preview" />
@@ -77,9 +43,7 @@ Fork creation and model requests have no local wall-clock deadline, so Magic Com
 - Lossless media persistence — Original user file parts and v3-covered assistant inline image parts remain untouched in the source, backup, API, and exports. New v3 summary envelopes carry a locally built user-then-assistant ordinal/MIME/SHA-256 manifest that remains valid when OpenCode rewrites IDs during forks or recovery. Persisted v2 manifests remain user-only and readable, but their historical `partId` does not override canonical content identity. Tool `state.attachments` stay on OpenCode's native media path and are not added to the persisted manifest. OpenCode's transient message-transform hook validates exact v2/v3 manifest matches and replaces each with a declarative placeholder only when the placeholder is strictly smaller than the original file URL token contribution; otherwise the exact file part stays inline and model-facing. Missing manifests do nothing and mismatches fail closed.
 - Useful-savings gate — A turn is replaced only when its exact projected replacement (summary plus the same planned pruning) is strictly smaller than the turn's exact source. Net-negative turns stay byte-identical. If the projected result cannot save at least 20% of the selected profitable turns' eligible removable content, Magic Compact fails unchanged before backup, mutation, or a stats increment instead of claiming weak savings.
 
-## Installation (V1)
-
-V2 users should follow the separate [V2 behavior](#v2-behavior) setup and tool instructions above.
+## Installation
 
 Install the `arkive-compact` package by adding it to your OpenCode config:
 
@@ -109,7 +73,7 @@ Install `arkive-compact`; run `/magic-compact`, `/magic-trim`, and `/magic-stats
 
 Compact and trim show a long-lived view-only progress toast while they run, then send terminal success, no-op, or failure feedback. If a timed-out progress delivery later settles, Magic Compact best-effort reasserts the terminal toast. Progress feedback does not add conversation history, model input, stats, or omission-cache entries, and toast delivery failure does not change the command or recovery outcome. A host-side delivery after the client promise has rejected cannot be detected.
 
-## Usage (V1)
+## Usage
 
 ### `/magic-compact`
 
