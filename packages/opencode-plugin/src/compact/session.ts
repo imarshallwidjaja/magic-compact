@@ -85,6 +85,42 @@ export async function createBackup(
   }
 }
 
+export async function deleteBackup(
+  v2: V2Client,
+  backupSessionID: string,
+): Promise<void> {
+  try {
+    unwrap(await v2.session.delete({ sessionID: backupSessionID }));
+  } catch (error) {
+    throw new Error(`Failed to delete backup session ${backupSessionID}.`, {
+      cause: error,
+    });
+  }
+  const cleanupErrors: unknown[] = [];
+  try {
+    await deleteCache(backupSessionID);
+  } catch (error) {
+    cleanupErrors.push(
+      new Error("Failed to delete backup omission cache.", { cause: error }),
+    );
+  }
+  try {
+    await deleteStats(backupSessionID);
+  } catch (error) {
+    cleanupErrors.push(
+      new Error("Failed to delete backup stats cache.", { cause: error }),
+    );
+  }
+  if (cleanupErrors.length === 1) throw cleanupErrors[0];
+  if (cleanupErrors.length > 1) {
+    throw new AggregateError(
+      cleanupErrors,
+      "Backup cache cleanup failed after backup session deletion.",
+      { cause: cleanupErrors[0] },
+    );
+  }
+}
+
 export async function applyBackup(
   v2: V2Client,
   originalSession: Session,

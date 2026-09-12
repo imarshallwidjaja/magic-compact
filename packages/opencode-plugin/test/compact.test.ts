@@ -43,10 +43,12 @@ import {
 import { countGptTokens } from "../src/stats/tokenize";
 import {
   createBackup,
+  deleteBackup,
   injectPostCompactionNotice,
 } from "../src/compact/session";
 import {
   COMPACT_INSUFFICIENT_SAVINGS,
+  COMPACT_NOOP,
   COMPACT_PENDING_REVERT,
   executeMagicCompact,
 } from "../src/magic-compact";
@@ -1932,6 +1934,7 @@ describe("bounded native compaction generation", () => {
       ),
     ).rejects.toThrow("fork history shape verification failed");
     expect(shapeHarness.prompts).toEqual([]);
+    expect(shapeHarness.aborts).toEqual([]);
     expect(shapeHarness.deletes).toEqual(["generation-fork"]);
 
     const markerHarness = generationHarness([turn], responseFor([turn]), {
@@ -1945,6 +1948,7 @@ describe("bounded native compaction generation", () => {
       ),
     ).rejects.toThrow("fork marker injection failed");
     expect(markerHarness.prompts).toEqual([]);
+    expect(markerHarness.aborts).toEqual([]);
     expect(markerHarness.deletes).toEqual(["generation-fork"]);
   });
 
@@ -2022,6 +2026,7 @@ describe("bounded native compaction generation", () => {
           prompt => prompt.sessionID === "generation-fork-2",
         ),
       ).toEqual([]);
+      expect(harness.aborts).toEqual([]);
     },
   );
 
@@ -2372,7 +2377,7 @@ describe("bounded native compaction generation", () => {
     expect(harness.deletes).toEqual(["generation-fork"]);
   });
 
-  test("cleans a generation fork that completes after the creation deadline", async () => {
+  test("allows fork creation to exceed the control deadline and deletes the resulting fork", async () => {
     const turn = candidateTurn("late-fork", "late fork request", []);
     let releaseFork!: () => void;
     const forkGate = new Promise<void>(resolve => {
@@ -2382,20 +2387,63 @@ describe("bounded native compaction generation", () => {
       forkGate,
     });
 
-    await expect(
-      generateCompactionSummaries(
-        harness.v2,
-        sourceSession(),
-        generationPlan([turn]),
-        { controlTimeoutMs: 1 },
-      ),
-    ).rejects.toThrow("fork creation timed out");
-    releaseFork();
-    await waitFor(() => harness.deletes.length === 1);
+    let settled = false;
+    const operation = generateCompactionSummaries(
+      harness.v2,
+      sourceSession(),
+      generationPlan([turn]),
+      { controlTimeoutMs: 1 },
+    ).finally(() => {
+      settled = true;
+    });
+    await new Promise(resolve => setTimeout(resolve, 10));
 
+    expect(settled).toBeFalse();
     expect(harness.prompts).toEqual([]);
-    expect(harness.aborts).toEqual(["generation-fork"]);
+    releaseFork();
+    await expect(operation).resolves.toEqual([
+      { text: "Turn 1 outcome and continuation details." },
+    ]);
+
+    expect(harness.prompts).toHaveLength(1);
+    expect(harness.aborts).toEqual([]);
     expect(harness.deletes).toEqual(["generation-fork"]);
+  });
+
+  test("stops sixth-batch admission before failed cleanup drains", async () => {
+    const turns = Array.from({ length: 161 }, (_, index) =>
+      candidateTurn(`cleanup-drain-${index + 1}`, `anchor ${index + 1}`, []),
+    );
+    let releaseDeletes!: () => void;
+    const deleteGate = new Promise<void>(resolve => {
+      releaseDeletes = resolve;
+    });
+    const harness = generationHarness(turns, responseFor(turns), {
+      providerErrorForFirstOrdinal: 1,
+      holdPromptsUntil: 5,
+      deleteGate,
+      deleteGateForFirstOrdinal: 1,
+    });
+    let settled = false;
+    const operation = generateCompactionSummaries(
+      harness.v2,
+      sourceSession(),
+      generationPlan(turns),
+    ).finally(() => {
+      settled = true;
+    });
+
+    await waitFor(() => harness.events.includes("delete-waiting"));
+    await waitFor(() => harness.deletes.length === 4);
+    expect(settled).toBeFalse();
+    expect(harness.prompts).toHaveLength(5);
+    expect(harness.forks).toHaveLength(5);
+    releaseDeletes();
+
+    await expect(operation).rejects.toThrow("model request failed");
+    expect(harness.prompts).toHaveLength(5);
+    expect(harness.aborts).toEqual(["generation-fork"]);
+    expect(harness.deletes).toHaveLength(5);
   });
 
   test.each([
@@ -2550,6 +2598,9 @@ describe("bounded native compaction generation", () => {
         directory: "/workspace",
         workspace: "workspace",
       });
+      if (name === "permission update") {
+        expect(harness.aborts).toEqual([]);
+      }
     },
   );
 
@@ -2830,6 +2881,16 @@ describe("compaction orchestration", () => {
           250,
         ),
       ).resolves.toBeFalse();
+      expect(noOp.toasts.map(toast => toast.message)).toEqual([
+        "Compacting session...",
+        COMPACT_NOOP,
+      ]);
+      expect(noOp.toasts[0]?.duration).toBe(2_147_483_647);
+      expect(JSON.stringify(noOp.messages)).not.toContain(
+        "Compacting session...",
+      );
+      expect(await readCache("source")).toBeNull();
+      expect(await readStats("source")).toBeNull();
 
       const successMessages = compactableCommandMessages(
         `toast-${toastMode}-success`,
@@ -2856,6 +2917,16 @@ describe("compaction orchestration", () => {
         ),
       ).resolves.toBeTrue();
       expect(summaryParts(successMessages)).toHaveLength(1);
+      expect(success.toasts.map(toast => toast.message)).toEqual([
+        "Compacting session...",
+        "Compacted 1 assistant turn(s).",
+      ]);
+      expect(JSON.stringify(successMessages)).not.toContain(
+        "Compacting session...",
+      );
+      expect(JSON.stringify(success.modelPrompts)).not.toContain(
+        "Compacting session...",
+      );
 
       const failed = commandHarness(
         compactableCommandMessages(
@@ -2882,8 +2953,59 @@ describe("compaction orchestration", () => {
       expect(nestedErrorMessages(failure).join(" ")).not.toContain(
         "toast failed",
       );
+      expect(failed.toasts.map(toast => toast.message)).toEqual([
+        "Compacting session...",
+        "GenerationLifecycleError: Compaction generation response validation failed.",
+      ]);
+      expect(JSON.stringify(failed.messages)).not.toContain(
+        "Compacting session...",
+      );
+      expect(JSON.stringify(failed.modelPrompts)).not.toContain(
+        "Compacting session...",
+      );
+      expect(JSON.stringify(await readCache("source"))).not.toContain(
+        "Compacting session...",
+      );
+      expect(JSON.stringify(await readStats("source"))).not.toContain(
+        "Compacting session...",
+      );
     },
   );
+
+  test("reasserts terminal feedback after a timed-out progress toast arrives late", async () => {
+    const harness = commandHarness(
+      candidateMessages("toast-late-progress", "keep", []),
+      {
+        generationResponse: { turns: [] },
+        toastMode: "delay-progress",
+      },
+    );
+
+    await expect(
+      settleWithin(
+        executeMagicCompact(harness.v2, "source", 1, {
+          controlTimeoutMs: 5,
+        }),
+        250,
+      ),
+    ).resolves.toBeFalse();
+    expect(harness.displayedToast?.message).toBe(COMPACT_NOOP);
+
+    harness.releaseProgressToast();
+    await waitFor(() => harness.toasts.length === 3);
+
+    expect(harness.toasts.map(toast => toast.message)).toEqual([
+      "Compacting session...",
+      COMPACT_NOOP,
+      COMPACT_NOOP,
+    ]);
+    expect(harness.displayedToast?.message).toBe(COMPACT_NOOP);
+    expect(JSON.stringify(harness.messages)).not.toContain(
+      "Compacting session...",
+    );
+    expect(await readCache("source")).toBeNull();
+    expect(await readStats("source")).toBeNull();
+  });
 
   test("uses the stable boundary part ID when the next turn already exists", async () => {
     let insertedPart: Part | undefined;
@@ -3653,6 +3775,48 @@ describe("compaction orchestration", () => {
     });
   });
 
+  test("reports cache cleanup after backup session deletion accurately", async () => {
+    await allocateOmission("backup", { content: "backup omission" });
+    await writeStats("backup", conversationStats());
+    const backupCachePath = cachePath("backup");
+    const backupStatsPath = `${pluginStorageDirectory()}/stats/backup.json`;
+    const client = {
+      session: {
+        delete: async () => {
+          await rm(backupCachePath, { force: true });
+          await mkdir(backupCachePath, { recursive: true });
+          await rm(backupStatsPath, { force: true });
+          await mkdir(backupStatsPath, { recursive: true });
+          return { data: true };
+        },
+      },
+    } as unknown as V2Client;
+    let failure: unknown;
+
+    try {
+      await deleteBackup(client, "backup");
+    } catch (error) {
+      failure = error;
+    } finally {
+      await rm(backupCachePath, { recursive: true, force: true });
+      await rm(backupStatsPath, { recursive: true, force: true });
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).message).toBe(
+      "Backup cache cleanup failed after backup session deletion.",
+    );
+    expect(nestedErrorMessages(failure)).toEqual(
+      expect.arrayContaining([
+        "Failed to delete backup omission cache.",
+        "Failed to delete backup stats cache.",
+      ]),
+    );
+    expect(nestedErrorMessages(failure)).not.toContain(
+      "Backup session and cache cleanup failed.",
+    );
+  });
+
   test("cleans a partially initialized backup and aggregates cleanup failures", async () => {
     const seedStats = conversationStats();
     await writeStats("source", seedStats);
@@ -3917,6 +4081,8 @@ function generationHarness(
     providerError?: Error;
     providerDelayMs?: number;
     forkGate?: Promise<void>;
+    deleteGate?: Promise<void>;
+    deleteGateForFirstOrdinal?: number;
     nextTurn?: Turn;
     forkMessages?: MessageWithParts[];
     markerError?: Error;
@@ -3968,6 +4134,7 @@ function generationHarness(
     messages: MessageWithParts[];
   }> = [];
   const completedPromptFirstOrdinals: number[] = [];
+  const promptFirstOrdinalByFork = new Map<string, number>();
   const forkMessagesByID = new Map<string, MessageWithParts[]>();
   const messageLoadsByFork = new Map<string, number>();
   let providerCalls = 0;
@@ -4104,6 +4271,7 @@ function generationHarness(
         });
         const index = generationPromptIndex(request);
         const firstOrdinal = index.turns[0]!.ordinal;
+        promptFirstOrdinalByFork.set(sessionID, firstOrdinal);
         activePrompts += 1;
         peakActivePrompts = Math.max(peakActivePrompts, activePrompts);
         if (
@@ -4161,8 +4329,17 @@ function generationHarness(
         return { data: true };
       },
       delete: async (request: Record<string, unknown>) => {
-        deleteRequests.push(request);
         const sessionID = String(request.sessionID);
+        if (
+          options.deleteGate
+          && (options.deleteGateForFirstOrdinal === undefined
+            || promptFirstOrdinalByFork.get(sessionID)
+              === options.deleteGateForFirstOrdinal)
+        ) {
+          events.push("delete-waiting");
+          await options.deleteGate;
+        }
+        deleteRequests.push(request);
         deletes.push(sessionID);
         events.push("delete");
         if (options.deleteError) throw options.deleteError;
@@ -4722,7 +4899,7 @@ type CommandHarnessOptions = {
   partDeleteError?: Error;
   sourceMetadataUpdateError?: Error;
   beforeFinalCount?: () => Promise<void>;
-  toastMode?: "hang" | "fail";
+  toastMode?: "hang" | "fail" | "delay-progress";
 };
 
 function commandHarness(
@@ -4737,8 +4914,23 @@ function commandHarness(
   const abortedSessions: string[] = [];
   const selectedSessions: string[] = [];
   const deletedSessions: string[] = [];
+  const toasts: Array<{
+    title?: string;
+    message?: string;
+    variant?: string;
+    duration?: number;
+  }> = [];
+  let displayedToast: (typeof toasts)[number] | undefined;
+  let releaseProgressToast: (() => void) | undefined;
+  const progressToastGate =
+    options.toastMode === "delay-progress"
+      ? new Promise<void>(resolve => {
+          releaseProgressToast = resolve;
+        })
+      : undefined;
   let backupMessages: MessageWithParts[] | undefined;
   const generationForkMessages = new Map<string, MessageWithParts[]>();
+  const modelPrompts: Record<string, unknown>[] = [];
   const activeGenerationForks = new Set<string>();
   const generationFirstOrdinalByFork = new Map<string, number>();
   let generationPromptCount = 0;
@@ -4930,6 +5122,7 @@ function commandHarness(
       },
       prompt: async (request: Record<string, unknown>) => {
         if (request.noReply !== true) {
+          modelPrompts.push(request);
           generationPromptCount += 1;
           events.push("generation-prompt");
           const firstOrdinal = generationPromptIndex(request).turns[0]!.ordinal;
@@ -5119,7 +5312,20 @@ function commandHarness(
       },
     },
     tui: {
-      showToast: async () => {
+      showToast: async (toast: {
+        title?: string;
+        message?: string;
+        variant?: string;
+        duration?: number;
+      }) => {
+        toasts.push(toast);
+        if (
+          options.toastMode === "delay-progress"
+          && toast.duration === 2_147_483_647
+        ) {
+          await progressToastGate;
+        }
+        displayedToast = toast;
         if (options.toastMode === "hang") return new Promise(() => {});
         if (options.toastMode === "fail") {
           throw new Error("toast failed");
@@ -5135,6 +5341,8 @@ function commandHarness(
 
   return {
     v2,
+    messages,
+    modelPrompts,
     events,
     forks,
     partUpdates,
@@ -5143,6 +5351,11 @@ function commandHarness(
     abortedSessions,
     selectedSessions,
     deletedSessions,
+    toasts,
+    releaseProgressToast: () => releaseProgressToast?.(),
+    get displayedToast() {
+      return displayedToast;
+    },
     get backupMessages() {
       return backupMessages;
     },

@@ -1,3 +1,5 @@
+import { unwrap, type V2Client } from "./api";
+
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -7,6 +9,14 @@ export function unwrapString(value: unknown): string | undefined {
 }
 
 export const CONTROL_OPERATION_TIMEOUT_MS = 30_000;
+export const IN_PROGRESS_TOAST_DURATION_MS = 2_147_483_647;
+
+export type MagicToast = {
+  title: string;
+  message: string;
+  variant: "info" | "error";
+  duration?: number;
+};
 
 const DEADLINE_REASON = Symbol("magic-compact control deadline");
 
@@ -43,4 +53,40 @@ export async function attemptWithinDeadline<T>(
     if (timer !== undefined) clearTimeout(timer);
     onDeadlineTimerChange(-1);
   }
+}
+
+export async function showToastBestEffort(
+  v2: V2Client,
+  toast: MagicToast,
+  deadlineMs: number = CONTROL_OPERATION_TIMEOUT_MS,
+): Promise<void> {
+  await attemptWithinDeadline(
+    signal => v2.tui.showToast(toast, { signal }).then(unwrap),
+    deadlineMs,
+  );
+}
+
+export function createToastFeedback(
+  v2: V2Client,
+  deadlineMs: number = CONTROL_OPERATION_TIMEOUT_MS,
+) {
+  let terminalToast: MagicToast | undefined;
+  return {
+    async showProgress(toast: MagicToast): Promise<void> {
+      await attemptWithinDeadline(signal => {
+        const delivery = v2.tui.showToast(toast, { signal }).then(unwrap);
+        const reassertTerminal = () => {
+          if (terminalToast) {
+            void showToastBestEffort(v2, terminalToast, deadlineMs);
+          }
+        };
+        void delivery.then(reassertTerminal, reassertTerminal);
+        return delivery;
+      }, deadlineMs);
+    },
+    async showTerminal(toast: MagicToast): Promise<void> {
+      terminalToast = toast;
+      await showToastBestEffort(v2, toast, deadlineMs);
+    },
+  };
 }

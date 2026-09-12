@@ -495,6 +495,9 @@ async function requestCompactionGenerationBatches(
           batch,
           plan,
           controlTimeoutMs,
+          () => {
+            stopAdmission = true;
+          },
         );
         if (batchResults.length !== batch.candidates.length) {
           throw validationFailure();
@@ -548,6 +551,7 @@ async function requestCompactionGeneration(
   batch: GenerationBatch,
   plan: CompactionPlan,
   controlTimeoutMs: number,
+  onFailureObserved: () => void,
 ): Promise<GenerationTurnResult[]> {
   const candidates = batch.candidates;
   const route: GenerationRoute = {
@@ -556,34 +560,21 @@ async function requestCompactionGeneration(
       ? { workspace: sourceSession.workspaceID }
       : {}),
   };
-  let forkPromise: Promise<Session> | undefined;
-  const forkOutcome = await attemptWithinDeadline(signal => {
-    forkPromise = v2.session
-      .fork({ sessionID: sourceSession.id, ...route }, { signal })
-      .then(unwrapLifecycleResponse);
-    return forkPromise;
-  }, controlTimeoutMs);
-  if (forkOutcome.kind !== "success") {
-    if (forkOutcome.kind === "timed-out") {
-      if (forkPromise) {
-        void forkPromise
-          .then(fork =>
-            cleanupLateGenerationFork(v2, fork, route, controlTimeoutMs),
-          )
-          .catch(() => undefined);
-      }
-      throw lifecycleFailure(sourceSession.id, "fork", "timeout");
-    }
-    throw lifecycleFailure(
-      sourceSession.id,
-      "fork",
-      "rejection",
-      forkOutcome.error,
+  let fork: Session;
+  try {
+    fork = unwrapLifecycleResponse(
+      await v2.session.fork({ sessionID: sourceSession.id, ...route }),
     );
+  } catch (error) {
+    onFailureObserved();
+    throw lifecycleFailure(sourceSession.id, "fork", "rejection", error);
   }
-  const fork = forkOutcome.value;
 
   let operationError: Error | undefined;
+  const recordOperationError = (error: Error): void => {
+    operationError = error;
+    onFailureObserved();
+  };
   let results: GenerationTurnResult[] | undefined;
   const generationNonce = batch.generationNonce;
   const stopMarker = batch.stopMarker;
@@ -603,11 +594,15 @@ async function requestCompactionGeneration(
     controlTimeoutMs,
   );
   if (permissionOutcome.kind !== "success") {
-    operationError = lifecycleFailure(
-      sourceSession.id,
-      "permission",
-      permissionOutcome.kind === "timed-out" ? "timeout" : "rejection",
-      permissionOutcome.kind === "failed" ? permissionOutcome.error : undefined,
+    recordOperationError(
+      lifecycleFailure(
+        sourceSession.id,
+        "permission",
+        permissionOutcome.kind === "timed-out" ? "timeout" : "rejection",
+        permissionOutcome.kind === "failed"
+          ? permissionOutcome.error
+          : undefined,
+      ),
     );
   }
 
@@ -620,11 +615,13 @@ async function requestCompactionGeneration(
       controlTimeoutMs,
     );
     if (messagesOutcome.kind !== "success") {
-      operationError = lifecycleFailure(
-        sourceSession.id,
-        "history",
-        messagesOutcome.kind === "timed-out" ? "timeout" : "rejection",
-        messagesOutcome.kind === "failed" ? messagesOutcome.error : undefined,
+      recordOperationError(
+        lifecycleFailure(
+          sourceSession.id,
+          "history",
+          messagesOutcome.kind === "timed-out" ? "timeout" : "rejection",
+          messagesOutcome.kind === "failed" ? messagesOutcome.error : undefined,
+        ),
       );
     } else {
       try {
@@ -634,11 +631,8 @@ async function requestCompactionGeneration(
           forkMessageIdentity(messagesOutcome.value[index]!),
         );
       } catch (error) {
-        operationError = lifecycleFailure(
-          sourceSession.id,
-          "history",
-          "rejection",
-          error,
+        recordOperationError(
+          lifecycleFailure(sourceSession.id, "history", "rejection", error),
         );
       }
 
@@ -661,13 +655,15 @@ async function requestCompactionGeneration(
             controlTimeoutMs,
           );
           if (isolationOutcome.kind === "success") continue;
-          operationError = lifecycleFailure(
-            sourceSession.id,
-            "isolation",
-            isolationOutcome.kind === "timed-out" ? "timeout" : "rejection",
-            isolationOutcome.kind === "failed"
-              ? isolationOutcome.error
-              : undefined,
+          recordOperationError(
+            lifecycleFailure(
+              sourceSession.id,
+              "isolation",
+              isolationOutcome.kind === "timed-out" ? "timeout" : "rejection",
+              isolationOutcome.kind === "failed"
+                ? isolationOutcome.error
+                : undefined,
+            ),
           );
           break;
         }
@@ -682,13 +678,15 @@ async function requestCompactionGeneration(
           controlTimeoutMs,
         );
         if (retainedOutcome.kind !== "success") {
-          operationError = lifecycleFailure(
-            sourceSession.id,
-            "history",
-            retainedOutcome.kind === "timed-out" ? "timeout" : "rejection",
-            retainedOutcome.kind === "failed"
-              ? retainedOutcome.error
-              : undefined,
+          recordOperationError(
+            lifecycleFailure(
+              sourceSession.id,
+              "history",
+              retainedOutcome.kind === "timed-out" ? "timeout" : "rejection",
+              retainedOutcome.kind === "failed"
+                ? retainedOutcome.error
+                : undefined,
+            ),
           );
         } else {
           try {
@@ -731,22 +729,21 @@ async function requestCompactionGeneration(
                 controlTimeoutMs,
               );
               if (markerOutcome.kind === "success") continue;
-              operationError = lifecycleFailure(
-                sourceSession.id,
-                "marker",
-                markerOutcome.kind === "timed-out" ? "timeout" : "rejection",
-                markerOutcome.kind === "failed"
-                  ? markerOutcome.error
-                  : undefined,
+              recordOperationError(
+                lifecycleFailure(
+                  sourceSession.id,
+                  "marker",
+                  markerOutcome.kind === "timed-out" ? "timeout" : "rejection",
+                  markerOutcome.kind === "failed"
+                    ? markerOutcome.error
+                    : undefined,
+                ),
               );
               break;
             }
           } catch (error) {
-            operationError = lifecycleFailure(
-              sourceSession.id,
-              "history",
-              "rejection",
-              error,
+            recordOperationError(
+              lifecycleFailure(sourceSession.id, "history", "rejection", error),
             );
           }
         }
@@ -787,78 +784,48 @@ async function requestCompactionGeneration(
         generationNonce,
       );
     } catch (error) {
-      operationError = lifecycleFailure(
-        sourceSession.id,
-        stage,
-        "rejection",
-        error,
-        candidates.length === 1,
+      recordOperationError(
+        lifecycleFailure(
+          sourceSession.id,
+          stage,
+          "rejection",
+          error,
+          candidates.length === 1,
+        ),
       );
-      const abortOutcome = await attemptWithinDeadline(
-        signal =>
-          v2.session
-            .abort({ sessionID: fork.id, ...route }, { signal })
-            .then(unwrapLifecycleResponse),
-        controlTimeoutMs,
-      );
-      if (abortOutcome.kind !== "success") {
+      try {
+        unwrapLifecycleResponse(
+          await v2.session.abort({ sessionID: fork.id, ...route }),
+        );
+      } catch (abortError) {
         operationError = combineLifecycleErrors(
-          operationError,
-          lifecycleFailure(
-            sourceSession.id,
-            "abort",
-            abortOutcome.kind === "timed-out" ? "timeout" : "rejection",
-            abortOutcome.kind === "failed" ? abortOutcome.error : undefined,
-          ),
+          operationError!,
+          lifecycleFailure(sourceSession.id, "abort", "rejection", abortError),
         );
       }
     }
   }
 
-  const deleteOutcome = await attemptWithinDeadline(
-    signal =>
-      v2.session
-        .delete({ sessionID: fork.id, ...route }, { signal })
-        .then(unwrapLifecycleResponse),
-    controlTimeoutMs,
-  );
-  const deleteError =
-    deleteOutcome.kind === "success"
-      ? undefined
-      : lifecycleFailure(
-          sourceSession.id,
-          "delete",
-          deleteOutcome.kind === "timed-out" ? "timeout" : "rejection",
-          deleteOutcome.kind === "failed" ? deleteOutcome.error : undefined,
-        );
+  let deleteError: Error | undefined;
+  try {
+    unwrapLifecycleResponse(
+      await v2.session.delete({ sessionID: fork.id, ...route }),
+    );
+  } catch (error) {
+    deleteError = lifecycleFailure(
+      sourceSession.id,
+      "delete",
+      "rejection",
+      error,
+    );
+    onFailureObserved();
+  }
   if (operationError && deleteError) {
     throw combineLifecycleErrors(operationError, deleteError);
   }
   if (operationError) throw operationError;
   if (deleteError) throw deleteError;
   return results!;
-}
-
-async function cleanupLateGenerationFork(
-  v2: V2Client,
-  fork: Session,
-  route: GenerationRoute,
-  controlTimeoutMs: number,
-): Promise<void> {
-  await attemptWithinDeadline(
-    signal =>
-      v2.session
-        .abort({ sessionID: fork.id, ...route }, { signal })
-        .then(unwrapLifecycleResponse),
-    controlTimeoutMs,
-  );
-  await attemptWithinDeadline(
-    signal =>
-      v2.session
-        .delete({ sessionID: fork.id, ...route }, { signal })
-        .then(unwrapLifecycleResponse),
-    controlTimeoutMs,
-  );
 }
 
 function assertRetainedForkMessageShape(
@@ -1588,9 +1555,7 @@ function lifecycleMessage(
   kind: LifecycleFailureKind,
 ): string {
   if (stage === "fork") {
-    return kind === "timeout"
-      ? "Compaction generation fork creation timed out."
-      : "Compaction generation fork creation failed.";
+    return "Compaction generation fork creation failed.";
   }
   if (stage === "permission") {
     return kind === "timeout"
@@ -1618,13 +1583,9 @@ function lifecycleMessage(
     return "Compaction generation response validation failed.";
   }
   if (stage === "abort") {
-    return kind === "timeout"
-      ? "Compaction generation fork abort timed out."
-      : "Compaction generation fork abort failed.";
+    return "Compaction generation fork abort failed.";
   }
-  return kind === "timeout"
-    ? "Compaction generation fork deletion timed out."
-    : "Compaction generation fork deletion failed.";
+  return "Compaction generation fork deletion failed.";
 }
 
 function safeStatus(error: unknown): number | undefined {

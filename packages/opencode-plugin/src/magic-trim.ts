@@ -5,20 +5,43 @@ import { trimToolParts } from "./compact/prune";
 import {
   applyBackup,
   createBackup,
+  deleteBackup,
   getCompactionCount,
   injectTrimStatsNotice,
   recordPruningStats,
 } from "./compact/session";
 import { countSessionTokens } from "./stats/tokenize";
+import {
+  CONTROL_OPERATION_TIMEOUT_MS,
+  createToastFeedback,
+  IN_PROGRESS_TOAST_DURATION_MS,
+} from "./util";
 
 export const TRIM_SUCCESS = "Magic trimming successful.";
 export const TRIM_NOOP = "No eligible tool calls need trimming.";
+
+export type MagicTrimExecutionOptions = {
+  controlTimeoutMs?: number;
+};
 
 export async function executeMagicTrim(
   v2: V2Client,
   sessionID: string,
   keepTurns: number,
+  options: MagicTrimExecutionOptions = {},
 ): Promise<boolean> {
+  const controlTimeoutMs =
+    options.controlTimeoutMs ?? CONTROL_OPERATION_TIMEOUT_MS;
+  if (!Number.isFinite(controlTimeoutMs) || controlTimeoutMs <= 0) {
+    throw new Error("Magic Trim control deadline must be positive.");
+  }
+  const toastFeedback = createToastFeedback(v2, controlTimeoutMs);
+  await toastFeedback.showProgress({
+    title: "Magic Trim",
+    message: "Trimming session...",
+    variant: "info",
+    duration: IN_PROGRESS_TOAST_DURATION_MS,
+  });
   let backupSession: Session | null = null;
   let sourceSession: Session | null = null;
 
@@ -37,7 +60,10 @@ export async function executeMagicTrim(
       plan.trimmedTurns,
     );
     if (trimmedToolCalls === 0) {
-      await v2.tui.showToast({
+      const unneededBackup = backupSession;
+      backupSession = null;
+      await deleteBackup(v2, unneededBackup.id);
+      await toastFeedback.showTerminal({
         title: "Magic Trim",
         message: TRIM_NOOP,
         variant: "info",
@@ -67,7 +93,7 @@ export async function executeMagicTrim(
       );
     }
 
-    await v2.tui.showToast({
+    await toastFeedback.showTerminal({
       title: "Magic Trim",
       message: `Trimmed ${trimmedToolCalls} tool call(s).`,
       variant: "info",
@@ -75,16 +101,29 @@ export async function executeMagicTrim(
     });
     return true;
   } catch (error) {
+    let failure = error;
     if (sourceSession && backupSession) {
-      await applyBackup(v2, sourceSession, backupSession);
+      try {
+        await applyBackup(v2, sourceSession, backupSession);
+      } catch (recoveryError) {
+        const recoveryGuidance = `Magic Trim automatic recovery failed. Inspect source session ${sourceSession.id} and backup session ${backupSession.id}, then recover manually.`;
+        const recoveryFailure = new Error(recoveryGuidance, {
+          cause: recoveryError,
+        });
+        failure = new AggregateError(
+          [error, recoveryFailure],
+          `Magic Trim failed: ${String(error)} ${recoveryGuidance}`,
+          { cause: error },
+        );
+      }
     }
 
-    await v2.tui.showToast({
+    await toastFeedback.showTerminal({
       title: "Magic Trim Failed",
-      message: String(error),
+      message: String(failure),
       variant: "error",
       duration: 8000,
     });
-    throw error;
+    throw failure;
   }
 }

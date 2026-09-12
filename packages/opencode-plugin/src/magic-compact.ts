@@ -37,7 +37,11 @@ import {
   boundaryPartID,
   summaryEnvelopeTextPart,
 } from "./compact/constants";
-import { attemptWithinDeadline, CONTROL_OPERATION_TIMEOUT_MS } from "./util";
+import {
+  CONTROL_OPERATION_TIMEOUT_MS,
+  createToastFeedback,
+  IN_PROGRESS_TOAST_DURATION_MS,
+} from "./util";
 
 export const COMPACT_SUCCESS = "Magic compaction successful.";
 export const COMPACT_NOOP = "No assistant turns are old enough to compact.";
@@ -58,13 +62,6 @@ export type MagicCompactExecutionOptions = {
   controlTimeoutMs?: number;
 };
 
-type MagicCompactToast = {
-  title: string;
-  message: string;
-  variant: "info" | "error";
-  duration?: number;
-};
-
 export async function executeMagicCompact(
   v2: V2Client,
   sessionID: string,
@@ -76,6 +73,13 @@ export async function executeMagicCompact(
   if (!Number.isFinite(controlTimeoutMs) || controlTimeoutMs <= 0) {
     throw new Error("Magic Compact control deadline must be positive.");
   }
+  const toastFeedback = createToastFeedback(v2, controlTimeoutMs);
+  await toastFeedback.showProgress({
+    title: "Magic Compact",
+    message: "Compacting session...",
+    variant: "info",
+    duration: IN_PROGRESS_TOAST_DURATION_MS,
+  });
   let backupSession: Session | null = null;
   let sourceSession: Session | null = null;
   let sourceWritesStarted = false;
@@ -85,16 +89,12 @@ export async function executeMagicCompact(
     // Check if there's anything to compact
     const sourcePlan = await createCompactionPlan(v2, sessionID, keepTurns);
     if (sourcePlan.summarizedTurns.length === 0) {
-      await showMagicCompactToast(
-        v2,
-        {
-          title: "Magic Compact",
-          message: COMPACT_NOOP,
-          variant: "info",
-          duration: 5000,
-        },
-        controlTimeoutMs,
-      );
+      await toastFeedback.showTerminal({
+        title: "Magic Compact",
+        message: COMPACT_NOOP,
+        variant: "info",
+        duration: 5000,
+      });
       return false;
     }
 
@@ -129,16 +129,12 @@ export async function executeMagicCompact(
       selection.turns.length === 0
       && summaries.every(summary => summary === null)
     ) {
-      await showMagicCompactToast(
-        v2,
-        {
-          title: "Magic Compact",
-          message: COMPACT_NOOP,
-          variant: "info",
-          duration: 5000,
-        },
-        controlTimeoutMs,
-      );
+      await toastFeedback.showTerminal({
+        title: "Magic Compact",
+        message: COMPACT_NOOP,
+        variant: "info",
+        duration: 5000,
+      });
       return false;
     }
 
@@ -233,29 +229,21 @@ export async function executeMagicCompact(
       failure = postWriteFailure(sourceSession.id, backupSession.id);
     }
 
-    await showMagicCompactToast(
-      v2,
-      {
-        title: "Magic Compact Failed",
-        message: String(failure),
-        variant: "error",
-        duration: 8000,
-      },
-      controlTimeoutMs,
-    );
+    await toastFeedback.showTerminal({
+      title: "Magic Compact Failed",
+      message: String(failure),
+      variant: "error",
+      duration: 8000,
+    });
     throw failure;
   }
 
-  await showMagicCompactToast(
-    v2,
-    {
-      title: "Magic Compact",
-      message: `Compacted ${compactedTurnCount} assistant turn(s).`,
-      variant: "info",
-      duration: 5000,
-    },
-    controlTimeoutMs,
-  );
+  await toastFeedback.showTerminal({
+    title: "Magic Compact",
+    message: `Compacted ${compactedTurnCount} assistant turn(s).`,
+    variant: "info",
+    duration: 5000,
+  });
   return true;
 }
 
@@ -265,17 +253,6 @@ function postWriteFailure(
 ): Error {
   return new Error(
     `Magic Compact failed after source writes began. The live source session ${sourceSessionID} and backup session ${backupSessionID} were both preserved; inspect both and recover manually from backup ${backupSessionID}.`,
-  );
-}
-
-async function showMagicCompactToast(
-  v2: V2Client,
-  toast: MagicCompactToast,
-  controlTimeoutMs: number,
-): Promise<void> {
-  await attemptWithinDeadline(
-    signal => v2.tui.showToast(toast, { signal }).then(unwrap),
-    controlTimeoutMs,
   );
 }
 
