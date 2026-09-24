@@ -41,6 +41,7 @@ import {
 
 const GENERATION_PERMISSION: PermissionRuleset = [
   { permission: "*", pattern: "*", action: "deny" },
+  { permission: "StructuredOutput", pattern: "*", action: "allow" },
 ];
 const GENERATION_FORMAT = {
   type: "json_schema" as const,

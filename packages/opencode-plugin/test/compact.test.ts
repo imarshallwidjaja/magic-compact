@@ -940,7 +940,10 @@ describe("bounded native compaction generation", () => {
         sessionID: "generation-fork",
         directory: "/workspace",
         workspace: "workspace",
-        permission: [{ permission: "*", pattern: "*", action: "deny" }],
+        permission: [
+          { permission: "*", pattern: "*", action: "deny" },
+          { permission: "StructuredOutput", pattern: "*", action: "allow" },
+        ],
       },
     ]);
     expect(harness.prompts[0]).toMatchObject({
