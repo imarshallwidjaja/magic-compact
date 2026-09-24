@@ -613,7 +613,7 @@ describe("native generation batch planning", () => {
 });
 
 describe("bounded native compaction generation", () => {
-  test("registers a hidden deny-all summarizer whose prompt uses retained native fork history", async () => {
+  test("registers a hidden summarizer that denies operational tools and uses retained fork history", async () => {
     const hooks = await server({} as PluginInput);
     const config = {} as Config;
 
@@ -907,7 +907,7 @@ describe("bounded native compaction generation", () => {
     expect(harness.prompts).toEqual([]);
   });
 
-  test("denies the complete fork before one configured summarizer request and deletes it once", async () => {
+  test("denies operational tools while permitting one structured summarizer response", async () => {
     const turns = [
       candidateTurn("first", "alpha", []),
       candidateTurn("second", "beta", []),
@@ -950,6 +950,14 @@ describe("bounded native compaction generation", () => {
       agent: "magic-compact-summarizer",
       model: { providerID: "configured-provider", modelID: "configured-model" },
       variant: "configured-variant",
+      format: {
+        type: "json_schema",
+        schema: {
+          type: "object",
+          required: ["turns"],
+          additionalProperties: false,
+        },
+      },
     });
     expect(harness.creates).toEqual([]);
     expect(harness.forks).toEqual([
@@ -959,6 +967,85 @@ describe("bounded native compaction generation", () => {
         workspace: "workspace",
       },
     ]);
+    expect(harness.deletes).toEqual(["generation-fork"]);
+    const format = harness.prompts[0]!["format"] as {
+      retryCount?: number;
+      schema: Record<string, unknown>;
+    };
+    expect(format.retryCount).toBeUndefined();
+    expect(format.schema).toMatchObject({
+      properties: {
+        turns: {
+          type: "array",
+          items: {
+            required: [
+              "ordinal",
+              "marker",
+              "anchor",
+              "summary",
+              "visualDescriptions",
+            ],
+            additionalProperties: false,
+            properties: {
+              visualDescriptions: {
+                items: {
+                  required: ["ordinal", "description"],
+                  additionalProperties: false,
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+  });
+
+  test("accepts structured output independently of text parts", async () => {
+    const turn = candidateTurn("structured", "anchor", []);
+    const harness = generationHarness([turn], responseFor([turn]), {
+      responseText: "invalid JSON from an unrelated text part",
+    });
+
+    const summaries = await generateCompactionSummaries(
+      harness.v2,
+      sourceSession(),
+      generationPlan([turn]),
+    );
+
+    expect(summaries[0]?.text).toBe("Turn 1 outcome and continuation details.");
+    expect(harness.aborts).toEqual([]);
+    expect(harness.deletes).toEqual(["generation-fork"]);
+  });
+
+  test("rejects text-only output without a fallback or leaking its contents", async () => {
+    const turn = candidateTurn("text-only", "private anchor", []);
+    const secret = "UNTRUSTED_PROVIDER_BODY_7c1";
+    const harness = generationHarness([turn], responseFor([turn]), {
+      omitStructured: true,
+      responseText: JSON.stringify({
+        turns: [result(1, "private anchor", secret)],
+      }),
+    });
+
+    let failure: unknown;
+    try {
+      await generateCompactionSummaries(
+        harness.v2,
+        sourceSession(),
+        generationPlan([turn]),
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe(
+      "Compaction generation response validation failed: missing structured output.",
+    );
+    expect(nestedErrorMessages(failure).join(" ")).not.toContain(secret);
+    expect(nestedErrorMessages(failure).join(" ")).not.toContain(
+      "private anchor",
+    );
+    expect(harness.aborts).toEqual(["generation-fork"]);
     expect(harness.deletes).toEqual(["generation-fork"]);
   });
 
@@ -1383,7 +1470,23 @@ describe("bounded native compaction generation", () => {
   });
 
   test.each([
-    ["drops a turn", { turns: [result(1, "alpha", "one")] }],
+    [
+      "drops a turn",
+      { turns: [result(1, "alpha", "one")] },
+      "invalid envelope or turn count",
+    ],
+    [
+      "adds an envelope key",
+      {
+        turns: [
+          result(1, "alpha", "one"),
+          result(2, "beta", "two"),
+          result(3, "gamma", "three"),
+        ],
+        secretEnvelopeKey: "sensitive",
+      },
+      "invalid envelope or turn count",
+    ],
     [
       "shifts a middle ordinal",
       {
@@ -1393,6 +1496,7 @@ describe("bounded native compaction generation", () => {
           result(3, "gamma", "three"),
         ],
       },
+      "invalid turn shape or identity",
     ],
     [
       "duplicates an ordinal",
@@ -1403,6 +1507,7 @@ describe("bounded native compaction generation", () => {
           result(3, "gamma", "three"),
         ],
       },
+      "invalid turn shape or identity",
     ],
     [
       "reorders anchors",
@@ -1413,6 +1518,7 @@ describe("bounded native compaction generation", () => {
           result(3, "gamma", "three"),
         ],
       },
+      "invalid turn shape or identity",
     ],
     [
       "returns an empty summary",
@@ -1423,28 +1529,57 @@ describe("bounded native compaction generation", () => {
           result(3, "gamma", "three"),
         ],
       },
+      "invalid summary",
     ],
-  ])("fails atomically when one response %s", async (_name, response) => {
-    const turns = [
-      candidateTurn("alpha", "alpha", []),
-      candidateTurn("beta", "beta", []),
-      candidateTurn("gamma", "gamma", []),
-    ];
-    const harness = generationHarness(turns, response as GenerationResponse);
+    [
+      "adds a turn key",
+      {
+        turns: [
+          { ...result(1, "alpha", "one"), secretTurnKey: "sensitive" },
+          result(2, "beta", "two"),
+          result(3, "gamma", "three"),
+        ],
+      },
+      "invalid turn shape or identity",
+    ],
+  ])(
+    "fails atomically when one response %s",
+    async (_name, response, category) => {
+      const turns = [
+        candidateTurn("alpha", "alpha", []),
+        candidateTurn("beta", "beta", []),
+        candidateTurn("gamma", "gamma", []),
+      ];
+      const harness = generationHarness(turns, response as GenerationResponse);
 
-    await expect(
-      generateCompactionSummaries(
-        harness.v2,
-        sourceSession(),
-        generationPlan(turns),
-      ),
-    ).rejects.toThrow("response validation failed");
+      let failure: unknown;
+      try {
+        await generateCompactionSummaries(
+          harness.v2,
+          sourceSession(),
+          generationPlan(turns),
+        );
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toBe(
+        `Compaction generation response validation failed: ${category}.`,
+      );
+      expect(nestedErrorMessages(failure).join(" ")).not.toContain("sensitive");
+      expect(nestedErrorMessages(failure).join(" ")).not.toContain(
+        "secretTurnKey",
+      );
+      expect(nestedErrorMessages(failure).join(" ")).not.toContain(
+        "secretEnvelopeKey",
+      );
 
-    expect(harness.forks).toHaveLength(1);
-    expect(harness.prompts).toHaveLength(1);
-    expect(harness.aborts).toEqual(["generation-fork"]);
-    expect(harness.deletes).toEqual(["generation-fork"]);
-  });
+      expect(harness.forks).toHaveLength(1);
+      expect(harness.prompts).toHaveLength(1);
+      expect(harness.aborts).toEqual(["generation-fork"]);
+      expect(harness.deletes).toEqual(["generation-fork"]);
+    },
+  );
 
   test("covers an assistant-only image without changing its persisted bytes", async () => {
     const url = `data:image/png;base64,${"A".repeat(512)}`;
@@ -1672,7 +1807,7 @@ describe("bounded native compaction generation", () => {
         sourceSession(),
         generationPlan([turn]),
       ),
-    ).rejects.toThrow("response validation failed");
+    ).rejects.toThrow("response validation failed: invalid visual coverage.");
     expect(harness.deletes).toEqual(["generation-fork"]);
   });
 
@@ -1824,7 +1959,9 @@ describe("bounded native compaction generation", () => {
         sourceSession(),
         generationPlan([turn]),
       ),
-    ).rejects.toThrow("response validation failed");
+    ).rejects.toThrow(
+      "response validation failed: invalid turn shape or identity.",
+    );
     expect(harness.aborts).toEqual(["generation-fork"]);
     expect(harness.deletes).toEqual(["generation-fork"]);
   });
@@ -1844,7 +1981,9 @@ describe("bounded native compaction generation", () => {
         sourceSession(),
         generationPlan(turns),
       ),
-    ).rejects.toThrow("response validation failed");
+    ).rejects.toThrow(
+      "response validation failed: invalid turn shape or identity.",
+    );
     expect(harness.aborts).toEqual(["generation-fork"]);
     expect(harness.deletes).toEqual(["generation-fork"]);
   });
@@ -2446,13 +2585,46 @@ describe("bounded native compaction generation", () => {
     expect(harness.deletes).toHaveLength(5);
   });
 
+  test("accepts captured structured output when finish reports length", async () => {
+    const turn = candidateTurn("captured-length", "captured response", []);
+    const harness = generationHarness([turn], responseFor([turn]), {
+      responseFinish: "length",
+    });
+
+    await expect(
+      generateCompactionSummaries(
+        harness.v2,
+        sourceSession(),
+        generationPlan([turn]),
+      ),
+    ).resolves.toEqual([{ text: "Turn 1 outcome and continuation details." }]);
+  });
+
   test.each([
-    ["finish length", { responseFinish: "length" }],
-    ["finish output-length", { responseFinish: "output_length" }],
-    ["finish max-token", { responseFinish: "max_token" }],
+    ["finish length", { responseFinish: "length", omitStructured: true }],
+    [
+      "finish length with structured output error",
+      {
+        responseFinish: "length",
+        omitStructured: true,
+        responseError: {
+          name: "StructuredOutputError",
+          data: {
+            message: "Model did not produce structured output",
+            retries: 0,
+          },
+        },
+      },
+    ],
+    [
+      "finish output-length",
+      { responseFinish: "output_length", omitStructured: true },
+    ],
+    ["finish max-token", { responseFinish: "max_token", omitStructured: true }],
     [
       "output length error",
       {
+        omitStructured: true,
         responseError: {
           name: "MessageOutputLengthError",
           data: { raw: "must stay hidden" },
@@ -2462,6 +2634,7 @@ describe("bounded native compaction generation", () => {
     [
       "nested max-output-token error",
       {
+        omitStructured: true,
         responseError: {
           error: {
             cause: {
@@ -2478,13 +2651,18 @@ describe("bounded native compaction generation", () => {
       const turn = candidateTurn("truncated", "truncate request", []);
       const harness = generationHarness([turn], { turns: [] }, options);
 
-      await expect(
-        generateCompactionSummaries(
-          harness.v2,
-          sourceSession(),
-          generationPlan([turn]),
-        ),
-      ).rejects.toThrow(/single turn.*more output capacity/i);
+      const failure = await generateCompactionSummaries(
+        harness.v2,
+        sourceSession(),
+        generationPlan([turn]),
+      ).then(
+        () => undefined,
+        error => error as Error,
+      );
+      expect(failure?.message).toMatch(/single turn.*more output capacity/i);
+      expect(failure?.message).not.toContain(
+        "Model did not produce structured output",
+      );
       expect(harness.aborts).toEqual(["generation-fork"]);
       expect(harness.deletes).toEqual(["generation-fork"]);
     },
@@ -2497,6 +2675,14 @@ describe("bounded native compaction generation", () => {
     ];
     const harness = generationHarness(turns, responseFor(turns), {
       responseFinish: "length",
+      omitStructured: true,
+      responseError: {
+        name: "StructuredOutputError",
+        data: {
+          message: "Model did not produce structured output",
+          retries: 0,
+        },
+      },
     });
 
     await expect(
@@ -2506,6 +2692,30 @@ describe("bounded native compaction generation", () => {
         generationPlan(turns),
       ),
     ).rejects.toThrow(/larger N.*fewer turns/i);
+  });
+
+  test("keeps other provider errors ahead of finish truncation with sanitized output", async () => {
+    const turn = candidateTurn("provider-error", "provider failure", []);
+    const harness = generationHarness([turn], responseFor([turn]), {
+      responseFinish: "length",
+      responseError: {
+        name: "ProviderError",
+        data: { message: "raw provider detail" },
+      },
+    });
+
+    const failure = await generateCompactionSummaries(
+      harness.v2,
+      sourceSession(),
+      generationPlan([turn]),
+    ).then(
+      () => undefined,
+      error => error as Error,
+    );
+
+    expect(failure?.message).toMatch(/model request failed/i);
+    expect(failure?.message).not.toContain("raw provider detail");
+    expect(failure?.message).not.toMatch(/more output capacity/i);
   });
 
   test("preserves trim-first overflow guidance through one sanitized nested cause", async () => {
@@ -2948,14 +3158,14 @@ describe("compaction orchestration", () => {
       }
       expect(failure).toBeInstanceOf(Error);
       expect((failure as Error).message).toBe(
-        "Compaction generation response validation failed.",
+        "Compaction generation response validation failed: invalid envelope or turn count.",
       );
       expect(nestedErrorMessages(failure).join(" ")).not.toContain(
         "toast failed",
       );
       expect(failed.toasts.map(toast => toast.message)).toEqual([
         "Compacting session...",
-        "GenerationLifecycleError: Compaction generation response validation failed.",
+        "GenerationLifecycleError: Compaction generation response validation failed: invalid envelope or turn count.",
       ]);
       expect(JSON.stringify(failed.messages)).not.toContain(
         "Compacting session...",
@@ -3110,8 +3320,7 @@ describe("compaction orchestration", () => {
       .find(part => {
         if (part.type !== "text") return false;
         const metadata = part.metadata?.magicCompact as
-          | Record<string, unknown>
-          | undefined;
+          Record<string, unknown> | undefined;
         return metadata?.["stats"] === true;
       }) as TextPart | undefined;
     expect(statsNotice).toBeDefined();
@@ -3257,7 +3466,7 @@ describe("compaction orchestration", () => {
     });
 
     await expect(executeMagicCompact(harness.v2, "source", 0)).rejects.toThrow(
-      "response validation failed",
+      "response validation failed: invalid envelope or turn count.",
     );
 
     expect(harness.forks).toEqual(["generation-fork"]);
@@ -3378,9 +3587,21 @@ describe("compaction orchestration", () => {
       }),
     });
 
-    await expect(executeMagicCompact(harness.v2, "source", 0)).rejects.toThrow(
-      "response validation failed",
+    let failure: unknown;
+    try {
+      await executeMagicCompact(harness.v2, "source", 0);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe(
+      "Compaction generation response validation failed: nonce leakage.",
     );
+    const diagnostics = nestedErrorMessages(failure).join(" ");
+    expect(diagnostics).not.toContain(
+      generationPromptIndex(harness.modelPrompts[0]!).turns[0]!.marker,
+    );
+    expect(diagnostics).not.toContain("summary-leak request");
 
     expect(messages).toEqual(before);
     expect(harness.forks).toEqual(["generation-fork"]);
@@ -3426,7 +3647,7 @@ describe("compaction orchestration", () => {
     });
 
     await expect(executeMagicCompact(harness.v2, "source", 0)).rejects.toThrow(
-      "response validation failed",
+      "response validation failed: nonce leakage.",
     );
 
     expect(messages).toEqual(before);
@@ -4089,6 +4310,8 @@ function generationHarness(
     modelImageCapability?: boolean;
     responseFinish?: string;
     responseError?: unknown;
+    responseText?: string;
+    omitStructured?: boolean;
     permissionError?: Error;
     abortError?: Error;
     deleteError?: Error;
@@ -4294,12 +4517,10 @@ function generationHarness(
           ) {
             throw options.providerError ?? new Error("batch provider failure");
           }
-          const text = JSON.stringify(
-            responseWithPromptMarkers(
-              request,
-              response,
-              options.responseMarkerOrder,
-            ),
+          const structured = responseWithPromptMarkers(
+            request,
+            response,
+            options.responseMarkerOrder,
           );
           completedPromptFirstOrdinals.push(firstOrdinal);
           return {
@@ -4312,8 +4533,11 @@ function generationHarness(
                 ...(options.responseError
                   ? { error: options.responseError }
                   : {}),
+                ...(!options.omitStructured ? { structured } : {}),
               },
-              parts: [textPart("response-text", "response", text)],
+              parts: options.responseText
+                ? [textPart("response-text", "response", options.responseText)]
+                : [],
             },
           };
         } finally {
@@ -4651,6 +4875,7 @@ function responseWithPromptMarkers(
   const index = generationPromptIndex(request);
   const ordinals = new Set(index.turns.map(turn => turn.ordinal));
   return {
+    ...response,
     turns: response.turns
       .filter(turn => ordinals.has(turn.ordinal))
       .map((turn, turnIndex) => ({
@@ -4681,6 +4906,7 @@ function generationRequestInputTokens(
 ): number {
   return (
     NATIVE_BATCH_FIXED_RESERVE_TOKENS
+    + generationSchemaTokens(request)
     + countGptTokens(promptText(request))
     + buildTurns(retainedMessages).reduce(
       (total, turn) => total + estimateNativeTurnCost(turn).inputTokens,
@@ -4720,10 +4946,16 @@ function conservativeGenerationRequestInputTokens(
     );
   return (
     NATIVE_BATCH_FIXED_RESERVE_TOKENS
+    + generationSchemaTokens(request)
     + countGptTokens(replaceNonce(promptText(request)))
     + actualHistoryTokens
     + markerTokenAdjustment
   );
+}
+
+function generationSchemaTokens(request: Record<string, unknown>): number {
+  const format = request["format"] as { schema: Record<string, unknown> };
+  return countGptTokens(JSON.stringify(format.schema));
 }
 
 function estimatedGenerationResponseTokens(
@@ -5156,14 +5388,11 @@ function commandHarness(
               : response;
             return {
               data: {
-                info: { id: "generation-response" },
-                parts: [
-                  textPart(
-                    "generation-response-text",
-                    "generation-response",
-                    JSON.stringify(transformedResponse),
-                  ),
-                ],
+                info: {
+                  id: "generation-response",
+                  structured: transformedResponse,
+                },
+                parts: [],
               },
             };
           } finally {

@@ -42,6 +42,48 @@ import {
 const GENERATION_PERMISSION: PermissionRuleset = [
   { permission: "*", pattern: "*", action: "deny" },
 ];
+const GENERATION_FORMAT = {
+  type: "json_schema" as const,
+  schema: {
+    type: "object",
+    properties: {
+      turns: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            ordinal: { type: "integer" },
+            marker: { type: "string" },
+            anchor: { type: "string" },
+            summary: { type: "string" },
+            visualDescriptions: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  ordinal: { type: "integer" },
+                  description: { type: "string" },
+                },
+                required: ["ordinal", "description"],
+                additionalProperties: false,
+              },
+            },
+          },
+          required: [
+            "ordinal",
+            "marker",
+            "anchor",
+            "summary",
+            "visualDescriptions",
+          ],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["turns"],
+    additionalProperties: false,
+  },
+};
 const TARGET_ANCHOR_CHARACTER_LIMIT = 300;
 const GLOBAL_ANCHOR_CHARACTER_LIMIT = 160;
 const GENERATION_NONCE_ATTEMPTS = 8;
@@ -500,7 +542,7 @@ async function requestCompactionGenerationBatches(
           },
         );
         if (batchResults.length !== batch.candidates.length) {
-          throw validationFailure();
+          throw validationFailure("invalid envelope or turn count");
         }
         results[batchIndex] = batchResults;
       } catch (error) {
@@ -539,7 +581,7 @@ async function requestCompactionGenerationBatches(
         candidate.ordinal !== index + 1 || !orderedResults[index],
     )
   ) {
-    throw validationFailure();
+    throw validationFailure("invalid envelope or turn count");
   }
   return orderedResults;
 }
@@ -761,6 +803,7 @@ async function requestCompactionGeneration(
           agent: MAGIC_COMPACT_SUMMARIZER_AGENT,
           model: settings.model,
           ...(settings.variant ? { variant: settings.variant } : {}),
+          format: GENERATION_FORMAT,
           parts: [
             {
               type: "text",
@@ -769,17 +812,25 @@ async function requestCompactionGeneration(
           ],
         }),
       );
-      if (isRecord(body) && body["info"] && isRecord(body["info"])) {
-        const responseInfo = body["info"];
+      const responseInfo =
+        isRecord(body) && isRecord(body["info"]) ? body["info"] : undefined;
+      const structuredOutput = responseInfo?.["structured"];
+      if (responseInfo) {
         const responseError = responseInfo["error"];
-        if (responseError) throw responseError;
-        if (isOutputTruncation(responseInfo["finish"])) {
+        const outputTruncated = isOutputTruncation(responseInfo["finish"]);
+        const structuredOutputFailure = diagnosticCategories(
+          responseError,
+        ).includes("structuredoutputerror");
+        if (responseError && !(outputTruncated && structuredOutputFailure)) {
+          throw responseError;
+        }
+        if (outputTruncated && structuredOutput === undefined) {
           throw { name: "MessageOutputLengthError" };
         }
       }
       stage = "validation";
       results = parseGenerationResponse(
-        isRecord(body) ? body["parts"] : undefined,
+        structuredOutput,
         candidates,
         generationNonce,
       );
@@ -1241,7 +1292,7 @@ function buildGenerationPrompt(
 ): string {
   return [
     "Generate one continuation summary for each indexed turn using the retained native fork history.",
-    "Return only the JSON object required by your system prompt.",
+    "Submit the object required by your system prompt through StructuredOutput.",
     globalTurnIndexPrompt,
     "Use the ephemeral markers only as ordering guides. Echo each exact marker token, target ordinal, and target anchor; marker echo is allowed. Never include the active generation nonce or marker token in summaries or visual descriptions; useful source identifiers may remain when you include them.",
     JSON.stringify({
@@ -1270,7 +1321,8 @@ function estimateGenerationExplicitRequestTokens(
   globalTurnIndexPrompt: string,
 ): number {
   return (
-    countGptTokens(
+    countGptTokens(JSON.stringify(GENERATION_FORMAT.schema))
+    + countGptTokens(
       buildGenerationPrompt(
         candidates,
         nextTurnAnchor,
@@ -1322,31 +1374,19 @@ function buildGlobalTurnIndexPrompt(plan: CompactionPlan): string {
 }
 
 function parseGenerationResponse(
-  parts: unknown,
+  parsed: unknown,
   candidates: GenerationCandidate[],
   nonce: string,
 ): GenerationTurnResult[] {
-  if (!Array.isArray(parts)) throw validationFailure();
-  const textParts = parts.flatMap(part => {
-    if (!isRecord(part) || part["type"] !== "text") return [];
-    const text = part["text"];
-    return typeof text === "string" && text.trim() ? [text] : [];
-  });
-  if (textParts.length !== 1) throw validationFailure();
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(textParts[0]!);
-  } catch {
-    throw validationFailure();
-  }
+  if (parsed === undefined)
+    throw validationFailure("missing structured output");
   if (
     !isPlainRecord(parsed)
     || !hasExactKeys(parsed, ["turns"])
     || !Array.isArray(parsed["turns"])
     || parsed["turns"].length !== candidates.length
   ) {
-    throw validationFailure();
+    throw validationFailure("invalid envelope or turn count");
   }
 
   return parsed["turns"].map((value, index) => {
@@ -1363,19 +1403,20 @@ function parseGenerationResponse(
       || value["ordinal"] !== candidate.ordinal
       || value["marker"] !== candidate.marker
       || value["anchor"] !== candidate.anchor
-      || typeof value["summary"] !== "string"
-      || !value["summary"].trim()
       || !Array.isArray(value["visualDescriptions"])
     ) {
-      throw validationFailure();
+      throw validationFailure("invalid turn shape or identity");
+    }
+    if (typeof value["summary"] !== "string" || !value["summary"].trim()) {
+      throw validationFailure("invalid summary");
     }
     const expectedImages = candidate.mediaManifest?.images.length ?? 0;
     if (value["visualDescriptions"].length !== expectedImages) {
-      throw validationFailure();
+      throw validationFailure("invalid visual coverage");
     }
     const summary = value["summary"].trim();
     if (summary.includes(nonce)) {
-      throw validationFailure();
+      throw validationFailure("nonce leakage");
     }
     const visualDescriptions = value["visualDescriptions"].map(
       (description, imageIndex) => {
@@ -1386,11 +1427,11 @@ function parseGenerationResponse(
           || typeof description["description"] !== "string"
           || !description["description"].trim()
         ) {
-          throw validationFailure();
+          throw validationFailure("invalid visual coverage");
         }
         const text = description["description"].trim();
         if (text.includes(nonce)) {
-          throw validationFailure();
+          throw validationFailure("nonce leakage");
         }
         return {
           ordinal: imageIndex + 1,
@@ -1454,8 +1495,22 @@ function assertGeneratedPartIDsAvailable(plan: CompactionPlan): void {
   }
 }
 
-function validationFailure(): Error {
-  return new Error("Compaction generation response validation failed.");
+type ValidationCategory =
+  | "missing structured output"
+  | "invalid envelope or turn count"
+  | "invalid turn shape or identity"
+  | "invalid summary"
+  | "invalid visual coverage"
+  | "nonce leakage";
+
+class GenerationResponseValidationError extends Error {
+  constructor(readonly category: ValidationCategory) {
+    super();
+  }
+}
+
+function validationFailure(category: ValidationCategory): Error {
+  return new GenerationResponseValidationError(category);
 }
 
 function hasExactKeys(
@@ -1514,13 +1569,16 @@ function lifecycleFailure(
   const message =
     error instanceof GenerationMarkerNonceCollisionError
       ? error.message
-      : overflow
-        ? "The complete forked session exceeded the configured compaction model context. Run /magic-trim first, then retry /magic-compact."
-        : truncated
-          ? singleTurn
-            ? "The compaction model reached its output limit while summarizing a single turn. Configure a compaction model with more output capacity."
-            : "The compaction model reached its output limit. Retry /magic-compact with a larger N so fewer turns are selected."
-          : lifecycleMessage(stage, kind);
+      : stage === "validation"
+          && error instanceof GenerationResponseValidationError
+        ? `Compaction generation response validation failed: ${error.category}.`
+        : overflow
+          ? "The complete forked session exceeded the configured compaction model context. Run /magic-trim first, then retry /magic-compact."
+          : truncated
+            ? singleTurn
+              ? "The compaction model reached its output limit while summarizing a single turn. Configure a compaction model with more output capacity."
+              : "The compaction model reached its output limit. Retry /magic-compact with a larger N so fewer turns are selected."
+            : lifecycleMessage(stage, kind);
   return new GenerationLifecycleError(
     sourceSessionID,
     stage,
