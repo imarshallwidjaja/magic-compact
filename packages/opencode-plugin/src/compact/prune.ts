@@ -240,12 +240,20 @@ async function prepareToolPart(
     return false;
   }
   const magicCompact = part.state.metadata["magicCompact"];
-  if (isRecord(magicCompact) && magicCompact["trimmed"] === true) {
+  const alreadyTrimmed =
+    isRecord(magicCompact) && magicCompact["trimmed"] === true;
+
+  // Input rules are idempotent on their own results ([Omitted], or a command
+  // already cut below its limit), so they still apply to parts marked by
+  // earlier rule sets. Output rules are not idempotent: read would re-wrap its
+  // own omission notice.
+  const inputNotice = await applyInputOmissions(part, allocate);
+  if (alreadyTrimmed && !inputNotice) {
     return false;
   }
-
-  const inputNotice = await applyInputOmissions(part, allocate);
-  await applyOutputOmissions(part, allocate);
+  if (!alreadyTrimmed) {
+    await applyOutputOmissions(part, allocate);
+  }
 
   if (inputNotice) {
     part.state.output = `${inputNotice}\n\n${part.state.output}`;
@@ -325,6 +333,19 @@ async function applyInputOmissions(
       return inputOmissionNotice(
         "File edit oldString and newString omitted due to compaction operation. If necessary, reread file to see current contents.",
         Buffer.byteLength(combined),
+        contentID,
+      );
+    }
+  }
+
+  if (part.tool === "task") {
+    const prompt = unwrapString(input["prompt"]);
+    if (prompt && exceeds(prompt, DEFAULT_LIMIT)) {
+      const contentID = await allocate({ content: prompt });
+      input["prompt"] = "[Omitted]";
+      return inputOmissionNotice(
+        "Task prompt omitted due to compaction operation. If necessary, reread it via read_omitted_content.",
+        Buffer.byteLength(prompt),
         contentID,
       );
     }

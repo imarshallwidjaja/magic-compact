@@ -151,13 +151,13 @@ Completed tool outputs over 128 words or 1024 characters are omitted by default.
 - `read` — output always omitted (stale file contents are reloadable)
 - `write` / `edit` / `apply_patch` — large file content omitted
 - `bash` — commands over 1024 characters are truncated
-- `task` — output omitted above a higher threshold (512 words / 4096 characters)
+- `task` — large prompts omitted; output omitted above a higher threshold (512 words / 4096 characters)
 - `question` — input and output preserved
 - `todowrite` / `skill` — output discarded without caching (redundant or reloadable)
 
 Pending, running, and errored tool calls are always preserved as-is.
 
-Completed tool calls processed by pruning are marked so later trim and compaction operations do not trim them again.
+Completed tool calls processed by pruning are marked so later trim and compaction operations do not output-trim them again. Idempotent input rules still apply to calls processed under earlier rules.
 
 ## Vs DCP Plugin (OpenCode)
 

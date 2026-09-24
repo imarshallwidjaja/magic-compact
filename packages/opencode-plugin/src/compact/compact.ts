@@ -543,7 +543,10 @@ async function requestCompactionGenerationBatches(
           },
         );
         if (batchResults.length !== batch.candidates.length) {
-          throw validationFailure("invalid envelope or turn count");
+          throw validationFailure("turn count mismatch", {
+            expected: batch.candidates.length,
+            received: batchResults.length,
+          });
         }
         results[batchIndex] = batchResults;
       } catch (error) {
@@ -575,14 +578,29 @@ async function requestCompactionGenerationBatches(
 
   const candidates = batches.flatMap(batch => batch.candidates);
   const orderedResults = results.flatMap(batchResults => batchResults ?? []);
+  if (orderedResults.length !== candidates.length) {
+    throw lifecycleFailure(
+      sourceSession.id,
+      "validation",
+      "rejection",
+      validationFailure("turn count mismatch", {
+        expected: candidates.length,
+        received: orderedResults.length,
+      }),
+    );
+  }
   if (
-    orderedResults.length !== candidates.length
-    || candidates.some(
+    candidates.some(
       (candidate, index) =>
         candidate.ordinal !== index + 1 || !orderedResults[index],
     )
   ) {
-    throw validationFailure("invalid envelope or turn count");
+    throw lifecycleFailure(
+      sourceSession.id,
+      "validation",
+      "rejection",
+      validationFailure("invalid envelope"),
+    );
   }
   return orderedResults;
 }
@@ -819,9 +837,7 @@ async function requestCompactionGeneration(
       if (responseInfo) {
         const responseError = responseInfo["error"];
         const outputTruncated = isOutputTruncation(responseInfo["finish"]);
-        const structuredOutputFailure = diagnosticCategories(
-          responseError,
-        ).includes("structuredoutputerror");
+        const structuredOutputFailure = isStructuredOutputError(responseError);
         if (responseError && !(outputTruncated && structuredOutputFailure)) {
           throw responseError;
         }
@@ -1385,9 +1401,14 @@ function parseGenerationResponse(
     !isPlainRecord(parsed)
     || !hasExactKeys(parsed, ["turns"])
     || !Array.isArray(parsed["turns"])
-    || parsed["turns"].length !== candidates.length
   ) {
-    throw validationFailure("invalid envelope or turn count");
+    throw validationFailure("invalid envelope");
+  }
+  if (parsed["turns"].length !== candidates.length) {
+    throw validationFailure("turn count mismatch", {
+      expected: candidates.length,
+      received: parsed["turns"].length,
+    });
   }
 
   return parsed["turns"].map((value, index) => {
@@ -1498,20 +1519,38 @@ function assertGeneratedPartIDsAvailable(plan: CompactionPlan): void {
 
 type ValidationCategory =
   | "missing structured output"
-  | "invalid envelope or turn count"
+  | "invalid envelope"
+  | "turn count mismatch"
   | "invalid turn shape or identity"
   | "invalid summary"
   | "invalid visual coverage"
   | "nonce leakage";
 
+type TurnCounts = { expected: number; received: number };
+
 class GenerationResponseValidationError extends Error {
-  constructor(readonly category: ValidationCategory) {
+  constructor(
+    readonly category: ValidationCategory,
+    readonly turnCounts?: TurnCounts,
+  ) {
     super();
   }
 }
 
-function validationFailure(category: ValidationCategory): Error {
-  return new GenerationResponseValidationError(category);
+function validationFailure(
+  category: ValidationCategory,
+  turnCounts?: TurnCounts,
+): Error {
+  return new GenerationResponseValidationError(category, turnCounts);
+}
+
+function validationCategoryText(
+  error: GenerationResponseValidationError,
+): string {
+  if (error.category === "turn count mismatch" && error.turnCounts) {
+    return `${error.category} (expected ${error.turnCounts.expected}, received ${error.turnCounts.received})`;
+  }
+  return error.category;
 }
 
 function hasExactKeys(
@@ -1567,19 +1606,23 @@ function lifecycleFailure(
   const status = safeStatus(error);
   const overflow = stage === "provider" && isContextOverflow(error, status);
   const truncated = stage === "provider" && isOutputTruncation(error);
+  const missingStructuredOutput =
+    stage === "provider" && isStructuredOutputError(error);
   const message =
     error instanceof GenerationMarkerNonceCollisionError
       ? error.message
       : stage === "validation"
           && error instanceof GenerationResponseValidationError
-        ? `Compaction generation response validation failed: ${error.category}.`
+        ? `Compaction generation response validation failed: ${validationCategoryText(error)}.`
         : overflow
           ? "The complete forked session exceeded the configured compaction model context. Run /magic-trim first, then retry /magic-compact."
           : truncated
             ? singleTurn
               ? "The compaction model reached its output limit while summarizing a single turn. Configure a compaction model with more output capacity."
               : "The compaction model reached its output limit. Retry /magic-compact with a larger N so fewer turns are selected."
-            : lifecycleMessage(stage, kind);
+            : missingStructuredOutput
+              ? "The compaction model finished without submitting its StructuredOutput response."
+              : lifecycleMessage(stage, kind);
   return new GenerationLifecycleError(
     sourceSessionID,
     stage,
@@ -1606,7 +1649,7 @@ function sanitizeGenerationFailure(
       );
     }
   }
-  return lifecycleFailure(sourceSessionID, "validation", "rejection");
+  return lifecycleFailure(sourceSessionID, "validation", "rejection", error);
 }
 
 function lifecycleMessage(
@@ -1736,6 +1779,12 @@ function diagnosticCategories(value: unknown): string[] {
     const item = ownDataProperty(value, key);
     return typeof item === "string" ? [category(item)] : [];
   });
+}
+
+function isStructuredOutputError(value: unknown): boolean {
+  return diagnosticChain(value).some(item =>
+    diagnosticCategories(item).includes("structuredoutputerror"),
+  );
 }
 
 function category(value: string): string {

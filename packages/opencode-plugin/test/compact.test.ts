@@ -1476,7 +1476,7 @@ describe("bounded native compaction generation", () => {
     [
       "drops a turn",
       { turns: [result(1, "alpha", "one")] },
-      "invalid envelope or turn count",
+      "turn count mismatch (expected 3, received 1)",
     ],
     [
       "adds an envelope key",
@@ -1488,7 +1488,7 @@ describe("bounded native compaction generation", () => {
         ],
         secretEnvelopeKey: "sensitive",
       },
-      "invalid envelope or turn count",
+      "invalid envelope",
     ],
     [
       "shifts a middle ordinal",
@@ -2648,6 +2648,24 @@ describe("bounded native compaction generation", () => {
         },
       },
     ],
+    [
+      "nested structured output error with finish length",
+      {
+        responseFinish: "length",
+        omitStructured: true,
+        responseError: {
+          error: {
+            cause: {
+              name: "StructuredOutputError",
+              data: {
+                message: "Model did not produce structured output",
+                retries: 0,
+              },
+            },
+          },
+        },
+      },
+    ],
   ])(
     "surfaces higher-output-capacity guidance for a single-turn provider %s signal",
     async (_name, options) => {
@@ -2719,6 +2737,39 @@ describe("bounded native compaction generation", () => {
     expect(failure?.message).toMatch(/model request failed/i);
     expect(failure?.message).not.toContain("raw provider detail");
     expect(failure?.message).not.toMatch(/more output capacity/i);
+  });
+
+  test("self-describes a missing structured response without host details", async () => {
+    const turn = candidateTurn("missing-structured", "structured failure", []);
+    const harness = generationHarness([turn], responseFor([turn]), {
+      responseFinish: "stop",
+      omitStructured: true,
+      responseError: {
+        name: "StructuredOutputError",
+        data: {
+          message: "Model did not produce structured output",
+          retries: 0,
+        },
+      },
+    });
+
+    const failure = await generateCompactionSummaries(
+      harness.v2,
+      sourceSession(),
+      generationPlan([turn]),
+    ).then(
+      () => undefined,
+      error => error as Error,
+    );
+
+    expect(failure?.message).toBe(
+      "The compaction model finished without submitting its StructuredOutput response.",
+    );
+    expect(failure?.message).not.toContain(
+      "Model did not produce structured output",
+    );
+    expect(harness.aborts).toEqual(["generation-fork"]);
+    expect(harness.deletes).toEqual(["generation-fork"]);
   });
 
   test("preserves trim-first overflow guidance through one sanitized nested cause", async () => {
@@ -3161,14 +3212,14 @@ describe("compaction orchestration", () => {
       }
       expect(failure).toBeInstanceOf(Error);
       expect((failure as Error).message).toBe(
-        "Compaction generation response validation failed: invalid envelope or turn count.",
+        "Compaction generation response validation failed: turn count mismatch (expected 1, received 0).",
       );
       expect(nestedErrorMessages(failure).join(" ")).not.toContain(
         "toast failed",
       );
       expect(failed.toasts.map(toast => toast.message)).toEqual([
         "Compacting session...",
-        "GenerationLifecycleError: Compaction generation response validation failed: invalid envelope or turn count.",
+        "GenerationLifecycleError: Compaction generation response validation failed: turn count mismatch (expected 1, received 0).",
       ]);
       expect(JSON.stringify(failed.messages)).not.toContain(
         "Compacting session...",
@@ -3341,6 +3392,72 @@ describe("compaction orchestration", () => {
     expect(harness.deletedSessions).toEqual(["generation-fork"]);
   });
 
+  test("omits a large task prompt on a previously trimmed part during compaction", async () => {
+    const prompt = "delegation context packet ".repeat(60);
+    const messages = compactableCommandMessages(
+      "task-prompt",
+      "subagent result",
+    );
+    const task = toolPart(
+      "task-prompt-task-tool",
+      "task-prompt-assistant",
+      {
+        status: "completed",
+        input: {
+          subagent_type: "forager-worker",
+          description: "delegated work",
+          prompt,
+        },
+        output: "subagent result",
+        title: "Task",
+        metadata: { magicCompact: { trimmed: true } },
+        time: { start: 1, end: 2 },
+      },
+      "task",
+    );
+    messages[1]!.parts.push(task);
+    const harness = commandHarness(messages, {
+      generationResponse: {
+        turns: [
+          result(1, "task-prompt request", "Completed the delegated work."),
+        ],
+      },
+    });
+
+    try {
+      await expect(
+        executeMagicCompact(harness.v2, "source", 0),
+      ).resolves.toBeTrue();
+
+      const persisted = messages
+        .flatMap(item => item.parts)
+        .find(
+          (part): part is Extract<Part, { type: "tool" }> =>
+            part.type === "tool" && part.tool === "task",
+        );
+      expect(persisted).toBeDefined();
+      expect(persisted!.state.status).toBe("completed");
+      if (persisted!.state.status !== "completed")
+        throw new Error("Expected completed tool state.");
+      expect(persisted!.state.input["prompt"]).toBe("[Omitted]");
+      expect(persisted!.state.input["description"]).toBe("delegated work");
+      expect(persisted!.state.input["subagent_type"]).toBe("forager-worker");
+      expect(persisted!.state.metadata["magicCompact"]).toEqual({
+        trimmed: true,
+      });
+      expect(persisted!.state.output).toContain(
+        "Task prompt omitted due to compaction operation.",
+      );
+      const contentID = persisted!.state.output.match(
+        /[A-Za-z0-9_-]{1,12}:omitted-[A-Za-z0-9_-]{22}/u,
+      )?.[0];
+      expect(contentID).toBeDefined();
+      expect(await readOmittedContent("source", contentID!)).toBe(prompt);
+    } finally {
+      await Promise.all([deleteCache("source"), deleteCache("backup")]);
+    }
+  });
+
   test("keeps small user and assistant inline images inline while compacting substantial reasoning", async () => {
     const userImage = imagePart(
       "small-media-user-image",
@@ -3469,7 +3586,7 @@ describe("compaction orchestration", () => {
     });
 
     await expect(executeMagicCompact(harness.v2, "source", 0)).rejects.toThrow(
-      "response validation failed: invalid envelope or turn count.",
+      "response validation failed: turn count mismatch (expected 2, received 1).",
     );
 
     expect(harness.forks).toEqual(["generation-fork"]);
@@ -3477,6 +3594,45 @@ describe("compaction orchestration", () => {
     expect(boundaryParts(messages)).toEqual([]);
     expect(harness.selectedSessions).toEqual([]);
     expect(harness.deletedSessions).toEqual(["generation-fork"]);
+  });
+
+  test("reports a post-request count mismatch as a categorized lifecycle error", async () => {
+    const messages = compactableCommandMessages(
+      "post-request-count",
+      "large output ".repeat(1_000),
+    );
+    const before = structuredClone(messages);
+    const harness = commandHarness(messages, {
+      generationResponse: {
+        turns: [result(1, "post-request-count request", "Completed request.")],
+      },
+      transformGenerationResponse: response => {
+        const turns = [...response.turns];
+        Object.defineProperty(turns, "map", { value: () => [] });
+        return { turns };
+      },
+    });
+    let failure: unknown;
+
+    try {
+      await executeMagicCompact(harness.v2, "source", 0);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).name).toBe("GenerationLifecycleError");
+    expect((failure as Error).message).toBe(
+      "Compaction generation response validation failed: turn count mismatch (expected 1, received 0).",
+    );
+
+    expect(messages).toEqual(before);
+    expect(harness.forks).toEqual(["generation-fork"]);
+    expect(harness.partUpdates).toEqual([]);
+    expect(boundaryParts(messages)).toEqual([]);
+    expect(harness.selectedSessions).toEqual([]);
+    expect(harness.deletedSessions).toEqual(["generation-fork"]);
+    expect(await readStats("source")).toBeNull();
   });
 
   test("discards completed batches when a later batch fails before backup, source writes, or stats", async () => {
@@ -4839,6 +4995,7 @@ function toolPart(
   id: string,
   messageID: string,
   state: Record<string, unknown>,
+  tool = "read",
 ): Part {
   return {
     id,
@@ -4846,7 +5003,7 @@ function toolPart(
     messageID,
     type: "tool",
     callID: `${id}-call`,
-    tool: "read",
+    tool,
     state,
   } as Part;
 }

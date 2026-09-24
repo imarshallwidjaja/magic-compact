@@ -22,6 +22,7 @@ import {
   cachePath,
   deleteCache,
   readCache,
+  readOmittedContent,
 } from "../src/storage/omission";
 import {
   type ConversationStats,
@@ -155,6 +156,128 @@ describe("magic trim", () => {
     } finally {
       await rm(cachePath(sessionID), { force: true });
     }
+  });
+
+  test("omits large task prompts and caches them", async () => {
+    const sessionID = `ses_trim_task_input_${randomUUID().replaceAll("-", "")}`;
+    const prompt = "delegation context packet ".repeat(60);
+    const tool = taskTool("tool_task_input", prompt);
+    const v2 = {
+      part: { update: async () => ({ data: tool }) },
+    } as unknown as V2Client;
+
+    try {
+      await trimToolParts({ v2, sessionID }, [turn(tool)]);
+
+      expect(tool.state.status).toBe("completed");
+      if (tool.state.status !== "completed")
+        throw new Error("Expected completion");
+      expect(tool.state.input["prompt"]).toBe("[Omitted]");
+      expect(tool.state.input["description"]).toBe("delegated work");
+      expect(tool.state.input["subagent_type"]).toBe("forager-worker");
+      expect(
+        tool.state.output.startsWith("<tool-input-omission-notice>"),
+      ).toBeTrue();
+      expect(tool.state.output).toContain(
+        "Task prompt omitted due to compaction operation.",
+      );
+      expect(tool.state.output).toContain(
+        `Content ID: ${sessionID.slice(-12)}:omitted-`,
+      );
+      const cache = await readCache(sessionID);
+      expect(
+        Object.values(cache?.entries ?? {}).map(entry => entry.content),
+      ).toContain(prompt);
+    } finally {
+      await rm(cachePath(sessionID), { force: true });
+    }
+  });
+
+  test("keeps short task prompts unchanged", async () => {
+    const sessionID = `ses_trim_task_short_${randomUUID().replaceAll("-", "")}`;
+    const tool = taskTool("tool_task_short", "Check the failing suite.");
+    const v2 = {
+      part: { update: async () => ({ data: tool }) },
+    } as unknown as V2Client;
+
+    try {
+      await trimToolParts({ v2, sessionID }, [turn(tool)]);
+
+      expect(tool.state.status).toBe("completed");
+      if (tool.state.status !== "completed")
+        throw new Error("Expected completion");
+      expect(tool.state.input).toEqual({
+        subagent_type: "forager-worker",
+        description: "delegated work",
+        prompt: "Check the failing suite.",
+      });
+      expect(tool.state.output).toBe("subagent result");
+      expect(await readCache(sessionID)).toBeNull();
+    } finally {
+      await rm(cachePath(sessionID), { force: true });
+    }
+  });
+
+  test("applies idempotent input rules to tools marked by earlier trims", async () => {
+    const sessionID = `ses_trim_marked_input_${randomUUID().replaceAll("-", "")}`;
+    const prompt = "delegation context packet ".repeat(60);
+    const tool = taskTool("tool_marked_input", prompt);
+    tool.state.metadata["magicCompact"] = { trimmed: true };
+    const v2 = {
+      part: { update: async () => ({ data: tool }) },
+    } as unknown as V2Client;
+
+    try {
+      expect(await trimToolParts({ v2, sessionID }, [turn(tool)])).toBe(1);
+
+      expect(tool.state.status).toBe("completed");
+      if (tool.state.status !== "completed")
+        throw new Error("Expected completion");
+      expect(tool.state.input["prompt"]).toBe("[Omitted]");
+      expect(tool.state.input["description"]).toBe("delegated work");
+      expect(tool.state.input["subagent_type"]).toBe("forager-worker");
+      expect(tool.state.metadata["magicCompact"]).toEqual({ trimmed: true });
+      expect(
+        tool.state.output.startsWith("<tool-input-omission-notice>"),
+      ).toBeTrue();
+      expect(tool.state.output).toContain(
+        "Task prompt omitted due to compaction operation.",
+      );
+      const contentID = tool.state.output.match(
+        /[A-Za-z0-9_-]{1,12}:omitted-[A-Za-z0-9_-]{22}/u,
+      )?.[0];
+      expect(contentID).toBeDefined();
+      expect(await readOmittedContent(sessionID, contentID!)).toBe(prompt);
+
+      expect(await trimToolParts({ v2, sessionID }, [turn(tool)])).toBe(0);
+      expect(tool.state.input["prompt"]).toBe("[Omitted]");
+      expect(
+        tool.state.output.match(/<tool-input-omission-notice>/gu),
+      ).toHaveLength(1);
+    } finally {
+      await rm(cachePath(sessionID), { force: true });
+    }
+  });
+
+  test("keeps output rules marker-guarded for tools marked by earlier trims", async () => {
+    const sessionID = `ses_trim_marked_output_${randomUUID().replaceAll("-", "")}`;
+    const tool = readTool("tool_marked_output", "large output ".repeat(100));
+    tool.state.metadata["magicCompact"] = { trimmed: true };
+    const before = structuredClone(tool.state);
+    let updates = 0;
+    const v2 = {
+      part: {
+        update: async () => {
+          updates += 1;
+          return { data: tool };
+        },
+      },
+    } as unknown as V2Client;
+
+    expect(await trimToolParts({ v2, sessionID }, [turn(tool)])).toBe(0);
+    expect(tool.state).toEqual(before);
+    expect(updates).toBe(0);
+    expect(await readCache(sessionID)).toBeNull();
   });
 
   test("reports trim stats on a cycle-free active basis across the 999-to-1K boundary", async () => {
@@ -662,6 +785,19 @@ function completedTool(id: string, tool: string, output: string): ToolPart {
       time: { start: 1, end: 2 },
     },
   };
+}
+
+function taskTool(id: string, prompt: string): ToolPart {
+  const tool = completedTool(id, "task", "subagent result");
+  if (tool.state.status !== "completed") {
+    throw new Error("Expected completed tool state.");
+  }
+  tool.state.input = {
+    subagent_type: "forager-worker",
+    description: "delegated work",
+    prompt,
+  };
+  return tool;
 }
 
 function v0SummaryPartID(messageID: string): string {

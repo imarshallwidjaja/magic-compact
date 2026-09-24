@@ -54,7 +54,7 @@ After argument and execution-option validation, compact and trim show a long-liv
 5. Load the source session and fork it as a backup.
 6. Copy omission and stats caches to the backup.
 7. Measure pre-trim canonical active tokens with the same local counting used after trimming.
-8. Apply the normal tool input and output trimming rules to older turns.
+8. Apply the normal tool input and output trimming rules to older turns. Input trimming still applies to states already marked trimmed by an earlier run; output trimming applies only to unmarked states.
 9. Mark processed completed tool states with `state.metadata.magicCompact.trimmed === true`.
 10. If no tool states were processed, delete the initialized backup and its copied caches before showing the no-op toast.
 11. Measure the exact post-trim canonical active count before the ignored reporting notice and add that reduction to conversation stats.
@@ -143,7 +143,7 @@ After argument and execution-option validation, compact and trim show a long-liv
 - Synthetic user text is deleted unless it is a preserved OpenCode wrapper or reminder.
 - Summarized assistant messages keep summary parts, tool parts, and v3 manifest-covered inline image files. Other assistant parts are deleted; empty assistant messages are deleted.
 - Only completed tool parts are pruned. Pending, running, and error states remain.
-- `/magic-trim` applies only tool rules and marks processed states to prevent repeated trimming.
+- `/magic-trim` applies only tool rules and marks processed states. Marked states are not output-trimmed again, but idempotent input rules still apply to them.
 
 ## Tool Rules
 
@@ -152,17 +152,18 @@ After argument and execution-option validation, compact and trim show a long-liv
 - `apply_patch`: omit large `input.patchText` and cache it.
 - `bash`: cache long commands and visibly truncate them.
 - `read`: always cache and omit output.
-- `task`: cache and omit output only above the higher task threshold.
+- `task`: omit and cache large `input.prompt`; cache and omit output only above the higher task threshold.
 - `todowrite`: preserve input and replace output with a success message, no cache.
 - `question`: preserve input and output.
 - `skill`: preserve input and replace output with a reload hint, no cache.
 - Other completed tool outputs are cached and omitted above the default threshold.
+- Input rules are idempotent on their own result and still apply to states marked trimmed by an earlier run; output rules are skipped on marked states.
 
 ## Error Handling
 
 - Any summarizer configuration, fork lifecycle, request, response contract, media manifest, SDK, cache, stats, token count, projection, or pruning failure aborts the attempt.
-- Generation errors expose only fixed lifecycle stage/kind text, source session ID, validation category, and range-validated HTTP status. Validation categories distinguish missing structured output, invalid envelope/turn count, invalid turn shape/identity, invalid summary, invalid visual coverage, and nonce leakage. Active-batch failures are ordered by batch in a sanitized aggregate. Raw provider/control/model errors, bodies, prompts, fork history, model output, and aggregate causes are not retained in the surfaced graph.
-- Native context overflow reports trim-first guidance. A configured model input budget too small to fit the fixed 8K non-explicit host reserve, or the reserve plus the complete explicit request and mandatory global index, fails before any fork with trim-first/model-capacity guidance. Exact real-nonce prompt or response-protocol variance beyond its conservative record also fails before fork creation. Single-turn output exhaustion requires more model output capacity; larger-`N` guidance is limited to multi-turn exhaustion. When structured output is absent, truncation signaled by `finish` or an output-length error reports capacity guidance. A captured structured object still passes local validation when `finish` reports truncation. Other provider errors retain precedence, and a genuine non-`StructuredOutput` provider error always rejects the response. Magic Compact adds no plugin-level retry, adaptive repartitioning, alternate-model fallback, or partial mutation. OpenCode may apply provider/transport retries or additional model steps required by structured-output processing.
+- Generation errors expose only fixed lifecycle stage/kind text, source session ID, validation category, and range-validated HTTP status. Validation categories distinguish missing structured output, invalid envelope, turn count mismatch, invalid turn shape/identity, invalid summary, invalid visual coverage, and nonce leakage; a turn count mismatch reports only its expected and received integers. Active-batch failures are ordered by batch in a sanitized aggregate. Raw provider/control/model errors, bodies, prompts, fork history, model output, and aggregate causes are not retained in the surfaced graph.
+- Native context overflow reports trim-first guidance. A configured model input budget too small to fit the fixed 8K non-explicit host reserve, or the reserve plus the complete explicit request and mandatory global index, fails before any fork with trim-first/model-capacity guidance. Exact real-nonce prompt or response-protocol variance beyond its conservative record also fails before fork creation. Single-turn output exhaustion requires more model output capacity; larger-`N` guidance is limited to multi-turn exhaustion. When structured output is absent, truncation signaled by `finish` or an output-length error reports capacity guidance; a missing structured response without truncation reports a fixed message that the model finished without submitting its `StructuredOutput` response. A captured structured object still passes local validation when `finish` reports truncation. Other provider errors retain precedence, and a genuine non-`StructuredOutput` provider error always rejects the response. Magic Compact adds no plugin-level retry, adaptive repartitioning, alternate-model fallback, or partial mutation. OpenCode may apply provider/transport retries or additional model steps required by structured-output processing.
 - Native checkpoint errors fail before generation. Ordered source snapshots are revalidated after backup creation and after owned summary/boundary insertion.
 - `/magic-compact` fails closed with a pending-revert error before generation and rechecks immediately before the first source write. The pre-generation guard runs before any backup exists, leaving source, backup, and stats unchanged; the pre-write guard preserves the already-created backup and its copied backup stats while source and source stats remain unchanged. OpenCode's prompt-time revert cleanup would otherwise delete the reverted suffix on the boundary or stats `session.prompt`, which is not recoverable by Magic Compact's drift revalidation. Magic Compact does not force the cleanup: OpenCode exposes no session-serialized or compare-and-swap revert commit, so forcing cleanup could delete concurrently appended messages. Users must restore with `/redo` without a model call or let a normal OpenCode prompt commit the discard before retrying.
 - Pre-write source drift and every failure after backup creation preserve both sessions; post-write errors report only the source and backup IDs plus manual-recovery guidance and never record a successful stats increment. Compaction never auto-applies the backup; trim retains its backup rollback path.
