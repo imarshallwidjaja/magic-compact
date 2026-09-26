@@ -104,6 +104,8 @@ type GenerationCandidate = {
   sourceTurnIndex: number;
   ordinal: number;
   anchor: string;
+  // Complete first user line when `anchor` is capped; models may echo either.
+  completeAnchor?: string;
   marker: string;
   expectedInlineImages: number;
   inputTokens: number;
@@ -187,12 +189,15 @@ export async function generateCompactionSummaries(
     if (turnHasPersistedSummary(turn)) return [];
     const mediaManifest = createMediaManifest(turn);
     const cost = estimateNativeTurnCost(turn);
+    const line = firstOrdinaryUserLine(turn);
+    const anchor = capCodePoints(line, TARGET_ANCHOR_CHARACTER_LIMIT);
     return [
       {
         planIndex,
         sourceTurnIndex: plan.sourceTurnStartIndex + planIndex,
         ordinal: 0,
-        anchor: firstOrdinaryUserLine(turn, TARGET_ANCHOR_CHARACTER_LIMIT),
+        anchor,
+        ...(anchor === line ? {} : { completeAnchor: line }),
         marker: "",
         expectedInlineImages: mediaManifest?.images.length ?? 0,
         ...cost,
@@ -348,7 +353,10 @@ function createGenerationBatch(
     const followingExplicitRequestTokens =
       estimateGenerationExplicitRequestTokens(
         batch.candidates,
-        firstOrdinaryUserLine(followingTurn, TARGET_ANCHOR_CHARACTER_LIMIT),
+        capCodePoints(
+          firstOrdinaryUserLine(followingTurn),
+          TARGET_ANCHOR_CHARACTER_LIMIT,
+        ),
         stopMarker,
         globalTurnIndexPrompt,
       );
@@ -441,8 +449,8 @@ function finalizeGenerationBatch(
     ? generationStopMarker(generationNonce, candidates.at(-1)!.ordinal + 1)
     : "";
   const nextTurnAnchor = batch.followingHalo
-    ? firstOrdinaryUserLine(
-        batch.followingHalo.turn,
+    ? capCodePoints(
+        firstOrdinaryUserLine(batch.followingHalo.turn),
         TARGET_ANCHOR_CHARACTER_LIMIT,
       )
     : undefined;
@@ -1382,7 +1390,10 @@ function buildGlobalTurnIndexPrompt(plan: CompactionPlan): string {
     .slice(plan.effectiveSourceTurnStartIndex, plan.effectiveSourceTurnEndIndex)
     .map((turn, index) => ({
       sourceOrdinal: plan.effectiveSourceTurnStartIndex + index + 1,
-      anchor: firstOrdinaryUserLine(turn, GLOBAL_ANCHOR_CHARACTER_LIMIT),
+      anchor: capCodePoints(
+        firstOrdinaryUserLine(turn),
+        GLOBAL_ANCHOR_CHARACTER_LIMIT,
+      ),
     }));
   return [
     "The globalTurnIndex is an orientation-only user-anchor map. Its sourceOrdinal values are immutable source-history positions, not target ordinals, and it does not supply distant assistant or tool detail. Each entry contains only its sourceOrdinal and bounded user anchor:",
@@ -1422,12 +1433,28 @@ function parseGenerationResponse(
         "summary",
         "visualDescriptions",
       ])
-      || value["ordinal"] !== candidate.ordinal
-      || value["marker"] !== candidate.marker
-      || value["anchor"] !== candidate.anchor
       || !Array.isArray(value["visualDescriptions"])
     ) {
-      throw validationFailure("invalid turn shape or identity");
+      throw validationFailure("invalid turn shape or identity", {
+        field: "shape",
+        ordinal: candidate.ordinal,
+      });
+    }
+    const identityField =
+      value["ordinal"] !== candidate.ordinal
+        ? "ordinal"
+        : value["marker"] !== candidate.marker
+          ? "marker"
+          : value["anchor"] !== candidate.anchor
+              && (candidate.completeAnchor === undefined
+                || value["anchor"] !== candidate.completeAnchor)
+            ? "anchor"
+            : undefined;
+    if (identityField) {
+      throw validationFailure("invalid turn shape or identity", {
+        field: identityField,
+        ordinal: candidate.ordinal,
+      });
     }
     if (typeof value["summary"] !== "string" || !value["summary"].trim()) {
       throw validationFailure("invalid summary");
@@ -1480,7 +1507,7 @@ function frameSummary(result: GenerationTurnResult): string {
   ].join("\n");
 }
 
-function firstOrdinaryUserLine(turn: Turn, characterLimit: number): string {
+function firstOrdinaryUserLine(turn: Turn): string {
   const text = turn.user
     .flatMap(message => message.parts)
     .find(
@@ -1489,8 +1516,11 @@ function firstOrdinaryUserLine(turn: Turn, characterLimit: number): string {
         && part.synthetic !== true
         && part.ignored !== true,
     )?.text;
-  const firstLine = (text ?? "").split(/\r\n|\r|\n/u, 1)[0] ?? "";
-  return Array.from(firstLine).slice(0, characterLimit).join("");
+  return (text ?? "").split(/\r\n|\r|\n/u, 1)[0] ?? "";
+}
+
+function capCodePoints(value: string, characterLimit: number): string {
+  return Array.from(value).slice(0, characterLimit).join("");
 }
 
 function assertGeneratedPartIDsAvailable(plan: CompactionPlan): void {
@@ -1528,10 +1558,16 @@ type ValidationCategory =
 
 type TurnCounts = { expected: number; received: number };
 
+// Names the first failed check and its target ordinal, never response content.
+type TurnIdentityFailure = {
+  field: "shape" | "ordinal" | "marker" | "anchor";
+  ordinal: number;
+};
+
 class GenerationResponseValidationError extends Error {
   constructor(
     readonly category: ValidationCategory,
-    readonly turnCounts?: TurnCounts,
+    readonly detail?: TurnCounts | TurnIdentityFailure,
   ) {
     super();
   }
@@ -1539,16 +1575,19 @@ class GenerationResponseValidationError extends Error {
 
 function validationFailure(
   category: ValidationCategory,
-  turnCounts?: TurnCounts,
+  detail?: TurnCounts | TurnIdentityFailure,
 ): Error {
-  return new GenerationResponseValidationError(category, turnCounts);
+  return new GenerationResponseValidationError(category, detail);
 }
 
 function validationCategoryText(
   error: GenerationResponseValidationError,
 ): string {
-  if (error.category === "turn count mismatch" && error.turnCounts) {
-    return `${error.category} (expected ${error.turnCounts.expected}, received ${error.turnCounts.received})`;
+  if (error.detail && "expected" in error.detail) {
+    return `${error.category} (expected ${error.detail.expected}, received ${error.detail.received})`;
+  }
+  if (error.detail) {
+    return `${error.category} (${error.detail.field} at target ordinal ${error.detail.ordinal})`;
   }
   return error.category;
 }

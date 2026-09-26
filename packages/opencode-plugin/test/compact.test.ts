@@ -1472,6 +1472,51 @@ describe("bounded native compaction generation", () => {
     expect(prompt).not.toContain("ignored reporting");
   });
 
+  const cappedAnchor = `${"a".repeat(299)}😀`;
+  test.each([
+    ["the capped anchor", cappedAnchor, true],
+    ["its own complete first line", `${cappedAnchor}tail`, true],
+    ["an extended complete line", `${cappedAnchor}tail extra`, false],
+    ["text past the first line", `${cappedAnchor}tail\nsecond line`, false],
+    ["another turn's complete line", `${cappedAnchor}other`, false],
+  ])(
+    "accepts only exact source forms of a capped anchor: %s",
+    async (_name, echoedAnchor, accepted) => {
+      const turns = [
+        candidateTurn("capped-own", `${cappedAnchor}tail\nsecond line`, []),
+        candidateTurn("capped-other", `${cappedAnchor}other`, []),
+      ];
+      const before = structuredClone(turns);
+      const harness = generationHarness(turns, {
+        turns: [
+          result(1, echoedAnchor, "Own summary."),
+          result(2, cappedAnchor, "Other summary."),
+        ],
+      });
+
+      const generation = generateCompactionSummaries(
+        harness.v2,
+        sourceSession(),
+        generationPlan(turns),
+      );
+
+      if (accepted) {
+        expect((await generation).map(summary => summary?.text)).toEqual([
+          "Own summary.",
+          "Other summary.",
+        ]);
+        expect(harness.aborts).toEqual([]);
+      } else {
+        await expect(generation).rejects.toThrow(
+          "Compaction generation response validation failed: invalid turn shape or identity (anchor at target ordinal 1).",
+        );
+        expect(harness.aborts).toEqual(["generation-fork"]);
+      }
+      expect(harness.deletes).toEqual(["generation-fork"]);
+      expect(turns).toEqual(before);
+    },
+  );
+
   test.each([
     [
       "drops a turn",
@@ -1499,7 +1544,7 @@ describe("bounded native compaction generation", () => {
           result(3, "gamma", "three"),
         ],
       },
-      "invalid turn shape or identity",
+      "invalid turn shape or identity (ordinal at target ordinal 2)",
     ],
     [
       "duplicates an ordinal",
@@ -1510,7 +1555,7 @@ describe("bounded native compaction generation", () => {
           result(3, "gamma", "three"),
         ],
       },
-      "invalid turn shape or identity",
+      "invalid turn shape or identity (ordinal at target ordinal 2)",
     ],
     [
       "reorders anchors",
@@ -1521,7 +1566,18 @@ describe("bounded native compaction generation", () => {
           result(3, "gamma", "three"),
         ],
       },
-      "invalid turn shape or identity",
+      "invalid turn shape or identity (anchor at target ordinal 1)",
+    ],
+    [
+      "extends an uncapped anchor",
+      {
+        turns: [
+          result(1, "alpha", "one"),
+          result(2, "beta continued", "two"),
+          result(3, "gamma", "three"),
+        ],
+      },
+      "invalid turn shape or identity (anchor at target ordinal 2)",
     ],
     [
       "returns an empty summary",
@@ -1543,7 +1599,7 @@ describe("bounded native compaction generation", () => {
           result(3, "gamma", "three"),
         ],
       },
-      "invalid turn shape or identity",
+      "invalid turn shape or identity (shape at target ordinal 1)",
     ],
   ])(
     "fails atomically when one response %s",
@@ -1963,7 +2019,7 @@ describe("bounded native compaction generation", () => {
         generationPlan([turn]),
       ),
     ).rejects.toThrow(
-      "response validation failed: invalid turn shape or identity.",
+      "response validation failed: invalid turn shape or identity (marker at target ordinal 1).",
     );
     expect(harness.aborts).toEqual(["generation-fork"]);
     expect(harness.deletes).toEqual(["generation-fork"]);
@@ -1985,7 +2041,7 @@ describe("bounded native compaction generation", () => {
         generationPlan(turns),
       ),
     ).rejects.toThrow(
-      "response validation failed: invalid turn shape or identity.",
+      "response validation failed: invalid turn shape or identity (marker at target ordinal 1).",
     );
     expect(harness.aborts).toEqual(["generation-fork"]);
     expect(harness.deletes).toEqual(["generation-fork"]);
