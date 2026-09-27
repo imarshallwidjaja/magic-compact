@@ -55,7 +55,6 @@ const GENERATION_FORMAT = {
           properties: {
             ordinal: { type: "integer" },
             marker: { type: "string" },
-            anchor: { type: "string" },
             summary: { type: "string" },
             visualDescriptions: {
               type: "array",
@@ -70,13 +69,7 @@ const GENERATION_FORMAT = {
               },
             },
           },
-          required: [
-            "ordinal",
-            "marker",
-            "anchor",
-            "summary",
-            "visualDescriptions",
-          ],
+          required: ["ordinal", "marker", "summary", "visualDescriptions"],
           additionalProperties: false,
         },
       },
@@ -85,7 +78,6 @@ const GENERATION_FORMAT = {
     additionalProperties: false,
   },
 };
-const TARGET_ANCHOR_CHARACTER_LIMIT = 300;
 const GLOBAL_ANCHOR_CHARACTER_LIMIT = 160;
 const GENERATION_NONCE_ATTEMPTS = 8;
 const GENERATION_NONCE_PATTERN = /^[A-Za-z0-9_-]{22}$/u;
@@ -103,9 +95,6 @@ type GenerationCandidate = {
   planIndex: number;
   sourceTurnIndex: number;
   ordinal: number;
-  anchor: string;
-  // Complete first user line when `anchor` is capped; models may echo either.
-  completeAnchor?: string;
   marker: string;
   expectedInlineImages: number;
   inputTokens: number;
@@ -116,7 +105,7 @@ type GenerationCandidate = {
 type GenerationBatchPlan = NativeGenerationBatch<GenerationCandidate> & {
   retainedMessageIndexes: number[];
   targetUserMessageIndexes: number[];
-  followingHalo?: { turn: Turn; userMessageIndex: number };
+  followingHalo?: { userMessageIndex: number };
 };
 
 type GenerationBatch = GenerationBatchPlan & {
@@ -189,15 +178,11 @@ export async function generateCompactionSummaries(
     if (turnHasPersistedSummary(turn)) return [];
     const mediaManifest = createMediaManifest(turn);
     const cost = estimateNativeTurnCost(turn);
-    const line = firstOrdinaryUserLine(turn);
-    const anchor = capCodePoints(line, TARGET_ANCHOR_CHARACTER_LIMIT);
     return [
       {
         planIndex,
         sourceTurnIndex: plan.sourceTurnStartIndex + planIndex,
         ordinal: 0,
-        anchor,
-        ...(anchor === line ? {} : { completeAnchor: line }),
         marker: "",
         expectedInlineImages: mediaManifest?.images.length ?? 0,
         ...cost,
@@ -224,7 +209,6 @@ export async function generateCompactionSummaries(
     explicitRequestTokens: batchCandidates =>
       estimateGenerationExplicitRequestTokens(
         batchCandidates,
-        undefined,
         "",
         globalTurnIndexPrompt,
       ),
@@ -353,10 +337,6 @@ function createGenerationBatch(
     const followingExplicitRequestTokens =
       estimateGenerationExplicitRequestTokens(
         batch.candidates,
-        capCodePoints(
-          firstOrdinaryUserLine(followingTurn),
-          TARGET_ANCHOR_CHARACTER_LIMIT,
-        ),
         stopMarker,
         globalTurnIndexPrompt,
       );
@@ -376,7 +356,7 @@ function createGenerationBatch(
       estimatedExplicitRequestTokens = followingExplicitRequestTokens;
       inputLimit = budget.haloInputLimit;
       retainedTurnIndexes.add(lastTurnIndex + 1);
-      followingHalo = { turn: followingTurn, userMessageIndex };
+      followingHalo = { userMessageIndex };
     }
   }
   const precedingTurn = sourceTurns[firstTurnIndex - 1];
@@ -448,21 +428,13 @@ function finalizeGenerationBatch(
   const stopMarker = batch.followingHalo
     ? generationStopMarker(generationNonce, candidates.at(-1)!.ordinal + 1)
     : "";
-  const nextTurnAnchor = batch.followingHalo
-    ? capCodePoints(
-        firstOrdinaryUserLine(batch.followingHalo.turn),
-        TARGET_ANCHOR_CHARACTER_LIMIT,
-      )
-    : undefined;
   const prompt = buildGenerationPrompt(
     candidates,
-    nextTurnAnchor,
     stopMarker,
     globalTurnIndexPrompt,
   );
   const exactExplicitRequestTokens = estimateGenerationExplicitRequestTokens(
     candidates,
-    nextTurnAnchor,
     stopMarker,
     globalTurnIndexPrompt,
   );
@@ -1309,9 +1281,9 @@ function historyMayExposeImages(sourceSnapshot: unknown): boolean {
   });
 }
 
+// `stopMarker` is empty when the batch retains no following halo.
 function buildGenerationPrompt(
   candidates: GenerationCandidate[],
-  nextTurnAnchor: string | undefined,
   stopMarker: string,
   globalTurnIndexPrompt: string,
 ): string {
@@ -1319,47 +1291,33 @@ function buildGenerationPrompt(
     "Generate one continuation summary for each indexed turn using the retained native fork history.",
     "Submit the object required by your system prompt through StructuredOutput.",
     globalTurnIndexPrompt,
-    "Use the ephemeral markers only as ordering guides. Echo each exact marker token, target ordinal, and target anchor; marker echo is allowed. Never include the active generation nonce or marker token in summaries or visual descriptions; useful source identifiers may remain when you include them.",
+    "Use the ephemeral markers only as ordering guides. Echo each exact marker token and target ordinal; marker echo is allowed. Never include the active generation nonce or marker token in summaries or visual descriptions; useful source identifiers may remain when you include them.",
     JSON.stringify({
       turns: candidates.map(candidate => ({
         ordinal: candidate.ordinal,
         marker: candidate.marker,
-        anchor: candidate.anchor,
         expectedInlineImages: candidate.expectedInlineImages,
       })),
-      ...(nextTurnAnchor !== undefined
-        ? {
-            nextTurn: {
-              marker: stopMarker,
-              anchor: nextTurnAnchor,
-            },
-          }
-        : {}),
+      ...(stopMarker === "" ? {} : { nextTurn: { marker: stopMarker } }),
     }),
   ].join("\n");
 }
 
 function estimateGenerationExplicitRequestTokens(
   candidates: GenerationCandidate[],
-  nextTurnAnchor: string | undefined,
   stopMarker: string,
   globalTurnIndexPrompt: string,
 ): number {
   return (
     countGptTokens(JSON.stringify(GENERATION_FORMAT.schema))
     + countGptTokens(
-      buildGenerationPrompt(
-        candidates,
-        nextTurnAnchor,
-        stopMarker,
-        globalTurnIndexPrompt,
-      ),
+      buildGenerationPrompt(candidates, stopMarker, globalTurnIndexPrompt),
     )
     + candidates.reduce(
       (total, candidate) => total + countGptTokens(candidate.marker),
       0,
     )
-    + (nextTurnAnchor === undefined ? 0 : countGptTokens(stopMarker))
+    + (stopMarker === "" ? 0 : countGptTokens(stopMarker))
   );
 }
 
@@ -1371,7 +1329,6 @@ function estimateGenerationResponseProtocolTokens(
       turns: candidates.map(candidate => ({
         ordinal: candidate.ordinal,
         marker: candidate.marker,
-        anchor: candidate.anchor,
         summary: "",
         visualDescriptions: Array.from(
           { length: candidate.expectedInlineImages },
@@ -1427,7 +1384,6 @@ function parseGenerationResponse(
     if (
       !isPlainRecord(value)
       || !hasExactKeys(value, [
-        "anchor",
         "marker",
         "ordinal",
         "summary",
@@ -1445,11 +1401,7 @@ function parseGenerationResponse(
         ? "ordinal"
         : value["marker"] !== candidate.marker
           ? "marker"
-          : value["anchor"] !== candidate.anchor
-              && (candidate.completeAnchor === undefined
-                || value["anchor"] !== candidate.completeAnchor)
-            ? "anchor"
-            : undefined;
+          : undefined;
     if (identityField) {
       throw validationFailure("invalid turn shape or identity", {
         field: identityField,
@@ -1560,7 +1512,7 @@ type TurnCounts = { expected: number; received: number };
 
 // Names the first failed check and its target ordinal, never response content.
 type TurnIdentityFailure = {
-  field: "shape" | "ordinal" | "marker" | "anchor";
+  field: "shape" | "ordinal" | "marker";
   ordinal: number;
 };
 
