@@ -7,6 +7,8 @@ import {
   OmissionIntegrityError,
   allocateOmission,
   cachePath,
+  commitPlannedOmission,
+  commitPlannedOmissions,
   copyCache,
   omissionReadDiagnostic,
   readCache,
@@ -29,6 +31,69 @@ afterAll(async () => {
 });
 
 describe("OpenCode omission storage", () => {
+  test("commits a batch once, ensures exact replays without rewriting, and keeps legacy collisions strict", async () => {
+    const sessionID = "ses_batch_replay";
+    const first = {
+      contentID: qualifiedContentID(sessionID, "A"),
+      content: "first\ud800",
+    };
+    const second = {
+      contentID: qualifiedContentID(sessionID, "B"),
+      content: "second",
+    };
+    await commitPlannedOmissions(sessionID, [first, second], "reject");
+    const bytes = await Bun.file(cachePath(sessionID)).text();
+    expect(await readOmittedContent(sessionID, first.contentID)).toBe(
+      first.content,
+    );
+    await commitPlannedOmissions(sessionID, [second, first], "ensure");
+    expect(await Bun.file(cachePath(sessionID)).text()).toBe(bytes);
+    await expect(commitPlannedOmission(sessionID, first)).rejects.toThrow(
+      "collided",
+    );
+    await expect(
+      commitPlannedOmissions(sessionID, [first], "reject"),
+    ).rejects.toThrow("collided");
+  });
+
+  test("rejects conflicting and corrupt batch entries without partial publication", async () => {
+    const sessionID = "ses_batch_conflict";
+    const first = {
+      contentID: qualifiedContentID(sessionID, "A"),
+      content: "first",
+    };
+    const second = {
+      contentID: qualifiedContentID(sessionID, "B"),
+      content: "second",
+    };
+    await commitPlannedOmissions(sessionID, [first], "reject");
+    const bytes = await Bun.file(cachePath(sessionID)).text();
+    await expect(
+      commitPlannedOmissions(
+        sessionID,
+        [second, { ...first, content: "wrong" }],
+        "ensure",
+      ),
+    ).rejects.toThrow("collided");
+    await expect(
+      commitPlannedOmissions(
+        sessionID,
+        [second, { ...second, content: "wrong" }],
+        "ensure",
+      ),
+    ).rejects.toThrow("Conflicting");
+    expect(await Bun.file(cachePath(sessionID)).text()).toBe(bytes);
+    const corrupt = rawV2Cache({
+      [first.contentID]: v2Entry(first.contentID, "first", {
+        sha256: "0".repeat(64),
+      }),
+    });
+    await writeRawCache(sessionID, corrupt);
+    await expect(
+      commitPlannedOmissions(sessionID, [second], "ensure"),
+    ).rejects.toBeInstanceOf(OmissionIntegrityError);
+    expect(await Bun.file(cachePath(sessionID)).text()).toBe(corrupt);
+  });
   test("allocates session-qualified random IDs with SHA-256 integrity metadata", async () => {
     const sessionID = "ses_1234567890abcdefghijkl";
     const content = "three bytes: \u20ac";

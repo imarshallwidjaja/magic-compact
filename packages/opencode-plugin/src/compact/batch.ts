@@ -94,18 +94,10 @@ export function computeNativeBatchBudget(limit: {
 }
 
 export function estimateNativeTurnCost(turn: Turn): NativeTurnCost {
-  const estimate = [...turn.user, ...turn.assistants].reduce(
-    (total, message) => {
-      for (const part of message.parts) {
-        const partEstimate = estimateNativePart(part, message.info.role);
-        total.inputTokens += partEstimate.tokens;
-        total.textTokens += partEstimate.textTokens;
-        total.mediaCount += partEstimate.mediaCount;
-      }
-      return total;
-    },
-    { inputTokens: 0, textTokens: 0, mediaCount: 0 },
-  );
+  const estimate = estimateNativeHistoryMessages([
+    ...turn.user,
+    ...turn.assistants,
+  ]);
   return {
     inputTokens: estimate.inputTokens,
     outputTokens:
@@ -118,6 +110,29 @@ export function estimateNativeTurnCost(turn: Turn): NativeTurnCost {
       )
       + estimate.mediaCount * NATIVE_BATCH_MEDIA_DESCRIPTION_OUTPUT,
   };
+}
+
+export function estimateNativeHistoryInputTokens(
+  messages: Array<{ info: { role: "user" | "assistant" }; parts: Part[] }>,
+): number {
+  return estimateNativeHistoryMessages(messages).inputTokens;
+}
+
+function estimateNativeHistoryMessages(
+  messages: Array<{ info: { role: "user" | "assistant" }; parts: Part[] }>,
+): { inputTokens: number; textTokens: number; mediaCount: number } {
+  return messages.reduce(
+    (total, message) => {
+      for (const part of message.parts) {
+        const partEstimate = estimateNativePart(part, message.info.role);
+        total.inputTokens += partEstimate.tokens;
+        total.textTokens += partEstimate.textTokens;
+        total.mediaCount += partEstimate.mediaCount;
+      }
+      return total;
+    },
+    { inputTokens: 0, textTokens: 0, mediaCount: 0 },
+  );
 }
 
 export function planNativeGenerationBatches<T extends NativeTurnCost>(

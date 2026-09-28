@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import type { Message } from "@opencode-ai/sdk/v2";
+import type { Message, ToolPart } from "@opencode-ai/sdk/v2";
 import * as gptTokenizer from "gpt-tokenizer";
 import type { V2Client } from "../src/api";
 import type { MessageWithParts } from "../src/compact/plan";
@@ -8,9 +8,50 @@ import {
   countGptTokens,
   countGptTokensWithinLimit,
   countSessionTokens,
+  countEffectiveViewTokens,
+  countModelFacingContentTokens,
 } from "../src/stats/tokenize";
+import { bindToolSource, createToolOverlaySnapshot } from "../src/trim/plan";
 
 describe("canonical token counting", () => {
+  test("keeps stored media-only and effective tool-overlay counts distinct", () => {
+    const tool: ToolPart = {
+      id: "prt_tool",
+      sessionID: "session",
+      messageID: "ast_tool",
+      type: "tool",
+      callID: "call_tool",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: {},
+        output: "long data ".repeat(300),
+        title: "read",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    };
+    const messages: MessageWithParts[] = [
+      { ...message("usr_tool", "user"), parts: [] },
+      { ...message("ast_tool", "assistant"), parts: [tool] },
+    ];
+    const replacement = structuredClone(tool);
+    if (replacement.state.status !== "completed")
+      throw new Error("Expected completed tool");
+    replacement.state.output = "Short receipt";
+    const snapshot = createToolOverlaySnapshot([
+      { source: bindToolSource(tool), part: replacement, omissions: [] },
+    ]);
+    const stored = countModelFacingContentTokens(messages);
+    const effective = countEffectiveViewTokens(messages, snapshot);
+    expect(stored.tokens).toBeGreaterThan(effective.tokens);
+    expect(stored.projectedMediaTokens).toBe(0);
+    expect(effective.projectedMediaTokens).toBe(0);
+    expect(countModelFacingContentTokens(messages)).toEqual(stored);
+    expect(
+      countEffectiveViewTokens(messages, createToolOverlaySnapshot([])),
+    ).toEqual(stored);
+  });
   test("counts canonical content locally regardless of provider usage", async () => {
     const messages: MessageWithParts[] = [
       {

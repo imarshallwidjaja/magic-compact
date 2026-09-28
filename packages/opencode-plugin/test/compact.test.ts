@@ -17,6 +17,7 @@ import type { V2Client } from "../src/api";
 import {
   computeNativeBatchBudget,
   estimateNativeTurnCost,
+  estimateNativeHistoryInputTokens,
   NATIVE_BATCH_FIXED_RESERVE_TOKENS,
   NATIVE_BATCH_PLANNING_NONCE,
   planNativeGenerationBatches,
@@ -103,6 +104,40 @@ afterAll(async () => {
 });
 
 describe("native generation batch planning", () => {
+  test("exposes the same native state/media input estimate without changing turn output", () => {
+    const tool = {
+      type: "tool",
+      id: "prt_estimate",
+      sessionID: "session",
+      messageID: "ast_estimate",
+      callID: "call_estimate",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: {},
+        output: "stored result",
+        title: "read",
+        metadata: {},
+        time: { start: 1, end: 2, compacted: 1 },
+        attachments: [],
+      },
+    } as unknown as Part;
+    const turn: Turn = {
+      user: [
+        { info: { id: "usr_estimate", role: "user" } as Message, parts: [] },
+      ],
+      assistants: [
+        {
+          info: { id: "ast_estimate", role: "assistant" } as Message,
+          parts: [tool],
+        },
+      ],
+    };
+    expect(
+      estimateNativeHistoryInputTokens([...turn.user, ...turn.assistants]),
+    ).toBe(estimateNativeTurnCost(turn).inputTokens);
+    expect(estimateNativeTurnCost(turn).outputTokens).toBeGreaterThan(0);
+  });
   const budget = computeNativeBatchBudget({
     context: 1_000_000,
     input: 500_000,

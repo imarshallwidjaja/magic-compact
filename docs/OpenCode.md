@@ -118,6 +118,7 @@ After argument and execution-option validation, compact and trim show a long-liv
 - Valid v1 bare entries are preserved under `legacy.entries` during migration and backup copying, but no new bare ID is allocated and bare legacy bytes are never returned.
 - An absent source cache materializes as an empty v2 cache when copied to a backup. Malformed, schema-invalid, or integrity-invalid caches fail loudly and are not reset.
 - Cache writes use atomic temporary-file replacement. In-process mutations for one session are serialized; distinct sessions remain independent.
+- Planned batches use one serialized atomic cache rewrite after validating every existing entry and every new ID/content pair. The explicit `ensure` policy accepts exact ID/content replay without rewriting; `reject` and legacy single-entry commits reject existing IDs. Conflicting content and invalid integrity fail before publication.
 
 ## Omission Retrieval
 
@@ -143,6 +144,7 @@ After argument and execution-option validation, compact and trim show a long-liv
 - Synthetic user text is deleted unless it is a preserved OpenCode wrapper or reminder.
 - Summarized assistant messages keep summary parts, tool parts, and v3 manifest-covered inline image files. Other assistant parts are deleted; empty assistant messages are deleted.
 - Only completed tool parts are pruned. Pending, running, and error states remain.
+- Legacy tool rules also produce immutable source-bound replacements for a pure tool-only outgoing-view projection. Source identity and behavior-affecting content must still match; projection clones history without deleting messages or changing user parts. Canonical stored counts retain their media-only basis, while an explicit effective-view count composes a supplied tool overlay with media projection. The native-history input estimate is separately exposed for request-pressure estimation and does not change compaction batch output budgeting.
 - `/magic-trim` applies only tool rules and marks processed states. Marked states are not output-trimmed again, but idempotent input rules still apply to them.
 
 ## Tool Rules
