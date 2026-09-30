@@ -33,22 +33,19 @@ bun install
 - `src/compact/constants.ts` - compaction notices, boundary metadata, summary metadata, and omission notice formatting.
 - `src/compact/media.ts` - authoritative v2 user-image and v3 user/assistant-image manifest discovery plus pure model-request projection.
 - `src/compact/plan.ts` - turn planning, native checkpoint validation, source snapshot capture, post-insertion validation, and boundary selection.
-- `src/compact/prune.ts` - exact compaction delete planning/execution and legacy tool mutation callers.
-- `src/trim/legacy.ts` - pure legacy completed-tool replacement rules and omission notices.
-- `src/trim/plan.ts` - source-bound immutable tool replacement and overlay snapshots.
-- `src/trim/projection.ts` - tool-only request-view projection without storage or deletion.
+- `src/compact/prune.ts` - exact prune mutation planning/execution and tool input/output pruning.
 - `src/compact/session.ts` - session backup, owned insertion, revalidation, and recovery helpers.
-- `src/storage/omission.ts` - omitted content cache persistence, strict single commits, and atomic batch publication with explicit replay policy.
+- `src/storage/omission.ts` - omitted content cache persistence and preplanned omission IDs for exact projection.
 - `src/storage/stats.ts` - persisted stats storage.
 - `src/storage/store.ts` - shared storage access helpers.
 - `src/stats/constants.ts` - stats constants.
 - `src/stats/events.ts` - stats event accounting.
 - `src/stats/pricing.ts` - pricing calculations.
-- `src/stats/tokenize.ts` - canonical stored/media-only counts and explicit effective tool-overlay counts.
+- `src/stats/tokenize.ts` - token estimation helpers.
 - `test/compact.test.ts` - native batch budgets/concurrency/isolation, encoded tool payload and fixed media canaries, exact retained fork identity, active-failure aggregation, response ordering, media manifests/projection, opaque summary-bearing turns, useful-savings projection, exact pruning/omission, source-drift preservation, checkpoint, stats, and recovery tests.
-- `test/omission.test.ts` - omission cache migration, integrity, strict/batch replay, backup, and concurrency tests.
-- `test/trim.test.ts` - isolated trim planning, legacy rules, tool-only projection, metadata idempotency, and omission-format integration tests.
-- `test/tokenize.test.ts` - stored and effective canonical local token-accounting tests.
+- `test/omission.test.ts` - omission cache migration, integrity, legacy quarantine, backup, and concurrency tests.
+- `test/trim.test.ts` - trim planning, metadata idempotency, v0 summary preservation, and omission-format integration tests.
+- `test/tokenize.test.ts` - canonical local token-accounting tests.
 - `test/license.test.ts` - packaged no-grant notice plus verbatim upstream Magic Compact BSD-3.
 
 ### License

@@ -101,45 +101,6 @@ export async function commitPlannedOmission(
   });
 }
 
-export async function commitPlannedOmissions(
-  sessionID: string,
-  omissions: readonly PlannedOmission[],
-  replay: "reject" | "ensure",
-): Promise<void> {
-  if (replay !== "reject" && replay !== "ensure") {
-    throw new Error("Invalid planned omission replay policy.");
-  }
-  if (omissions.length === 0) return;
-  await withSessionMutation(sessionID, async () => {
-    const cache = (await readCacheFile(sessionID)) ?? createEmptyCache();
-    const pending = new Map<string, string>();
-    for (const omission of omissions) {
-      if (!QualifiedContentIDSchema.safeParse(omission.contentID).success) {
-        throw new Error("Invalid planned omission Content ID.");
-      }
-      const previous = pending.get(omission.contentID);
-      if (previous !== undefined && previous !== omission.content) {
-        throw new Error("Conflicting planned omission content.");
-      }
-      pending.set(omission.contentID, omission.content);
-      const existing = cache.entries[omission.contentID];
-      if (
-        existing
-        && (replay === "reject" || existing.content !== omission.content)
-      ) {
-        throw new Error("Planned omission Content ID collided before pruning.");
-      }
-    }
-    let changed = false;
-    for (const [contentID, content] of pending) {
-      if (cache.entries[contentID]) continue;
-      cache.entries[contentID] = createEntry(contentID, content);
-      changed = true;
-    }
-    if (changed) await writeCacheFile(sessionID, cache);
-  });
-}
-
 export async function copyCache(
   sourceSessionID: string,
   targetSessionID: string,

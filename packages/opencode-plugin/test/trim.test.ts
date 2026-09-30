@@ -1,8 +1,6 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { rm } from "node:fs/promises";
 import type {
   Message,
   Part,
@@ -18,9 +16,6 @@ import {
   type Turn,
 } from "../src/compact/plan";
 import { trimToolParts } from "../src/compact/prune";
-import { prepareLegacyToolReplacement } from "../src/trim/legacy";
-import { bindToolSource, createToolOverlaySnapshot } from "../src/trim/plan";
-import { projectToolReplacements } from "../src/trim/projection";
 import { TRIM_NOOP, executeMagicTrim } from "../src/magic-trim";
 import {
   allocateOmission,
@@ -38,188 +33,7 @@ import {
 import { trimStatsMessage } from "../src/stats/constants";
 import { countCanonicalContentTokens } from "../src/stats/tokenize";
 
-let storageDirectory: string;
-const originalDataHome = process.env.XDG_DATA_HOME;
-beforeAll(async () => {
-  storageDirectory = await mkdtemp(join(tmpdir(), "magic-compact-trim-"));
-  process.env.XDG_DATA_HOME = storageDirectory;
-});
-afterAll(async () => {
-  if (originalDataHome === undefined) delete process.env.XDG_DATA_HOME;
-  else process.env.XDG_DATA_HOME = originalDataHome;
-  await rm(storageDirectory, { recursive: true, force: true });
-});
-
 describe("magic trim", () => {
-  test("legacy replacement preserves tool-specific thresholds and does not mutate its source", async () => {
-    const cases: Array<{
-      name: string;
-      input: Record<string, unknown>;
-      output: string;
-      changed: boolean;
-      omissions: string[];
-      expectedOutput?: string;
-    }> = [
-      {
-        name: "write",
-        input: { content: "x".repeat(1025) },
-        output: "ok",
-        changed: true,
-        omissions: ["x".repeat(1025)],
-      },
-      {
-        name: "edit",
-        input: { oldString: "x".repeat(1024), newString: "y" },
-        output: "ok",
-        changed: true,
-        omissions: [`${"x".repeat(1024)}\ny`],
-      },
-      {
-        name: "apply_patch",
-        input: { patchText: "x".repeat(1025) },
-        output: "ok",
-        changed: true,
-        omissions: ["x".repeat(1025)],
-      },
-      {
-        name: "bash",
-        input: { command: "x".repeat(1025) },
-        output: "ok",
-        changed: true,
-        omissions: ["x".repeat(1025)],
-      },
-      { name: "read", input: {}, output: "", changed: true, omissions: [""] },
-      {
-        name: "task",
-        input: { prompt: "x".repeat(1025) },
-        output: "z".repeat(4097),
-        changed: true,
-        omissions: ["x".repeat(1025), "z".repeat(4097)],
-      },
-      {
-        name: "question",
-        input: {},
-        output: "z".repeat(4097),
-        changed: true,
-        omissions: [],
-        expectedOutput: "z".repeat(4097),
-      },
-      {
-        name: "todowrite",
-        input: {},
-        output: "x",
-        changed: true,
-        omissions: [],
-        expectedOutput: "Successfully updated todos.",
-      },
-      {
-        name: "skill",
-        input: {},
-        output: "x",
-        changed: true,
-        omissions: [],
-        expectedOutput:
-          "Skill contents omitted due to compaction operation. If necessary, recall skill.",
-      },
-      {
-        name: "unknown",
-        input: {},
-        output: "x".repeat(1024),
-        changed: true,
-        omissions: [],
-      },
-    ];
-    for (const [index, item] of cases.entries()) {
-      const tool = completedTool(`case_${index}`, item.name, item.output);
-      if (tool.state.status !== "completed")
-        throw new Error("Expected completed tool");
-      tool.state.input = item.input;
-      const before = structuredClone(tool);
-      const omitted: string[] = [];
-      const replacement = await prepareLegacyToolReplacement(
-        tool,
-        async entry => {
-          omitted.push(entry.content);
-          return `session:omitted-${"A".repeat(22)}`;
-        },
-      );
-      expect(Boolean(replacement)).toBe(item.changed);
-      expect(omitted).toEqual(item.omissions);
-      expect(tool).toEqual(before);
-      if (replacement?.state.status === "completed" && item.expectedOutput) {
-        expect(replacement.state.output).toBe(item.expectedOutput);
-      }
-    }
-  });
-
-  test("tool-only overlays clone history and reject changed or missing sources", async () => {
-    const tool = readTool("tool_projection", "historical output");
-    const source = [
-      message("user", "user", [
-        {
-          id: "user_text",
-          sessionID: "session",
-          messageID: "user",
-          type: "text",
-          text: "Keep me",
-        },
-      ]),
-      message("assistant", "assistant", [tool]),
-    ];
-    const before = structuredClone(source);
-    const replacement = await prepareLegacyToolReplacement(
-      tool,
-      async () => `session:omitted-${"A".repeat(22)}`,
-    );
-    expect(replacement).not.toBeNull();
-    const snapshot = createToolOverlaySnapshot([
-      {
-        source: bindToolSource(tool),
-        part: replacement!,
-        omissions: [],
-      },
-    ]);
-    replacement!.state = tool.state;
-    const result = projectToolReplacements(source, snapshot);
-    expect(source).toEqual(before);
-    expect(result.map(item => item.info.id)).toEqual(
-      source.map(item => item.info.id),
-    );
-    expect(result[0]).toEqual(source[0]);
-    expect(result[1]!.parts[0]).not.toEqual(tool);
-    expect(Object.isFrozen(snapshot.replacements[0]!.part.state)).toBeTrue();
-    const drift = structuredClone(source);
-    (drift[1]!.parts[0] as ToolPart).state.metadata = { changed: true };
-    expect(() => projectToolReplacements(drift, snapshot)).toThrow(
-      "source changed",
-    );
-    const timing = structuredClone(source);
-    const timed = timing[1]!.parts[0] as ToolPart;
-    if (timed.state.status !== "completed")
-      throw new Error("Expected completed tool");
-    timed.state.time.start = 999;
-    expect(projectToolReplacements(timing, snapshot)[1]!.parts[0]).toEqual(
-      snapshot.replacements[0]!.part,
-    );
-    timed.state.time.compacted = 1;
-    expect(() => projectToolReplacements(timing, snapshot)).toThrow(
-      "source changed",
-    );
-    expect(() => projectToolReplacements(source.slice(0, 1), snapshot)).toThrow(
-      "source is missing",
-    );
-    const userTool = structuredClone(source);
-    userTool[1]!.info = { ...userTool[1]!.info, role: "user" } as Message;
-    expect(() => projectToolReplacements(userTool, snapshot)).toThrow(
-      "assistant message",
-    );
-    expect(() =>
-      createToolOverlaySnapshot([
-        snapshot.replacements[0]!,
-        snapshot.replacements[0]!,
-      ]),
-    ).toThrow("Duplicate");
-  });
   test("preserves the requested assistant-turn tail", async () => {
     const messages = [
       message("usr_1", "user", []),

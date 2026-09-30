@@ -4,8 +4,6 @@ import { countTokens } from "gpt-tokenizer";
 import { unwrap, type V2Client } from "../api";
 import { projectManifestCoveredMedia } from "../compact/media";
 import type { MessageWithParts } from "../compact/plan";
-import { projectToolReplacements } from "../trim/projection";
-import type { ToolOverlaySnapshot } from "../trim/plan";
 
 const PINNED_GPT_TOKENIZER_VERSION = "3.4.0";
 const PINNED_O200K_MAX_TOKEN_BYTES = 128;
@@ -132,15 +130,6 @@ export function countModelFacingContentTokens(
     tokens,
     projectedMediaTokens: persistedTokens - tokens,
   };
-}
-
-export function countEffectiveViewTokens(
-  messages: MessageWithParts[],
-  snapshot: ToolOverlaySnapshot,
-): ModelFacingTokenCount {
-  return countModelFacingContentTokens(
-    projectToolReplacements(messages, snapshot),
-  );
 }
 
 export function countCanonicalContentTokens(
