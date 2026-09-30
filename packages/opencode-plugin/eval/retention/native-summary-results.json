@@ -1,0 +1,696 @@
+{
+  "threshold": 0.8,
+  "uniqueCases": 144,
+  "requestTokenEvidence": {
+    "requests": 448,
+    "maxInputTokens": 7035,
+    "source": "Per-case inputTokens in the six saved live-run JSON files; body hashes and scores checked against native-summary-cases.json. Raw files remain private under /tmp/opencode/task-aware-retention-final-eval/runs/.",
+    "runSha256": {
+      "dev-r1": "401cfd38c1c965179a779b5b3e679f9e83a53731cb9ca43ed929fde9eaca1dfc",
+      "dev-r2": "a3a991fc7c9b2140f3916fff50a2ed60c7dfebe46badebd7287f37117c0887e7",
+      "held-r1": "3df1245aedf7ac6c0e8641eda6f1c55e2851e8094ac0ee47654468ee9452ecbf",
+      "held-r2": "6e8fbc721ef30f3209738e62e8d4b8ea9da0d39191d4a515ea9dbd3165ae8d49",
+      "held-r3": "6e4cde378643361ded72bcfe2f35b344adccd6fd832d1c7a7f8e4bbea258f4a6",
+      "held-r4": "8cc360f26222b8be300d838e3e0b63f07eb8185d00b55e4f06fd5b6b680d93ef"
+    }
+  },
+  "repeatInterpretation": "Repeated scores of the same cases; not independent samples.",
+  "development": {
+    "cases": 64,
+    "runs": ["dev-r1", "dev-r2"],
+    "scoreSpread": {
+      "max": 0.06,
+      "p90": 0.02,
+      "median": 0.01
+    },
+    "perRun": {
+      "dev-r1": {
+        "primary": {
+          "TP": 24,
+          "FP": 0,
+          "FN": 13,
+          "TN": 17,
+          "keptUnresolved": 0,
+          "precision": 1.0,
+          "recall": 0.649
+        },
+        "annotatorA": {
+          "TP": 24,
+          "FP": 0,
+          "FN": 16,
+          "TN": 19,
+          "keptUnresolved": 0,
+          "precision": 1.0,
+          "recall": 0.6
+        },
+        "annotatorB": {
+          "TP": 24,
+          "FP": 0,
+          "FN": 14,
+          "TN": 23,
+          "keptUnresolved": 0,
+          "precision": 1.0,
+          "recall": 0.632
+        },
+        "unresolvedFalse": {
+          "TP": 24,
+          "FP": 0,
+          "FN": 13,
+          "TN": 27,
+          "keptUnresolved": 0,
+          "precision": 1.0,
+          "recall": 0.649
+        },
+        "unresolvedTrue": {
+          "TP": 24,
+          "FP": 0,
+          "FN": 23,
+          "TN": 17,
+          "keptUnresolved": 0,
+          "precision": 1.0,
+          "recall": 0.511
+        },
+        "kept": 24
+      },
+      "dev-r2": {
+        "primary": {
+          "TP": 24,
+          "FP": 0,
+          "FN": 13,
+          "TN": 17,
+          "keptUnresolved": 0,
+          "precision": 1.0,
+          "recall": 0.649
+        },
+        "annotatorA": {
+          "TP": 24,
+          "FP": 0,
+          "FN": 16,
+          "TN": 19,
+          "keptUnresolved": 0,
+          "precision": 1.0,
+          "recall": 0.6
+        },
+        "annotatorB": {
+          "TP": 24,
+          "FP": 0,
+          "FN": 14,
+          "TN": 23,
+          "keptUnresolved": 0,
+          "precision": 1.0,
+          "recall": 0.632
+        },
+        "unresolvedFalse": {
+          "TP": 24,
+          "FP": 0,
+          "FN": 13,
+          "TN": 27,
+          "keptUnresolved": 0,
+          "precision": 1.0,
+          "recall": 0.649
+        },
+        "unresolvedTrue": {
+          "TP": 24,
+          "FP": 0,
+          "FN": 23,
+          "TN": 17,
+          "keptUnresolved": 0,
+          "precision": 1.0,
+          "recall": 0.511
+        },
+        "kept": 24
+      }
+    },
+    "majority": {
+      "primary": {
+        "TP": 24,
+        "FP": 0,
+        "FN": 13,
+        "TN": 17,
+        "keptUnresolved": 0,
+        "precision": 1.0,
+        "recall": 0.649
+      },
+      "annotatorA": {
+        "TP": 24,
+        "FP": 0,
+        "FN": 16,
+        "TN": 19,
+        "keptUnresolved": 0,
+        "precision": 1.0,
+        "recall": 0.6
+      },
+      "annotatorB": {
+        "TP": 24,
+        "FP": 0,
+        "FN": 14,
+        "TN": 23,
+        "keptUnresolved": 0,
+        "precision": 1.0,
+        "recall": 0.632
+      },
+      "unresolvedFalse": {
+        "TP": 24,
+        "FP": 0,
+        "FN": 13,
+        "TN": 27,
+        "keptUnresolved": 0,
+        "precision": 1.0,
+        "recall": 0.649
+      },
+      "unresolvedTrue": {
+        "TP": 24,
+        "FP": 0,
+        "FN": 23,
+        "TN": 17,
+        "keptUnresolved": 0,
+        "precision": 1.0,
+        "recall": 0.511
+      },
+      "kept": 24
+    },
+    "flippingCases": 0,
+    "perSnapshot": {
+      "ses_06968d72affeqXJAGAscUXo8XN@g1": {
+        "cases": 20,
+        "keptMajority": 7,
+        "primaryTrue": 11,
+        "TP": 7,
+        "FP": 0,
+        "keptUnresolved": 0
+      },
+      "ses_06b9b6f4bffe9lSxWGfUEBSOgq@g1": {
+        "cases": 20,
+        "keptMajority": 10,
+        "primaryTrue": 12,
+        "TP": 10,
+        "FP": 0,
+        "keptUnresolved": 0
+      },
+      "ses_08045a843ffeeNdNyzOHggh4gv@g1": {
+        "cases": 24,
+        "keptMajority": 7,
+        "primaryTrue": 14,
+        "TP": 7,
+        "FP": 0,
+        "keptUnresolved": 0
+      }
+    },
+    "usage": {
+      "dev-r1": {
+        "requests": 64,
+        "inputTokens": 288347,
+        "costUSD": 0.01211,
+        "retries": 0,
+        "requestMsP50": 233,
+        "requestMsP90": 257,
+        "requestMsMax": 420,
+        "invocationMs": {
+          "ses_06968d72affeqXJAGAscUXo8XN@g1": 1317,
+          "ses_06b9b6f4bffe9lSxWGfUEBSOgq@g1": 1179,
+          "ses_08045a843ffeeNdNyzOHggh4gv@g1": 1592
+        },
+        "prepMs": 44,
+        "cleanupMs": 0,
+        "totalMs": 4133
+      },
+      "dev-r2": {
+        "requests": 64,
+        "inputTokens": 288347,
+        "costUSD": 0.01211,
+        "retries": 0,
+        "requestMsP50": 230,
+        "requestMsP90": 263,
+        "requestMsMax": 345,
+        "invocationMs": {
+          "ses_08045a843ffeeNdNyzOHggh4gv@g1": 1471,
+          "ses_06b9b6f4bffe9lSxWGfUEBSOgq@g1": 1379,
+          "ses_06968d72affeqXJAGAscUXo8XN@g1": 1206
+        },
+        "prepMs": 44,
+        "cleanupMs": 0,
+        "totalMs": 4101
+      }
+    }
+  },
+  "heldout": {
+    "cases": 80,
+    "runs": ["held-r1", "held-r2", "held-r3", "held-r4"],
+    "scoreSpread": {
+      "max": 0.11,
+      "p90": 0.05,
+      "median": 0.02
+    },
+    "perRun": {
+      "held-r1": {
+        "primary": {
+          "TP": 9,
+          "FP": 1,
+          "FN": 19,
+          "TN": 37,
+          "keptUnresolved": 0,
+          "precision": 0.9,
+          "recall": 0.321
+        },
+        "annotatorA": {
+          "TP": 9,
+          "FP": 1,
+          "FN": 23,
+          "TN": 41,
+          "keptUnresolved": 0,
+          "precision": 0.9,
+          "recall": 0.281
+        },
+        "annotatorB": {
+          "TP": 9,
+          "FP": 1,
+          "FN": 24,
+          "TN": 39,
+          "keptUnresolved": 0,
+          "precision": 0.9,
+          "recall": 0.273
+        },
+        "unresolvedFalse": {
+          "TP": 9,
+          "FP": 1,
+          "FN": 19,
+          "TN": 51,
+          "keptUnresolved": 0,
+          "precision": 0.9,
+          "recall": 0.321
+        },
+        "unresolvedTrue": {
+          "TP": 9,
+          "FP": 1,
+          "FN": 33,
+          "TN": 37,
+          "keptUnresolved": 0,
+          "precision": 0.9,
+          "recall": 0.214
+        },
+        "kept": 10
+      },
+      "held-r2": {
+        "primary": {
+          "TP": 8,
+          "FP": 1,
+          "FN": 20,
+          "TN": 37,
+          "keptUnresolved": 0,
+          "precision": 0.889,
+          "recall": 0.286
+        },
+        "annotatorA": {
+          "TP": 8,
+          "FP": 1,
+          "FN": 24,
+          "TN": 41,
+          "keptUnresolved": 0,
+          "precision": 0.889,
+          "recall": 0.25
+        },
+        "annotatorB": {
+          "TP": 8,
+          "FP": 1,
+          "FN": 25,
+          "TN": 39,
+          "keptUnresolved": 0,
+          "precision": 0.889,
+          "recall": 0.242
+        },
+        "unresolvedFalse": {
+          "TP": 8,
+          "FP": 1,
+          "FN": 20,
+          "TN": 51,
+          "keptUnresolved": 0,
+          "precision": 0.889,
+          "recall": 0.286
+        },
+        "unresolvedTrue": {
+          "TP": 8,
+          "FP": 1,
+          "FN": 34,
+          "TN": 37,
+          "keptUnresolved": 0,
+          "precision": 0.889,
+          "recall": 0.19
+        },
+        "kept": 9
+      },
+      "held-r3": {
+        "primary": {
+          "TP": 9,
+          "FP": 1,
+          "FN": 19,
+          "TN": 37,
+          "keptUnresolved": 0,
+          "precision": 0.9,
+          "recall": 0.321
+        },
+        "annotatorA": {
+          "TP": 9,
+          "FP": 1,
+          "FN": 23,
+          "TN": 41,
+          "keptUnresolved": 0,
+          "precision": 0.9,
+          "recall": 0.281
+        },
+        "annotatorB": {
+          "TP": 9,
+          "FP": 1,
+          "FN": 24,
+          "TN": 39,
+          "keptUnresolved": 0,
+          "precision": 0.9,
+          "recall": 0.273
+        },
+        "unresolvedFalse": {
+          "TP": 9,
+          "FP": 1,
+          "FN": 19,
+          "TN": 51,
+          "keptUnresolved": 0,
+          "precision": 0.9,
+          "recall": 0.321
+        },
+        "unresolvedTrue": {
+          "TP": 9,
+          "FP": 1,
+          "FN": 33,
+          "TN": 37,
+          "keptUnresolved": 0,
+          "precision": 0.9,
+          "recall": 0.214
+        },
+        "kept": 10
+      },
+      "held-r4": {
+        "primary": {
+          "TP": 10,
+          "FP": 1,
+          "FN": 18,
+          "TN": 37,
+          "keptUnresolved": 0,
+          "precision": 0.909,
+          "recall": 0.357
+        },
+        "annotatorA": {
+          "TP": 10,
+          "FP": 1,
+          "FN": 22,
+          "TN": 41,
+          "keptUnresolved": 0,
+          "precision": 0.909,
+          "recall": 0.312
+        },
+        "annotatorB": {
+          "TP": 10,
+          "FP": 1,
+          "FN": 23,
+          "TN": 39,
+          "keptUnresolved": 0,
+          "precision": 0.909,
+          "recall": 0.303
+        },
+        "unresolvedFalse": {
+          "TP": 10,
+          "FP": 1,
+          "FN": 18,
+          "TN": 51,
+          "keptUnresolved": 0,
+          "precision": 0.909,
+          "recall": 0.357
+        },
+        "unresolvedTrue": {
+          "TP": 10,
+          "FP": 1,
+          "FN": 32,
+          "TN": 37,
+          "keptUnresolved": 0,
+          "precision": 0.909,
+          "recall": 0.238
+        },
+        "kept": 11
+      }
+    },
+    "majority": {
+      "primary": {
+        "TP": 9,
+        "FP": 1,
+        "FN": 19,
+        "TN": 37,
+        "keptUnresolved": 0,
+        "precision": 0.9,
+        "recall": 0.321
+      },
+      "annotatorA": {
+        "TP": 9,
+        "FP": 1,
+        "FN": 23,
+        "TN": 41,
+        "keptUnresolved": 0,
+        "precision": 0.9,
+        "recall": 0.281
+      },
+      "annotatorB": {
+        "TP": 9,
+        "FP": 1,
+        "FN": 24,
+        "TN": 39,
+        "keptUnresolved": 0,
+        "precision": 0.9,
+        "recall": 0.273
+      },
+      "unresolvedFalse": {
+        "TP": 9,
+        "FP": 1,
+        "FN": 19,
+        "TN": 51,
+        "keptUnresolved": 0,
+        "precision": 0.9,
+        "recall": 0.321
+      },
+      "unresolvedTrue": {
+        "TP": 9,
+        "FP": 1,
+        "FN": 33,
+        "TN": 37,
+        "keptUnresolved": 0,
+        "precision": 0.9,
+        "recall": 0.214
+      },
+      "kept": 10
+    },
+    "flippingCases": 2,
+    "perSnapshot": {
+      "ses_0617c1227ffe6ufR1KiqW0cGWC@g1": {
+        "cases": 19,
+        "keptMajority": 3,
+        "primaryTrue": 8,
+        "TP": 3,
+        "FP": 0,
+        "keptUnresolved": 0
+      },
+      "ses_080cf0d26ffeepy134f5s297rv@g2": {
+        "cases": 16,
+        "keptMajority": 4,
+        "primaryTrue": 4,
+        "TP": 3,
+        "FP": 1,
+        "keptUnresolved": 0
+      },
+      "ses_09826833effeBXaptrgL9kDUlp@g2": {
+        "cases": 23,
+        "keptMajority": 3,
+        "primaryTrue": 9,
+        "TP": 3,
+        "FP": 0,
+        "keptUnresolved": 0
+      },
+      "ses_fddb10c47ffeXXyiIxJt3mOSvC@g1": {
+        "cases": 22,
+        "keptMajority": 0,
+        "primaryTrue": 7,
+        "TP": 0,
+        "FP": 0,
+        "keptUnresolved": 0
+      }
+    },
+    "usage": {
+      "held-r1": {
+        "requests": 80,
+        "inputTokens": 279149,
+        "costUSD": 0.01172,
+        "retries": 0,
+        "requestMsP50": 227,
+        "requestMsP90": 276,
+        "requestMsMax": 437,
+        "invocationMs": {
+          "ses_09826833effeBXaptrgL9kDUlp@g2": 1570,
+          "ses_080cf0d26ffeepy134f5s297rv@g2": 963,
+          "ses_0617c1227ffe6ufR1KiqW0cGWC@g1": 1246,
+          "ses_fddb10c47ffeXXyiIxJt3mOSvC@g1": 1329
+        },
+        "prepMs": 47,
+        "cleanupMs": 0,
+        "totalMs": 5157
+      },
+      "held-r2": {
+        "requests": 80,
+        "inputTokens": 279149,
+        "costUSD": 0.01172,
+        "retries": 0,
+        "requestMsP50": 231,
+        "requestMsP90": 272,
+        "requestMsMax": 306,
+        "invocationMs": {
+          "ses_09826833effeBXaptrgL9kDUlp@g2": 1410,
+          "ses_080cf0d26ffeepy134f5s297rv@g2": 1044,
+          "ses_0617c1227ffe6ufR1KiqW0cGWC@g1": 1208,
+          "ses_fddb10c47ffeXXyiIxJt3mOSvC@g1": 1398
+        },
+        "prepMs": 49,
+        "cleanupMs": 0,
+        "totalMs": 5110
+      },
+      "held-r3": {
+        "requests": 80,
+        "inputTokens": 279149,
+        "costUSD": 0.01172,
+        "retries": 0,
+        "requestMsP50": 230,
+        "requestMsP90": 281,
+        "requestMsMax": 318,
+        "invocationMs": {
+          "ses_09826833effeBXaptrgL9kDUlp@g2": 1443,
+          "ses_080cf0d26ffeepy134f5s297rv@g2": 981,
+          "ses_0617c1227ffe6ufR1KiqW0cGWC@g1": 1318,
+          "ses_fddb10c47ffeXXyiIxJt3mOSvC@g1": 1346
+        },
+        "prepMs": 49,
+        "cleanupMs": 0,
+        "totalMs": 5137
+      },
+      "held-r4": {
+        "requests": 80,
+        "inputTokens": 279149,
+        "costUSD": 0.01172,
+        "retries": 0,
+        "requestMsP50": 225,
+        "requestMsP90": 270,
+        "requestMsMax": 655,
+        "invocationMs": {
+          "ses_fddb10c47ffeXXyiIxJt3mOSvC@g1": 1355,
+          "ses_0617c1227ffe6ufR1KiqW0cGWC@g1": 1472,
+          "ses_080cf0d26ffeepy134f5s297rv@g2": 1001,
+          "ses_09826833effeBXaptrgL9kDUlp@g2": 1551
+        },
+        "prepMs": 47,
+        "cleanupMs": 0,
+        "totalMs": 5427
+      }
+    }
+  },
+  "details": {
+    "threshold": 0.8,
+    "retained": {
+      "bytes": 92925,
+      "totalBytes": 663682,
+      "byteFraction": 0.14,
+      "estTokens": 25516,
+      "totalEstTokens": 164783,
+      "tokenFraction": 0.1548
+    },
+    "perSnapshot": {
+      "ses_09826833effeBXaptrgL9kDUlp@g2": {
+        "cases": 23,
+        "keptMajority": 3,
+        "bytes": 162763,
+        "keptBytes": 10652,
+        "tokens": 43138,
+        "keptTokens": 3289
+      },
+      "ses_080cf0d26ffeepy134f5s297rv@g2": {
+        "cases": 16,
+        "keptMajority": 4,
+        "bytes": 66459,
+        "keptBytes": 27003,
+        "tokens": 19677,
+        "keptTokens": 8144
+      },
+      "ses_0617c1227ffe6ufR1KiqW0cGWC@g1": {
+        "cases": 19,
+        "keptMajority": 3,
+        "bytes": 239487,
+        "keptBytes": 55270,
+        "tokens": 57581,
+        "keptTokens": 14083
+      },
+      "ses_fddb10c47ffeXXyiIxJt3mOSvC@g1": {
+        "cases": 22,
+        "keptMajority": 0,
+        "bytes": 194973,
+        "keptBytes": 0,
+        "tokens": 44387,
+        "keptTokens": 0
+      }
+    },
+    "clippedCases": {
+      "latest": 19,
+      "summary": 0,
+      "turnRequest": 44,
+      "input": 4,
+      "output": 26
+    },
+    "jevTokensPerBodyByte": {
+      "min": 0.233,
+      "median": 0.274,
+      "max": 0.387
+    },
+    "maxBodyBytes": 23854,
+    "maxStatePlusQuestionBytes": 23794,
+    "errorsAndFlips": [
+      {
+        "kind": "flip",
+        "caseID": "ses_09826833effeBXaptrgL9kDUlp@g2#14",
+        "tool": "hive_background_reconcile",
+        "requestsBeforeLatest": 1,
+        "scores": [0.78, 0.78, 0.78, 0.8],
+        "primary": true,
+        "a": true,
+        "b": true,
+        "inputBytes": 284,
+        "outputBytes": 7909,
+        "outputClipped": false
+      },
+      {
+        "kind": "flip",
+        "caseID": "ses_09826833effeBXaptrgL9kDUlp@g2#22",
+        "tool": "hive_plan_read",
+        "requestsBeforeLatest": 0,
+        "scores": [0.8, 0.79, 0.8, 0.8],
+        "primary": true,
+        "a": true,
+        "b": true,
+        "inputBytes": 59,
+        "outputBytes": 3939,
+        "outputClipped": false
+      },
+      {
+        "kind": "FP",
+        "caseID": "ses_080cf0d26ffeepy134f5s297rv@g2#15",
+        "tool": "ctx_execute",
+        "requestsBeforeLatest": 0,
+        "scores": [0.82, 0.83, 0.82, 0.82],
+        "primary": false,
+        "a": false,
+        "b": false,
+        "inputBytes": 898,
+        "outputBytes": 1093,
+        "outputClipped": false
+      }
+    ]
+  }
+}

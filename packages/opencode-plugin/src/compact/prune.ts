@@ -1,4 +1,5 @@
 import type { Part, ToolPart } from "@opencode-ai/sdk/v2";
+import { isDeepStrictEqual } from "node:util";
 import { unwrap, type V2Client } from "../api";
 import {
   inputOmissionNotice,
@@ -90,9 +91,12 @@ export async function pruneSummarizedTurns(
   }
 }
 
+// `keep` names tool parts that task-aware retention keeps whole: they stay
+// byte-identical, including their trim metadata, and produce no mutation.
 export async function createPruneProjection(
   turns: Turn[],
   sessionID: string,
+  keep: ReadonlySet<string>,
 ): Promise<PruneProjection> {
   assertNoNativeArtifacts(turns);
   const projected = structuredClone(turns);
@@ -130,6 +134,8 @@ export async function createPruneProjection(
           part.type === "file"
           && coveredAssistantImages.has(part.id)
         ) {
+          kept.push(part);
+        } else if (part.type === "tool" && keep.has(part.id)) {
           kept.push(part);
         } else if (part.type === "tool") {
           const partOmissions: PlannedOmission[] = [];
@@ -191,6 +197,7 @@ function assertNoNativeArtifacts(turns: Turn[]): void {
 export async function trimToolParts(
   context: PruneContext,
   turns: Turn[],
+  keep: ReadonlySet<string>,
 ): Promise<number> {
   let trimmed = 0;
   for (const turn of turns) {
@@ -198,6 +205,7 @@ export async function trimToolParts(
       for (const part of assistant.parts) {
         if (
           part.type === "tool"
+          && !keep.has(part.id)
           && (await pruneToolPart(context, part, entry =>
             allocateOmission(context.sessionID, entry),
           ))
@@ -208,6 +216,20 @@ export async function trimToolParts(
     }
   }
   return trimmed;
+}
+
+// True when the existing tool rules would change a completed part's model
+// input or output, not merely stamp its trim metadata. Runs the rules on a
+// clone and allocates no omission IDs.
+export async function trimWouldChangeContent(part: ToolPart): Promise<boolean> {
+  if (part.state.status !== "completed") return false;
+  const probe = structuredClone(part);
+  await prepareToolPart(probe, async () => "retention-probe");
+  return (
+    probe.state.status === "completed"
+    && (probe.state.output !== part.state.output
+      || !isDeepStrictEqual(probe.state.input, part.state.input))
+  );
 }
 
 async function pruneToolPart(

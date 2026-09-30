@@ -1,0 +1,2331 @@
+{
+  "labeler": "forager-worker (single annotator, snapshot-only view, labelled before any classifier call)",
+  "definition": "useful = the candidate tool call input or output holds concrete content likely to help the assistant continue the task in the latest user request at the snapshot, even if the content could be fetched again. Stale, superseded, finished-task, topic-only, empty, and routine content is expendable.",
+  "snapshots": [
+    {
+      "snapshotID": "ses_03dea5104ffejUfuSyl9xWyKJi@70",
+      "split": "development",
+      "kind": "incident debugging",
+      "labels": [
+        {
+          "partID": "prt_fc215af65001KlisNqawOaxBon",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -25,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier incident investigation; output omitted"
+        },
+        {
+          "partID": "prt_fc215af68001uxY3egt3AI5pI9",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -25,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier incident investigation; output omitted"
+        },
+        {
+          "partID": "prt_fc215b069001UtukwWCHzQ4gB4",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -23,
+          "useful": false,
+          "category": "routine-noise",
+          "ambiguous": false,
+          "note": "background task start notice for a finished phase"
+        },
+        {
+          "partID": "prt_fc215b12f001cFsFuYfa2OdvRP",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -20,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier recovery design; output omitted"
+        },
+        {
+          "partID": "prt_fc215b166001x49A0b6pUei2d3",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -20,
+          "useful": false,
+          "category": "failed-or-empty",
+          "ambiguous": false,
+          "note": "empty worker result"
+        },
+        {
+          "partID": "prt_fc215b19c001LprN552q6eQP7V",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -19,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier stale-tick fix, finished phase"
+        },
+        {
+          "partID": "prt_fc215b2c8001tuxA6r5Ml3CPLv",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -16,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier review; output omitted"
+        },
+        {
+          "partID": "prt_fc215b30e001EkLlpTqJPw4aSE",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -16,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier research; output omitted"
+        },
+        {
+          "partID": "prt_fc215b36b0013H12DyYArLxo0B",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -16,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier decision; output omitted"
+        },
+        {
+          "partID": "prt_fc215b3db001iYO6U4cbENW2AL",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -16,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier redelivery fix, finished phase"
+        },
+        {
+          "partID": "prt_fc215b3e8001CTyRAdZNcMQExQ",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -16,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier final review of a finished fix"
+        },
+        {
+          "partID": "prt_fc215b3f80017JDTkAaoDc9oNL",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -16,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier transfer fix; only passing mention of perf counters"
+        },
+        {
+          "partID": "prt_fc215b646002yi0FzxPFbQ4ZUY",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -9,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "crash reproduction prompt; output omitted"
+        },
+        {
+          "partID": "prt_fc215b67c001CkUzQcJA23Qd2o",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -9,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": true,
+          "note": "Linea crash causal proof; different subtask from the performance RCA directive"
+        },
+        {
+          "partID": "prt_fc215b767001myIGziGwkMH8mO",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -8,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "destructive-operation safety check; output omitted"
+        }
+      ]
+    },
+    {
+      "snapshotID": "ses_03dea5104ffejUfuSyl9xWyKJi@45",
+      "split": "development",
+      "kind": "incident debugging",
+      "labels": [
+        {
+          "partID": "prt_fc215b646002yi0FzxPFbQ4ZUY",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "delegation-prompt",
+          "ambiguous": true,
+          "note": "exact Linea incident coordinates for the RCA in progress; output omitted"
+        },
+        {
+          "partID": "prt_fc215b648001tvLVyGkvF46fmq",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": true,
+          "note": "slot comparison prompt; output omitted"
+        },
+        {
+          "partID": "prt_fc215b67c001CkUzQcJA23Qd2o",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "causal proof of the Linea crash for the current RCA"
+        },
+        {
+          "partID": "prt_fc215b68f00132RaStcFND2Em5",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "readiness verification results for the current redeploy decision"
+        },
+        {
+          "partID": "prt_fc215b69c001SrVZXQ237PUksE",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": true,
+          "note": "review findings already remediated by the next worker"
+        },
+        {
+          "partID": "prt_fc215b6a4001Tu4KQ52c8gQ9JJ",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "current regression state and verification for readiness"
+        }
+      ]
+    },
+    {
+      "snapshotID": "ses_fcdc2e182ffeSA2j01aITOQQnd@70",
+      "split": "heldout",
+      "kind": "incident debugging",
+      "labels": [
+        {
+          "partID": "prt_03311bb21001fk3u28YshiWm62",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -12,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier frontend fix result; different finished task"
+        },
+        {
+          "partID": "prt_03311bb3d001a4z3msKMy3ZMjv",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -12,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier indexer pricing fix; different finished task"
+        },
+        {
+          "partID": "prt_0332e6a1b001NF1IDZIf9VjQ4H",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -11,
+          "useful": false,
+          "category": "routine-noise",
+          "ambiguous": false,
+          "note": "background start notice"
+        },
+        {
+          "partID": "prt_0332ed8e2001LMrTCYfYKbmm8Y",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -11,
+          "useful": false,
+          "category": "routine-noise",
+          "ambiguous": false,
+          "note": "background start notice"
+        },
+        {
+          "partID": "prt_0334ec185001UU4X06C0yC3wr0",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -11,
+          "useful": false,
+          "category": "routine-noise",
+          "ambiguous": false,
+          "note": "background start notice"
+        },
+        {
+          "partID": "prt_03352c363001HrCon4hHrJFybI",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -11,
+          "useful": false,
+          "category": "routine-noise",
+          "ambiguous": false,
+          "note": "background start notice"
+        },
+        {
+          "partID": "prt_0337ab20f001BxZE8nnJD7EULn",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -10,
+          "useful": false,
+          "category": "routine-noise",
+          "ambiguous": false,
+          "note": "background start notice"
+        },
+        {
+          "partID": "prt_033d8734d001PfDoMRalwZ07dP",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -9,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier infrastructure preflight; output omitted"
+        },
+        {
+          "partID": "prt_033e0f0e70017SZ5YJorq0WSA3",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -9,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier destroy execution result"
+        },
+        {
+          "partID": "prt_033ee6fea001xqeatTVXSTtLtE",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -9,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier recreate; output omitted"
+        },
+        {
+          "partID": "prt_034295ad0001Map8ocxG26I2m8",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -8,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier Sarcophagus implementation result"
+        },
+        {
+          "partID": "prt_034458350001r6aMILmAwl7hiC",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -7,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier review; output omitted"
+        },
+        {
+          "partID": "prt_03484e0ee001e2RQmkzrYNCVtw",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -7,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier lifecycle reconciliation result"
+        },
+        {
+          "partID": "prt_034a7447f001wtIQP9g0K0Fpyn",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -7,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier recreate; output omitted"
+        },
+        {
+          "partID": "prt_034b895050015ZJZJZcgF7wDYE",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -7,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": true,
+          "note": "one-off monitoring spec; status routine already established"
+        },
+        {
+          "partID": "prt_036215688001FlrEKID2wyuzVV",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "HyperEVM diagnosis prompt; conclusion already summarized"
+        },
+        {
+          "partID": "prt_0362156a2001k1Nsc3lkeIJFWg",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "config comparison prompt; output omitted"
+        },
+        {
+          "partID": "prt_0363cd9c40015gTIZwIsNSsOYi",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "hot-path mapping prompt for a finished handoff"
+        },
+        {
+          "partID": "prt_0363cd9de001BTiZJLLITMT95f",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "verification mapping prompt for a finished handoff"
+        },
+        {
+          "partID": "prt_0364438f3001cYqDoxhwvnUfE5",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "handoff review prompt; finished"
+        }
+      ]
+    },
+    {
+      "snapshotID": "ses_fcdc2e182ffeSA2j01aITOQQnd@45",
+      "split": "heldout",
+      "kind": "incident debugging",
+      "labels": [
+        {
+          "partID": "prt_0337ab20f001BxZE8nnJD7EULn",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "routine-noise",
+          "ambiguous": false,
+          "note": "background start notice"
+        },
+        {
+          "partID": "prt_033d8734d001PfDoMRalwZ07dP",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier preflight; output omitted"
+        },
+        {
+          "partID": "prt_033e0f0e70017SZ5YJorq0WSA3",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier destroy execution"
+        },
+        {
+          "partID": "prt_033e802f8001FpVt2Tdt0YkwYL",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier recreate plan; output omitted"
+        },
+        {
+          "partID": "prt_033ee6fea001xqeatTVXSTtLtE",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier recreate; output omitted"
+        },
+        {
+          "partID": "prt_033ff0f67001fkdaa4PrRIVeJ6",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier monitoring; output omitted"
+        },
+        {
+          "partID": "prt_0340bd3d0001mzgkhS73I1U1dy",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier Robinhood stop, superseded"
+        },
+        {
+          "partID": "prt_03410164b001nhK2gYPW1JFWuG",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier failure trace; output omitted"
+        },
+        {
+          "partID": "prt_034101666001DTYRlnQMHa10pA",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": true,
+          "category": "diagnostic",
+          "ambiguous": true,
+          "hiddenMiddle": true,
+          "note": "stale numbers but contains the per-chain status page and API links the user asked for, mid-output"
+        },
+        {
+          "partID": "prt_0341cde8a0011nvSDEQZMrrWVm",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier investigation; output omitted"
+        },
+        {
+          "partID": "prt_0341cdea9001Rx4Je3T6DJvtlg",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier design advice; output omitted"
+        },
+        {
+          "partID": "prt_034295ad0001Map8ocxG26I2m8",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "implementation result for finished fix"
+        },
+        {
+          "partID": "prt_034458350001r6aMILmAwl7hiC",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier review; output omitted"
+        },
+        {
+          "partID": "prt_03454c91b001TOnlL8VMQuRif4",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "remediation result for finished fix"
+        },
+        {
+          "partID": "prt_03463b948001gQwAlMI8VYpLO4",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "final review of finished fix"
+        },
+        {
+          "partID": "prt_0347e5853001MDDsPhQgke7aMB",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "destroy preflight for finished redeploy"
+        },
+        {
+          "partID": "prt_03484e0ee001e2RQmkzrYNCVtw",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "lifecycle reconciliation, finished"
+        },
+        {
+          "partID": "prt_0348c4458001BIfauHIEwHu6Dv",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "partial destroy result, finished"
+        },
+        {
+          "partID": "prt_03496a1b0001PoPSWsPDAQGquK",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "destroy recovery, finished"
+        },
+        {
+          "partID": "prt_034a7447f001wtIQP9g0K0Fpyn",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "recreate; output omitted"
+        },
+        {
+          "partID": "prt_034b895050015ZJZJZcgF7wDYE",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": true,
+          "note": "monitoring spec requests links but does not contain them; output omitted"
+        }
+      ]
+    },
+    {
+      "snapshotID": "ses_09acc8f15ffe8YBD78Nh317p4K@70",
+      "split": "development",
+      "kind": "tooling development",
+      "labels": [
+        {
+          "partID": "prt_f65340328001ObsuGSb8alqwQ8",
+          "tool": "skill",
+          "stratum": "older",
+          "groupOffset": -8,
+          "useful": false,
+          "category": "skill",
+          "ambiguous": true,
+          "note": "generic process skill, reloadable"
+        },
+        {
+          "partID": "prt_f65340334001IZDImcnccnRWz3",
+          "tool": "skill",
+          "stratum": "older",
+          "groupOffset": -8,
+          "useful": false,
+          "category": "skill",
+          "ambiguous": false,
+          "note": "generic process skill"
+        },
+        {
+          "partID": "prt_f6534033e0010JmNaGpAmoTKHG",
+          "tool": "skill",
+          "stratum": "older",
+          "groupOffset": -8,
+          "useful": false,
+          "category": "skill",
+          "ambiguous": false,
+          "note": "generic process skill"
+        },
+        {
+          "partID": "prt_f65340347001qvmoUwb246gXdw",
+          "tool": "skill",
+          "stratum": "older",
+          "groupOffset": -8,
+          "useful": false,
+          "category": "skill",
+          "ambiguous": false,
+          "note": "generic process skill"
+        },
+        {
+          "partID": "prt_f65340354001d1gKcHhyBrGVSv",
+          "tool": "skill",
+          "stratum": "older",
+          "groupOffset": -8,
+          "useful": false,
+          "category": "stale-read",
+          "ambiguous": true,
+          "note": "pre-edit skill text now superseded by worktree edits"
+        },
+        {
+          "partID": "prt_f6534035e001fyk2Fqy4hnohJZ",
+          "tool": "skill",
+          "stratum": "older",
+          "groupOffset": -8,
+          "useful": false,
+          "category": "stale-read",
+          "ambiguous": true,
+          "note": "pre-edit skill text now superseded by worktree edits"
+        },
+        {
+          "partID": "prt_f6535e6e2001VDIjLJw4r6gjdW",
+          "tool": "context-mode_ctx_fetch_and_index",
+          "stratum": "older",
+          "groupOffset": -7,
+          "useful": false,
+          "category": "routine-noise",
+          "ambiguous": false,
+          "note": "fetch/index log"
+        },
+        {
+          "partID": "prt_f653723bd001asZ08JFAsGHH57",
+          "tool": "hive_background_status",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "routine-noise",
+          "ambiguous": false,
+          "note": "background board status"
+        },
+        {
+          "partID": "prt_f65380421001R4eQvzJvWergo9",
+          "tool": "hive_background_reconcile",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": true,
+          "note": "research audit superseded by chosen architecture"
+        },
+        {
+          "partID": "prt_f653a651a001csit5cf4kIPEek",
+          "tool": "hive_background_reconcile",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "paper assessment; research phase finished"
+        },
+        {
+          "partID": "prt_f655182ba001tG738hkqjzHTou",
+          "tool": "context-mode_ctx_search",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "reference-doc",
+          "ambiguous": false,
+          "note": "raw paper search hits; research finished"
+        },
+        {
+          "partID": "prt_f655182c5001P2YbsSV6LSASQy",
+          "tool": "context-mode_ctx_batch_execute",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "diagnostic",
+          "ambiguous": false,
+          "note": "pre-change audit output; superseded"
+        },
+        {
+          "partID": "prt_f6551b652001p78Fcajyhwg6HE",
+          "tool": "context-mode_ctx_fetch_and_index",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "routine-noise",
+          "ambiguous": false,
+          "note": "fetch/index log"
+        },
+        {
+          "partID": "prt_f65551fb7001X1l1Um7256yMHF",
+          "tool": "context-mode_ctx_search",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "reference-doc",
+          "ambiguous": false,
+          "note": "raw paper search hits; research finished"
+        },
+        {
+          "partID": "prt_f65634430001zqnYSySitPuX0Q",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "first architecture advice, superseded by xhigh review"
+        },
+        {
+          "partID": "prt_f656d040a001nS33U9F3HMT5jR",
+          "tool": "skill",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "skill",
+          "ambiguous": false,
+          "note": "generic process skill"
+        },
+        {
+          "partID": "prt_f656d04130018UIrA7kL3dLQ1s",
+          "tool": "skill",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "skill",
+          "ambiguous": false,
+          "note": "generic process skill"
+        },
+        {
+          "partID": "prt_f656d041a0011rOVNVX6193A9T",
+          "tool": "skill",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "skill",
+          "ambiguous": false,
+          "note": "generic process skill"
+        },
+        {
+          "partID": "prt_f656d0428001do5zD4EQxycqS4",
+          "tool": "skill",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": true,
+          "category": "skill",
+          "ambiguous": true,
+          "note": "skill-authoring guidance directly applies to the skill being built and reviewed"
+        },
+        {
+          "partID": "prt_f656d04330013TItiY8rVh1fzu",
+          "tool": "skill",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": true,
+          "category": "skill",
+          "ambiguous": true,
+          "note": "adversarial review guidance for the imminent review lane"
+        },
+        {
+          "partID": "prt_f656d2327001w3bi32qDV6r9qr",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "approved architecture and repository facts the implementation is reviewed against"
+        },
+        {
+          "partID": "prt_f658493ee001vJNJagT2yBUKpi",
+          "tool": "todowrite",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "todo",
+          "ambiguous": false,
+          "note": "todo list; input keeps the todos"
+        },
+        {
+          "partID": "prt_f6584ba93001WJgvKZKNex6xt3",
+          "tool": "hive_adhoc_worktree_create",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": true,
+          "note": "worktree spec and identity for the current implementation"
+        },
+        {
+          "partID": "prt_f65852e1a0019BYTy3ZkneJ59W",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "worker claim that later proved unpersisted"
+        },
+        {
+          "partID": "prt_f658f39d9001kwBk8reOS7zBMo",
+          "tool": "todowrite",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "todo",
+          "ambiguous": false,
+          "note": "todo list"
+        },
+        {
+          "partID": "prt_f658fb232001pdhtWNDPbXh0Ch",
+          "tool": "context-mode_ctx_batch_execute",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "diagnostic",
+          "ambiguous": false,
+          "note": "earlier branch state, superseded"
+        },
+        {
+          "partID": "prt_f65900e81001JSlPN2acZN7ZkQ",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "failed-or-empty",
+          "ambiguous": false,
+          "note": "empty worker result"
+        },
+        {
+          "partID": "prt_f659ad04f0012ffP4Ll50Ff60V",
+          "tool": "bash",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": true,
+          "category": "diagnostic",
+          "ambiguous": true,
+          "note": "current diff file list under review"
+        },
+        {
+          "partID": "prt_f65a430a4001UJ9i38WKd9NxUp",
+          "tool": "read",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "current-read",
+          "ambiguous": false,
+          "note": "current skill file under review"
+        },
+        {
+          "partID": "prt_f65a430b100140XZoklR4AOX0q",
+          "tool": "read",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "current-read",
+          "ambiguous": false,
+          "note": "misplaced reference file that is the known layout defect"
+        },
+        {
+          "partID": "prt_f65a430dc001oH94cQiQGwTs7w",
+          "tool": "read",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "current-read",
+          "ambiguous": false,
+          "note": "installer section relevant to installer-correctness review"
+        },
+        {
+          "partID": "prt_f65a592980016Qv5GqB2bGQ8gR",
+          "tool": "todowrite",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "todo",
+          "ambiguous": false,
+          "note": "todo list"
+        }
+      ]
+    },
+    {
+      "snapshotID": "ses_09acc8f15ffe8YBD78Nh317p4K@45",
+      "split": "development",
+      "kind": "tooling development",
+      "labels": [
+        {
+          "partID": "prt_f6535e6e2001VDIjLJw4r6gjdW",
+          "tool": "context-mode_ctx_fetch_and_index",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "routine-noise",
+          "ambiguous": false,
+          "note": "fetch/index log"
+        },
+        {
+          "partID": "prt_f653723bd001asZ08JFAsGHH57",
+          "tool": "hive_background_status",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "routine-noise",
+          "ambiguous": false,
+          "note": "background board status"
+        },
+        {
+          "partID": "prt_f65380421001R4eQvzJvWergo9",
+          "tool": "hive_background_reconcile",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "audit of the current writing configuration behind the verdict"
+        },
+        {
+          "partID": "prt_f653a651a001csit5cf4kIPEek",
+          "tool": "hive_background_reconcile",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "paper assessment behind the verdict"
+        },
+        {
+          "partID": "prt_f6551829d0015XYxzUtqSuJu3l",
+          "tool": "hive_background_reconcile",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "external-validity review behind the verdict"
+        },
+        {
+          "partID": "prt_f655182ba001tG738hkqjzHTou",
+          "tool": "context-mode_ctx_search",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "reference-doc",
+          "ambiguous": true,
+          "note": "raw paper search hits, mostly PDF structure noise; superseded by the assessment"
+        },
+        {
+          "partID": "prt_f655182c5001P2YbsSV6LSASQy",
+          "tool": "context-mode_ctx_batch_execute",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "diagnostic",
+          "ambiguous": true,
+          "note": "local writing-config audit output with drift evidence"
+        },
+        {
+          "partID": "prt_f6551b652001p78Fcajyhwg6HE",
+          "tool": "context-mode_ctx_fetch_and_index",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "routine-noise",
+          "ambiguous": false,
+          "note": "fetch/index log"
+        },
+        {
+          "partID": "prt_f65551fb7001X1l1Um7256yMHF",
+          "tool": "context-mode_ctx_search",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "reference-doc",
+          "ambiguous": true,
+          "note": "raw abstract search hits; superseded by the external-validity review"
+        }
+      ]
+    },
+    {
+      "snapshotID": "ses_035ce2405ffeSnNpdxD83yCWhd@70",
+      "split": "heldout",
+      "kind": "tooling development",
+      "labels": [
+        {
+          "partID": "prt_fca31dcbb0013kiKyI3siIJWD2",
+          "tool": "skill",
+          "stratum": "older",
+          "groupOffset": -26,
+          "useful": false,
+          "category": "skill",
+          "ambiguous": false,
+          "note": "generic process skill"
+        },
+        {
+          "partID": "prt_fca31dd15001TElShfDVh84CJ8",
+          "tool": "todowrite",
+          "stratum": "older",
+          "groupOffset": -26,
+          "useful": false,
+          "category": "todo",
+          "ambiguous": false,
+          "note": "todo list"
+        },
+        {
+          "partID": "prt_fca31dd56001Zf6fdgMAR78xGi",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -26,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier review of a merged, superseded feature"
+        },
+        {
+          "partID": "prt_fca31dd8a001uc4pIG3bZjF9bb",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -26,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier test simplification result"
+        },
+        {
+          "partID": "prt_fca31de00001cg4tVkFVIpTJ6a",
+          "tool": "hive_adhoc_merge",
+          "stratum": "older",
+          "groupOffset": -26,
+          "useful": false,
+          "category": "routine-noise",
+          "ambiguous": false,
+          "note": "merge result metadata for finished work"
+        },
+        {
+          "partID": "prt_fca31de1a001ahsp0zXxZmTpZn",
+          "tool": "todowrite",
+          "stratum": "older",
+          "groupOffset": -26,
+          "useful": false,
+          "category": "todo",
+          "ambiguous": false,
+          "note": "todo list"
+        },
+        {
+          "partID": "prt_fca31deb70010pevGKllhTHvro",
+          "tool": "ctx_execute",
+          "stratum": "older",
+          "groupOffset": -26,
+          "useful": false,
+          "category": "diagnostic",
+          "ambiguous": false,
+          "note": "earlier config probe"
+        },
+        {
+          "partID": "prt_fca31decc001DjTnfNpD2egg6e",
+          "tool": "todowrite",
+          "stratum": "older",
+          "groupOffset": -26,
+          "useful": false,
+          "category": "todo",
+          "ambiguous": false,
+          "note": "todo list"
+        },
+        {
+          "partID": "prt_fca31df130014BCmfF6ayDF2Ue",
+          "tool": "ctx_execute",
+          "stratum": "older",
+          "groupOffset": -25,
+          "useful": false,
+          "category": "diagnostic",
+          "ambiguous": false,
+          "note": "model context lookup for a different question"
+        },
+        {
+          "partID": "prt_fca31dfd2001q9hCWUtd846y2B",
+          "tool": "skill",
+          "stratum": "older",
+          "groupOffset": -22,
+          "useful": false,
+          "category": "skill",
+          "ambiguous": false,
+          "note": "generic process skill"
+        },
+        {
+          "partID": "prt_fca31dfd3001la8cQKKgHShsSN",
+          "tool": "skill",
+          "stratum": "older",
+          "groupOffset": -22,
+          "useful": false,
+          "category": "skill",
+          "ambiguous": false,
+          "note": "generic process skill"
+        },
+        {
+          "partID": "prt_fca31e0c3001q1jV0zHVP7bRqY",
+          "tool": "context7_query-docs",
+          "stratum": "older",
+          "groupOffset": -20,
+          "useful": false,
+          "category": "reference-doc",
+          "ambiguous": false,
+          "note": "docs lookup for an earlier question"
+        },
+        {
+          "partID": "prt_fca31e0fe001baxyrYAodveBTk",
+          "tool": "read",
+          "stratum": "older",
+          "groupOffset": -19,
+          "useful": false,
+          "category": "stale-read",
+          "ambiguous": false,
+          "note": "old code window since rewritten"
+        },
+        {
+          "partID": "prt_fca31e11e001mqOFKXnnBqNtcb",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -18,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "reasoning-handling trace for a different question"
+        },
+        {
+          "partID": "prt_fca31e1a9001zIqwI03sCpJME8",
+          "tool": "bash",
+          "stratum": "older",
+          "groupOffset": -16,
+          "useful": false,
+          "category": "diagnostic",
+          "ambiguous": false,
+          "note": "earlier session token query"
+        },
+        {
+          "partID": "prt_fca31e568001SK4fiJDLmZutND",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": true,
+          "note": "summarizer implementation result; background for the design but not the audit being explained"
+        },
+        {
+          "partID": "prt_fca31e581001lE8S2vLR1NqkH4",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "simplification result"
+        },
+        {
+          "partID": "prt_fca31e5a7001joJ4DeFKRzZzV3",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "tool-use contract fix result"
+        },
+        {
+          "partID": "prt_fca35b1cf001rxAypvwlEQh2M5",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "audit prompt; output omitted"
+        },
+        {
+          "partID": "prt_fca35b1d5001gjDvYEyxqMo5Ps",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": true,
+          "note": "fidelity audit prompt; output omitted"
+        },
+        {
+          "partID": "prt_fca48cdb00011EXUjvKEA3RXfH",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "lists the exact audit claims the user is asking to have explained"
+        }
+      ]
+    },
+    {
+      "snapshotID": "ses_035ce2405ffeSnNpdxD83yCWhd@45",
+      "split": "heldout",
+      "kind": "tooling development",
+      "labels": [
+        {
+          "partID": "prt_fca31e215001lOIBBEdD8LFLUs",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "projection counts for a different question"
+        },
+        {
+          "partID": "prt_fca31e252001YVQ4ehkVSgMisM",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": true,
+          "note": "attribution diagnosis prompt; related but answered; output omitted"
+        },
+        {
+          "partID": "prt_fca31e3370019DiYju7B7TZ3HK",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "delegation-prompt",
+          "ambiguous": true,
+          "note": "routing advice prompt stating the exact current behavior being questioned; output omitted"
+        }
+      ]
+    },
+    {
+      "snapshotID": "ses_00210d4a7ffeAZeVWzoOTCSXKc@70",
+      "split": "development",
+      "kind": "product documents and diagrams",
+      "labels": [
+        {
+          "partID": "prt_ffdf05dfb001IPpF6zSZb16EpE",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "superseded contract split result from an earlier phase"
+        },
+        {
+          "partID": "prt_ffdfc081b001Gni13B9holWJss",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "output already omitted; review prompt for finished phase"
+        },
+        {
+          "partID": "prt_ffe022c32001I89ZUKpZiTrg6e",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "superseded remediation result"
+        },
+        {
+          "partID": "prt_ffe0bf3b6001FjzWCRSrULQ2FY",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "output already omitted; finished phase"
+        },
+        {
+          "partID": "prt_ffe0bf3c60017HsiQTG3N3JnVl",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "failed-or-empty",
+          "ambiguous": false,
+          "note": "empty review result"
+        },
+        {
+          "partID": "prt_ffe1bff0d001UV36roDs015dR6",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier PRD fix phase, finished"
+        },
+        {
+          "partID": "prt_ffe211eec00169lTv5VHhZrXaO",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "failed-or-empty",
+          "ambiguous": false,
+          "note": "empty review result"
+        },
+        {
+          "partID": "prt_ffe2fce8a001cMX0wvZZdhNNH3",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "output already omitted; finished phase"
+        },
+        {
+          "partID": "prt_ffe381061001Jz4AcB9LIEqU6R",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "output already omitted; finished phase"
+        },
+        {
+          "partID": "prt_ffe40585c00137vIRbrg0v2QOw",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier SRS hardening phase, finished"
+        },
+        {
+          "partID": "prt_ffe4b9c03001NtHexYSY55TkoD",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "final PRD review; gaps closed later in the same phase"
+        },
+        {
+          "partID": "prt_ffe4b9c0d001iwrl2Vtl64NxqT",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "contract review approval; phase finished"
+        },
+        {
+          "partID": "prt_ffe512fd400193OWj2s73iH156",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "failed-or-empty",
+          "ambiguous": false,
+          "note": "empty result"
+        },
+        {
+          "partID": "prt_ffe5cf04c001ZAzaMIVI3mxHG7",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "roadmap advice already captured in the turn conclusion; output omitted"
+        },
+        {
+          "partID": "prt_ffe6ac006001MJ3W0ig7mDov1x",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "visual advisory prompt; output omitted"
+        },
+        {
+          "partID": "prt_ffe79244a0010bRjeGp65DOTBT",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "failed-or-empty",
+          "ambiguous": false,
+          "note": "empty worker result"
+        },
+        {
+          "partID": "prt_ffe7b7765001spLxmr2LSgJRGd",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "current diagram portfolio implementation result with remaining work"
+        },
+        {
+          "partID": "prt_ffeb057f4001hA3PqVUP03jAhO",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "failed-or-empty",
+          "ambiguous": false,
+          "note": "empty review result"
+        },
+        {
+          "partID": "prt_ffeba1324001jzCcb25Y3Y7oVD",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": true,
+          "note": "recent fix details for current diagram artifacts"
+        },
+        {
+          "partID": "prt_ffec7766e0016xdAdHk5TcMm55",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "failed-or-empty",
+          "ambiguous": false,
+          "note": "empty result"
+        },
+        {
+          "partID": "prt_fff0652d1001IDpdojfFRpRIoN",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": true,
+          "note": "remediation prompt, outcome not present"
+        }
+      ]
+    },
+    {
+      "snapshotID": "ses_00210d4a7ffeAZeVWzoOTCSXKc@45",
+      "split": "development",
+      "kind": "product documents and diagrams",
+      "labels": [
+        {
+          "partID": "prt_ffdf05dfb001IPpF6zSZb16EpE",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "superseded contract split result from an earlier phase"
+        },
+        {
+          "partID": "prt_ffdfc081b001Gni13B9holWJss",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "output already omitted; review prompt for finished phase"
+        },
+        {
+          "partID": "prt_ffe022c32001I89ZUKpZiTrg6e",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "superseded remediation result"
+        },
+        {
+          "partID": "prt_ffe0bf3b6001FjzWCRSrULQ2FY",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "output already omitted; finished phase"
+        },
+        {
+          "partID": "prt_ffe0bf3c60017HsiQTG3N3JnVl",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "failed-or-empty",
+          "ambiguous": false,
+          "note": "empty review result"
+        },
+        {
+          "partID": "prt_ffe1bff0d001UV36roDs015dR6",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier PRD fix phase, finished"
+        },
+        {
+          "partID": "prt_ffe211eec00169lTv5VHhZrXaO",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "failed-or-empty",
+          "ambiguous": false,
+          "note": "empty review result"
+        },
+        {
+          "partID": "prt_ffe2fce8a001cMX0wvZZdhNNH3",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "output already omitted; finished phase"
+        },
+        {
+          "partID": "prt_ffe381061001Jz4AcB9LIEqU6R",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "output already omitted; finished phase"
+        },
+        {
+          "partID": "prt_ffe40585c00137vIRbrg0v2QOw",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier SRS hardening phase, finished"
+        },
+        {
+          "partID": "prt_ffe4b9c03001NtHexYSY55TkoD",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "final PRD review; gaps closed later in the same phase"
+        },
+        {
+          "partID": "prt_ffe4b9c0d001iwrl2Vtl64NxqT",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "contract review approval; phase finished"
+        },
+        {
+          "partID": "prt_ffe512fd400193OWj2s73iH156",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -2,
+          "useful": false,
+          "category": "failed-or-empty",
+          "ambiguous": false,
+          "note": "empty result"
+        },
+        {
+          "partID": "prt_ffe5cf04c001ZAzaMIVI3mxHG7",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": true,
+          "note": "roadmap advice already captured in an earlier conclusion; output omitted"
+        },
+        {
+          "partID": "prt_ffe6ac006001MJ3W0ig7mDov1x",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": true,
+          "note": "visual advisory prompt for current work; output omitted"
+        },
+        {
+          "partID": "prt_ffe79244a0010bRjeGp65DOTBT",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "failed-or-empty",
+          "ambiguous": false,
+          "note": "empty worker result"
+        },
+        {
+          "partID": "prt_ffe7b7765001spLxmr2LSgJRGd",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "current diagram portfolio implementation result with remaining work"
+        },
+        {
+          "partID": "prt_ffeb057f4001hA3PqVUP03jAhO",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "failed-or-empty",
+          "ambiguous": false,
+          "note": "empty review result"
+        },
+        {
+          "partID": "prt_ffeba1324001jzCcb25Y3Y7oVD",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": true,
+          "note": "recent fix details for current diagram artifacts"
+        },
+        {
+          "partID": "prt_ffec7766e0016xdAdHk5TcMm55",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "failed-or-empty",
+          "ambiguous": false,
+          "note": "empty result"
+        },
+        {
+          "partID": "prt_fff0652d1001IDpdojfFRpRIoN",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": true,
+          "note": "remediation prompt, outcome not present"
+        }
+      ]
+    },
+    {
+      "snapshotID": "ses_fcc3dd9beffe8FApDXau3ZBM9s@70",
+      "split": "heldout",
+      "kind": "product documents and diagrams",
+      "labels": [
+        {
+          "partID": "prt_033de1ad4001m299izvi47yXTw",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -14,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier visual review of an older diagram revision"
+        },
+        {
+          "partID": "prt_033de1ae1001xUKs76U28tZT0B",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -14,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier simplicity review; output omitted"
+        },
+        {
+          "partID": "prt_033e6d3e5001NbYFQpJVF3pGCq",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -14,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier correction pass, superseded"
+        },
+        {
+          "partID": "prt_034375e6c0018ukSUG8UfeedTM",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -11,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier suite review; output omitted"
+        },
+        {
+          "partID": "prt_0344421b0001rnLbZBY7HftB1Y",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -11,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "other diagram in the suite; finished"
+        },
+        {
+          "partID": "prt_0344421dd001zIhFd2wiRaS7gx",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -11,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "other diagram in the suite; finished"
+        },
+        {
+          "partID": "prt_03454185c0016bbgSMczFNUStV",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -11,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier suite visual review"
+        },
+        {
+          "partID": "prt_034724ac0001EbP1ZZHacK8GI6",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -10,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier edge review, fixed since"
+        },
+        {
+          "partID": "prt_03480d259001LKnopS58SDDwDP",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -10,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier correction; output omitted"
+        },
+        {
+          "partID": "prt_0348df6ca001HGVuhC3sD6kCMr",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -10,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier reverification; output omitted"
+        },
+        {
+          "partID": "prt_03620eb08001n7sDzUV8K3CGdJ",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -8,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier audit; output omitted"
+        },
+        {
+          "partID": "prt_036a569df001CXDfp55UU1kKWu",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -5,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier correction pass, superseded by user edits"
+        },
+        {
+          "partID": "prt_036b45aad001BQyPhAOEYl3kvU",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -5,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "status wording update; finished"
+        },
+        {
+          "partID": "prt_036b622d1001yXDzCsZGkJZJ9x",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -5,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier review; output omitted"
+        },
+        {
+          "partID": "prt_036ccdd15001mC4uPr1VpZwMpw",
+          "tool": "task",
+          "stratum": "older",
+          "groupOffset": -5,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "earlier contract review, addressed since"
+        },
+        {
+          "partID": "prt_03704320e001YgxJ7L9RV2iYue",
+          "tool": "skill",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "skill",
+          "ambiguous": false,
+          "note": "writing skill for a finished stanza subtask"
+        },
+        {
+          "partID": "prt_03704329b001VlLvFKnMtw6pBR",
+          "tool": "skill",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "skill",
+          "ambiguous": false,
+          "note": "writing skill for a finished stanza subtask"
+        },
+        {
+          "partID": "prt_037043321001gj6HGjHFp9S8BF",
+          "tool": "skill",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "skill",
+          "ambiguous": false,
+          "note": "writing skill for a finished stanza subtask"
+        },
+        {
+          "partID": "prt_03704337e001S4HPX1j0HGTHRg",
+          "tool": "grep",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "reference-doc",
+          "ambiguous": false,
+          "note": "broad noisy grep for the finished stanza subtask"
+        },
+        {
+          "partID": "prt_0370433af001tMtbd4cT1fzino",
+          "tool": "grep",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "reference-doc",
+          "ambiguous": false,
+          "note": "broad noisy grep for the finished stanza subtask"
+        },
+        {
+          "partID": "prt_0370433d5001mOqIHs3LRqRkmF",
+          "tool": "grep",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "reference-doc",
+          "ambiguous": false,
+          "note": "broad noisy grep for the finished stanza subtask"
+        },
+        {
+          "partID": "prt_0370492ca001l4ZMQG5A334VIK",
+          "tool": "grep",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "reference-doc",
+          "ambiguous": true,
+          "note": "focused worker-contract matches; background for the diagram stanza"
+        },
+        {
+          "partID": "prt_037049394001SPIr6BA3W5k2Zj",
+          "tool": "grep",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "reference-doc",
+          "ambiguous": false,
+          "note": "ADR grep for the finished stanza subtask"
+        },
+        {
+          "partID": "prt_0370494000013Zw59aEgmqhmNd",
+          "tool": "read",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "reference-doc",
+          "ambiguous": false,
+          "note": "SRS window, recoverable and not needed after commit"
+        },
+        {
+          "partID": "prt_037049418001m3ssGFQ6buZ5Oo",
+          "tool": "read",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "reference-doc",
+          "ambiguous": false,
+          "note": "SRS window, recoverable and not needed after commit"
+        },
+        {
+          "partID": "prt_03704946b001oQp4AcFDxealT1",
+          "tool": "read",
+          "stratum": "recent",
+          "groupOffset": -4,
+          "useful": false,
+          "category": "reference-doc",
+          "ambiguous": false,
+          "note": "worked-example window for the finished stanza subtask"
+        },
+        {
+          "partID": "prt_0370a969f001inGrdP2w6BcDct",
+          "tool": "skill",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "skill",
+          "ambiguous": false,
+          "note": "large generic diagram skill; task finished"
+        },
+        {
+          "partID": "prt_0370a9774001JRivDSxEGPTez8",
+          "tool": "skill",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "skill",
+          "ambiguous": false,
+          "note": "generic process skill"
+        },
+        {
+          "partID": "prt_0370a9910001ML9lc8qVJLjCZL",
+          "tool": "read",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "routine-noise",
+          "ambiguous": false,
+          "note": "image read confirmation text only"
+        },
+        {
+          "partID": "prt_0370a995d001E1tWuuC77E29Wa",
+          "tool": "ctx_execute_file",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "current-read",
+          "ambiguous": false,
+          "note": "extracted labels and edges of the diagram the user just asked to understand"
+        },
+        {
+          "partID": "prt_0370adde2001hZopY4jKc0VztD",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "verification of the exact committed diagram state"
+        }
+      ]
+    },
+    {
+      "snapshotID": "ses_fcc3dd9beffe8FApDXau3ZBM9s@45",
+      "split": "heldout",
+      "kind": "product documents and diagrams",
+      "labels": [
+        {
+          "partID": "prt_03620e454001fZqMKVmewN7yoW",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier audit; output omitted"
+        },
+        {
+          "partID": "prt_03620e9980010EBeV3agI3x1i2",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier audit; output omitted"
+        },
+        {
+          "partID": "prt_03620eb08001n7sDzUV8K3CGdJ",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier audit; output omitted"
+        },
+        {
+          "partID": "prt_03620eb60001qQOdNpgCmWI0oR",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier audit; output omitted"
+        },
+        {
+          "partID": "prt_03620eb81001trJztR2sbEvFLc",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -3,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "earlier holistic review; output omitted"
+        },
+        {
+          "partID": "prt_036689c2a001DKkuTXPV7bBY5R",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": true,
+          "note": "advice prompt; decision already summarized; output omitted"
+        },
+        {
+          "partID": "prt_036689c50001tNeMBmdzHhNLCf",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": -1,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "adversarial advice prompt; output omitted"
+        },
+        {
+          "partID": "prt_0367de879001nmY2f2s2EzQugi",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": true,
+          "note": "doc alignment spec; output omitted"
+        },
+        {
+          "partID": "prt_0368714080011qww37ntfN2En1",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "exact diagram changes made in the current task"
+        },
+        {
+          "partID": "prt_03699087800137SxgwT9es4LBY",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": true,
+          "note": "visual review findings fixed by later passes"
+        },
+        {
+          "partID": "prt_0369909aa001KW5vlRW7Cf8kRZ",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "review prompt; output omitted"
+        },
+        {
+          "partID": "prt_036a56297001JBiw2eAlxSSokY",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "contract doc changes made in the current task"
+        },
+        {
+          "partID": "prt_036a569df001CXDfp55UU1kKWu",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "final diagram correction pass in the current task"
+        },
+        {
+          "partID": "prt_036b45aad001BQyPhAOEYl3kvU",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": true,
+          "note": "status wording changes in the current task"
+        },
+        {
+          "partID": "prt_036b6223b001J3x4X60jb4rO2a",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": true,
+          "note": "final visual approval of the current diagram"
+        },
+        {
+          "partID": "prt_036b622d1001yXDzCsZGkJZJ9x",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "review prompt; output omitted"
+        },
+        {
+          "partID": "prt_036b6238c001beboU0u5ifD4CD",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": true,
+          "note": "simplicity suggestions with unclear adoption"
+        },
+        {
+          "partID": "prt_036c1782f001R87SuTMa02gSEi",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "documentation blocker fixes in the current task"
+        },
+        {
+          "partID": "prt_036c17c8d001ZiZfVx1AX4cxxh",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "authority edge changes in the current diagram"
+        },
+        {
+          "partID": "prt_036ccdd15001mC4uPr1VpZwMpw",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "task-finding",
+          "ambiguous": true,
+          "note": "contract review findings closed by later passes"
+        },
+        {
+          "partID": "prt_036ccdd9b001aeWGxhvrPexJKU",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "verification prompt; output omitted"
+        },
+        {
+          "partID": "prt_036d6a572001dWda1VjGSD70SX",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "final contract classification fixes in the current task"
+        },
+        {
+          "partID": "prt_036d6a7c8001jgqwIfErHoOXZ4",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": true,
+          "category": "task-finding",
+          "ambiguous": false,
+          "note": "final diagram text corrections in the current task"
+        },
+        {
+          "partID": "prt_036dc601d001W6tcYMJdWPhOnT",
+          "tool": "task",
+          "stratum": "recent",
+          "groupOffset": 0,
+          "useful": false,
+          "category": "delegation-prompt",
+          "ambiguous": false,
+          "note": "final verification prompt; output omitted"
+        }
+      ]
+    }
+  ]
+}

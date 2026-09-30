@@ -69,6 +69,8 @@ import {
   readStats,
   writeStats,
 } from "../src/storage/stats";
+import { RetentionClassificationError } from "../src/retention/classifier";
+import { scoredJevFetch, summaryReply, type JevCall } from "./retention-host";
 
 type TurnResult = {
   ordinal: number;
@@ -80,6 +82,7 @@ type TurnResult = {
 type GenerationResponse = { turns: TurnResult[] };
 
 let storageDirectory: string;
+const HEURISTIC_OPTIONS = { retention: { mode: "heuristic" } } as const;
 const originalDataHome = process.env.XDG_DATA_HOME;
 
 beforeAll(async () => {
@@ -2942,7 +2945,7 @@ describe("compaction orchestration", () => {
     });
 
     await expect(
-      executeMagicCompact(harness.v2, "source", 0),
+      executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
     ).resolves.toBeTrue();
 
     expect(messages.slice(0, 2)).toEqual(smallBefore);
@@ -2959,7 +2962,7 @@ describe("compaction orchestration", () => {
     });
 
     await expect(
-      executeMagicCompact(harness.v2, "source", 1),
+      executeMagicCompact(harness.v2, "source", 1, HEURISTIC_OPTIONS),
     ).resolves.toBeFalse();
 
     expect(harness.forks).toEqual([]);
@@ -2997,6 +3000,7 @@ describe("compaction orchestration", () => {
       await expect(
         settleWithin(
           executeMagicCompact(noOp.v2, "source", 1, {
+            ...HEURISTIC_OPTIONS,
             controlTimeoutMs: 5,
           }),
           250,
@@ -3026,6 +3030,7 @@ describe("compaction orchestration", () => {
       await expect(
         settleWithin(
           executeMagicCompact(success.v2, "source", 0, {
+            ...HEURISTIC_OPTIONS,
             controlTimeoutMs: 5,
           }),
           250,
@@ -3034,7 +3039,7 @@ describe("compaction orchestration", () => {
       expect(summaryParts(successMessages)).toHaveLength(1);
       expect(success.toasts.map(toast => toast.message)).toEqual([
         "Compacting session...",
-        "Compacted 1 assistant turn(s).",
+        "Compacted 1 assistant turn(s). Heuristic mode: no task-aware retention.",
       ]);
       expect(JSON.stringify(successMessages)).not.toContain(
         "Compacting session...",
@@ -3054,6 +3059,7 @@ describe("compaction orchestration", () => {
       try {
         await settleWithin(
           executeMagicCompact(failed.v2, "source", 0, {
+            ...HEURISTIC_OPTIONS,
             controlTimeoutMs: 5,
           }),
           250,
@@ -3099,6 +3105,7 @@ describe("compaction orchestration", () => {
     await expect(
       settleWithin(
         executeMagicCompact(harness.v2, "source", 1, {
+          ...HEURISTIC_OPTIONS,
           controlTimeoutMs: 5,
         }),
         250,
@@ -3170,7 +3177,7 @@ describe("compaction orchestration", () => {
     });
 
     await expect(
-      executeMagicCompact(harness.v2, "source", 0),
+      executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
     ).resolves.toBeTrue();
 
     expect(harness.forks).toEqual(["generation-fork", "backup"]);
@@ -3274,7 +3281,7 @@ describe("compaction orchestration", () => {
 
     try {
       await expect(
-        executeMagicCompact(harness.v2, "source", 0),
+        executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
       ).resolves.toBeTrue();
 
       const persisted = messages
@@ -3335,7 +3342,7 @@ describe("compaction orchestration", () => {
     });
 
     await expect(
-      executeMagicCompact(harness.v2, "source", 0),
+      executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
     ).resolves.toBeTrue();
 
     const persistedUserImage = messages
@@ -3409,9 +3416,9 @@ describe("compaction orchestration", () => {
       },
     });
 
-    await expect(executeMagicCompact(harness.v2, "source", 0)).rejects.toThrow(
-      COMPACT_INSUFFICIENT_SAVINGS,
-    );
+    await expect(
+      executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
+    ).rejects.toThrow(COMPACT_INSUFFICIENT_SAVINGS);
 
     expect(harness.forks).toEqual(["generation-fork"]);
     expect(harness.partUpdates).toEqual([]);
@@ -3435,7 +3442,9 @@ describe("compaction orchestration", () => {
       },
     });
 
-    await expect(executeMagicCompact(harness.v2, "source", 0)).rejects.toThrow(
+    await expect(
+      executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
+    ).rejects.toThrow(
       "response validation failed: turn count mismatch (expected 1, received 0).",
     );
 
@@ -3475,7 +3484,7 @@ describe("compaction orchestration", () => {
     let failure: unknown;
 
     try {
-      await executeMagicCompact(harness.v2, "source", 0);
+      await executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS);
     } catch (error) {
       failure = error;
     }
@@ -3520,7 +3529,7 @@ describe("compaction orchestration", () => {
     let failure: unknown;
 
     try {
-      await executeMagicCompact(harness.v2, "source", 0);
+      await executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS);
     } catch (error) {
       failure = error;
     }
@@ -3568,7 +3577,7 @@ describe("compaction orchestration", () => {
 
     let failure: unknown;
     try {
-      await executeMagicCompact(harness.v2, "source", 0);
+      await executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS);
     } catch (error) {
       failure = error;
     }
@@ -3608,7 +3617,7 @@ describe("compaction orchestration", () => {
 
     let failure: unknown;
     try {
-      await executeMagicCompact(harness.v2, "source", 0);
+      await executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS);
     } catch (error) {
       failure = error;
     }
@@ -3663,9 +3672,9 @@ describe("compaction orchestration", () => {
       }),
     });
 
-    await expect(executeMagicCompact(harness.v2, "source", 0)).rejects.toThrow(
-      "response validation failed: nonce leakage.",
-    );
+    await expect(
+      executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
+    ).rejects.toThrow("response validation failed: nonce leakage.");
 
     expect(messages).toEqual(before);
     expect(harness.forks).toEqual(["generation-fork"]);
@@ -3727,7 +3736,7 @@ describe("compaction orchestration", () => {
       let failure: unknown;
 
       try {
-        await executeMagicCompact(harness.v2, "source", 0);
+        await executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS);
       } catch (error) {
         failure = error;
       }
@@ -3769,9 +3778,9 @@ describe("compaction orchestration", () => {
       driftAfterBackup: true,
     });
 
-    await expect(executeMagicCompact(harness.v2, "source", 0)).rejects.toThrow(
-      "OpenCode source changed",
-    );
+    await expect(
+      executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
+    ).rejects.toThrow("OpenCode source changed");
 
     expect(harness.forks).toEqual(["generation-fork", "backup"]);
     expect(harness.selectedSessions).toEqual([]);
@@ -3801,9 +3810,9 @@ describe("compaction orchestration", () => {
       sessionRevert: { messageID: "revert-suffix-user" },
     });
 
-    await expect(executeMagicCompact(harness.v2, "source", 0)).rejects.toThrow(
-      COMPACT_PENDING_REVERT,
-    );
+    await expect(
+      executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
+    ).rejects.toThrow(COMPACT_PENDING_REVERT);
 
     expect(messages).toEqual(before);
     expect(harness.forks).toEqual([]);
@@ -3828,9 +3837,9 @@ describe("compaction orchestration", () => {
       stageRevertAfterBackup: true,
     });
 
-    await expect(executeMagicCompact(harness.v2, "source", 0)).rejects.toThrow(
-      COMPACT_PENDING_REVERT,
-    );
+    await expect(
+      executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
+    ).rejects.toThrow(COMPACT_PENDING_REVERT);
 
     expect(messages).toEqual(before);
     expect(harness.forks).toEqual(["generation-fork", "backup"]);
@@ -3889,7 +3898,7 @@ describe("compaction orchestration", () => {
     let failure: unknown;
 
     try {
-      await executeMagicCompact(harness.v2, "source", 0);
+      await executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS);
     } catch (error) {
       failure = error;
     }
@@ -3943,7 +3952,7 @@ describe("compaction orchestration", () => {
 
     let failure: unknown;
     try {
-      await executeMagicCompact(harness.v2, "source", 0);
+      await executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS);
     } catch (error) {
       failure = error;
     }
@@ -4128,7 +4137,7 @@ describe("compaction orchestration", () => {
     try {
       let failure: unknown;
       try {
-        await executeMagicCompact(harness.v2, "source", 0);
+        await executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS);
       } catch (error) {
         failure = error;
       }
@@ -4272,7 +4281,7 @@ describe("compaction orchestration", () => {
     });
 
     await expect(
-      executeMagicCompact(harness.v2, "source", 0),
+      executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
     ).resolves.toBeTrue();
 
     expect(messages.slice(0, 2)).toEqual(historicalBefore);
@@ -5339,6 +5348,17 @@ function commandHarness(
         return { data: { ...sourceSession(), id: String(request.sessionID) } };
       },
       prompt: async (request: Record<string, unknown>) => {
+        // Task-aware retention summarizes the whole session on its own fork
+        // through the native compaction agent before any turn generation.
+        if (request.agent === "compaction") {
+          events.push("retention-summary");
+          const forkID = String(request.sessionID);
+          return summaryReply(
+            generationForkMessages.get(forkID)!,
+            request as never,
+            forkID,
+          );
+        }
         if (request.noReply !== true) {
           modelPrompts.push(request);
           generationPromptCount += 1;
@@ -5430,8 +5450,9 @@ function commandHarness(
       abort: async (request: { sessionID: string }) => {
         abortedSessions.push(request.sessionID);
         if (
-          generationFirstOrdinalByFork.get(request.sessionID)
-          === options.generationAbortErrorForFirstOrdinal
+          options.generationAbortErrorForFirstOrdinal !== undefined
+          && generationFirstOrdinalByFork.get(request.sessionID)
+            === options.generationAbortErrorForFirstOrdinal
         ) {
           throw new Error("raw generation abort payload");
         }
@@ -5442,8 +5463,9 @@ function commandHarness(
         if (request.sessionID.startsWith("generation-fork")) {
           events.push("generation-delete");
           if (
-            generationFirstOrdinalByFork.get(request.sessionID)
-            === options.generationDeleteErrorForFirstOrdinal
+            options.generationDeleteErrorForFirstOrdinal !== undefined
+            && generationFirstOrdinalByFork.get(request.sessionID)
+              === options.generationDeleteErrorForFirstOrdinal
           ) {
             throw new Error("raw generation delete payload");
           }
@@ -5585,6 +5607,135 @@ function commandHarness(
     },
   };
 }
+
+describe("magic compact task-aware retention", () => {
+  function retainedTurns() {
+    const useful = compactableCommandMessages(
+      "useful",
+      "useful parser finding ".repeat(400),
+    );
+    const stale = compactableCommandMessages(
+      "stale",
+      "stale directory listing ".repeat(400),
+    );
+    return [...useful, ...stale];
+  }
+
+  function taskAware(calls: JevCall[] = []) {
+    return {
+      retention: {
+        mode: "task-aware" as const,
+        apiKey: "test-key",
+        fetch: scoredJevFetch(
+          output => (output.includes("useful") ? 0.95 : 0.1),
+          calls,
+        ),
+      },
+    };
+  }
+
+  test("keeps a judged-useful call whole while summarizing its turn", async () => {
+    const messages = retainedTurns();
+    const usefulTool = structuredClone(
+      messages[1]!.parts.find(part => part.type === "tool")!,
+    );
+    const calls: JevCall[] = [];
+    const harness = commandHarness(messages, {
+      generationResponse: {
+        turns: [
+          result(1, "Useful turn summary."),
+          result(2, "Stale turn summary."),
+        ],
+      },
+    });
+
+    await expect(
+      executeMagicCompact(harness.v2, "source", 0, taskAware(calls)),
+    ).resolves.toBeTrue();
+
+    expect(calls.map(call => call.candidate.output.slice(0, 6))).toEqual([
+      "useful",
+      "stale ",
+    ]);
+    expect(calls[0]!.task.latestUserRequest).toBe("stale request");
+    expect(harness.events.slice(0, 3)).toEqual([
+      "generation-fork",
+      "retention-summary",
+      "generation-delete",
+    ]);
+    expect(summaryParts(messages)).toHaveLength(2);
+    const tools = messages
+      .flatMap(item => item.parts)
+      .filter(part => part.type === "tool");
+    expect(tools[0]).toEqual(usefulTool);
+    expect(JSON.stringify(tools[1])).toContain("Stale read contents omitted");
+    expect(harness.partUpdates.map(part => part.id)).not.toContain(
+      usefulTool.id,
+    );
+    expect(harness.toasts.at(-1)?.message).toBe(
+      "Compacted 2 assistant turn(s). Task-aware retention kept 1 of 2 evaluated tool call(s) whole.",
+    );
+  });
+
+  test("counts kept payloads in per-turn profitability and the savings gate", async () => {
+    // Without retention the large read output makes this turn profitable.
+    const heuristic = compactableCommandMessages(
+      "gate",
+      "useful parser finding ".repeat(400),
+    );
+    heuristic[1]!.parts = heuristic[1]!.parts.filter(
+      part => part.type !== "reasoning",
+    );
+    const retained = structuredClone(heuristic);
+    const before = structuredClone(retained);
+    const response = {
+      generationResponse: { turns: [result(1, "Gate turn summary.")] },
+    };
+
+    const heuristicHarness = commandHarness(heuristic, response);
+    await expect(
+      executeMagicCompact(heuristicHarness.v2, "source", 0, HEURISTIC_OPTIONS),
+    ).resolves.toBeTrue();
+    await deleteStats("source");
+    await deleteCache("source");
+
+    const retainedHarness = commandHarness(retained, response);
+    await expect(
+      executeMagicCompact(retainedHarness.v2, "source", 0, taskAware()),
+    ).rejects.toThrow(COMPACT_INSUFFICIENT_SAVINGS);
+    expect(retained).toEqual(before);
+    expect(retainedHarness.forks).not.toContain("backup");
+    expect(await readStats("source")).toBeNull();
+  });
+
+  test("a classification failure stops before turn generation, backup, or writes", async () => {
+    const messages = retainedTurns();
+    const before = structuredClone(messages);
+    const harness = commandHarness(messages, {
+      generationResponse: { turns: [result(1, "unused"), result(2, "unused")] },
+    });
+
+    const error = await executeMagicCompact(harness.v2, "source", 0, {
+      retention: {
+        mode: "task-aware",
+        apiKey: "test-key",
+        fetch: async () => new Response("private", { status: 429 }),
+      },
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(RetentionClassificationError);
+    expect(String(error)).toContain("/magic-trim --heuristic");
+    expect(messages).toEqual(before);
+    expect(harness.modelPrompts).toEqual([]);
+    expect(harness.forks).toEqual(["generation-fork"]);
+    expect(harness.activeGenerationForks).toEqual([]);
+    expect(harness.partUpdates).toEqual([]);
+    expect(await readStats("source")).toBeNull();
+  });
+});
 
 function compactableCommandMessages(
   id: string,

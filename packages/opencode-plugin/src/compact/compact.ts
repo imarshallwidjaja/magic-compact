@@ -87,7 +87,7 @@ const GLOBAL_ANCHOR_CHARACTER_LIMIT = 160;
 const GENERATION_NONCE_ATTEMPTS = 8;
 const GENERATION_NONCE_PATTERN = /^[A-Za-z0-9_-]{22}$/u;
 
-type CompactionSettings = {
+export type CompactionSettings = {
   model: { providerID: string; modelID: string };
   variant?: string;
   descriptor: {
@@ -954,7 +954,7 @@ function assertRetainedForkIdentity(
   }
 }
 
-function assertForkRecordIdentity(
+export function assertForkRecordIdentity(
   messages: MessageWithParts[],
   forkSessionID: string,
 ): void {
@@ -1126,7 +1126,7 @@ function containsString(value: unknown, needle: string): boolean {
   return false;
 }
 
-async function resolveCompactionSettings(
+export async function resolveCompactionSettings(
   v2: V2Client,
   sourceSession: Session,
   requiresImages: boolean,
@@ -1235,7 +1235,7 @@ async function resolveCompactionSettings(
   };
 }
 
-function assertConfiguredModelSupportsImages(
+export function assertConfiguredModelSupportsImages(
   settings: CompactionSettings,
 ): void {
   if (settings.descriptor.capabilities?.input?.image !== true) {
@@ -1245,7 +1245,7 @@ function assertConfiguredModelSupportsImages(
   }
 }
 
-function historyMayExposeImages(sourceSnapshot: unknown): boolean {
+export function historyMayExposeImages(sourceSnapshot: unknown): boolean {
   if (!Array.isArray(sourceSnapshot)) return false;
   return sourceSnapshot.some(message => {
     if (!isRecord(message) || !Array.isArray(message["parts"])) return false;
@@ -1675,7 +1675,7 @@ function lifecycleMessage(
   return "Compaction generation fork deletion failed.";
 }
 
-function safeStatus(error: unknown): number | undefined {
+export function safeStatus(error: unknown): number | undefined {
   for (const item of diagnosticChain(error)) {
     const data = ownDataProperty(item, "data");
     const value =
@@ -1694,7 +1694,7 @@ function safeStatus(error: unknown): number | undefined {
   return undefined;
 }
 
-function isContextOverflow(
+export function isContextOverflow(
   error: unknown,
   status: number | undefined,
 ): boolean {

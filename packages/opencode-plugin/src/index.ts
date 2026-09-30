@@ -11,7 +11,14 @@ import {
   executeMagicCompact,
 } from "./magic-compact";
 import { STATS_SUCCESS, executeMagicStats } from "./magic-stats";
-import { TRIM_NOOP, TRIM_SUCCESS, executeMagicTrim } from "./magic-trim";
+import {
+  TRIM_NOOP,
+  TRIM_SUCCESS,
+  executeMagicTrim,
+  parseMagicTrimArguments,
+} from "./magic-trim";
+import type { RetentionPolicy } from "./retention/retention";
+import { rejectNativeCompactionOfSummaryFork } from "./retention/summary";
 import { omissionReadDiagnostic, readOmittedContent } from "./storage/omission";
 import { handleStatsEvent } from "./stats/events";
 import { projectManifestCoveredMedia } from "./compact/media";
@@ -21,6 +28,14 @@ const COMPACT_COMMAND = "magic-compact";
 const TRIM_COMMAND = "magic-trim";
 const STATS_COMMAND = "magic-stats";
 const SUMMARIZER_PERMISSION = { "*": "deny" } as const;
+
+// Read per command so a missing key fails that command, not plugin startup.
+function taskAwareRetention(): RetentionPolicy {
+  return {
+    mode: "task-aware",
+    apiKey: process.env["TYPESAFE_API_KEY"] || undefined,
+  };
+}
 
 const server: Plugin = async input => {
   return {
@@ -44,7 +59,8 @@ const server: Plugin = async input => {
       };
       config.command[TRIM_COMMAND] = {
         template: "",
-        description: "Trim historical tool inputs and outputs",
+        description:
+          "Trim historical tool inputs and outputs (add --heuristic to skip task-aware retention)",
       };
     },
     "command.execute.before": async command => {
@@ -70,26 +86,31 @@ const server: Plugin = async input => {
           getV2Client(input),
           command.sessionID,
           keepTurns,
+          { retention: taskAwareRetention() },
         );
         // Must throw error or OpenCode will send message to LLM
         throw new Error(compacted ? COMPACT_SUCCESS : COMPACT_NOOP);
       }
 
       if (command.command === TRIM_COMMAND) {
-        const trimmed = command.arguments.trim();
-        if (!/^\d*$/.test(trimmed)) {
-          throw new Error(
-            "/magic-trim argument must be a non-negative integer.",
-          );
-        }
-        const keepTurns = trimmed ? Number(trimmed) : 0;
+        const { keepTurns, heuristic } = parseMagicTrimArguments(
+          command.arguments,
+        );
         const didTrim = await executeMagicTrim(
           getV2Client(input),
           command.sessionID,
           keepTurns,
+          {
+            retention: heuristic ? { mode: "heuristic" } : taskAwareRetention(),
+          },
         );
         throw new Error(didTrim ? TRIM_SUCCESS : TRIM_NOOP);
       }
+    },
+    // A retention summary fork must never be compacted natively: that would
+    // send another model request and replace the whole-session summary.
+    "experimental.session.compacting": async input => {
+      rejectNativeCompactionOfSummaryFork(input.sessionID);
     },
     "experimental.chat.messages.transform": async (_input, output) => {
       const projected = projectManifestCoveredMedia(

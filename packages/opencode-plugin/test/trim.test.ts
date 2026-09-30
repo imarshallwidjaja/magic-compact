@@ -16,7 +16,26 @@ import {
   type Turn,
 } from "../src/compact/plan";
 import { trimToolParts } from "../src/compact/prune";
-import { TRIM_NOOP, executeMagicTrim } from "../src/magic-trim";
+import server from "../src/index";
+import {
+  TRIM_ARGUMENTS_ERROR,
+  TRIM_NOOP,
+  TRIM_PENDING_REVERT,
+  TrimRevalidationError,
+  executeMagicTrim,
+  parseMagicTrimArguments,
+} from "../src/magic-trim";
+import type { PluginInput } from "@opencode-ai/plugin";
+import { RetentionClassificationError } from "../src/retention/classifier";
+import {
+  compactionAgent,
+  providerCatalog,
+  rewriteFork,
+  scoredJevFetch,
+  SESSION_SUMMARY_TEXT,
+  summaryReply,
+  type JevCall,
+} from "./retention-host";
 import {
   allocateOmission,
   cachePath,
@@ -32,6 +51,9 @@ import {
 } from "../src/storage/stats";
 import { trimStatsMessage } from "../src/stats/constants";
 import { countCanonicalContentTokens } from "../src/stats/tokenize";
+
+const HEURISTIC_OPTIONS = { retention: { mode: "heuristic" } } as const;
+const HEURISTIC_FEEDBACK = "Heuristic mode: no task-aware retention.";
 
 describe("magic trim", () => {
   test("preserves the requested assistant-turn tail", async () => {
@@ -120,7 +142,11 @@ describe("magic trim", () => {
     } as unknown as V2Client;
 
     expect(
-      await trimToolParts({ v2, sessionID: "session" }, [selectedTurn]),
+      await trimToolParts(
+        { v2, sessionID: "session" },
+        [selectedTurn],
+        new Set(),
+      ),
     ).toBe(1);
     expect(tool.state.status).toBe("completed");
     if (tool.state.status !== "completed") {
@@ -131,7 +157,11 @@ describe("magic trim", () => {
     expect(reasoning.text).toBe("unchanged");
 
     expect(
-      await trimToolParts({ v2, sessionID: "session" }, [selectedTurn]),
+      await trimToolParts(
+        { v2, sessionID: "session" },
+        [selectedTurn],
+        new Set(),
+      ),
     ).toBe(0);
     expect(updates).toBe(1);
   });
@@ -144,7 +174,7 @@ describe("magic trim", () => {
     } as unknown as V2Client;
 
     try {
-      await trimToolParts({ v2, sessionID }, [turn(tool)]);
+      await trimToolParts({ v2, sessionID }, [turn(tool)], new Set());
 
       expect(tool.state.status).toBe("completed");
       if (tool.state.status !== "completed")
@@ -167,7 +197,7 @@ describe("magic trim", () => {
     } as unknown as V2Client;
 
     try {
-      await trimToolParts({ v2, sessionID }, [turn(tool)]);
+      await trimToolParts({ v2, sessionID }, [turn(tool)], new Set());
 
       expect(tool.state.status).toBe("completed");
       if (tool.state.status !== "completed")
@@ -201,7 +231,7 @@ describe("magic trim", () => {
     } as unknown as V2Client;
 
     try {
-      await trimToolParts({ v2, sessionID }, [turn(tool)]);
+      await trimToolParts({ v2, sessionID }, [turn(tool)], new Set());
 
       expect(tool.state.status).toBe("completed");
       if (tool.state.status !== "completed")
@@ -228,7 +258,9 @@ describe("magic trim", () => {
     } as unknown as V2Client;
 
     try {
-      expect(await trimToolParts({ v2, sessionID }, [turn(tool)])).toBe(1);
+      expect(
+        await trimToolParts({ v2, sessionID }, [turn(tool)], new Set()),
+      ).toBe(1);
 
       expect(tool.state.status).toBe("completed");
       if (tool.state.status !== "completed")
@@ -249,7 +281,9 @@ describe("magic trim", () => {
       expect(contentID).toBeDefined();
       expect(await readOmittedContent(sessionID, contentID!)).toBe(prompt);
 
-      expect(await trimToolParts({ v2, sessionID }, [turn(tool)])).toBe(0);
+      expect(
+        await trimToolParts({ v2, sessionID }, [turn(tool)], new Set()),
+      ).toBe(0);
       expect(tool.state.input["prompt"]).toBe("[Omitted]");
       expect(
         tool.state.output.match(/<tool-input-omission-notice>/gu),
@@ -274,7 +308,9 @@ describe("magic trim", () => {
       },
     } as unknown as V2Client;
 
-    expect(await trimToolParts({ v2, sessionID }, [turn(tool)])).toBe(0);
+    expect(
+      await trimToolParts({ v2, sessionID }, [turn(tool)], new Set()),
+    ).toBe(0);
     expect(tool.state).toEqual(before);
     expect(updates).toBe(0);
     expect(await readCache(sessionID)).toBeNull();
@@ -300,7 +336,9 @@ describe("magic trim", () => {
       });
       const beforeTokens = countCanonicalContentTokens(messages);
 
-      expect(await executeMagicTrim(v2, sessionID, 0)).toBeTrue();
+      expect(
+        await executeMagicTrim(v2, sessionID, 0, HEURISTIC_OPTIONS),
+      ).toBeTrue();
 
       const activeMessages = messages.map(item => ({
         ...item,
@@ -350,7 +388,7 @@ describe("magic trim", () => {
       await writeStats(sessionID, trimStats(sessionID));
 
       await expect(
-        executeMagicTrim(harness.v2, sessionID, 0),
+        executeMagicTrim(harness.v2, sessionID, 0, HEURISTIC_OPTIONS),
       ).resolves.toBeFalse();
 
       expect(harness.deletedSessions).toEqual([harness.backupID]);
@@ -358,7 +396,7 @@ describe("magic trim", () => {
       expect(await readStats(harness.backupID)).toBeNull();
       expect(harness.toasts.map(toast => toast.message)).toEqual([
         "Trimming session...",
-        TRIM_NOOP,
+        `${TRIM_NOOP} ${HEURISTIC_FEEDBACK}`,
       ]);
       expect(harness.prompts).toEqual([]);
       expect(JSON.stringify(messages)).not.toContain("Trimming session...");
@@ -389,7 +427,7 @@ describe("magic trim", () => {
       await allocateOmission(sessionID, { content: "source cache" });
       await writeStats(sessionID, trimStats(sessionID));
       try {
-        await executeMagicTrim(harness.v2, sessionID, 0);
+        await executeMagicTrim(harness.v2, sessionID, 0, HEURISTIC_OPTIONS);
       } catch (error) {
         failure = error;
       }
@@ -458,18 +496,22 @@ describe("magic trim", () => {
       try {
         await expect(
           settleWithin(
-            executeMagicTrim(noOp.v2, noOpID, 0, { controlTimeoutMs: 5 }),
+            executeMagicTrim(noOp.v2, noOpID, 0, {
+              ...HEURISTIC_OPTIONS,
+              controlTimeoutMs: 5,
+            }),
             250,
           ),
         ).resolves.toBeFalse();
         expect(noOp.toasts.map(toast => toast.message)).toEqual([
           "Trimming session...",
-          TRIM_NOOP,
+          `${TRIM_NOOP} ${HEURISTIC_FEEDBACK}`,
         ]);
 
         await expect(
           settleWithin(
             executeMagicTrim(success.v2, successID, 0, {
+              ...HEURISTIC_OPTIONS,
               controlTimeoutMs: 5,
             }),
             250,
@@ -477,12 +519,13 @@ describe("magic trim", () => {
         ).resolves.toBeTrue();
         expect(success.toasts.map(toast => toast.message)).toEqual([
           "Trimming session...",
-          "Trimmed 1 tool call(s).",
+          `Trimmed 1 tool call(s). ${HEURISTIC_FEEDBACK}`,
         ]);
 
         await expect(
           settleWithin(
             executeMagicTrim(failed.v2, failureID, 0, {
+              ...HEURISTIC_OPTIONS,
               controlTimeoutMs: 5,
             }),
             250,
@@ -532,7 +575,7 @@ describe("magic trim", () => {
 
     try {
       try {
-        await executeMagicTrim(harness.v2, sessionID, 0);
+        await executeMagicTrim(harness.v2, sessionID, 0, HEURISTIC_OPTIONS);
       } catch (error) {
         failure = error;
       }
@@ -598,7 +641,11 @@ describe("magic trim", () => {
 
     const compaction = await createCompactionPlan(v2, "session", 0);
     const trim = await createTrimPlan(v2, "session", 0);
-    await trimToolParts({ v2, sessionID: "session" }, trim.trimmedTurns);
+    await trimToolParts(
+      { v2, sessionID: "session" },
+      trim.trimmedTurns,
+      new Set(),
+    );
 
     expect(
       compaction.summarizedTurns.flatMap(turn =>
@@ -613,11 +660,395 @@ describe("magic trim", () => {
   });
 });
 
+describe("magic trim task-aware retention", () => {
+  test("parses an optional turn count and --heuristic flag in either order", () => {
+    expect(parseMagicTrimArguments("")).toEqual({
+      keepTurns: 0,
+      heuristic: false,
+    });
+    expect(parseMagicTrimArguments(" 3 ")).toEqual({
+      keepTurns: 3,
+      heuristic: false,
+    });
+    expect(parseMagicTrimArguments("--heuristic")).toEqual({
+      keepTurns: 0,
+      heuristic: true,
+    });
+    expect(parseMagicTrimArguments("--heuristic 2")).toEqual({
+      keepTurns: 2,
+      heuristic: true,
+    });
+    expect(parseMagicTrimArguments("2  --heuristic")).toEqual({
+      keepTurns: 2,
+      heuristic: true,
+    });
+  });
+
+  test.each([
+    "--heuristic --heuristic",
+    "1 2",
+    "-1",
+    "1.5",
+    "--Heuristic",
+    "--heuristic=true",
+    "heuristic",
+  ])("rejects malformed arguments %p before any work", async raw => {
+    expect(() => parseMagicTrimArguments(raw)).toThrow(TRIM_ARGUMENTS_ERROR);
+    const hooks = await server({} as PluginInput);
+    await expect(
+      hooks["command.execute.before"]!(
+        { command: "magic-trim", arguments: raw, sessionID: "session" },
+        { parts: [] },
+      ),
+    ).rejects.toThrow(TRIM_ARGUMENTS_ERROR);
+  });
+
+  test("keeps judged-useful calls whole and trims the rest by the existing rules", async () => {
+    const sessionID = `ses_trim_retain_${randomUUID().replaceAll("-", "")}`;
+    const useful = readTool("tool_useful", "useful parser finding ".repeat(80));
+    const stale = readTool("tool_stale", "stale directory listing ".repeat(80));
+    const todo = completedTool(
+      "tool_todo",
+      "todowrite",
+      "Successfully updated todos.",
+    );
+    const messages = [
+      message("usr_1", "user", [userText("usr_1", "Add the parser.")]),
+      message("ast_1", "assistant", [useful, stale, todo]),
+      message("usr_2", "user", [userText("usr_2", "Now fix its tests.")]),
+      message("ast_2", "assistant", []),
+    ];
+    const usefulBefore = structuredClone(useful);
+    const calls: JevCall[] = [];
+    const harness = trimCommandHarness(sessionID, messages);
+
+    try {
+      await expect(
+        executeMagicTrim(harness.v2, sessionID, 0, {
+          retention: {
+            mode: "task-aware",
+            apiKey: "test-key",
+            fetch: scoredJevFetch(
+              output => (output.includes("useful") ? 0.95 : 0.1),
+              calls,
+            ),
+          },
+        }),
+      ).resolves.toBeTrue();
+
+      expect(useful).toEqual(usefulBefore);
+      if (stale.state.status !== "completed") throw new Error("completed");
+      expect(stale.state.output).toContain("Stale read contents omitted");
+      expect(stale.state.metadata["magicCompact"]).toEqual({ trimmed: true });
+      expect(calls.map(call => call.candidate.output.slice(0, 6))).toEqual([
+        "useful",
+        "stale ",
+      ]);
+      expect(calls[0]!.task).toEqual({
+        latestUserRequest: "Now fix its tests.",
+        sessionSummary: SESSION_SUMMARY_TEXT,
+      });
+      expect(calls[0]!.candidate.calledWhile).toBe(
+        "handling the previous user request",
+      );
+      expect(harness.forks).toEqual([harness.summaryForkID, harness.backupID]);
+      expect(harness.deletedSessions).toEqual([harness.summaryForkID]);
+      expect(JSON.stringify(messages)).not.toContain(harness.summaryForkID);
+      expect(harness.toasts.at(-1)?.message).toBe(
+        "Trimmed 2 tool call(s). Task-aware retention kept 1 of 2 evaluated tool call(s) whole.",
+      );
+    } finally {
+      await cleanupTrimSessions(sessionID, harness.backupID);
+    }
+  });
+
+  test("makes no summary or classifier request when no call would change", async () => {
+    const sessionID = `ses_trim_no_candidates_${randomUUID().replaceAll("-", "")}`;
+    const marked = readTool("tool_marked", "large output ".repeat(100));
+    if (marked.state.status !== "completed") throw new Error("completed");
+    marked.state.metadata["magicCompact"] = { trimmed: true };
+    const messages = [
+      message("usr_1", "user", []),
+      message("ast_1", "assistant", [
+        marked,
+        completedTool("tool_small", "bash", "ok"),
+      ]),
+    ];
+    const harness = trimCommandHarness(sessionID, messages);
+
+    try {
+      await expect(
+        executeMagicTrim(harness.v2, sessionID, 0, {
+          retention: { mode: "task-aware", apiKey: undefined },
+        }),
+      ).resolves.toBeTrue();
+
+      expect(harness.modelCalls).toEqual([]);
+      expect(harness.forks).toEqual([harness.backupID]);
+      expect(harness.toasts.at(-1)?.message).toBe(
+        "Trimmed 1 tool call(s). Task-aware retention: no tool calls needed evaluation.",
+      );
+    } finally {
+      await cleanupTrimSessions(sessionID, harness.backupID);
+    }
+  });
+
+  test("heuristic mode trims candidates without a key, model, or classifier", async () => {
+    const sessionID = `ses_trim_heuristic_${randomUUID().replaceAll("-", "")}`;
+    const tool = readTool("tool_read", "large output ".repeat(100));
+    const harness = trimCommandHarness(sessionID, [
+      message("usr_1", "user", []),
+      message("ast_1", "assistant", [tool]),
+    ]);
+
+    try {
+      await expect(
+        executeMagicTrim(harness.v2, sessionID, 0, HEURISTIC_OPTIONS),
+      ).resolves.toBeTrue();
+
+      expect(harness.modelCalls).toEqual([]);
+      expect(harness.forks).toEqual([harness.backupID]);
+      if (tool.state.status !== "completed") throw new Error("completed");
+      expect(tool.state.output).toContain("Stale read contents omitted");
+    } finally {
+      await cleanupTrimSessions(sessionID, harness.backupID);
+    }
+  });
+
+  test.each([
+    ["a missing API key", undefined, 200],
+    ["a failed classification", "test-key", 500],
+  ] as const)(
+    "%s leaves source, backup, cache, and stats untouched",
+    async (_name, apiKey, status) => {
+      const sessionID = `ses_trim_retention_fail_${randomUUID().replaceAll("-", "")}`;
+      const messages = [
+        message("usr_1", "user", [userText("usr_1", "Add the parser.")]),
+        message("ast_1", "assistant", [
+          readTool("tool_read", "large output ".repeat(100)),
+        ]),
+      ];
+      const before = structuredClone(messages);
+      const harness = trimCommandHarness(sessionID, messages);
+      let failure: unknown;
+
+      try {
+        try {
+          await executeMagicTrim(harness.v2, sessionID, 0, {
+            retention: {
+              mode: "task-aware",
+              apiKey,
+              fetch: async () => new Response("private", { status }),
+            },
+          });
+        } catch (error) {
+          failure = error;
+        }
+
+        expect(failure).toBeInstanceOf(RetentionClassificationError);
+        expect(String(failure)).toContain("/magic-trim --heuristic");
+        expect(String(failure)).not.toContain("private");
+        expect(messages).toEqual(before);
+        expect(harness.forks).not.toContain(harness.backupID);
+        expect(harness.deletedSessions).toEqual(
+          apiKey ? [harness.summaryForkID] : [],
+        );
+        expect(harness.modelCalls).toEqual(
+          apiKey ? ["agents", "providers", "summary"] : [],
+        );
+        expect(harness.prompts).toEqual([]);
+        expect(await readCache(sessionID)).toBeNull();
+        expect(await readStats(sessionID)).toBeNull();
+        expect(harness.toasts.at(-1)?.message).toContain(
+          "/magic-trim --heuristic",
+        );
+      } finally {
+        await cleanupTrimSessions(sessionID, harness.backupID);
+      }
+    },
+  );
+
+  test.each(["source drift", "a pending revert"] as const)(
+    "%s during classification fails before writes and removes the backup",
+    async change => {
+      const sessionID = `ses_trim_retention_race_${randomUUID().replaceAll("-", "")}`;
+      const tool = readTool("tool_read", "large output ".repeat(100));
+      const messages = [
+        message("usr_1", "user", [userText("usr_1", "Add the parser.")]),
+        message("ast_1", "assistant", [tool]),
+      ];
+      const toolBefore = structuredClone(tool);
+      const harness = trimCommandHarness(sessionID, messages, {
+        duringSummary: () => {
+          if (change === "source drift") {
+            messages.push(
+              message("usr_concurrent", "user", [
+                userText("usr_concurrent", "concurrent request"),
+              ]),
+            );
+          } else {
+            harness.setRevert({ messageID: "ast_1" });
+          }
+        },
+      });
+
+      try {
+        await expect(
+          executeMagicTrim(harness.v2, sessionID, 0, {
+            retention: {
+              mode: "task-aware",
+              apiKey: "test-key",
+              fetch: scoredJevFetch(() => 0.1),
+            },
+          }),
+        ).rejects.toThrow(
+          change === "source drift"
+            ? "OpenCode source changed during Magic Trim"
+            : TRIM_PENDING_REVERT,
+        );
+
+        expect(tool).toEqual(toolBefore);
+        expect(harness.deletedSessions).toEqual([
+          harness.summaryForkID,
+          harness.backupID,
+        ]);
+        expect(harness.selectedSessions).toEqual([]);
+        expect(harness.prompts).toEqual([]);
+        expect(await readCache(sessionID)).toBeNull();
+        expect(await readStats(sessionID)).toBeNull();
+      } finally {
+        await cleanupTrimSessions(sessionID, harness.backupID);
+      }
+    },
+  );
+
+  test.each([
+    ["a thrown messages reload", "messages", "throw", false],
+    [
+      "an error messages response and failed backup cleanup",
+      "messages",
+      "response",
+      true,
+    ],
+    [
+      "a thrown session reload and failed backup cleanup",
+      "session",
+      "throw",
+      true,
+    ],
+    ["an error session response", "session", "response", false],
+  ] as const)(
+    "%s before trim writes keep only sanitized failures",
+    async (_name, target, kind, cleanupFails) => {
+      const sessionID = `ses_trim_reload_${randomUUID().replaceAll("-", "")}`;
+      const messages = [
+        message("usr_1", "user", [userText("usr_1", "Add the parser.")]),
+        message("ast_1", "assistant", [
+          readTool("tool_read", "large output ".repeat(100)),
+        ]),
+      ];
+      const before = structuredClone(messages);
+      const harness = trimCommandHarness(sessionID, messages, {
+        sourceReload: {
+          target,
+          read: async () => {
+            if (kind === "throw") {
+              throw Object.assign(
+                new Error(`fetch failed: ${PRIVATE_BODY}`, {
+                  cause: new Error(PRIVATE_BODY),
+                }),
+                { status: 503, body: PRIVATE_BODY },
+              );
+            }
+            return {
+              error: { name: "UnknownError", data: { message: PRIVATE_BODY } },
+              response: new Response(PRIVATE_BODY, { status: 502 }),
+            };
+          },
+        },
+        ...(cleanupFails
+          ? {
+              backupDeleteError: new Error(PRIVATE_BODY, {
+                cause: PRIVATE_BODY,
+              }),
+            }
+          : {}),
+      });
+      let failure: unknown;
+
+      try {
+        try {
+          await executeMagicTrim(harness.v2, sessionID, 0, {
+            retention: {
+              mode: "task-aware",
+              apiKey: "test-key",
+              fetch: scoredJevFetch(() => 0.1),
+            },
+          });
+        } catch (error) {
+          failure = error;
+        }
+
+        const root = cleanupFails
+          ? (failure as AggregateError).errors[0]
+          : failure;
+        expect(root).toBeInstanceOf(TrimRevalidationError);
+        expect(root).toMatchObject({
+          target,
+          status: kind === "throw" ? 503 : 502,
+        });
+        if (cleanupFails) {
+          expect(failure).toBeInstanceOf(AggregateError);
+          expect(String(failure)).toContain(sessionID);
+          expect(String(failure)).toContain(harness.backupID);
+        }
+        expect(reachableStrings(failure).join("\n")).not.toContain(
+          PRIVATE_BODY,
+        );
+        expect(JSON.stringify(harness.toasts)).not.toContain(PRIVATE_BODY);
+        expect(harness.toasts.at(-1)?.message).toContain("left unchanged");
+        expect(messages).toEqual(before);
+        expect(harness.deletedSessions).toEqual([
+          harness.summaryForkID,
+          harness.backupID,
+        ]);
+        expect(harness.selectedSessions).toEqual([]);
+        expect(harness.prompts).toEqual([]);
+        expect(await readStats(sessionID)).toBeNull();
+      } finally {
+        await cleanupTrimSessions(sessionID, harness.backupID);
+      }
+    },
+  );
+});
+
+const PRIVATE_BODY = "PRIVATE-SESSION-BODY-7f3a";
+
+// Every string reachable from an error: messages, stacks, causes, aggregate
+// members, and any other own property.
+function reachableStrings(value: unknown, seen = new Set<unknown>()): string[] {
+  if (typeof value === "string") return [value];
+  if (typeof value !== "object" || value === null || seen.has(value)) {
+    return [];
+  }
+  seen.add(value);
+  return Object.getOwnPropertyNames(value).flatMap(key =>
+    reachableStrings((value as Record<string, unknown>)[key], seen),
+  );
+}
+
 type TrimCommandHarnessOptions = {
   toastMode?: "hang" | "fail";
   partUpdateError?: Error;
   selectError?: Error;
   backupDeleteError?: Error;
+  // Runs while the retention summary request is in flight.
+  duringSummary?: () => void;
+  // Replaces source reads made after the retention summary.
+  sourceReload?: {
+    target: "messages" | "session";
+    read: () => Promise<unknown>;
+  };
 };
 
 function trimCommandHarness(
@@ -635,18 +1066,75 @@ function trimCommandHarness(
   const toasts: Array<{ message?: string }> = [];
   const selectedSessions: string[] = [];
   const deletedSessions: string[] = [];
+  const forks: string[] = [];
+  const modelCalls: string[] = [];
+  const summaryForkID = `${sessionID}_summary`;
+  let summaryFork: MessageWithParts[] | undefined;
+  let revert: { messageID: string } | undefined;
   let noticeCount = 0;
   const v2 = {
+    app: {
+      agents: async () => {
+        modelCalls.push("agents");
+        return { data: [compactionAgent()] };
+      },
+    },
+    provider: {
+      list: async () => {
+        modelCalls.push("providers");
+        return { data: providerCatalog() };
+      },
+    },
     session: {
-      messages: async () => ({ data: messages }),
-      get: async () => ({ data: sourceSession }),
-      fork: async () => ({
-        data: { ...sourceSession, id: backupID } as Session,
-      }),
+      messages: async (request: { sessionID: string }) => {
+        if (
+          request.sessionID === sessionID
+          && options.sourceReload?.target === "messages"
+          && modelCalls.includes("summary")
+        ) {
+          return options.sourceReload.read();
+        }
+        return {
+          data:
+            request.sessionID === summaryForkID
+              ? structuredClone(summaryFork)
+              : messages,
+        };
+      },
+      get: async () => {
+        if (
+          options.sourceReload?.target === "session"
+          && modelCalls.includes("summary")
+        ) {
+          return options.sourceReload.read();
+        }
+        return {
+          data: { ...sourceSession, ...(revert ? { revert } : {}) },
+        };
+      },
+      // The first fork of a task-aware run is the retention summary fork.
+      fork: async () => {
+        const summaryRun = modelCalls.length > 0 && summaryFork === undefined;
+        const id = summaryRun ? summaryForkID : backupID;
+        forks.push(id);
+        if (summaryRun) summaryFork = rewriteFork(messages, id);
+        return { data: { ...sourceSession, id } as Session };
+      },
       update: async (request: { sessionID: string }) => ({
         data: { ...sourceSession, id: request.sessionID } as Session,
       }),
-      prompt: async (request: { parts?: Part[] }) => {
+      abort: async () => ({ data: true }),
+      prompt: async (request: {
+        sessionID: string;
+        messageID?: string;
+        agent?: string;
+        parts?: Part[];
+      }) => {
+        if (request.sessionID === summaryForkID) {
+          modelCalls.push("summary");
+          options.duringSummary?.();
+          return summaryReply(summaryFork!, request, summaryForkID);
+        }
         prompts.push(request);
         noticeCount += 1;
         const messageID = `trim-notice-${noticeCount}`;
@@ -661,6 +1149,7 @@ function trimCommandHarness(
       },
       delete: async (request: { sessionID: string }) => {
         deletedSessions.push(request.sessionID);
+        if (request.sessionID === summaryForkID) summaryFork = [];
         if (request.sessionID === backupID && options.backupDeleteError) {
           throw options.backupDeleteError;
         }
@@ -692,11 +1181,17 @@ function trimCommandHarness(
     v2,
     sessionID,
     backupID,
+    summaryForkID,
     messages,
     prompts,
     toasts,
     selectedSessions,
     deletedSessions,
+    forks,
+    modelCalls,
+    setRevert(value: { messageID: string }) {
+      revert = value;
+    },
   };
 }
 
@@ -754,6 +1249,16 @@ function message(
   return {
     info: { id, role } as Message,
     parts,
+  };
+}
+
+function userText(messageID: string, text: string): TextPart {
+  return {
+    id: `${messageID}_text`,
+    sessionID: "session",
+    messageID,
+    type: "text",
+    text,
   };
 }
 

@@ -1,0 +1,106 @@
+{
+  "productionBase": "0c47483a7916e7c5171ae42bf8580681d5f63b0f",
+  "patch": {
+    "file": "classifier.patch",
+    "sha256": "1744d20fbe4f3a61876bcc8cda769a936c48ec4b2931a2ab23f9fedd54576570"
+  },
+  "dataset": {
+    "sha256": "e363f6296877c63ce3e2e43be8dce26eef193dd25d2bff14e32f03ef4a6567ae",
+    "policy": "POLICY.md (Addenda A, B)",
+    "policySha256": "cab31df5804f7fee81f2e98d9e6ac28f4d085f3115a879ec7e34c4b856ceec75",
+    "source": "archive opencode.db.bak-20260901-101113 read with sqlite immutable=1; candidates from 0c createTrimPlan/findRetentionCandidates for /magic-trim N=0"
+  },
+  "summaries": {
+    "producer": {
+      "function": "generateSessionSummary",
+      "commit": "0c47483a7916e7c5171ae42bf8580681d5f63b0f",
+      "summaryModuleSha256": "7b0c89183459e435965b625765a94f0843361574eaddecabe70e085966fea3ba",
+      "promptSha256": "577f39e16329586218ff23bb965cbb63764b6b7b6ab6e0d60ca2dc2ca4a6e31c"
+    },
+    "host": {
+      "version": "1.18.30",
+      "binarySha256": "02ac838580d5488422a29788b103c58acdd9327bfe81635e799a63a9fa4622d8",
+      "compactionAgent": {
+        "model": {
+          "modelID": "gpt-6-luna-fast",
+          "providerID": "openai"
+        },
+        "variant": "low",
+        "native": true,
+        "promptSha": "552db0de0af1873a8acd4a631e2548345d4c43192de1d9be69c8feab4b41f80c"
+      },
+      "modelLimit": {
+        "context": 1050000,
+        "input": 922000,
+        "output": 128000
+      }
+    },
+    "indexSha256": "a0b68a3566a238cde217a9764041150be933e296f25a14f9566151f2551028eb"
+  },
+  "labels": {
+    "a": "18fe9dbcf8201df12ec96ca1bec2d4333e465fd1be5d3e05dbe5b3d2a2e668ca",
+    "b": "d9a0bebc896e9b062037810e8bcc00b54c1a8a478e69139e329337b4aa45da00",
+    "joinedSha256": "12eca21e3ad85d262022b75dfd2dcedce3122fc1b3be0ff15f8fd11bf19ec176"
+  },
+  "protocolSha256": "b4d193b6076c2baae61aaf040b38519884158c18422a4683e60ed53b7d9c0bdb",
+  "freezeSha256": "f77401d646c1aeacd9bf52878afcb00804488d4e3d6f1f5761fd4a664053217b",
+  "question": {
+    "type": "noul",
+    "instructions": "Would the assistant likely use concrete content from the input or output of the tool call `candidates[0]` again while continuing the current task described by `task.latestUserRequest` and `task.sessionSummary`? Answer yes even when the same content also appears elsewhere or could be fetched again.",
+    "criteria": {
+      "true": "It holds concrete content the assistant would likely use again for the current task: results, findings, current file or artifact contents, specifications, instructions or procedures the remaining work still follows, identifiers, links, commands, errors, or decisions. A file that was partly edited later still counts when its unchanged content is useful.",
+      "false": "Its content is empty, an omission or status notice, or tool bookkeeping; or its content is superseded by later work, belongs to a finished or different task, or is only related to the current task by topic."
+    }
+  },
+  "questionSha256": "4c8879efb6b7a9ed509e1952a8354a79676a89fc43fa30e34bca8da28062ff90",
+  "heldoutBodySetSha256": "6461a94eb499789a8975ac11778c85f68e92edee87eb8ca70698d3a8ca2a088f",
+  "runs": {
+    "dev-r1": {
+      "startedAt": "2026-09-30T16:30:48.639Z",
+      "order": "chronological",
+      "split": "development",
+      "classifierSha256": "94b515c7b4f52648dd2b7b3faa5ff0cc84a8612d931f98bdb9f2b86e60697337",
+      "manifestSha256": "578dbd18f2c7daadb2198e588bd41f1db6a5644673f274269606686e9aa97657"
+    },
+    "dev-r2": {
+      "startedAt": "2026-09-30T16:30:52.789Z",
+      "order": "reversed",
+      "split": "development",
+      "classifierSha256": "94b515c7b4f52648dd2b7b3faa5ff0cc84a8612d931f98bdb9f2b86e60697337",
+      "manifestSha256": "578dbd18f2c7daadb2198e588bd41f1db6a5644673f274269606686e9aa97657"
+    },
+    "held-r1": {
+      "startedAt": "2026-09-30T16:32:32.910Z",
+      "order": "chronological",
+      "split": "heldout",
+      "classifierSha256": "a1dc742548eeb3a6e2c9a9023cc367d6167cbda05797438ddbe4c894cfb40d80",
+      "manifestSha256": "f85382400244655a9ca8407f45d9d244bbac21a526961dc79f91d3b0f1856a0f"
+    },
+    "held-r2": {
+      "startedAt": "2026-09-30T16:32:39.704Z",
+      "order": "chronological",
+      "split": "heldout",
+      "classifierSha256": "a1dc742548eeb3a6e2c9a9023cc367d6167cbda05797438ddbe4c894cfb40d80",
+      "manifestSha256": "f85382400244655a9ca8407f45d9d244bbac21a526961dc79f91d3b0f1856a0f"
+    },
+    "held-r3": {
+      "startedAt": "2026-09-30T16:32:44.831Z",
+      "order": "chronological",
+      "split": "heldout",
+      "classifierSha256": "a1dc742548eeb3a6e2c9a9023cc367d6167cbda05797438ddbe4c894cfb40d80",
+      "manifestSha256": "f85382400244655a9ca8407f45d9d244bbac21a526961dc79f91d3b0f1856a0f"
+    },
+    "held-r4": {
+      "startedAt": "2026-09-30T16:32:49.983Z",
+      "order": "reversed",
+      "split": "heldout",
+      "classifierSha256": "a1dc742548eeb3a6e2c9a9023cc367d6167cbda05797438ddbe4c894cfb40d80",
+      "manifestSha256": "f85382400244655a9ca8407f45d9d244bbac21a526961dc79f91d3b0f1856a0f"
+    }
+  },
+  "exclusion": {
+    "snapshotID": "ses_fad9f918affeWkcfg61v3FA1PG@g2",
+    "cases": 20,
+    "reason": "future-content contamination; entire snapshot excluded before inference"
+  }
+}

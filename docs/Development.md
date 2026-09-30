@@ -24,7 +24,7 @@ bun install
 - `src/api.ts` - OpenCode API access helpers.
 - `src/index.ts` - package export surface and slash/tool registration.
 - `src/magic-compact.ts` - `/magic-compact` command entrypoint, projection, profitability, and recovery orchestration.
-- `src/magic-trim.ts` - `/magic-trim` command entrypoint.
+- `src/magic-trim.ts` - `/magic-trim` command entrypoint, argument parsing, and the retention drift guard.
 - `src/magic-stats.ts` - `/magic-stats` command entrypoint.
 - `src/tui.ts` - TUI plugin wiring.
 - `src/util.ts` - shared local utilities.
@@ -32,9 +32,12 @@ bun install
 - `src/compact/compact.ts` - command-owned generation-fork lifecycle, message isolation, structured-output request and ordered local response validation, and v3 summary-part insertion.
 - `src/compact/constants.ts` - compaction notices, boundary metadata, summary metadata, and omission notice formatting.
 - `src/compact/media.ts` - authoritative v2 user-image and v3 user/assistant-image manifest discovery plus pure model-request projection.
-- `src/compact/plan.ts` - turn planning, native checkpoint validation, source snapshot capture, post-insertion validation, and boundary selection.
+- `src/compact/plan.ts` - turn planning, strict writer checkpoint validation, the independent pure native model-visible history projection for retention accounting, source snapshot capture, post-insertion validation, and boundary selection.
 - `src/compact/prune.ts` - exact prune mutation planning/execution and tool input/output pruning.
 - `src/compact/session.ts` - session backup, owned insertion, revalidation, and recovery helpers.
+- `src/retention/classifier.ts` - task-aware retention classifier: one pinned TypeSafe Jev Noul per trim candidate, byte-budgeted excerpts, bounded concurrency, and all-or-nothing response validation. See `docs/RetentionEvaluation.md`.
+- `src/retention/summary.ts` - `generateSessionSummary`: the one whole-session summary fork through the native compaction agent, its vendored native template, model-visible budget and image gate, exact-shape acceptance, and the owned-fork registry used by the native compaction hook.
+- `src/retention/retention.ts` - retention candidates, request context, the keep decision set shared by both commands, and terminal feedback text.
 - `src/storage/omission.ts` - omitted content cache persistence and preplanned omission IDs for exact projection.
 - `src/storage/stats.ts` - persisted stats storage.
 - `src/storage/store.ts` - shared storage access helpers.
@@ -42,10 +45,13 @@ bun install
 - `src/stats/events.ts` - stats event accounting.
 - `src/stats/pricing.ts` - pricing calculations.
 - `src/stats/tokenize.ts` - token estimation helpers.
-- `test/compact.test.ts` - native batch budgets/concurrency/isolation, encoded tool payload and fixed media canaries, exact retained fork identity, active-failure aggregation, one-target requests and their fixed response schema, response count and identity, media manifests/projection, opaque summary-bearing turns, useful-savings projection, exact pruning/omission, source-drift preservation, checkpoint, stats, and recovery tests.
+- `test/compact.test.ts` - task-aware keeps during compaction and their effect on profitability, native batch budgets/concurrency/isolation, encoded tool payload and fixed media canaries, exact retained fork identity, active-failure aggregation, one-target requests and their fixed response schema, response count and identity, media manifests/projection, opaque summary-bearing turns, useful-savings projection, exact pruning/omission, source-drift preservation, checkpoint, stats, and recovery tests.
 - `test/omission.test.ts` - omission cache migration, integrity, legacy quarantine, backup, and concurrency tests.
-- `test/trim.test.ts` - trim planning, metadata idempotency, v0 summary preservation, and omission-format integration tests.
+- `test/trim.test.ts` - trim planning, metadata idempotency, v0 summary preservation, omission-format integration, argument parsing, and task-aware keep, no-candidate, heuristic, failure, drift/revert, and sanitized pre-write reload failure tests.
 - `test/tokenize.test.ts` - canonical local token-accounting tests.
+- `test/retention.test.ts` - retention request format, byte budgets, threshold boundary, bounded concurrency, whole-invocation rejection on invalid or failed classification, candidate canaries per tool rule, request mapping, frozen-cohort ID/body binding and membership (including reorder and identical-body cases), and summary-fork acceptance, rejection, model-visible budget and image gate, provider errors on 200 responses, native compaction guard, and cleanup tests. No network access.
+- `test/retention-host.ts` - fake summary-fork host pieces and fake Jev endpoint shared by the retention, trim, and compact suites.
+- `eval/retention/` - manual evaluation. The content-free `native-summary-{cases,provenance,results}.json` artifacts cover the 144-case dual-annotator cohort. `run.ts check <external-input.json>` compares production request hashes without network access; `metrics` recomputes unique-case and stability results; `score` explicitly makes paid calls through production classification. See `docs/RetentionEvaluation.md` for the input contract. `dataset.ts`, `labels.json` and the older `run`/`report` interface belong to the historical single-annotator proxy cohort and must not be paired with current labels. Tests exercise only the offline parity checker with synthetic fixtures.
 - `test/license.test.ts` - packaged no-grant notice plus verbatim upstream Magic Compact BSD-3.
 
 ### License
@@ -59,6 +65,7 @@ bun install
 - `docs/Development.md` - contributor setup and repository map.
 - `docs/Core.md` - core behavior and safety guarantees.
 - `docs/OpenCode.md` - OpenCode runtime behavior specification.
+- `docs/RetentionEvaluation.md` - task-aware retention classifier contract, evaluation protocol, and measured results.
 
 ## Common Commands
 
@@ -67,12 +74,14 @@ bun install
 - `bun run format` - Prettier formatting.
 - `bun test packages/opencode-plugin/test/compact.test.ts` - focused compaction suite.
 - `bun test packages/opencode-plugin/test/trim.test.ts` - focused trim suite.
+- `bun test packages/opencode-plugin/test/retention.test.ts` - focused retention classifier suite.
 
 ## Notes
 
 - The project uses Bun workspaces.
 - For the user-facing plugin install flow, see the main `README.md`.
 - The native-checkpoint cases in `packages/opencode-plugin/test/compact.test.ts` are maintenance canaries for user `compaction` parts with optional `tail_start_id`, and assistant `parentID`, `summary`, `finish`, and `error` fields. Check those fields against OpenCode's compaction implementation whenever OpenCode or `@opencode-ai/sdk` is upgraded.
+- Retention's native-view canaries in `test/retention.test.ts` cover failed no-tail checkpoints, completed then failed checkpoints, failed/unfinished tail reordering, and two completed checkpoints with a crossing retained tail. Compare membership and order against pinned `filterCompacted`, including its final reorder independently of summary completion. Do not reuse the writer checkpoint inspector for budget/image accounting: valid native error/incomplete paths must remain available to task-aware trim. Only unresolved or nonpreceding selected tails fail this view's safety check; full stored fork identity remains checked separately.
 - Source race detection structurally compares every behavior-affecting message/part field and ordering while ignoring volatile timing fields and token/cost accounting churn. The semantic tool `state.time.compacted` bit survives snapshot normalization, so a concurrent change to it counts as drift while `start`/`end` timing churn does not. It runs before writes and again after owned summary/boundary insertion immediately before exact planned pruning. Pre-write drift and every failure from the first source-write attempt onward preserve both the live source and backup without selecting or deleting either, retain concurrent messages, record no successful stats increment, and report both session IDs for manual recovery. Recheck message info and part state variants on OpenCode or SDK upgrades.
 - OpenCode's `session.prompt` applies pending-revert cleanup before appending the message, silently deleting the reverted suffix. Magic Compact therefore fails closed with a pending-revert error before generation and rechecks the session immediately before the first source write. Recheck this prompt-time cleanup on OpenCode or SDK upgrades.
 - Resolve the native hidden compaction agent's explicit model/variant and matching provider descriptor once. Derive the 32K maximum half-output target, usable input, 400K/80% normal target, 90% hard single-turn limit, 500K/90% halo limit, and 8K fixed reserve in `compact/batch.ts`, which plans exactly one target turn per batch. The 8K reserve is only for non-explicit host, system, and provider overhead. Separately tokenize each complete rendered explicit request exactly once for every normal, usable, hard-turn, and halo decision: static instructions, byte-identical global index, local target JSON and punctuation, fixed-shape conservative markers plus injected marker text, exact ordinal digits, media counts, and an optional following-halo stop record/marker. Use the 32K fallback output limit only when the descriptor lacks a safe positive output value. Estimate ordinary visible strings through `countGptTokens`. Charge only image/PDF-typed file parts and completed non-compacted tool attachments 8K; ignore `text/plain` and directory file parts as non-model-visible, and estimate other model-visible file parts and attachments by their URL (encoded length for `data:` URLs, tokenized text otherwise). Estimate arbitrary or nested `data:` tool strings by their encoded length without invoking the tokenizer on their payloads. Match the pinned `message-v2.ts` compacted, error, interrupted-output, pending, and running state branches exactly.
@@ -91,6 +100,9 @@ bun install
 - OpenCode's native history conversion is the only generation media and reasoning path. Completed tool output/attachments, user and assistant files, and provider reasoning remain native. Gate the configured model's image capability over the union of retained batch histories. The cross-provider reasoning test remains a maintainer canary. Magic Compact must not manually serialize, redact, split, convert, or reattach those values.
 - New v3 summaries persist `magicCompact.mediaManifest` version `1`, built locally from authoritative source user then assistant inline images and binding encounter ordinal, exact MIME values, and SHA-256 hashes of exact original URLs. Tool `state.attachments` remain native tool media and omission behavior and never enter the persisted manifest. Persisted v2 manifests remain user-only; their `partId` values are parsed only for compatibility and never override canonical ordinal/MIME/hash identity after OpenCode rewrites IDs. Never trust model-supplied IDs or hashes, and never update, delete, omit-cache, or migrate user file parts or accepted v3-covered assistant image files. `projectManifestCoveredMedia` accepts persisted v2 and current v3 envelopes and remains the one pure projection used by the OpenCode message-transform hook, profitability, final token verification, and model-facing accounting. It validates every manifest-covered image by canonical ordinal/MIME/hash and replaces it with a placeholder only when the placeholder's canonical token count is strictly smaller than the original file URL token contribution; otherwise the exact file part stays inline and model-facing, so projected media token counts are non-negative by construction. Missing manifests are inert; malformed, incomplete, added, removed, reordered, MIME-changed, or hash-changed cohorts throw rather than hiding or resending media.
 - Keep `totalTokensPruned`/`cachedTokensSaved` as physical canonical-content accounting. Optional v1 stats fields `mediaTokensProjected` and `cachedMediaTokensSaved` preserve compatibility with existing files while reporting request-only media projection separately. Recompaction treats all summary-bearing turns as opaque; a valid existing media manifest still projects independently.
+- Task-aware retention reads `TYPESAFE_API_KEY` from the OpenCode server process environment per command; the classifier and summary modules never read the environment. Tests inject `apiKey` and `fetch` through the command's `retention` option and must never reach the network; command tests of the unchanged tool rules pass `{ mode: "heuristic" }`.
+- Retention keeps whole calls at `useful >= 0.80`, with singleton requests, concurrency four and no retries. Latest request/summary/turn request/input/output allocations are 5,000/8,000/600/3,000/9,000 UTF-8 JSON bytes; short fields up to 200 bytes stay whole when input fits. Never treat byte limits as a documented Jev token bound or tune wording, allocations or threshold against held-out outcomes. Both commands need a native compaction model and server-side TypeSafe key when candidates exist; `/magic-trim [N] --heuristic` makes no model calls. Retention's temporary summary is never appended to the source.
+- The retention summary prompt vendors OpenCode's `SUMMARY_TEMPLATE` from `packages/core/src/session/compaction.ts` at 830d5eb535 (1.18.30). On an OpenCode upgrade, recheck that template; that `SessionCompaction.process` in `packages/opencode/src/session/compaction.ts` still triggers `experimental.session.compacting` before its summary request, overflow replay, and auto-continue, and that a thrown hook still ends the prompt loop; that `nativeModelVisibleMessages` in `src/compact/plan.ts` still mirrors `filterCompacted` in `packages/opencode/src/session/message-v2.ts`; that provider failures still arrive as `info.error` on the prompt response; the explicit `messageID` prompt field and ascending-ID format; and the reply fields the acceptance check reads (`agent`, `finish`, `summary`, `error`, `parentID`).
 - OpenCode imports this plugin once per server process. After changing plugin source, restart the OpenCode server process itself; restarting an attached TUI does not reload it.
 
 ## Release

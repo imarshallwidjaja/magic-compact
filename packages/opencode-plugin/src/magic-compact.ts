@@ -36,12 +36,21 @@ import {
   POST_COMPACTION_NOTICE,
   boundaryPartID,
   summaryEnvelopeTextPart,
+  turnHasPersistedSummary,
 } from "./compact/constants";
 import {
   CONTROL_OPERATION_TIMEOUT_MS,
   createToastFeedback,
   IN_PROGRESS_TOAST_DURATION_MS,
 } from "./util";
+import {
+  decideRetention,
+  findRetentionCandidates,
+  HEURISTIC_RETENTION,
+  retentionFeedback,
+  type RetentionPlan,
+  type RetentionPolicy,
+} from "./retention/retention";
 
 export const COMPACT_SUCCESS = "Magic compaction successful.";
 export const COMPACT_NOOP = "No assistant turns are old enough to compact.";
@@ -59,6 +68,9 @@ type CompactionSelection = {
 };
 
 export type MagicCompactExecutionOptions = {
+  // The command always uses task-aware retention; heuristic exists for tests
+  // of the unchanged tool rules.
+  retention: RetentionPolicy;
   controlTimeoutMs?: number;
 };
 
@@ -66,7 +78,7 @@ export async function executeMagicCompact(
   v2: V2Client,
   sessionID: string,
   keepTurns: number,
-  options: MagicCompactExecutionOptions = {},
+  options: MagicCompactExecutionOptions,
 ): Promise<boolean> {
   const controlTimeoutMs =
     options.controlTimeoutMs ?? CONTROL_OPERATION_TIMEOUT_MS;
@@ -84,6 +96,7 @@ export async function executeMagicCompact(
   let sourceSession: Session | null = null;
   let sourceWritesStarted = false;
   let compactedTurnCount: number;
+  let retention: RetentionPlan = HEURISTIC_RETENTION;
 
   try {
     // Check if there's anything to compact
@@ -113,6 +126,24 @@ export async function executeMagicCompact(
 
     await revalidateCompactionSource(v2, sessionID, sourcePlan);
 
+    if (options.retention.mode === "task-aware") {
+      // Opaque summary-bearing turns are never pruned, so they hold no
+      // candidates. Retention runs before per-turn generation and backup.
+      retention = await decideRetention(
+        v2,
+        sourceSession,
+        sourceMessages,
+        await findRetentionCandidates(
+          sourceMessages,
+          sourcePlan.summarizedTurns.filter(
+            turn => !turnHasPersistedSummary(turn),
+          ),
+        ),
+        options.retention,
+        { controlTimeoutMs },
+      );
+    }
+
     const summaries = await generateCompactionSummaries(
       v2,
       sourceSession,
@@ -124,6 +155,7 @@ export async function executeMagicCompact(
       sourcePlan,
       summaries,
       sessionID,
+      retention.keep,
     );
     if (
       selection.turns.length === 0
@@ -240,7 +272,7 @@ export async function executeMagicCompact(
 
   await toastFeedback.showTerminal({
     title: "Magic Compact",
-    message: `Compacted ${compactedTurnCount} assistant turn(s).`,
+    message: `Compacted ${compactedTurnCount} assistant turn(s). ${retentionFeedback(retention)}`,
     variant: "info",
     duration: 5000,
   });
@@ -260,6 +292,7 @@ async function selectProfitableTurns(
   plan: CompactionPlan,
   summaries: GeneratedSummary[],
   sessionID: string,
+  keep: ReadonlySet<string>,
 ): Promise<CompactionSelection> {
   const selectedTurns: Turn[] = [];
   const selectedSummaries: Exclude<GeneratedSummary, null>[] = [];
@@ -271,7 +304,7 @@ async function selectProfitableTurns(
       throw new Error("Missing summary for assistant turn.");
     if (summary === null) continue;
     const candidates = [injectProjectedSummary(turn, summary, sessionID)];
-    const pruning = await createPruneProjection(candidates, sessionID);
+    const pruning = await createPruneProjection(candidates, sessionID, keep);
     const projectedTurn = pruning.turns[0]!;
     if (
       countTurnModelFacingTokens(projectedTurn)

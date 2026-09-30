@@ -26,7 +26,7 @@ export type CompactionSourceInsertion =
   | { type: "part"; messageID: string; part: Part }
   | { type: "message"; messageID: string; parts: Part[] };
 
-type SourceSnapshot = Array<{ info: unknown; parts: unknown[] }>;
+export type SourceSnapshot = Array<{ info: unknown; parts: unknown[] }>;
 
 export class NativeCheckpointChangedError extends Error {
   constructor(cause?: unknown) {
@@ -47,8 +47,19 @@ export class CompactionPruneSourceDriftError extends Error {
   }
 }
 
+export class TrimSourceChangedError extends Error {
+  constructor() {
+    super(
+      "OpenCode source changed during Magic Trim; the source session was left unchanged.",
+    );
+    this.name = "TrimSourceChangedError";
+  }
+}
+
 export type TrimPlan = {
   trimmedTurns: Turn[];
+  messages: MessageWithParts[];
+  sourceSnapshot: SourceSnapshot;
 };
 
 export async function createCompactionPlan(
@@ -58,9 +69,8 @@ export async function createCompactionPlan(
 ): Promise<CompactionPlan> {
   const messages = await loadMessages(v2, sessionID);
   const sourceTurns = buildTurns(messages);
-  const native = inspectNativeCheckpoints(messages);
-  const suffixStart =
-    native.summaryIndex === null ? 0 : native.summaryIndex + 1;
+  const { summaryIndex } = inspectNativeCheckpoints(messages);
+  const suffixStart = summaryIndex === null ? 0 : summaryIndex + 1;
   const turns = buildTurns(messages.slice(suffixStart));
 
   const boundaryTurnIndex = turns.findLastIndex(turn =>
@@ -108,13 +118,29 @@ export async function createTrimPlan(
   sessionID: string,
   keepTurns: number,
 ): Promise<TrimPlan> {
-  const turns = buildTurns(await loadMessages(v2, sessionID));
+  const messages = await loadMessages(v2, sessionID);
+  const turns = buildTurns(messages);
   removeTrailingAssistantlessTurn(turns);
   const trimEndIndex = Math.max(0, turns.length - keepTurns);
 
   return {
     trimmedTurns: turns.slice(0, trimEndIndex),
+    messages,
+    sourceSnapshot: snapshotSourceMessages(messages),
   };
+}
+
+// Trim spans the whole session and never validates native checkpoints, so
+// its drift guard compares the same normalized fields without inspecting them.
+export function assertTrimSourceUnchanged(
+  messages: MessageWithParts[],
+  plan: TrimPlan,
+): void {
+  if (
+    !isDeepStrictEqual(snapshotSourceMessages(messages), plan.sourceSnapshot)
+  ) {
+    throw new TrimSourceChangedError();
+  }
 }
 
 async function loadMessages(
@@ -165,7 +191,7 @@ export function assertCompactionSourceUnchanged(
 
 export function assertForkMessageShape(
   messages: MessageWithParts[],
-  plan: CompactionPlan,
+  plan: { sourceSnapshot: SourceSnapshot },
 ): void {
   if (messages.length !== plan.sourceSnapshot.length) {
     throw new Error("Compaction generation fork history shape mismatch.");
@@ -246,6 +272,12 @@ function captureSourceSnapshot(messages: MessageWithParts[]): SourceSnapshot {
   } catch (error) {
     throw new NativeCheckpointChangedError(error);
   }
+  return snapshotSourceMessages(messages);
+}
+
+export function snapshotSourceMessages(
+  messages: MessageWithParts[],
+): SourceSnapshot {
   return messages.map(sourceMessage);
 }
 
@@ -279,6 +311,81 @@ function sourcePart(part: Part): unknown {
     }
   }
   return snapshot;
+}
+
+// The history OpenCode's prompt loop sends to the model, mirroring
+// `filterCompacted` in packages/opencode/src/session/message-v2.ts at
+// 830d5eb535 (1.18.30). Native filtering scans newest-first, then reorders
+// around the last tail-bearing marker even when its summary failed or is
+// unfinished. This read-only view must not use the stricter writer inspector.
+export function nativeModelVisibleMessages(
+  messages: MessageWithParts[],
+): MessageWithParts[] {
+  const result: MessageWithParts[] = [];
+  const completed = new Set<string>();
+  let retain: string | null = null;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]!;
+    result.push(message);
+    if (retain) {
+      if (message.info.id === retain) break;
+      continue;
+    }
+    if (message.info.role === "user" && completed.has(message.info.id)) {
+      const part = message.parts.find(item => item.type === "compaction");
+      if (!part) continue;
+      retain = readTailStartID(part);
+      if (!retain || message.info.id === retain) break;
+      continue;
+    }
+    if (
+      message.info.role === "assistant"
+      && message.info.summary
+      && message.info.finish
+      && !message.info.error
+    ) {
+      completed.add(message.info.parentID);
+    }
+  }
+  if (retain && result.at(-1)?.info.id !== retain) {
+    throw new Error("Native compaction retained tail is missing from history.");
+  }
+  result.reverse();
+  const hasTail = (item: Part) =>
+    item.type === "compaction"
+    && "tail_start_id" in item
+    && item.tail_start_id !== undefined;
+  const markerIndex = result.findLastIndex(
+    message => message.info.role === "user" && message.parts.some(hasTail),
+  );
+  const marker = result[markerIndex];
+  const part = marker?.parts.find(hasTail);
+  const summaryIndex = marker
+    ? result.findIndex(
+        (message, index) =>
+          index > markerIndex
+          && message.info.role === "assistant"
+          && message.info.summary
+          && message.info.parentID === marker.info.id,
+      )
+    : -1;
+  const tailStartID = part ? readTailStartID(part) : null;
+  const tailIndex = tailStartID
+    ? result.findIndex(message => message.info.id === tailStartID)
+    : -1;
+  if (part && (tailIndex < 0 || tailIndex >= markerIndex)) {
+    throw new Error(
+      "Native compaction tail does not resolve before its marker.",
+    );
+  }
+  if (tailIndex >= 0 && tailIndex < markerIndex && summaryIndex > markerIndex) {
+    return [
+      ...result.slice(markerIndex, summaryIndex + 1),
+      ...result.slice(tailIndex, markerIndex),
+      ...result.slice(summaryIndex + 1),
+    ];
+  }
+  return result;
 }
 
 function inspectNativeCheckpoints(messages: MessageWithParts[]): {
@@ -413,7 +520,7 @@ function inspectNativeCheckpoints(messages: MessageWithParts[]): {
   }
 
   return {
-    summaryIndex: selected?.summary.index ?? null,
+    summaryIndex: selected ? selected.summary.index : null,
   };
 }
 

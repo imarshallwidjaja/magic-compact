@@ -1,7 +1,7 @@
 import type { FilePart, Part } from "@opencode-ai/sdk/v2";
 import { countGptTokens } from "../stats/tokenize";
 import { isRecord } from "../util";
-import type { Turn } from "./plan";
+import type { MessageWithParts, Turn } from "./plan";
 
 export const NATIVE_BATCH_MAX_CONCURRENCY = 5;
 export const NATIVE_BATCH_NORMAL_INPUT_TARGET = 400_000;
@@ -117,6 +117,20 @@ export function estimateNativeTurnCost(turn: Turn): NativeTurnCost {
       )
       + estimate.mediaCount * NATIVE_BATCH_MEDIA_DESCRIPTION_OUTPUT,
   };
+}
+
+// Estimates native model input for a whole message history with the same
+// per-part rules as turn estimates.
+export function estimateNativeHistoryTokens(
+  messages: MessageWithParts[],
+): number {
+  let tokens = 0;
+  for (const message of messages) {
+    for (const part of message.parts) {
+      tokens += estimateNativePart(part, message.info.role).tokens;
+    }
+  }
+  return tokens;
 }
 
 // Every generation request owns exactly one target turn. The host does not
