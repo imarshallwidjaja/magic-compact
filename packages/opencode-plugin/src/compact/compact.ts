@@ -43,6 +43,9 @@ const GENERATION_PERMISSION: PermissionRuleset = [
   { permission: "*", pattern: "*", action: "deny" },
   { permission: "StructuredOutput", pattern: "*", action: "allow" },
 ];
+// Every generation request owns one target turn, so the schema asks for one
+// result. OpenCode transmits it as the model-visible StructuredOutput tool
+// schema without enforcing it; parseGenerationResponse remains the authority.
 const GENERATION_FORMAT = {
   type: "json_schema" as const,
   schema: {
@@ -50,6 +53,8 @@ const GENERATION_FORMAT = {
     properties: {
       turns: {
         type: "array",
+        minItems: 1,
+        maxItems: 1,
         items: {
           type: "object",
           properties: {
@@ -465,9 +470,7 @@ function finalizeGenerationBatch(
     || exactOutputTokens > budget.outputTarget
   ) {
     throw new Error(
-      batch.candidates.length === 1
-        ? `A single compaction turn cannot fit the configured ${budget.outputTarget}-token output target. Configure a compaction model with more output capacity.`
-        : `A compaction generation batch cannot fit the configured ${budget.outputTarget}-token output target. Keep more recent turns unchanged and retry.`,
+      `A single compaction turn cannot fit the configured ${budget.outputTarget}-token output target. Configure a compaction model with more output capacity.`,
     );
   }
   return {
@@ -833,13 +836,7 @@ async function requestCompactionGeneration(
       );
     } catch (error) {
       recordOperationError(
-        lifecycleFailure(
-          sourceSession.id,
-          stage,
-          "rejection",
-          error,
-          candidates.length === 1,
-        ),
+        lifecycleFailure(sourceSession.id, stage, "rejection", error),
       );
       try {
         unwrapLifecycleResponse(
@@ -1288,8 +1285,8 @@ function buildGenerationPrompt(
   globalTurnIndexPrompt: string,
 ): string {
   return [
-    "Generate one continuation summary for each indexed turn using the retained native fork history.",
-    "Submit the object required by your system prompt through StructuredOutput.",
+    "Generate one continuation summary for the indexed target turn using the retained native fork history.",
+    "Submit the object required by your system prompt through StructuredOutput. Its turns array must contain exactly one object, for the single target index entry below.",
     globalTurnIndexPrompt,
     "Use the ephemeral markers only as ordering guides. Echo each exact marker token and target ordinal; marker echo is allowed. Never include the active generation nonce or marker token in summaries or visual descriptions; useful source identifiers may remain when you include them.",
     JSON.stringify({
@@ -1592,7 +1589,6 @@ function lifecycleFailure(
   stage: GenerationStage,
   kind: LifecycleFailureKind,
   error?: unknown,
-  singleTurn = false,
 ): GenerationLifecycleError {
   const status = safeStatus(error);
   const overflow = stage === "provider" && isContextOverflow(error, status);
@@ -1608,9 +1604,7 @@ function lifecycleFailure(
         : overflow
           ? "The complete forked session exceeded the configured compaction model context. Run /magic-trim first, then retry /magic-compact."
           : truncated
-            ? singleTurn
-              ? "The compaction model reached its output limit while summarizing a single turn. Configure a compaction model with more output capacity."
-              : "The compaction model reached its output limit. Retry /magic-compact with a larger N so fewer turns are selected."
+            ? "The compaction model reached its output limit while summarizing a single turn. Configure a compaction model with more output capacity."
             : missingStructuredOutput
               ? "The compaction model finished without submitting its StructuredOutput response."
               : lifecycleMessage(stage, kind);

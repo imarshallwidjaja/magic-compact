@@ -236,81 +236,63 @@ describe("native generation batch planning", () => {
     const above = plan([estimate(1, exactHistoryTokens + 1), estimate(2, 1)]);
 
     expect(below).toMatchObject([
-      { estimatedInputTokens: 399_999, candidates: [{ ordinal: 1 }] },
+      {
+        estimatedInputTokens: 399_999,
+        inputLimit: budget.normalInputTarget,
+        candidates: [{ ordinal: 1 }],
+      },
     ]);
     expect(exact).toMatchObject([
-      { estimatedInputTokens: 400_000, candidates: [{ ordinal: 1 }] },
+      {
+        estimatedInputTokens: 400_000,
+        inputLimit: budget.normalInputTarget,
+        candidates: [{ ordinal: 1 }],
+      },
     ]);
-    expect(
-      above.map(batch => batch.candidates.map(item => item.ordinal)),
-    ).toEqual([[1], [2]]);
+    expect(above).toMatchObject([
+      {
+        estimatedInputTokens: 400_001,
+        inputLimit: budget.hardSingleTurnInput,
+        candidates: [{ ordinal: 1 }],
+      },
+      { inputLimit: budget.normalInputTarget, candidates: [{ ordinal: 2 }] },
+    ]);
   });
 
-  test("keeps 32 under-budget targets and splits a 33rd, input, and output overflow", () => {
-    const thirtyTwo = plan(
-      Array.from({ length: 32 }, (_, index) => estimate(index + 1, 1)),
+  test("plans one target per request with its global index charged once", () => {
+    const protocol = generationProtocol(
+      JSON.stringify({
+        globalTurnIndex: [{ sourceOrdinal: 1, anchor: "global orientation" }],
+      }),
     );
-    const thirtyThree = plan(
-      Array.from({ length: 33 }, (_, index) => estimate(index + 1, 1)),
-    );
-    const inputTemplates = [estimate(1, 0), estimate(2, 0)];
-    const pairInputTokens =
-      budget.normalInputTarget
-      - NATIVE_BATCH_FIXED_RESERVE_TOKENS
-      - generationProtocol().explicitRequestTokens(inputTemplates);
-    const byInput = plan([
-      estimate(1, Math.floor(pairInputTokens / 2) + 1),
-      estimate(2, Math.ceil(pairInputTokens / 2)),
-    ]);
-    const outputTemplates = [estimate(1, 1, 0), estimate(2, 1, 0)];
-    const pairOutputTokens =
-      budget.outputTarget
-      - generationProtocol().responseProtocolTokens(outputTemplates);
-    const byOutput = plan([
-      estimate(1, 1, Math.floor(pairOutputTokens / 2) + 1),
-      estimate(2, 1, Math.ceil(pairOutputTokens / 2)),
-    ]);
-
-    expect(thirtyTwo.map(batch => batch.candidates.length)).toEqual([32]);
-    expect(thirtyThree.map(batch => batch.candidates.length)).toEqual([32, 1]);
-    expect(byInput.map(batch => batch.candidates.length)).toEqual([1, 1]);
-    expect(byOutput.map(batch => batch.candidates.length)).toEqual([1, 1]);
-  });
-
-  test("renders and charges the global index exactly once in every batch request", () => {
-    const globalIndexPrompt = JSON.stringify({
-      globalTurnIndex: [{ sourceOrdinal: 1, anchor: "global orientation" }],
-    });
-    const templates = [estimate(1, 0), estimate(2, 0)];
-    const withoutGlobal = generationProtocol();
-    const withGlobal = generationProtocol(globalIndexPrompt);
-    const pairHistoryTokens =
-      budget.normalInputTarget
-      - NATIVE_BATCH_FIXED_RESERVE_TOKENS
-      - withoutGlobal.explicitRequestTokens(templates);
     const candidates = [
-      estimate(1, Math.floor(pairHistoryTokens / 2)),
-      estimate(2, Math.ceil(pairHistoryTokens / 2)),
+      estimate(1, 1, 1),
+      estimate(2, 1, 1),
+      estimate(3, 1, 1),
     ];
+    const batches = plan(candidates, budget, protocol);
 
-    const withoutGlobalIndex = plan(candidates, budget, withoutGlobal);
-    const withGlobalIndex = plan(candidates, budget, withGlobal);
-
-    expect(withoutGlobalIndex.map(batch => batch.candidates.length)).toEqual([
-      2,
-    ]);
-    expect(withGlobalIndex.map(batch => batch.candidates.length)).toEqual([
-      1, 1,
-    ]);
-    for (const batch of withGlobalIndex) {
-      expect(batch.estimatedInputTokens).toBe(
-        NATIVE_BATCH_FIXED_RESERVE_TOKENS
-          + batch.candidates.reduce(
-            (total, candidate) => total + candidate.inputTokens,
-            0,
-          )
-          + withGlobal.explicitRequestTokens(batch.candidates),
-      );
+    expect(protocol.explicitRequestTokens(candidates)).toBeLessThan(
+      budget.normalInputTarget,
+    );
+    expect(batches.map(batch => batch.candidates)).toEqual(
+      candidates.map(candidate => [candidate]),
+    );
+    for (const [index, batch] of batches.entries()) {
+      const candidate = candidates[index]!;
+      expect(batch).toEqual({
+        candidates: [candidate],
+        estimatedInputTokens:
+          NATIVE_BATCH_FIXED_RESERVE_TOKENS
+          + candidate.inputTokens
+          + protocol.explicitRequestTokens([candidate]),
+        estimatedExplicitRequestTokens: protocol.explicitRequestTokens([
+          candidate,
+        ]),
+        estimatedOutputTokens:
+          candidate.outputTokens + protocol.responseProtocolTokens([candidate]),
+        inputLimit: budget.normalInputTarget,
+      });
     }
   });
 
@@ -359,22 +341,6 @@ describe("native generation batch planning", () => {
     expect(batches[0]!.estimatedOutputTokens).toBeLessThanOrEqual(
       budget.outputTarget,
     );
-  });
-
-  test("splits 32 targets by response protocol cost when content alone fits", () => {
-    const candidates = Array.from({ length: 32 }, (_, index) =>
-      estimate(index + 1, 1, 1),
-    );
-    const outputTarget =
-      generationProtocol().responseProtocolTokens(candidates.slice(0, 16)) + 16;
-    const batches = plan(candidates, { ...budget, outputTarget });
-
-    expect(candidates.length).toBeLessThan(outputTarget);
-    expect(batches[0]!.candidates).toHaveLength(16);
-    expect(batches.flatMap(batch => batch.candidates)).toEqual(candidates);
-    expect(
-      batches.every(batch => batch.estimatedOutputTokens <= outputTarget),
-    ).toBeTrue();
   });
 
   test("requires more model output capacity when one complete turn response exceeds the target", () => {
@@ -796,78 +762,6 @@ describe("bounded native compaction generation", () => {
     expect(generationPromptIndex(harness.prompts[0]!).turns).toHaveLength(1);
   });
 
-  test("partitions real generation requests by their complete rendered input", async () => {
-    const turns = [
-      candidateTurn("indexed-budget-first", "alpha", []),
-      candidateTurn("indexed-budget-second", "beta", []),
-    ];
-    const calibration = generationHarness(turns, responseFor(turns));
-    await generateCompactionSummaries(
-      calibration.v2,
-      sourceSession(),
-      generationPlan(turns),
-      { nonceFactory: () => "uB_4fLx2Xv5Tz7E1M-8vQn" },
-    );
-
-    const completeInput = generationRequestInputTokens(
-      calibration.prompts[0]!,
-      calibration.promptHistories[0]!.messages,
-    );
-    const globalIndexText = generationGlobalTurnIndexText(
-      calibration.prompts[0]!,
-    );
-    expect(
-      promptText(calibration.prompts[0]!).split(globalIndexText),
-    ).toHaveLength(2);
-    const globalOnlyInput =
-      NATIVE_BATCH_FIXED_RESERVE_TOKENS
-      + turns.reduce(
-        (total, turn) => total + estimateNativeTurnCost(turn).inputTokens,
-        0,
-      )
-      + countGptTokens(globalIndexText);
-    const normalTarget = completeInput - 1;
-    expect(globalOnlyInput).toBeLessThanOrEqual(normalTarget);
-    const input = configuredInputForDerivedLimit(normalTarget, 0.8);
-    const harness = generationHarness(turns, responseFor(turns), {
-      modelLimits: { context: 1_000_000, input, output: 64_000 },
-    });
-
-    await generateCompactionSummaries(
-      harness.v2,
-      sourceSession(),
-      generationPlan(turns),
-    );
-
-    expect(
-      harness.prompts
-        .map(generationPromptIndex)
-        .map(index => index.turns.map(turn => turn.ordinal))
-        .sort((left, right) => left[0]! - right[0]!),
-    ).toEqual([[1], [2]]);
-    const constrainedBudget = computeNativeBatchBudget({
-      context: 1_000_000,
-      input,
-      output: 64_000,
-    });
-    expect(
-      harness.prompts.every((request, index) => {
-        const actualTokens = generationRequestInputTokens(
-          request,
-          harness.promptHistories[index]!.messages,
-        );
-        const recordedTokens = conservativeGenerationRequestInputTokens(
-          request,
-          harness.promptHistories[index]!.messages,
-        );
-        return (
-          actualTokens <= recordedTokens
-          && recordedTokens <= constrainedBudget.haloInputLimit
-        );
-      }),
-    ).toBeTrue();
-  });
-
   test("rejects an unaffordable global index before creating a fork", async () => {
     const alphabet =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{};:,.<>/?";
@@ -902,11 +796,7 @@ describe("bounded native compaction generation", () => {
   });
 
   test("denies operational tools while permitting one structured summarizer response", async () => {
-    const turns = [
-      candidateTurn("first", "alpha", []),
-      candidateTurn("second", "beta", []),
-      candidateTurn("third", "gamma", []),
-    ];
+    const turns = [candidateTurn("first", "alpha", [])];
     const harness = generationHarness(turns, responseFor(turns));
 
     const summaries = await generateCompactionSummaries(
@@ -915,7 +805,7 @@ describe("bounded native compaction generation", () => {
       generationPlan(turns),
     );
 
-    expect(summaries).toHaveLength(3);
+    expect(summaries).toHaveLength(1);
     expect(harness.events).toEqual([
       "agents",
       "providers",
@@ -923,8 +813,6 @@ describe("bounded native compaction generation", () => {
       "deny",
       "messages",
       "messages",
-      "marker",
-      "marker",
       "marker",
       "prompt",
       "delete",
@@ -974,6 +862,8 @@ describe("bounded native compaction generation", () => {
       properties: {
         turns: {
           type: "array",
+          minItems: 1,
+          maxItems: 1,
           items: {
             required: ["ordinal", "marker", "summary", "visualDescriptions"],
             additionalProperties: false,
@@ -1051,8 +941,8 @@ describe("bounded native compaction generation", () => {
     expect(harness.deletes).toEqual(["generation-fork"]);
   });
 
-  test("isolates 35 targets across independent forks with one immutable global index", async () => {
-    const turns = Array.from({ length: 35 }, (_, index) =>
+  test("isolates nine targets into nine one-target forks with one immutable global index", async () => {
+    const turns = Array.from({ length: 9 }, (_, index) =>
       candidateTurn(`batch-${index + 1}`, `anchor ${index + 1}`, []),
     );
     const harness = generationHarness(turns, responseFor(turns), {
@@ -1071,52 +961,66 @@ describe("bounded native compaction generation", () => {
       ),
     );
     expect(harness.providerCalls).toBe(1);
-    expect(harness.deletes).toEqual(["generation-fork-2", "generation-fork"]);
-    expect(harness.completedPromptFirstOrdinals).toEqual([33, 1]);
-    const targetIndexes = harness.prompts.map(generationPromptIndex);
-    expect(
-      targetIndexes.map(index => index.turns.map(turn => turn.ordinal)),
-    ).toEqual([
-      Array.from({ length: 32 }, (_, index) => index + 1),
-      [33, 34, 35],
+    expect(harness.forks).toHaveLength(9);
+    expect(harness.prompts).toHaveLength(9);
+    expect(harness.deletes).toHaveLength(9);
+    expect(harness.completedPromptFirstOrdinals.at(-1)).toBe(1);
+    // Forks prompt concurrently, so compare requests in target-ordinal order.
+    const requests = harness.prompts
+      .map((request, position) => ({
+        request,
+        index: generationPromptIndex(request),
+        history: harness.promptHistories[position]!.messages,
+      }))
+      .toSorted(
+        (left, right) =>
+          left.index.turns[0]!.ordinal - right.index.turns[0]!.ordinal,
+      );
+    expect(requests.map(({ index }) => index.turns)).toEqual(
+      turns.map((_, position) => [
+        {
+          ordinal: position + 1,
+          marker: expect.stringMatching(
+            new RegExp(
+              `^<magic-compact-turn nonce="[A-Za-z0-9_-]{22}" ordinal="${position + 1}" />$`,
+              "u",
+            ),
+          ),
+          expectedInlineImages: 0,
+        },
+      ]),
+    );
+    expect(requests.map(({ index }) => index.nextTurn !== undefined)).toEqual([
+      ...Array.from({ length: 8 }, () => true),
+      false,
     ]);
-    expect(harness.prompts.map(generationGlobalTurnIndexText)).toEqual([
-      generationGlobalTurnIndexText(harness.prompts[0]!),
-      generationGlobalTurnIndexText(harness.prompts[0]!),
+    expect(requests.map(({ history }) => history.length)).toEqual([
+      4, 6, 6, 6, 6, 6, 6, 6, 4,
     ]);
-    expect(generationGlobalTurnIndex(harness.prompts[0]!)).toHaveLength(35);
-    const markerSets = targetIndexes.map(
-      index => new Set(index.turns.map(turn => turn.marker)),
-    );
-    expect(
-      [...markerSets[0]!].some(marker => markerSets[1]!.has(marker)),
-    ).toBeFalse();
-    expect(promptText(harness.prompts[0]!)).not.toContain(
-      targetIndexes[1]!.turns[0]!.marker,
-    );
-    expect(promptText(harness.prompts[1]!)).not.toContain(
-      targetIndexes[0]!.turns[0]!.marker,
-    );
-    expect(
-      harness.prompts.some(request =>
-        promptText(request).includes(
-          "Turn 1 outcome and continuation details.",
-        ),
-      ),
-    ).toBeFalse();
-    expect(
-      harness.promptHistories.map(history => history.messages.length),
-    ).toEqual([66, 8]);
-    expect(
-      harness.messageDeletes.filter(
-        request => request.sessionID === "generation-fork",
-      ),
-    ).toHaveLength(4);
-    expect(
-      harness.messageDeletes.filter(
-        request => request.sessionID === "generation-fork-2",
-      ),
-    ).toHaveLength(62);
+    const globalIndexText = generationGlobalTurnIndexText(requests[0]!.request);
+    expect(generationGlobalTurnIndex(requests[0]!.request)).toHaveLength(9);
+    for (const [position, { request, index, history }] of requests.entries()) {
+      const text = promptText(request);
+      expect(generationTurnsSchema(request)).toMatchObject({
+        minItems: 1,
+        maxItems: 1,
+      });
+      expect(text).toContain("turns array must contain exactly one object");
+      expect(generationGlobalTurnIndexText(request)).toBe(globalIndexText);
+      expect(text.split(globalIndexText)).toHaveLength(2);
+      expect(text).not.toContain("outcome and continuation details.");
+      expect(JSON.stringify(history)).toContain(
+        JSON.stringify(index.turns[0]!.marker),
+      );
+      for (const [other, otherRequest] of requests.entries()) {
+        if (other === position) continue;
+        const otherNonce = otherRequest.index.turns[0]!.marker.match(
+          /nonce="([A-Za-z0-9_-]{22})"/u,
+        )![1]!;
+        expect(text).not.toContain(otherNonce);
+        expect(JSON.stringify(history)).not.toContain(otherNonce);
+      }
+    }
     expect(harness.partDeletes).toEqual([]);
     const noncesByFork = new Map<string, Set<string>>();
     for (const update of harness.markerUpdates) {
@@ -1126,20 +1030,28 @@ describe("bounded native compaction generation", () => {
       nonces.add(nonce!);
       noncesByFork.set(update.sessionID, nonces);
     }
-    expect([...noncesByFork.values()].map(nonces => nonces.size)).toEqual([
-      1, 1,
-    ]);
+    expect([...noncesByFork.values()].map(nonces => nonces.size)).toEqual(
+      Array.from({ length: 9 }, () => 1),
+    );
     expect(
       new Set([...noncesByFork.values()].flatMap(nonces => [...nonces])).size,
-    ).toBe(2);
+    ).toBe(9);
   });
 
-  test("keeps 32 high-token Unicode first lines out of the response protocol budget", async () => {
+  test("fits summary and protocol within a small output target without charging Unicode user anchors", async () => {
     const highTokenLine = "\u{10ffff}".repeat(300);
-    const turns = Array.from({ length: 32 }, (_, index) =>
+    const turns = Array.from({ length: 2 }, (_, index) =>
       candidateTurn(`unicode-output-${index + 1}`, highTokenLine, []),
     );
-    const harness = generationHarness(turns, responseFor(turns));
+    const modelLimits = {
+      context: 1_000_000,
+      input: 500_000,
+      output: 1_536,
+    };
+    const budget = computeNativeBatchBudget(modelLimits);
+    const harness = generationHarness(turns, responseFor(turns), {
+      modelLimits,
+    });
 
     await generateCompactionSummaries(
       harness.v2,
@@ -1151,7 +1063,7 @@ describe("bounded native compaction generation", () => {
       harness.prompts
         .map(generationPromptIndex)
         .map(index => index.turns.length),
-    ).toEqual([32]);
+    ).toEqual([1, 1]);
     expect(
       harness.prompts.every(request => {
         const actualTokens = estimatedGenerationResponseTokens(request, turns);
@@ -1160,14 +1072,16 @@ describe("bounded native compaction generation", () => {
           turns,
           true,
         );
-        return actualTokens <= recordedTokens && recordedTokens <= 32_000;
+        const anchorTokens = countGptTokens(
+          generationGlobalTurnIndex(request)[0]!.anchor,
+        );
+        return (
+          actualTokens <= recordedTokens
+          && recordedTokens <= budget.outputTarget
+          && recordedTokens + anchorTokens > budget.outputTarget
+        );
       }),
     ).toBeTrue();
-    const defaultBudget = computeNativeBatchBudget({
-      context: 1_000_000,
-      input: 500_000,
-      output: 64_000,
-    });
     expect(
       harness.prompts.every((request, index) => {
         const actualTokens = generationRequestInputTokens(
@@ -1180,7 +1094,7 @@ describe("bounded native compaction generation", () => {
         );
         return (
           actualTokens <= recordedTokens
-          && recordedTokens <= defaultBudget.haloInputLimit
+          && recordedTokens <= budget.haloInputLimit
         );
       }),
     ).toBeTrue();
@@ -1190,11 +1104,11 @@ describe("bounded native compaction generation", () => {
           generationPromptIndex(request).turns.map(turn => turn.ordinal),
         )
         .sort((left, right) => left - right),
-    ).toEqual(Array.from({ length: 32 }, (_, index) => index + 1));
+    ).toEqual([1, 2]);
   });
 
   test("runs independent generation batches with exactly five prompts and forks in flight", async () => {
-    const turns = Array.from({ length: 161 }, (_, index) =>
+    const turns = Array.from({ length: 6 }, (_, index) =>
       candidateTurn(`concurrent-${index + 1}`, `anchor ${index + 1}`, []),
     );
     const harness = generationHarness(turns, responseFor(turns), {
@@ -1207,49 +1121,12 @@ describe("bounded native compaction generation", () => {
       generationPlan(turns),
     );
 
-    expect(summaries).toHaveLength(161);
+    expect(summaries).toHaveLength(6);
     expect(harness.prompts).toHaveLength(6);
     expect(harness.forks).toHaveLength(6);
     expect(harness.peakActivePrompts).toBe(5);
     expect(harness.peakActiveForks).toBe(5);
     expect(harness.deletes).toHaveLength(6);
-  });
-
-  test("uses more chronological batches when the configured model has smaller limits", async () => {
-    const turns = Array.from({ length: 4 }, (_, index) =>
-      candidateTurn(`small-model-${index + 1}`, `anchor ${index + 1}`, [
-        toolPart(
-          `small-model-${index + 1}-tool`,
-          `small-model-${index + 1}-assistant`,
-          {
-            status: "completed",
-            input: {
-              payload: `data:application/octet-stream;base64,${"A".repeat(40_000)}`,
-            },
-            output: "done",
-            title: "Process",
-            metadata: {},
-            time: { start: 1, end: 2 },
-          },
-        ),
-      ]),
-    );
-    const harness = generationHarness(turns, responseFor(turns), {
-      modelLimits: { context: 120_000, input: 120_000, output: 32_000 },
-    });
-
-    await generateCompactionSummaries(
-      harness.v2,
-      sourceSession(),
-      generationPlan(turns),
-    );
-
-    expect(
-      harness.prompts
-        .map(generationPromptIndex)
-        .map(index => index.turns.map(turn => turn.ordinal))
-        .sort((left, right) => left[0]! - right[0]!),
-    ).toEqual([[1], [2], [3], [4]]);
   });
 
   test("excludes oversized neighboring summary turns without splitting their messages", async () => {
@@ -1513,80 +1390,61 @@ describe("bounded native compaction generation", () => {
         "Second summary.",
       ]);
       expect(harness.aborts).toEqual([]);
-      expect(harness.deletes).toEqual(["generation-fork"]);
+      expect(harness.deletes.toSorted()).toEqual([
+        "generation-fork",
+        "generation-fork-2",
+      ]);
       expect(turns).toEqual(before);
     },
   );
 
   test.each([
     [
-      "drops a turn",
-      { turns: [result(1, "one")] },
-      "turn count mismatch (expected 3, received 1)",
+      "omits its result",
+      { turns: [] },
+      "turn count mismatch (expected 1, received 0)",
+    ],
+    [
+      "adds a second result",
+      { turns: [result(1, "one"), result(1, "two")] },
+      "turn count mismatch (expected 1, received 2)",
     ],
     [
       "adds an envelope key",
-      {
-        turns: [result(1, "one"), result(2, "two"), result(3, "three")],
-        secretEnvelopeKey: "sensitive",
-      },
+      { turns: [result(1, "one")], secretEnvelopeKey: "sensitive" },
       "invalid envelope",
     ],
     [
-      "shifts a middle ordinal",
-      {
-        turns: [result(1, "one"), result(3, "two"), result(3, "three")],
-      },
-      "invalid turn shape or identity (ordinal at target ordinal 2)",
-    ],
-    [
-      "duplicates an ordinal",
-      {
-        turns: [result(1, "one"), result(1, "two"), result(3, "three")],
-      },
-      "invalid turn shape or identity (ordinal at target ordinal 2)",
-    ],
-    [
-      "reorders results",
-      {
-        turns: [result(2, "two"), result(1, "one"), result(3, "three")],
-      },
+      "shifts its ordinal",
+      { turns: [result(2, "one")] },
       "invalid turn shape or identity (ordinal at target ordinal 1)",
     ],
     [
       "returns an empty summary",
-      {
-        turns: [result(1, "one"), result(2, "  "), result(3, "three")],
-      },
+      { turns: [result(1, "  ")] },
       "invalid summary",
     ],
     [
       "adds a turn key",
-      {
-        turns: [
-          { ...result(1, "one"), secretTurnKey: "sensitive" },
-          result(2, "two"),
-          result(3, "three"),
-        ],
-      },
+      { turns: [{ ...result(1, "one"), secretTurnKey: "sensitive" }] },
       "invalid turn shape or identity (shape at target ordinal 1)",
     ],
   ])(
-    "fails atomically when one response %s",
+    "rejects a one-target response that %s",
     async (_name, response, category) => {
-      const turns = [
-        candidateTurn("alpha", "alpha", []),
-        candidateTurn("beta", "beta", []),
-        candidateTurn("gamma", "gamma", []),
-      ];
-      const harness = generationHarness(turns, response as GenerationResponse);
+      const turn = candidateTurn("alpha", "alpha", []);
+      const harness = generationHarness(
+        [turn],
+        response as GenerationResponse,
+        { unfilteredResponse: true },
+      );
 
       let failure: unknown;
       try {
         await generateCompactionSummaries(
           harness.v2,
           sourceSession(),
-          generationPlan(turns),
+          generationPlan([turn]),
         );
       } catch (error) {
         failure = error;
@@ -1942,26 +1800,49 @@ describe("bounded native compaction generation", () => {
     expect(summaries[0]).toMatchObject({ text: "First duplicate summary." });
     expect(summaries[1]).toBeNull();
     expect(summaries[2]).toMatchObject({ text: "Empty-line summary." });
-    const markerTexts = harness.markerUpdates.map(update => update.part.text);
-    const nonces = markerTexts.map(
-      marker => marker.match(/nonce="([A-Za-z0-9_-]{22})"/u)?.[1],
+    const forkMarkers = ["generation-fork", "generation-fork-2"].map(
+      sessionID =>
+        harness.markerUpdates.filter(update => update.sessionID === sessionID),
     );
-    expect(new Set(nonces)).toEqual(new Set([nonces[0]]));
-    expect(nonces[0]).toMatch(/^[A-Za-z0-9_-]{22}$/u);
-    expect(markerTexts[0]).toContain('ordinal="1"');
-    expect(markerTexts[1]).toContain('ordinal="2"');
-    expect(markerTexts[2]).toContain("magic-compact-stop");
-    expect(markerTexts).not.toContain('<magic-compact-turn ordinal="1" />');
-    expect(markerTexts).not.toContain("<magic-compact-stop />");
-    expect(harness.markerUpdates.map(update => update.messageID)).toEqual([
-      "fork-message-1",
-      "fork-message-5",
-      "fork-message-7",
+    expect(
+      forkMarkers.map(updates => updates.map(update => update.messageID)),
+    ).toEqual([
+      ["fork-message-1", "fork-message-3"],
+      ["fork-message-5", "fork-message-7"],
     ]);
-    const prompt = promptText(harness.prompts[0]!);
-    expect(prompt).toContain(JSON.stringify(markerTexts[0]));
-    expect(prompt).toContain(JSON.stringify(markerTexts[1]));
-    expect(prompt).toContain(JSON.stringify(markerTexts[2]));
+    const nonces = forkMarkers.map(updates => {
+      const forkNonces = new Set(
+        updates.map(
+          update => update.part.text.match(/nonce="([A-Za-z0-9_-]{22})"/u)?.[1],
+        ),
+      );
+      expect(forkNonces.size).toBe(1);
+      return [...forkNonces][0]!;
+    });
+    expect(nonces[0]).toMatch(/^[A-Za-z0-9_-]{22}$/u);
+    expect(nonces[1]).toMatch(/^[A-Za-z0-9_-]{22}$/u);
+    expect(nonces[0]).not.toBe(nonces[1]);
+    const markerTexts = forkMarkers.map(updates =>
+      updates.map(update => update.part.text),
+    );
+    expect(markerTexts[0]![0]).toContain('ordinal="1"');
+    expect(markerTexts[0]![1]).toContain("magic-compact-stop");
+    expect(markerTexts[1]![0]).toContain('ordinal="2"');
+    expect(markerTexts[1]![1]).toContain("magic-compact-stop");
+    expect(markerTexts.flat()).not.toContain(
+      '<magic-compact-turn ordinal="1" />',
+    );
+    expect(markerTexts.flat()).not.toContain("<magic-compact-stop />");
+    for (const request of harness.prompts) {
+      const sessionIndex = request.sessionID === "generation-fork" ? 0 : 1;
+      const prompt = promptText(request);
+      for (const marker of markerTexts[sessionIndex]!) {
+        expect(prompt).toContain(JSON.stringify(marker));
+      }
+      for (const marker of markerTexts[1 - sessionIndex]!) {
+        expect(prompt).not.toContain(JSON.stringify(marker));
+      }
+    }
     expect(
       summaries.flatMap(summary => (summary ? [summary.text] : [])),
     ).not.toContain(nonces[0]!);
@@ -1987,28 +1868,6 @@ describe("bounded native compaction generation", () => {
         harness.v2,
         sourceSession(),
         generationPlan([turn]),
-      ),
-    ).rejects.toThrow(
-      "response validation failed: invalid turn shape or identity (marker at target ordinal 1).",
-    );
-    expect(harness.aborts).toEqual(["generation-fork"]);
-    expect(harness.deletes).toEqual(["generation-fork"]);
-  });
-
-  test("rejects exact markers echoed against the wrong turns", async () => {
-    const turns = [
-      candidateTurn("marker-first", "first", []),
-      candidateTurn("marker-second", "second", []),
-    ];
-    const harness = generationHarness(turns, responseFor(turns), {
-      responseMarkerOrder: [1, 0],
-    });
-
-    await expect(
-      generateCompactionSummaries(
-        harness.v2,
-        sourceSession(),
-        generationPlan(turns),
       ),
     ).rejects.toThrow(
       "response validation failed: invalid turn shape or identity (marker at target ordinal 1).",
@@ -2578,7 +2437,7 @@ describe("bounded native compaction generation", () => {
   });
 
   test("stops sixth-batch admission before failed cleanup drains", async () => {
-    const turns = Array.from({ length: 161 }, (_, index) =>
+    const turns = Array.from({ length: 6 }, (_, index) =>
       candidateTurn(`cleanup-drain-${index + 1}`, `anchor ${index + 1}`, []),
     );
     let releaseDeletes!: () => void;
@@ -2713,32 +2572,6 @@ describe("bounded native compaction generation", () => {
       expect(harness.deletes).toEqual(["generation-fork"]);
     },
   );
-
-  test("keeps larger-N guidance when a multi-turn batch reaches the provider output limit", async () => {
-    const turns = [
-      candidateTurn("multi-output-one", "one", []),
-      candidateTurn("multi-output-two", "two", []),
-    ];
-    const harness = generationHarness(turns, responseFor(turns), {
-      responseFinish: "length",
-      omitStructured: true,
-      responseError: {
-        name: "StructuredOutputError",
-        data: {
-          message: "Model did not produce structured output",
-          retries: 0,
-        },
-      },
-    });
-
-    await expect(
-      generateCompactionSummaries(
-        harness.v2,
-        sourceSession(),
-        generationPlan(turns),
-      ),
-    ).rejects.toThrow(/larger N.*fewer turns/i);
-  });
 
   test("keeps other provider errors ahead of finish truncation with sanitized output", async () => {
     const turn = candidateTurn("provider-error", "provider failure", []);
@@ -3586,26 +3419,41 @@ describe("compaction orchestration", () => {
     expect(await readStats("source")).toBeNull();
   });
 
-  test("rejects a malformed all-turn response before backup or source writes", async () => {
-    const messages = [
-      ...compactableCommandMessages("batch-one", "first output"),
-      ...compactableCommandMessages("batch-two", "second output"),
-    ];
+  test("discards eight accepted one-target results when the ninth is malformed", async () => {
+    const messages = Array.from({ length: 9 }, (_, index) =>
+      compactableCommandMessages(
+        `nine-targets-${index + 1}`,
+        `large output ${index + 1} `.repeat(1_000),
+      ),
+    ).flat();
+    const before = structuredClone(messages);
     const harness = commandHarness(messages, {
       generationResponse: {
-        turns: [result(1, "Only one summary was returned.")],
+        turns: Array.from({ length: 8 }, (_, index) =>
+          result(index + 1, `Summary ${index + 1}.`),
+        ),
       },
     });
 
     await expect(executeMagicCompact(harness.v2, "source", 0)).rejects.toThrow(
-      "response validation failed: turn count mismatch (expected 2, received 1).",
+      "response validation failed: turn count mismatch (expected 1, received 0).",
     );
 
-    expect(harness.forks).toEqual(["generation-fork"]);
+    const forks = [
+      "generation-fork",
+      ...Array.from(
+        { length: 8 },
+        (_, index) => `generation-fork-${index + 2}`,
+      ),
+    ];
+    expect(harness.forks).toEqual(forks);
+    expect(harness.deletedSessions.toSorted()).toEqual(forks.toSorted());
+    expect(harness.activeGenerationForks).toEqual([]);
+    expect(messages).toEqual(before);
     expect(harness.partUpdates).toEqual([]);
     expect(boundaryParts(messages)).toEqual([]);
     expect(harness.selectedSessions).toEqual([]);
-    expect(harness.deletedSessions).toEqual(["generation-fork"]);
+    expect(await readStats("source")).toBeNull();
   });
 
   test("reports a post-request count mismatch as a categorized lifecycle error", async () => {
@@ -3647,40 +3495,8 @@ describe("compaction orchestration", () => {
     expect(await readStats("source")).toBeNull();
   });
 
-  test("discards completed batches when a later batch fails before backup, source writes, or stats", async () => {
-    const messages = Array.from({ length: 33 }, (_, index) =>
-      compactableCommandMessages(
-        `atomic-batch-${index + 1}`,
-        `large output ${index + 1} `.repeat(1_000),
-      ),
-    ).flat();
-    const before = structuredClone(messages);
-    const harness = commandHarness(messages, {
-      generationResponse: {
-        turns: Array.from({ length: 33 }, (_, index) =>
-          result(index + 1, `Summary ${index + 1}.`),
-        ),
-      },
-      generationErrorForFirstOrdinal: 33,
-    });
-
-    await expect(executeMagicCompact(harness.v2, "source", 0)).rejects.toThrow(
-      "model request failed",
-    );
-
-    expect(messages).toEqual(before);
-    expect(harness.forks).toEqual(["generation-fork", "generation-fork-2"]);
-    expect(harness.deletedSessions).toEqual(
-      expect.arrayContaining(["generation-fork", "generation-fork-2"]),
-    );
-    expect(harness.forks).not.toContain("backup");
-    expect(harness.partUpdates).toEqual([]);
-    expect(boundaryParts(messages)).toEqual([]);
-    expect(await readStats("source")).toBeNull();
-  });
-
   test("aggregates every active batch failure in batch order before any durable mutation", async () => {
-    const messages = Array.from({ length: 33 }, (_, index) =>
+    const messages = Array.from({ length: 2 }, (_, index) =>
       compactableCommandMessages(
         `aggregate-batch-${index + 1}`,
         `large output ${index + 1} `.repeat(1_000),
@@ -3689,16 +3505,16 @@ describe("compaction orchestration", () => {
     const before = structuredClone(messages);
     const harness = commandHarness(messages, {
       generationResponse: {
-        turns: Array.from({ length: 33 }, (_, index) =>
+        turns: Array.from({ length: 2 }, (_, index) =>
           result(index + 1, `Summary ${index + 1}.`),
         ),
       },
       generationErrorsByFirstOrdinal: {
         1: new Error("raw first provider payload"),
-        33: new Error("raw second provider payload"),
+        2: new Error("raw second provider payload"),
       },
-      generationAbortErrorForFirstOrdinal: 33,
-      generationDeleteErrorForFirstOrdinal: 33,
+      generationAbortErrorForFirstOrdinal: 2,
+      generationDeleteErrorForFirstOrdinal: 2,
       holdGenerationPromptsUntil: 2,
     });
     let failure: unknown;
@@ -4493,7 +4309,7 @@ function generationHarness(
     abortError?: Error;
     deleteError?: Error;
     compactionAgent?: "missing" | "disabled" | "model-missing";
-    responseMarkerOrder?: number[];
+    unfilteredResponse?: boolean;
     providerDelayByFirstOrdinal?: Record<number, number>;
     providerErrorForFirstOrdinal?: number;
     holdPromptsUntil?: number;
@@ -4697,7 +4513,7 @@ function generationHarness(
           const structured = responseWithPromptMarkers(
             request,
             response,
-            options.responseMarkerOrder,
+            options.unfilteredResponse,
           );
           completedPromptFirstOrdinals.push(firstOrdinal);
           return {
@@ -5043,23 +4859,22 @@ function promptText(request: Record<string, unknown>): string {
     .join("");
 }
 
+// Each request answers only its own indexed targets unless a test sends the
+// response through unchanged to exercise malformed results.
 function responseWithPromptMarkers(
   request: Record<string, unknown>,
   response: GenerationResponse,
-  markerOrder?: number[],
+  unfiltered = false,
 ): GenerationResponse {
   const index = generationPromptIndex(request);
   const ordinals = new Set(index.turns.map(turn => turn.ordinal));
   return {
     ...response,
     turns: response.turns
-      .filter(turn => ordinals.has(turn.ordinal))
+      .filter(turn => unfiltered || ordinals.has(turn.ordinal))
       .map((turn, turnIndex) => ({
         ...turn,
-        marker:
-          turn.marker
-          ?? index.turns[markerOrder?.[turnIndex] ?? turnIndex]?.marker
-          ?? "",
+        marker: turn.marker ?? index.turns[turnIndex]?.marker ?? "",
       })),
   };
 }
@@ -5131,6 +4946,17 @@ function conservativeGenerationRequestInputTokens(
 function generationSchemaTokens(request: Record<string, unknown>): number {
   const format = request["format"] as { schema: Record<string, unknown> };
   return countGptTokens(JSON.stringify(format.schema));
+}
+
+function generationTurnsSchema(request: Record<string, unknown>) {
+  const format = request["format"] as {
+    schema: {
+      properties: {
+        turns: { minItems: number; maxItems: number; items: unknown };
+      };
+    };
+  };
+  return format.schema.properties.turns;
 }
 
 function estimatedGenerationResponseTokens(

@@ -5,7 +5,6 @@ import type { Turn } from "./plan";
 
 export const NATIVE_BATCH_MAX_CONCURRENCY = 5;
 export const NATIVE_BATCH_NORMAL_INPUT_TARGET = 400_000;
-export const NATIVE_BATCH_MAX_TARGET_TURNS = 32;
 export const NATIVE_BATCH_FIXED_RESERVE_TOKENS = 8_000;
 export const NATIVE_BATCH_MEDIA_TOKEN_CHARGE = 8_000;
 export const NATIVE_BATCH_MAX_OUTPUT_TARGET = 32_000;
@@ -120,12 +119,15 @@ export function estimateNativeTurnCost(turn: Turn): NativeTurnCost {
   };
 }
 
+// Every generation request owns exactly one target turn. The host does not
+// enforce the response schema, and multi-target requests returned the wrong
+// number of results live, so the response must never have to map several
+// targets back to their ordinals.
 export function planNativeGenerationBatches<T extends NativeTurnCost>(
   candidates: T[],
   budget: NativeBatchBudget,
   protocol: NativeBatchProtocol<T>,
 ): NativeGenerationBatch<T>[] {
-  const batches: NativeGenerationBatch<T>[] = [];
   const emptyRequestTokens = Math.ceil(protocol.explicitRequestTokens([]));
   if (
     NATIVE_BATCH_FIXED_RESERVE_TOKENS + emptyRequestTokens
@@ -135,75 +137,38 @@ export function planNativeGenerationBatches<T extends NativeTurnCost>(
       "Magic Compact explicit request and global turn index cannot fit the configured model input budget. Run /magic-trim first or configure a compaction model with more input capacity.",
     );
   }
-  let current: NativeGenerationBatch<T> | undefined;
-  const flush = () => {
-    if (current) batches.push(current);
-    current = undefined;
-  };
-  const estimateBatch = (
-    batchCandidates: T[],
-    inputLimit: number,
-  ): NativeGenerationBatch<T> => {
+  return candidates.map(candidate => {
     const estimatedExplicitRequestTokens = Math.ceil(
-      protocol.explicitRequestTokens(batchCandidates),
+      protocol.explicitRequestTokens([candidate]),
     );
-    return {
-      candidates: batchCandidates,
-      estimatedInputTokens:
-        NATIVE_BATCH_FIXED_RESERVE_TOKENS
-        + estimatedExplicitRequestTokens
-        + batchCandidates.reduce(
-          (total, candidate) => total + Math.ceil(candidate.inputTokens),
-          0,
-        ),
-      estimatedExplicitRequestTokens,
-      estimatedOutputTokens:
-        Math.ceil(protocol.responseProtocolTokens(batchCandidates))
-        + batchCandidates.reduce(
-          (total, candidate) => total + Math.ceil(candidate.outputTokens),
-          0,
-        ),
-      inputLimit,
-    };
-  };
-
-  for (const candidate of candidates) {
-    const single = estimateBatch([candidate], budget.normalInputTarget);
-    if (single.estimatedInputTokens > budget.hardSingleTurnInput) {
+    const estimatedInputTokens =
+      NATIVE_BATCH_FIXED_RESERVE_TOKENS
+      + estimatedExplicitRequestTokens
+      + Math.ceil(candidate.inputTokens);
+    const estimatedOutputTokens =
+      Math.ceil(protocol.responseProtocolTokens([candidate]))
+      + Math.ceil(candidate.outputTokens);
+    if (estimatedInputTokens > budget.hardSingleTurnInput) {
       throw new Error(
         "A single compaction turn cannot fit the configured model input. Run /magic-trim first and retry.",
       );
     }
-    if (single.estimatedOutputTokens > budget.outputTarget) {
+    if (estimatedOutputTokens > budget.outputTarget) {
       throw new Error(
         `A single compaction turn cannot fit the configured ${budget.outputTarget}-token output target. Configure a compaction model with more output capacity.`,
       );
     }
-    if (single.estimatedInputTokens > budget.normalInputTarget) {
-      flush();
-      single.inputLimit = budget.hardSingleTurnInput;
-      batches.push(single);
-      continue;
-    }
-
-    if (current && current.candidates.length < NATIVE_BATCH_MAX_TARGET_TURNS) {
-      const tentative = estimateBatch(
-        [...current.candidates, candidate],
-        budget.normalInputTarget,
-      );
-      if (
-        tentative.estimatedInputTokens <= budget.normalInputTarget
-        && tentative.estimatedOutputTokens <= budget.outputTarget
-      ) {
-        current = tentative;
-        continue;
-      }
-    }
-    flush();
-    current = single;
-  }
-  flush();
-  return batches;
+    return {
+      candidates: [candidate],
+      estimatedInputTokens,
+      estimatedExplicitRequestTokens,
+      estimatedOutputTokens,
+      inputLimit:
+        estimatedInputTokens > budget.normalInputTarget
+          ? budget.hardSingleTurnInput
+          : budget.normalInputTarget,
+    };
+  });
 }
 
 type ContentEstimate = {
