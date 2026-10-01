@@ -158,13 +158,14 @@ export async function executeMagicTrim(
       plan.trimmedTurns,
       retention.keep,
     );
+    const retentionLine = retentionFeedback(retention, plan.messages);
     if (trimmedToolCalls === 0) {
       const unneededBackup = backupSession;
       backupSession = null;
       await deleteBackup(v2, unneededBackup.id);
       await toastFeedback.showTerminal({
         title: "Magic Trim",
-        message: `${TRIM_NOOP} ${retentionFeedback(retention)}`,
+        message: `${TRIM_NOOP} ${retentionLine}`,
         variant: "info",
         duration: 5000,
       });
@@ -184,6 +185,7 @@ export async function executeMagicTrim(
       beforeTokens,
       afterTokens,
       trimmedToolCalls,
+      retentionLine,
     );
     const actualAfterTokens = await countSessionTokens(v2, sessionID);
     if (actualAfterTokens !== afterTokens) {
@@ -194,7 +196,7 @@ export async function executeMagicTrim(
 
     await toastFeedback.showTerminal({
       title: "Magic Trim",
-      message: `Trimmed ${trimmedToolCalls} tool call(s). ${retentionFeedback(retention)}`,
+      message: `Trimmed ${trimmedToolCalls} tool call(s). ${retentionLine}`,
       variant: "info",
       duration: 5000,
     });

@@ -133,7 +133,15 @@ Examples:
 - `/magic-trim 3` — preserve tool I/O in the 3 most recent assistant turns.
 - `/magic-trim --heuristic` or `/magic-trim 3 --heuristic` — the same, without task-aware retention.
 
-Terminal feedback reports the retention mode and how many evaluated tool calls were kept, never their content. Held-out evaluation kept 10 unique calls, nine labelled useful, with 32% consensus useful recall. This small sample does not establish universal precision or probability calibration.
+The trim result adds one retention line, matching its terminal toast, for example:
+
+```text
+Retention | Task-aware retention kept 21 of 233 evaluated tool call(s) whole (read 7, hive_status 3, task 2, +9 other calls).
+```
+
+The denominator counts evaluated candidates, not all completed calls. The breakdown shows at most three tool names, ordered by kept count then name; remaining keeps are counted as other calls. Names are shortened to 24 characters and control/whitespace characters are collapsed. No arguments or tool content appear. Zero keeps, no candidates and heuristic mode are explicit. An all-kept no-op reports through the toast only and removes its unnecessary backup.
+
+Held-out evaluation kept 10 unique calls, nine labelled useful, with 32% consensus useful recall. This small sample does not establish universal precision or probability calibration.
 
 ### `/magic-stats`
 
@@ -145,7 +153,7 @@ Reported token counts are canonical active-content estimates, not provider usage
 
 Magic Compact registers a `read_omitted_content` tool that the agent can call to retrieve any tool input or output that was pruned during compaction or trimming.
 
-Each omission notice in the conversation includes an integrity-protected Content ID such as `2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA`. The agent uses that ID to fetch the original content when it needs stale information that cannot be reproduced via a new tool call. OpenCode preserves historical v1 bare entries during migration and backup copying, but cannot retrieve them because they have no cryptographic binding. Unavailable or integrity-invalid entries fail closed instead of returning guessed bytes.
+Each omission notice in the conversation includes an integrity-protected Content ID such as `2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA`. The agent uses that ID to retrieve an exact original task prompt or captured result from the authorized current-session cache. Historical content is not a new assignment or proof of current file state; reread files when current contents are needed. OpenCode preserves historical v1 bare entries during migration and backup copying, but cannot retrieve them because they have no cryptographic binding. Unavailable or integrity-invalid entries fail closed instead of returning guessed bytes.
 
 ## Pruning Rules
 
@@ -170,16 +178,18 @@ Removed or condensed:
 
 Completed tool outputs over 128 words or 1024 characters are omitted by default. A few tools have special handling.
 
-- `read` — output always omitted (stale file contents are reloadable)
+- `read` — output always omitted; retrieve the exact captured result by Content ID or reread for current file contents
 - `write` / `edit` / `apply_patch` — large file content omitted
 - `bash` — commands over 1024 characters are truncated
-- `task` — large prompts omitted; output omitted above a higher threshold (512 words / 4096 characters)
+- `task` — large prompts replaced with a historical placeholder containing their Content ID and a retrieval hint; output omitted above a higher threshold (512 words / 4096 characters)
 - `question` — input and output preserved
 - `todowrite` / `skill` — output discarded without caching (redundant or reloadable)
 
 Pending, running, and errored tool calls are always preserved as-is.
 
 Completed tool calls processed by pruning are marked so later trim and compaction operations do not output-trim them again. Idempotent input rules still apply to calls processed under earlier rules.
+
+Task prompt placeholders identify historical omissions, not runnable assignments. Retrieve the original before reuse. Earlier bare `[Omitted]` placeholders remain unchanged; their recovery ID, when available, stays in the output-side notice.
 
 A call kept by task-aware retention is left exactly as it was, including its trim marker, and is judged again the next time either command runs. Nothing about the decision is stored.
 

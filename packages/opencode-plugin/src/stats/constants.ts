@@ -60,11 +60,13 @@ export function trimStatsMessage(
   beforeTokens: number,
   afterTokens: number,
   trimmedToolCallCount: number,
+  retentionFeedback: string,
 ): string {
   return [
     "Magic Trim",
     `Context | ${contextReductionLine(beforeTokens, afterTokens)}`,
     `Changes | Tool calls trimmed: ${trimmedToolCallCount}`,
+    `Retention | ${retentionFeedback}`,
   ].join("\n");
 }
 

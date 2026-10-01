@@ -124,7 +124,7 @@ const server: Plugin = async input => {
     tool: {
       read_omitted_content: tool({
         description:
-          "Read original tool input or output content omitted by context compaction or trimming operations. Note that this tool reads the snapshot of previously executed tool I/O back in time and contents should be expected to be stale. Only use this tool if you strictly require stale input or output content information from previously completed tool calls AND similar information cannot be obtained via new tool calls.",
+          "Retrieve exact historical tool input or output omitted by context compaction or trimming, using its Content ID. Use this for the original task prompt or captured result. Retrieved content is a historical snapshot, not a new assignment or proof of current file state; reread files when current contents are needed.",
         args: {
           contentId: tool.schema
             .string()

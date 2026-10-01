@@ -4,7 +4,7 @@ import type { MediaManifest } from "./media";
 import type { Turn } from "./plan";
 
 export const POST_COMPACTION_NOTICE = `<post-compaction-notice>
-A compaction operation has just been applied to all messages above. You may have to reread certain files to regain context. Certain historical tool input/output may have been omitted due to length. If the exact I/O of the tool call needs to be retrieved and functionality cannot be replicated via a new tool call, call the read_omitted_content tool with the appropriate Content ID to reread the tool I/O content.
+A compaction operation has just been applied to all messages above. Certain historical tool input/output may have been omitted. Use read_omitted_content with the appropriate Content ID to retrieve an exact original task prompt or captured result. Historical content is not a new assignment or proof of current file state; reread files when current contents are needed.
 </post-compaction-notice>`;
 
 export const MAGIC_COMPACT_SUMMARIZER_AGENT = "magic-compact-summarizer";

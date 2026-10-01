@@ -62,7 +62,7 @@ After argument and execution-option validation, compact and trim show a long-liv
 10. Mark processed completed tool states with `state.metadata.magicCompact.trimmed === true`. Kept parts are not marked.
 11. If no tool states were processed, delete the initialized backup and its copied caches before showing the no-op toast.
 12. Measure the exact post-trim canonical active count before the ignored reporting notice and add that reduction to conversation stats.
-13. Inject a concise ignored notice reporting the exact pre-notice before/after context counts, the trimmed amount and percentage, and the number of trimmed tool calls, then require the actual final active count to match before showing success.
+13. Inject a concise ignored notice reporting the exact pre-notice before/after context counts, the trimmed amount and percentage, and the number of trimmed tool calls. Add one retention line matching terminal feedback, for example `Retention | Task-aware retention kept 4 of 9 evaluated tool call(s) whole (read 4).` Then require the actual final active count to match before showing success.
 
 `/magic-trim` never generates turn summaries, modifies ordinary user or assistant content, inserts a compaction boundary, or increments `compactionCount`. Its only model and TypeSafe requests are the task-aware retention summary and classifications; `--heuristic` makes none.
 
@@ -80,6 +80,7 @@ After argument and execution-option validation, compact and trim show a long-liv
 - Classify each candidate with one `jev-1.13.0` Noul request. Fixed UTF-8 serialized-JSON excerpt allocations are latest ordinary user request 5,000 bytes, temporary native session summary 8,000, originating request 600, input 3,000 and output 9,000. Fields that fit stay whole; longer fields show head and tail. Input fields up to 200 bytes stay whole when aggregate input fits, otherwise input becomes one excerpted arguments blob. The summary never enters source history. State plus longest question must fit 28,000 bytes, and state plus all questions 56,000; these byte limits rely on empirical token headroom, not a documented tokenizer bound. Requests run at most four at a time, with a 30-second timeout and no retries; any failure stops admission, drains in-flight requests and discards every decision.
 - Require a decision for every candidate. Keep the entire current part unchanged only when its probability is >= 0.80; uncertainty trims. Judge likely reuse of concrete input or output independently, including duplicates, recoverable content, still-relevant task procedures and useful unchanged content in partly edited reads. Empty notices, bookkeeping and genuinely superseded or unrelated content do not qualify. No size cap, persistent pin or automatic restoration is added.
 - Terminal feedback names the retention mode and the kept and evaluated counts, never tool content.
+- Trim's notice and toast also show up to three kept tool names ordered by descending count with lexical ties, then the remaining kept-call count. Each label is capped at 24 characters with control/formatting characters and whitespace collapsed. The denominator is evaluated candidates, not all completed calls. Zero keeps, no candidates and heuristic non-evaluation are explicit; all-kept no-ops inject no notice and retain no unnecessary backup.
 
 ## Backup Sessions
 
@@ -142,6 +143,7 @@ After argument and execution-option validation, compact and trim show a long-liv
 
 - `read_omitted_content` accepts one `contentId` and receives `context.sessionID` from OpenCode.
 - Retrieval reads only the current session cache and never routes by the diagnostic ID prefix.
+- Retrieval returns an exact historical snapshot, not a new assignment or proof of current file state. Read notices offer exact captured-result retrieval and a separate reread for current contents.
 - Missing authorization, no exact entry, invalid integrity, malformed cache, and bare legacy IDs return explicit unavailable/integrity diagnostics and never guessed bytes.
 
 ## Stats
@@ -172,12 +174,13 @@ After argument and execution-option validation, compact and trim show a long-liv
 - `apply_patch`: omit large `input.patchText` and cache it.
 - `bash`: cache long commands and visibly truncate them.
 - `read`: always cache and omit output.
-- `task`: omit and cache large `input.prompt`; cache and omit output only above the higher task threshold.
+- `task`: omit and cache large `input.prompt` once; replace it with a short historical placeholder containing the allocated Content ID and a `read_omitted_content` hint. The output-side input notice uses that same ID and still triggers persistence on already-trimmed states. Cache and omit output only above the higher task threshold, under a separate ID.
 - `todowrite`: preserve input and replace output with a success message, no cache.
 - `question`: preserve input and output.
 - `skill`: preserve input and replace output with a reload hint, no cache.
 - Other completed tool outputs are cached and omitted above the default threshold.
 - Input rules are idempotent on their own result and still apply to states marked trimmed by an earlier run; output rules are skipped on marked states.
+- Earlier bare `[Omitted]` task inputs remain unchanged; no placeholder migration or new cache allocation occurs on repeat trimming.
 
 ## Error Handling
 

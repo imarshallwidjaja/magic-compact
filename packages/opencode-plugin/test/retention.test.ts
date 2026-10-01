@@ -14,6 +14,7 @@ import server from "../src/index";
 import {
   decideRetention,
   findRetentionCandidates,
+  retentionFeedback,
 } from "../src/retention/retention";
 import {
   generateSessionSummary,
@@ -421,6 +422,95 @@ describe("retention classification", () => {
   });
 });
 
+describe("retention feedback", () => {
+  test("aggregates kept tool names, orders ties lexically and caps the breakdown at three", () => {
+    const names = [
+      "task",
+      "read",
+      "hive_status",
+      "read",
+      "task",
+      "bash",
+      "skill",
+      "read",
+    ];
+    const parts = names.map((name, index) =>
+      tool(
+        name,
+        { secret: "hidden-input" },
+        "hidden-output",
+        false,
+        `kept-${index}`,
+      ),
+    );
+    const messages = [
+      assistantMessage("assistant", [
+        ...parts,
+        tool("excluded", {}, "", false, "not-kept"),
+      ]),
+    ];
+    const plan = {
+      mode: "task-aware" as const,
+      evaluated: 12,
+      keep: new Set(parts.map(part => part.id)),
+    };
+    const feedback = retentionFeedback(plan, messages);
+    expect(feedback).toBe(
+      "Task-aware retention kept 8 of 12 evaluated tool call(s) whole (read 3, task 2, bash 1, +2 other calls).",
+    );
+    expect(
+      retentionFeedback(plan, [
+        assistantMessage("assistant", [...messages[0]!.parts].reverse()),
+      ]),
+    ).toBe(feedback);
+    expect(feedback).not.toMatch(/hidden|excluded|kept-/);
+  });
+
+  test("bounds long labels and removes whitespace, control and formatting characters", () => {
+    const names = [
+      "custom".repeat(100),
+      "\n\tread\u001b\u202e tool\r",
+      "\u0000\n",
+    ];
+    const parts = names.map((name, index) =>
+      tool(name, {}, "", false, `kept-${index}`),
+    );
+    const feedback = retentionFeedback(
+      {
+        mode: "task-aware",
+        evaluated: 3,
+        keep: new Set(parts.map(part => part.id)),
+      },
+      [assistantMessage("assistant", parts)],
+    );
+    expect(feedback).toContain("customcustomcustomcus... 1");
+    expect(feedback).toContain("read tool 1");
+    expect(feedback).toContain("unnamed 1");
+    expect(feedback).not.toMatch(/[\p{C}]/u);
+    expect(feedback.length).toBeLessThan(180);
+
+    const astralPart = tool(
+      "a".repeat(20) + "😀" + "bbbb",
+      {},
+      "",
+      false,
+      "kept-astral",
+    );
+    const astralFeedback = retentionFeedback(
+      {
+        mode: "task-aware",
+        evaluated: 1,
+        keep: new Set([astralPart.id]),
+      },
+      [assistantMessage("assistant", [astralPart])],
+    );
+    const label = astralFeedback.match(/whole \((.*) 1\)\.$/u)![1]!;
+    expect(label).toBe("a".repeat(20) + "😀...");
+    expect(label.isWellFormed()).toBeTrue();
+    expect(Array.from(label)).toHaveLength(24);
+  });
+});
+
 describe("retention candidates", () => {
   const long = "word ".repeat(300);
   const cases: Array<[string, ToolPart, boolean]> = [
@@ -444,6 +534,24 @@ describe("retention candidates", () => {
     ],
     ["a large task prompt", tool("task", { prompt: long }, "done"), true],
     ["a short task", tool("task", { prompt: "go" }, "done"), false],
+    [
+      "a marked historical task placeholder",
+      tool(
+        "task",
+        {
+          prompt:
+            "[Historical task prompt omitted; Content ID: 2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA. Retrieve the original with read_omitted_content before reuse.]",
+        },
+        long,
+        true,
+      ),
+      false,
+    ],
+    [
+      "a marked bare task placeholder",
+      tool("task", { prompt: "[Omitted]" }, long, true),
+      false,
+    ],
     ["a question", tool("question", {}, long), false],
     [
       "a todo list already at its replacement",

@@ -146,8 +146,7 @@ export async function applyBackup(
 
 export function getCompactionCount(session: Session): number {
   const metadata = session.metadata?.magicCompact as
-    | MagicCompactMetadata
-    | undefined;
+    MagicCompactMetadata | undefined;
   return metadata?.compactionCount ?? 0;
 }
 
@@ -300,6 +299,7 @@ export async function injectTrimStatsNotice(
   beforeTokens: number,
   afterTokens: number,
   trimmedToolCallCount: number,
+  retentionFeedback: string,
 ): Promise<void> {
   unwrap(
     await v2.session.prompt({
@@ -312,6 +312,7 @@ export async function injectTrimStatsNotice(
             beforeTokens,
             afterTokens,
             trimmedToolCallCount,
+            retentionFeedback,
           ),
           ignored: true,
           metadata: STATS_METADATA,

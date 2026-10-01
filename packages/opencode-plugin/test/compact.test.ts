@@ -40,7 +40,10 @@ import {
   type MessageWithParts,
   type Turn,
 } from "../src/compact/plan";
-import { countGptTokens } from "../src/stats/tokenize";
+import {
+  countCanonicalContentTokens,
+  countGptTokens,
+} from "../src/stats/tokenize";
 import {
   createBackup,
   deleteBackup,
@@ -3039,7 +3042,7 @@ describe("compaction orchestration", () => {
       expect(summaryParts(successMessages)).toHaveLength(1);
       expect(success.toasts.map(toast => toast.message)).toEqual([
         "Compacting session...",
-        "Compacted 1 assistant turn(s). Heuristic mode: no task-aware retention.",
+        "Compacted 1 assistant turn(s). Heuristic mode: tool calls not evaluated.",
       ]);
       expect(JSON.stringify(successMessages)).not.toContain(
         "Compacting session...",
@@ -3273,6 +3276,7 @@ describe("compaction orchestration", () => {
       "task",
     );
     messages[1]!.parts.push(task);
+    const beforeTokens = countCanonicalContentTokens(messages);
     const harness = commandHarness(messages, {
       generationResponse: {
         turns: [result(1, "Completed the delegated work.")],
@@ -3294,7 +3298,6 @@ describe("compaction orchestration", () => {
       expect(persisted!.state.status).toBe("completed");
       if (persisted!.state.status !== "completed")
         throw new Error("Expected completed tool state.");
-      expect(persisted!.state.input["prompt"]).toBe("[Omitted]");
       expect(persisted!.state.input["description"]).toBe("delegated work");
       expect(persisted!.state.input["subagent_type"]).toBe("forager-worker");
       expect(persisted!.state.metadata["magicCompact"]).toEqual({
@@ -3307,7 +3310,21 @@ describe("compaction orchestration", () => {
         /[A-Za-z0-9_-]{1,12}:omitted-[A-Za-z0-9_-]{22}/u,
       )?.[0];
       expect(contentID).toBeDefined();
+      expect(persisted!.state.input["prompt"]).toBe(
+        `[Historical task prompt omitted; Content ID: ${contentID}. Retrieve the original with read_omitted_content before reuse.]`,
+      );
       expect(await readOmittedContent("source", contentID!)).toBe(prompt);
+      const cache = await readCache("source");
+      expect(
+        Object.values(cache!.entries).filter(entry => entry.content === prompt),
+      ).toHaveLength(1);
+      expect(harness.partUpdates.filter(part => part.id === task.id)).toEqual([
+        persisted!,
+      ]);
+      const afterTokens = countCanonicalContentTokens(messages);
+      expect((await readStats("source"))?.totalTokensPruned).toBe(
+        beforeTokens - afterTokens,
+      );
     } finally {
       await Promise.all([deleteCache("source"), deleteCache("backup")]);
     }
@@ -5668,7 +5685,9 @@ describe("magic compact task-aware retention", () => {
       .flatMap(item => item.parts)
       .filter(part => part.type === "tool");
     expect(tools[0]).toEqual(usefulTool);
-    expect(JSON.stringify(tools[1])).toContain("Stale read contents omitted");
+    expect(JSON.stringify(tools[1])).toContain(
+      "Historical read contents omitted",
+    );
     expect(harness.partUpdates.map(part => part.id)).not.toContain(
       usefulTool.id,
     );

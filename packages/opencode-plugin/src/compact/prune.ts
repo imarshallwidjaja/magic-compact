@@ -265,7 +265,7 @@ async function prepareToolPart(
   const alreadyTrimmed =
     isRecord(magicCompact) && magicCompact["trimmed"] === true;
 
-  // Input rules are idempotent on their own results ([Omitted], or a command
+  // Input rules are idempotent on their own results (placeholders, or a command
   // already cut below its limit), so they still apply to parts marked by
   // earlier rule sets. Output rules are not idempotent: read would re-wrap its
   // own omission notice.
@@ -364,7 +364,8 @@ async function applyInputOmissions(
     const prompt = unwrapString(input["prompt"]);
     if (prompt && exceeds(prompt, DEFAULT_LIMIT)) {
       const contentID = await allocate({ content: prompt });
-      input["prompt"] = "[Omitted]";
+      input["prompt"] =
+        `[Historical task prompt omitted; Content ID: ${contentID}. Retrieve the original with read_omitted_content before reuse.]`;
       return inputOmissionNotice(
         "Task prompt omitted due to compaction operation. If necessary, reread it via read_omitted_content.",
         Buffer.byteLength(prompt),
@@ -406,7 +407,7 @@ async function applyOutputOmissions(
       content: output,
     });
     part.state.output = outputOmissionNotice(
-      "Stale read contents omitted due to compaction operation. If necessary, reread to see current contents.",
+      "Historical read contents omitted due to compaction operation. Retrieve the exact captured result with read_omitted_content; reread the file for current contents.",
       Buffer.byteLength(output),
       contentID,
     );

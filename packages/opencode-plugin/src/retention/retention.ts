@@ -108,14 +108,38 @@ export async function decideRetention(
   return { mode: "task-aware", evaluated: found.candidates.length, keep };
 }
 
-export function retentionFeedback(plan: RetentionPlan): string {
+export function retentionFeedback(
+  plan: RetentionPlan,
+  messages: readonly MessageWithParts[] = [],
+): string {
   if (plan.mode === "heuristic") {
-    return "Heuristic mode: no task-aware retention.";
+    return "Heuristic mode: tool calls not evaluated.";
   }
   if (plan.evaluated === 0) {
     return "Task-aware retention: no tool calls needed evaluation.";
   }
-  return `Task-aware retention kept ${plan.keep.size} of ${plan.evaluated} evaluated tool call(s) whole.`;
+  const counts = new Map<string, number>();
+  for (const message of messages) {
+    for (const part of message.parts) {
+      if (part.type === "tool" && plan.keep.has(part.id)) {
+        counts.set(part.tool, (counts.get(part.tool) ?? 0) + 1);
+      }
+    }
+  }
+  const shown = [...counts]
+    .sort(([a, x], [b, y]) => y - x || (a < b ? -1 : a > b ? 1 : 0))
+    .slice(0, 3);
+  const breakdown = shown.map(([tool, count]) => {
+    // Tool names are display labels, never arguments or content. Strip control
+    // and formatting characters and cap each label to keep feedback one line.
+    const name = tool.replace(/[\p{C}\s]+/gu, " ").trim() || "unnamed";
+    const codePoints = Array.from(name);
+    return `${codePoints.length > 24 ? `${codePoints.slice(0, 21).join("")}...` : name} ${count}`;
+  });
+  const other =
+    plan.keep.size - shown.reduce((sum, [, count]) => sum + count, 0);
+  if (shown.length > 0 && other > 0) breakdown.push(`+${other} other calls`);
+  return `Task-aware retention kept ${plan.keep.size} of ${plan.evaluated} evaluated tool call(s) whole${breakdown.length > 0 ? ` (${breakdown.join(", ")})` : ""}.`;
 }
 
 // A request is one turn with ordinary user text plus the following turns
