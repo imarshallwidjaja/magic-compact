@@ -78,6 +78,28 @@ bun packages/opencode-plugin/eval/retention/run.ts metrics
 bun packages/opencode-plugin/eval/retention/run.ts score /private/retention-input.json heldout chronological /tmp/opencode/retention-scores.json
 ```
 
+## Rejected chronology experiment (2026-10-02)
+
+The `callOrder` experiment was rejected at development selection and was not adopted. It tested source `c984287005f1f049390677f0473cf939346dda78`, adding only `state.candidates[0].callOrder`: `tool call <k> of <n> made while handling that request; <n-k> later call(s) followed it`. Coordinates were one-based chronological positions among completed calls in the same ordinary-request group, without timestamps. Both arms shared native summaries and unchanged model, 0.80 threshold, question, allocations, singleton/concurrency/no-retry settings. The field added 91 to 94 serialized bytes in development.
+
+Development had 48 cases: 15 agreed useful, 32 agreed not useful (including 23 agreed superseded), and one unresolved. Precision and recall exclude unresolved cases; total keeps include them.
+
+| Development arm            | Keeps | TP  | FP  | FN  | TN  | Unresolved keeps | Precision   | Recall       | Superseded keeps |
+| -------------------------- | ----- | --- | --- | --- | --- | ---------------- | ----------- | ------------ | ---------------- |
+| Baseline, chronological    | 10    | 5   | 4   | 10  | 28  | 1                | 5/9 (55.6%) | 5/15 (33.3%) | 4                |
+| Candidate, chronological   | 11    | 5   | 5   | 10  | 27  | 1                | 5/10 (50%)  | 5/15 (33.3%) | 5                |
+| Candidate, reversed repeat | 11    | 5   | 5   | 10  | 27  | 1                | 5/10 (50%)  | 5/15 (33.3%) | 5                |
+
+Predeclared gates required strictly fewer superseded keeps than a baseline with at least one, TP loss <= 1, precision >= 0.80 with TP >= 3 and FP <= baseline, and a repeat meeting those quality gates with <= 3 decision flips. Supersession and precision failed; recall passed. The stability gate failed on repeat quality, not order instability: zero candidate decision changes, maximum probability spread 0.06. No useful keep was gained or lost; the additional keep was an agreed-superseded false positive.
+
+Whole-kept tool I/O increased from 31,551 to 34,017 local tokens (+2,466), and from 120,266 to 131,115 UTF-8 bytes (+10,849), measured with production `countGptTokens(JSON.stringify(input) + output)`. This is not net trim accounting or the overall model-request budget. Useful keeps retained the same 16,687 tokens; the unresolved keep retained 10,070. Superseded probabilities rose on 19/23 cases, with median changes +0.02 chronologically and +0.03 reversed. Added wording encouraging the wrong direction is a hypothesis, not an isolated causal result.
+
+All 144 classifier requests returned HTTP 200, without failures or reruns, using 506,538 billed input tokens from API usage. The run used 144 of 300 authorized classifier calls and five of six authorized native-summary generations. Selection recorded `pass: false` and `candidateFreeze: null`; no held-out classifier calls or production classifier change followed. The unused budget is not authorization to keep tuning this rejected variant.
+
+[`chronology-results.json`](../packages/opencode-plugin/eval/retention/chronology-results.json) contains aggregate counts, gates, usage, field definition and full SHA-256 evidence bindings. Private content remains outside Git under `/tmp/opencode/retention-chronology-evaluation`; hashes cannot reconstruct it. The artifact binds the final pre-inference freeze. The protocol retains append/freeze history and discloses an earlier protocol version whose full difference was not retained.
+
+Limits: two development sessions/projects, mostly task and skill calls, some finished-task segments, no edit-tool cases or development reads later edited/reread. Two blind annotators produced 192 label rows across 96 cases (48 development, 48 fresh held-out) in 14 card-part dispatches; partial inspection was disclosed, with no post-score label changes. The baseline had one pass, so its variance is unknown. Held-out inference stopped because development failed. These results do not measure held-out/general production accuracy, replace September's native-summary results, or establish that 0.80 is universally unsuitable.
+
 ## Historical proxy-summary evaluation
 
 The sections below preserve the earlier methodology and failed held-out operating point. They do not measure the current request. That study used proxy summaries, a different question and smaller excerpts, with one annotator. The categorical todo/instruction exclusion and the distinction between indispensable content and likely reusable content also mismatched the now-settled independent-usefulness rubric. These differences motivated a fresh predeclared evaluation; historical labels and failures were not relabelled or deleted to improve results.

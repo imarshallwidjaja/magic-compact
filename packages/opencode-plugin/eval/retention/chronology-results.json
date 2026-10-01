@@ -1,0 +1,179 @@
+{
+  "recordedDate": "2026-10-02",
+  "outcome": "rejected-development-selection",
+  "adopted": false,
+  "sourceCommit": "c984287005f1f049390677f0473cf939346dda78",
+  "model": "jev-1.13.0",
+  "threshold": 0.8,
+  "variant": {
+    "field": "state.candidates[0].callOrder",
+    "template": "tool call <k> of <n> made while handling that request; <n-k> later call(s) followed it",
+    "templateSha256": "aec068421ce02546950670306f3e63d45e5a978f0324a031a48808a421b4242b",
+    "templateHashMethod": "SHA-256 of the literal template's UTF-8 bytes, without a trailing newline",
+    "coordinates": "k is the one-based position among completed tool parts in chronological message/part order within the production ordinary-request group; n is that group's completed-call count through the invocation point. No timestamps.",
+    "developmentAddedBytesRange": [91, 94],
+    "unchanged": [
+      "native summaries shared by both arms",
+      "model, threshold and question",
+      "excerpt allocations and byte limits",
+      "singleton requests, concurrency four, 30-second timeout and no retries"
+    ]
+  },
+  "fixture": {
+    "cases": 96,
+    "developmentCases": 48,
+    "freshHeldoutCases": 48,
+    "developmentSessions": 2,
+    "developmentProjects": 2,
+    "developmentLatestRequestCases": 36,
+    "developmentEarlierRequestCases": 12,
+    "blindAnnotators": 2,
+    "labelRows": 192,
+    "cardPartDispatches": 14,
+    "partialInspectionDisclosed": true,
+    "postScoreLabelChanges": 0
+  },
+  "development": {
+    "labels": {
+      "agreedUseful": 15,
+      "agreedNotUseful": 32,
+      "agreedSuperseded": 23,
+      "unresolved": 1
+    },
+    "metricDefinition": "TP/FP/FN/TN and precision/recall use agreed labels only; total keeps include unresolved keeps. Agreed superseded requires both annotators to label false with reason superseded.",
+    "passes": [
+      {
+        "pass": 1,
+        "arm": "baseline",
+        "order": "chronological",
+        "kept": 10,
+        "tp": 5,
+        "fp": 4,
+        "fn": 10,
+        "tn": 28,
+        "unresolvedKeeps": 1,
+        "supersededKeeps": 4,
+        "inputTokens": 167876
+      },
+      {
+        "pass": 2,
+        "arm": "candidate",
+        "order": "chronological",
+        "kept": 11,
+        "tp": 5,
+        "fp": 5,
+        "fn": 10,
+        "tn": 27,
+        "unresolvedKeeps": 1,
+        "supersededKeeps": 5,
+        "inputTokens": 169331
+      },
+      {
+        "pass": 3,
+        "arm": "candidate",
+        "order": "reversed",
+        "kept": 11,
+        "tp": 5,
+        "fp": 5,
+        "fn": 10,
+        "tn": 27,
+        "unresolvedKeeps": 1,
+        "supersededKeeps": 5,
+        "inputTokens": 169331
+      }
+    ],
+    "selection": {
+      "pass": false,
+      "candidateFreeze": null,
+      "rules": {
+        "supersession": "Baseline superseded keeps >= 1 and candidate superseded keeps strictly fewer",
+        "recall": "Candidate TP >= baseline TP - 1",
+        "precision": "Candidate precision >= 0.80, TP >= 3 and FP <= baseline FP",
+        "stability": "Repeat meets supersession, recall and precision against the same baseline, with <= 3 keep-decision changes across all 48 cases"
+      },
+      "criteria": {
+        "supersession": false,
+        "recall": true,
+        "precision": false,
+        "stability": false
+      },
+      "repeatCriteria": {
+        "supersession": false,
+        "recall": true,
+        "precision": false
+      },
+      "repeatChanges": 0,
+      "maxCandidateRepeatProbabilitySpread": 0.06,
+      "stabilityFailure": "Repeat quality gates failed; request-order decisions were identical"
+    },
+    "secondaryMetrics": {
+      "selectedOn": false,
+      "sizeMeasure": "UTF-8 bytes and production countGptTokens(JSON.stringify(input) + output) of full kept tool I/O; not net trim accounting or overall model-request budget",
+      "baseline": { "bytes": 120266, "tokens": 31551 },
+      "candidateBothPasses": { "bytes": 131115, "tokens": 34017 },
+      "candidateMinusBaseline": { "bytes": 10849, "tokens": 2466 },
+      "agreedUsefulBothArms": { "bytes": 66903, "tokens": 16687 },
+      "unresolvedBothArms": { "bytes": 34431, "tokens": 10070 },
+      "usefulKeepTransitions": { "gained": 0, "lost": 0 },
+      "falseKeepTransitions": { "gained": 1, "lost": 0, "supersededGained": 1 },
+      "supersededProbabilityChange": {
+        "cases": 23,
+        "chronologicalMedian": 0.02,
+        "reversedMedian": 0.03,
+        "chronologicalRaised": 19,
+        "chronologicalLowered": 2
+      },
+      "interpretation": "Added wording may have encouraged higher superseded scores; causality was not isolated"
+    }
+  },
+  "usage": {
+    "classifierCalls": 144,
+    "authorizedClassifierCalls": 300,
+    "completePasses": 3,
+    "http200": 144,
+    "failedRequests": 0,
+    "invalidPasses": 0,
+    "reruns": 0,
+    "billedInputTokens": 506538,
+    "billedInputTokensSource": "API usage.input_tokens, not a byte-derived estimate",
+    "acceptedNativeSummaryGenerations": 5,
+    "authorizedNativeSummaryGenerations": 6,
+    "heldoutClassifierCalls": 0
+  },
+  "provenance": {
+    "privateEvidenceRoot": "/tmp/opencode/retention-chronology-evaluation",
+    "productionClassifierSha256": "a1dc742548eeb3a6e2c9a9023cc367d6167cbda05797438ddbe4c894cfb40d80",
+    "productionQuestionSha256": "4c8879efb6b7a9ed509e1952a8354a79676a89fc43fa30e34bca8da28062ff90",
+    "questionHashMethod": "SHA-256 of UTF-8 Python json.dumps(question, sort_keys=True), default separators and ensure_ascii=True",
+    "developmentBodySets": {
+      "baselineSha256": "0d09b8a2e2c33e012dc94ffadbb4bdf10813f15831aa6e57b601332a8efbbeb6",
+      "candidateSha256": "7077aac3bbfa673f7f1b23d4c803cae2f8b91e234cbace1ac6d57662e66b1922"
+    },
+    "fileSha256": {
+      "FREEZE.preinference.json": "56bf598ce863de90f18de7973b30bae82a27c318ce7ca46d883e007ff371185c",
+      "labels/FREEZE.sha256": "c082e8e5a7661e1418e724a8893f0d4365d4f5cf30a87b41374e8f9baddc185e",
+      "PROTOCOL.md": "6537d3336aad9fd295abc6a0186155c2b72006ef4ac600c70dc622a85c76c05a",
+      "tools/decision.ts": "97d8ea42e5226a9346e5846d722b7de563df9cd56294b29776331149e548c89b",
+      "requests-manifest.json": "3b7c99b94142960c1ab3210b1fdc0ccf072c9ebc72f9558af90b45c61d07f748",
+      "evidence/classifier-ledger.json": "72c9d629bf0a9b0e083bea92a8d8622383f834c0fccd0b36e46dea8109c95f41",
+      "evidence/native-ledger.json": "a20e14d2e8c6b63fceb2f68ed7e47b8589f0f6cdf5f8ec6741f52437e1630076",
+      "evidence/development-selection.json": "227c6569466e40a5701f0e162b81aadd87ac276cb0302e6357d8089376e03c01",
+      "evidence/development-secondary-metrics.json": "ccdfaa6a5ee72ed84d26a02fab78317bd0e328d0f1c72dd01c763ab40e0d7335",
+      "evidence/scores/pass1-development-baseline-chronological-attempt1.json": "1a4a188afb88e9c40d9bce4cb072379d0ec508f89ee0db9ea15800cf482d4166",
+      "evidence/scores/pass2-development-candidate-chronological-attempt1.json": "ebe33b69dfe22be0f0baa1ff0701052a686f68bf3ce7ae81721e8bc483854e9d",
+      "evidence/scores/pass3-development-candidate-reversed-attempt1.json": "6517a06c4f02ef32b72161f7d016d8d06b621e901305c95674dddbc3116cdcff"
+    },
+    "historyLimit": "The protocol records append/freeze history and an earlier protocol version whose full difference was not retained. This artifact binds the final pre-inference freeze; it does not repair that history.",
+    "contentPolicy": "Aggregate counts and evidence hashes only; no cases, prompts, tool outputs, generated summaries, label notes or credentials. Hashes cannot reconstruct missing private content."
+  },
+  "limitations": [
+    "Development-only selection; fresh held-out inference was not admitted",
+    "Small clustered cohort from two development projects, mostly task and skill calls and some finished-task segments",
+    "No edit-tool cases or development reads later edited or reread",
+    "Partial label inspection and one unresolved development case",
+    "Baseline has one pass; baseline variance is unknown",
+    "Candidate repeats are the same cases, not independent samples",
+    "No held-out or general production accuracy claim; no universal conclusion about the frozen 0.80 threshold",
+    "Unused paid budget is not authorization to keep tuning this rejected variant"
+  ]
+}
