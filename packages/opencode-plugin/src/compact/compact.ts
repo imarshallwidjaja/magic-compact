@@ -5,6 +5,7 @@ import type {
   TextPart,
 } from "@opencode-ai/sdk/v2";
 import { randomBytes } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { unwrap, type V2Client } from "../api";
 import { countGptTokens } from "../stats/tokenize";
 import {
@@ -31,9 +32,11 @@ import {
   type NativeGenerationBatch,
 } from "./batch";
 import { createMediaManifest, type MediaManifest } from "./media";
+import { ForkCleanupError, ForkHistoryError, forkSession } from "./fork";
 import {
   assertForkMessageShape,
   buildTurns,
+  snapshotSourceMessages,
   type CompactionPlan,
   type MessageWithParts,
   type Turn,
@@ -249,12 +252,43 @@ export async function generateCompactionSummaries(
   ) {
     assertConfiguredModelSupportsImages(settings);
   }
+  const sourceOutcome = await attemptWithinDeadline(
+    signal =>
+      v2.session
+        .messages(
+          {
+            sessionID: session.id,
+            directory: session.directory,
+            ...(session.workspaceID ? { workspace: session.workspaceID } : {}),
+          },
+          { signal },
+        )
+        .then(unwrapLifecycleResponse),
+    controlTimeoutMs,
+  );
+  if (sourceOutcome.kind !== "success") {
+    throw lifecycleFailure(
+      session.id,
+      "history",
+      sourceOutcome.kind === "timed-out" ? "timeout" : "rejection",
+      sourceOutcome.kind === "failed" ? sourceOutcome.error : undefined,
+    );
+  }
+  if (
+    !isDeepStrictEqual(
+      snapshotSourceMessages(sourceOutcome.value),
+      plan.sourceSnapshot,
+    )
+  ) {
+    throw lifecycleFailure(session.id, "history", "rejection");
+  }
   const results = await requestCompactionGenerationBatches(
     v2,
     session,
     settings,
     batches,
     plan,
+    sourceOutcome.value,
     controlTimeoutMs,
   );
   for (const [index, candidate] of candidates.entries()) {
@@ -497,6 +531,7 @@ async function requestCompactionGenerationBatches(
   settings: CompactionSettings,
   batches: GenerationBatch[],
   plan: CompactionPlan,
+  sourceMessages: MessageWithParts[],
   controlTimeoutMs: number,
 ): Promise<GenerationTurnResult[]> {
   const results: Array<GenerationTurnResult[] | undefined> = Array.from({
@@ -520,6 +555,7 @@ async function requestCompactionGenerationBatches(
           settings,
           batch,
           plan,
+          sourceMessages,
           controlTimeoutMs,
           () => {
             stopAdmission = true;
@@ -594,6 +630,7 @@ async function requestCompactionGeneration(
   settings: CompactionSettings,
   batch: GenerationBatch,
   plan: CompactionPlan,
+  sourceMessages: MessageWithParts[],
   controlTimeoutMs: number,
   onFailureObserved: () => void,
 ): Promise<GenerationTurnResult[]> {
@@ -606,12 +643,21 @@ async function requestCompactionGeneration(
   };
   let fork: Session;
   try {
-    fork = unwrapLifecycleResponse(
-      await v2.session.fork({ sessionID: sourceSession.id, ...route }),
+    fork = await forkSession(
+      v2,
+      sourceSession,
+      sourceMessages,
+      controlTimeoutMs,
     );
   } catch (error) {
     onFailureObserved();
-    throw lifecycleFailure(sourceSession.id, "fork", "rejection", error);
+    if (error instanceof ForkCleanupError) throw error;
+    throw lifecycleFailure(
+      sourceSession.id,
+      error instanceof ForkHistoryError ? "history" : "fork",
+      "rejection",
+      error,
+    );
   }
 
   let operationError: Error | undefined;
@@ -1621,7 +1667,11 @@ function sanitizeGenerationFailure(
   sourceSessionID: string,
   error: unknown,
 ): Error {
-  if (error instanceof GenerationLifecycleError) return error;
+  if (
+    error instanceof GenerationLifecycleError
+    || error instanceof ForkCleanupError
+  )
+    return error;
   if (error instanceof AggregateError) {
     const errors = error.errors.map(item =>
       sanitizeGenerationFailure(sourceSessionID, item),

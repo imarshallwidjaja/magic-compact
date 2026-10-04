@@ -28,6 +28,11 @@ import {
   snapshotSourceMessages,
   type MessageWithParts,
 } from "../compact/plan";
+import {
+  ForkCleanupError,
+  ForkHistoryError,
+  forkSession,
+} from "../compact/fork";
 import { countGptTokens } from "../stats/tokenize";
 import { attemptWithinDeadline, CONTROL_OPERATION_TIMEOUT_MS } from "../util";
 import { RETENTION_FAILURE_GUIDANCE } from "./classifier";
@@ -190,11 +195,19 @@ export async function generateSessionSummary(
   };
   let fork: Session;
   try {
-    fork = unwrapResponse(
-      await v2.session.fork({ sessionID: session.id, ...route }),
-    );
+    fork = await forkSession(v2, session, messages, controlTimeoutMs);
   } catch (error) {
-    throw new SessionSummaryError("fork", safeStatus(error));
+    if (error instanceof ForkCleanupError) {
+      throw new AggregateError(
+        [error, new SessionSummaryError("history")],
+        `${error.message} ${RETENTION_FAILURE_GUIDANCE}`,
+        { cause: error },
+      );
+    }
+    throw new SessionSummaryError(
+      error instanceof ForkHistoryError ? "history" : "fork",
+      safeStatus(error),
+    );
   }
   const owned = { nativeCompaction: false };
   ownedSummaryForks.set(fork.id, owned);

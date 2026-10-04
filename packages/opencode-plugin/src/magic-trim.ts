@@ -121,6 +121,7 @@ export async function executeMagicTrim(
       v2,
       sourceSession,
       getCompactionCount(sourceSession),
+      plan.messages,
     );
     if (retention.evaluated > 0) {
       // Classification is slow, so the source must still match the planned

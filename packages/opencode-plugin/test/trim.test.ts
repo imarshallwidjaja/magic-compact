@@ -29,6 +29,7 @@ import type { PluginInput } from "@opencode-ai/plugin";
 import { RetentionClassificationError } from "../src/retention/classifier";
 import {
   compactionAgent,
+  persistedForkHistory,
   providerCatalog,
   rewriteFork,
   scoredJevFetch,
@@ -657,47 +658,142 @@ describe("magic trim", () => {
     },
   );
 
-  test("preserves the root error and terminal feedback when trim recovery fails", async () => {
-    const sessionID = `ses_trim_recovery_${randomUUID().replaceAll("-", "")}`;
-    const messages = [
-      message("usr_recovery", "user", []),
-      message("ast_recovery", "assistant", [
-        readTool("tool_recovery", "large output ".repeat(100)),
-      ]),
-    ];
-    const harness = trimCommandHarness(sessionID, messages, {
-      partUpdateError: new Error("trim root failure"),
-      selectError: new Error("raw select failure"),
-    });
-    let failure: unknown;
-
-    try {
-      try {
-        await executeMagicTrim(harness.v2, sessionID, 0, HEURISTIC_OPTIONS);
-      } catch (error) {
-        failure = error;
-      }
-
-      expect(failure).toBeInstanceOf(AggregateError);
-      expect(trimErrorMessages(failure)).toEqual(
-        expect.arrayContaining([
-          "trim root failure",
-          "Magic Trim automatic recovery failed. Inspect source session "
-            + `${sessionID} and backup session ${harness.backupID}, then recover manually.`,
+  test.each([false, true])(
+    "preserves the root error and terminal feedback when trim recovery fails (timestamp-disagreeing history: %s)",
+    async persisted => {
+      const sessionID = `ses_trim_recovery_${randomUUID().replaceAll("-", "")}`;
+      const messages = [
+        message("usr_recovery", "user", []),
+        message("ast_recovery", "assistant", [
+          readTool("tool_recovery", "large output ".repeat(100)),
         ]),
-      );
-      expect(harness.deletedSessions).toEqual([]);
-      expect(await readCache(harness.backupID)).not.toBeNull();
-      expect(await readStats(harness.backupID)).not.toBeNull();
-      expect(harness.toasts).toHaveLength(2);
-      expect(harness.toasts[0]?.message).toBe("Trimming session...");
-      expect(harness.toasts[1]?.message).toContain("trim root failure");
-      expect(harness.toasts[1]?.message).toContain(sessionID);
-      expect(harness.toasts[1]?.message).toContain(harness.backupID);
-    } finally {
-      await cleanupTrimSessions(sessionID, harness.backupID);
-    }
-  });
+      ];
+      if (persisted)
+        messages.forEach((item, index) => {
+          item.info.sessionID = sessionID;
+          item.info.time = { created: index === 0 ? 7 : 1 };
+          if (item.info.role === "assistant")
+            item.info.parentID = messages[0]!.info.id;
+          item.parts.forEach(part => {
+            part.sessionID = sessionID;
+            part.messageID = item.info.id;
+          });
+        });
+      const harness = trimCommandHarness(sessionID, messages, {
+        persisted,
+        partUpdateError: new Error("trim root failure"),
+        selectError: new Error("raw select failure"),
+      });
+      let failure: unknown;
+
+      try {
+        try {
+          await executeMagicTrim(harness.v2, sessionID, 0, HEURISTIC_OPTIONS);
+        } catch (error) {
+          failure = error;
+        }
+
+        expect(failure).toBeInstanceOf(AggregateError);
+        expect(trimErrorMessages(failure)).toEqual(
+          expect.arrayContaining([
+            "trim root failure",
+            "Magic Trim automatic recovery failed. Inspect source session "
+              + `${sessionID} and backup session ${harness.backupID}, then recover manually.`,
+          ]),
+        );
+        expect(harness.deletedSessions).toEqual([]);
+        expect(await readCache(harness.backupID)).not.toBeNull();
+        expect(await readStats(harness.backupID)).not.toBeNull();
+        expect(harness.toasts).toHaveLength(2);
+        expect(harness.toasts[0]?.message).toBe("Trimming session...");
+        expect(harness.toasts[1]?.message).toContain("trim root failure");
+        expect(harness.toasts[1]?.message).toContain(sessionID);
+        expect(harness.toasts[1]?.message).toContain(harness.backupID);
+        if (persisted) {
+          const backup = harness.history!.read(harness.backupID);
+          expect(backup.map(item => item.info.role)).toEqual([
+            "user",
+            "assistant",
+          ]);
+          expect((backup[1]!.info as { parentID: string }).parentID).toBe(
+            backup[0]!.info.id,
+          );
+        }
+      } finally {
+        harness.history?.close();
+        await cleanupTrimSessions(sessionID, harness.backupID);
+      }
+    },
+  );
+
+  test.each(["heuristic", "no-candidates"] as const)(
+    "preserves an independently appended source before replay-backed %s trim can recover a stale backup",
+    async mode => {
+      const sessionID = `ses_trim_replay_drift_${randomUUID().replaceAll("-", "")}`;
+      const messages = [
+        message("usr_planned", "user", [
+          userText("usr_planned", "Original request"),
+        ]),
+        message("ast_planned", "assistant", [
+          completedTool(
+            "tool_planned",
+            mode === "heuristic" ? "read" : "question",
+            "Exact result",
+          ),
+        ]),
+      ];
+      messages.forEach((item, index) => {
+        item.info.sessionID = sessionID;
+        item.info.time = { created: index === 0 ? 7 : 1 };
+        if (item.info.role === "assistant")
+          item.info.parentID = messages[0]!.info.id;
+        item.parts.forEach(part => {
+          part.sessionID = sessionID;
+          part.messageID = item.info.id;
+        });
+      });
+      const appended = message("usr_concurrent", "user", [
+        userText("usr_concurrent", "Concurrent request must survive"),
+      ]);
+      appended.info.sessionID = sessionID;
+      appended.info.time = { created: 20 };
+      appended.parts[0]!.sessionID = sessionID;
+      const harness = trimCommandHarness(sessionID, messages, {
+        persisted: true,
+        beforeFork: () => harness.history!.write(appended),
+        partUpdateError: new Error("injected trim failure"),
+      });
+      const before = harness.history!.read(sessionID);
+      let failure: unknown;
+      try {
+        try {
+          await executeMagicTrim(harness.v2, sessionID, 0, {
+            retention:
+              mode === "heuristic"
+                ? { mode: "heuristic" }
+                : { mode: "task-aware", apiKey: undefined },
+          });
+        } catch (error) {
+          failure = error;
+        }
+        expect(harness.history!.read(sessionID)).toEqual([...before, appended]);
+        expect(harness.selectedSessions).toEqual([]);
+        expect(harness.deletedSessions).toEqual([harness.backupID]);
+        expect(String(failure)).toContain(
+          "chronological fork initialization failed",
+        );
+        expect(harness.history!.read(harness.backupID)).toEqual([]);
+        expect(await readCache(harness.backupID)).toBeNull();
+        expect(await readStats(harness.backupID)).toBeNull();
+        expect(await readStats(sessionID)).toBeNull();
+        expect(harness.modelCalls).toEqual([]);
+        expect(harness.prompts).toEqual([]);
+      } finally {
+        harness.history!.close();
+        await cleanupTrimSessions(sessionID, harness.backupID);
+      }
+    },
+  );
 
   test("preserves an existing unversioned v0 summary through recompaction planning and trim", async () => {
     const legacyText =
@@ -759,6 +855,72 @@ describe("magic trim", () => {
 });
 
 describe("magic trim task-aware retention", () => {
+  test("trims timestamp-disagreeing history twice with faithful backups and unchanged users", async () => {
+    const sessionID = `ses_trim_chronology_${randomUUID().replaceAll("-", "")}`;
+    const source = [
+      message("usr_first", "user", [
+        userText("usr_first", "Keep the exact user request."),
+      ]),
+      ...Array.from({ length: 6 }, (_, index) =>
+        message(
+          `ast_${index}`,
+          "assistant",
+          index === 5 ? [readTool("read_old", "obsolete listing")] : [],
+        ),
+      ),
+    ];
+    source.forEach((item, index) => {
+      item.info.sessionID = sessionID;
+      item.info.time = { created: index === 0 ? 7 : index };
+      if (item.info.role === "assistant")
+        item.info.parentID = source[0]!.info.id;
+      item.parts.forEach(part => {
+        part.sessionID = sessionID;
+        part.messageID = item.info.id;
+      });
+    });
+    const harness = trimCommandHarness(sessionID, source, { persisted: true });
+    const originalUser = structuredClone(source[0]);
+    const retention = {
+      mode: "task-aware" as const,
+      apiKey: "fake-key",
+      fetch: scoredJevFetch(() => 0),
+    };
+    try {
+      for (const attempt of [0, 1]) {
+        if (attempt === 1) {
+          const assistant = harness.history!.read(sessionID)[6]!;
+          const part = readTool("read_new", "new obsolete listing");
+          part.sessionID = sessionID;
+          part.messageID = assistant.info.id;
+          harness.history!.updatePart(part);
+        }
+        await expect(
+          executeMagicTrim(harness.v2, sessionID, 0, { retention }),
+        ).resolves.toBe(true);
+        const backup = harness.history!.read(harness.backupID);
+        expect(backup.slice(0, 7).map(item => item.info.role)).toEqual(
+          source.slice(0, 7).map(item => item.info.role),
+        );
+        expect(backup[0]!.info.time).toEqual(originalUser!.info.time);
+        expect(backup[0]!.parts[0]).toMatchObject({
+          type: "text",
+          text: "Keep the exact user request.",
+        });
+        expect(harness.history!.read(sessionID)[0]).toEqual(originalUser);
+        expect((backup[6]!.info as { parentID: string }).parentID).toBe(
+          backup[0]!.info.id,
+        );
+      }
+      expect(
+        harness.modelCalls.filter(call => call === "summary"),
+      ).toHaveLength(2);
+      expect(harness.selectedSessions).toEqual([]);
+    } finally {
+      harness.history!.close();
+      await cleanupTrimSessions(sessionID, harness.backupID);
+    }
+  });
   test("parses an optional turn count and --heuristic flag in either order", () => {
     expect(parseMagicTrimArguments("")).toEqual({
       keepTurns: 0,
@@ -1194,10 +1356,12 @@ function reachableStrings(value: unknown, seen = new Set<unknown>()): string[] {
 }
 
 type TrimCommandHarnessOptions = {
+  persisted?: boolean;
   toastMode?: "hang" | "fail";
   partUpdateError?: Error;
   selectError?: Error;
   backupDeleteError?: Error;
+  beforeFork?: () => void;
   // Runs while the retention summary request is in flight.
   duringSummary?: () => void;
   // Replaces source reads made after the retention summary.
@@ -1212,6 +1376,9 @@ function trimCommandHarness(
   messages: MessageWithParts[],
   options: TrimCommandHarnessOptions = {},
 ) {
+  const history = options.persisted
+    ? persistedForkHistory(messages)
+    : undefined;
   const backupID = `${sessionID}_backup`;
   const sourceSession = {
     id: sessionID,
@@ -1226,12 +1393,15 @@ function trimCommandHarness(
   const modelCalls: string[] = [];
   const summaryForkID = `${sessionID}_summary`;
   let summaryFork: MessageWithParts[] | undefined;
+  let backupFork: MessageWithParts[] | undefined;
+  let summaryReady = false;
   let revert: { messageID: string } | undefined;
   let noticeCount = 0;
   const v2 = {
     app: {
       agents: async () => {
         modelCalls.push("agents");
+        summaryReady = true;
         return { data: [compactionAgent()] };
       },
     },
@@ -1251,10 +1421,13 @@ function trimCommandHarness(
           return options.sourceReload.read();
         }
         return {
-          data:
-            request.sessionID === summaryForkID
+          data: history
+            ? history.read(request.sessionID)
+            : request.sessionID === summaryForkID
               ? structuredClone(summaryFork)
-              : messages,
+              : request.sessionID === backupID
+                ? structuredClone(backupFork)
+                : messages,
         };
       },
       get: async () => {
@@ -1269,11 +1442,16 @@ function trimCommandHarness(
         };
       },
       // The first fork of a task-aware run is the retention summary fork.
-      fork: async () => {
-        const summaryRun = modelCalls.length > 0 && summaryFork === undefined;
+      fork: async (request: { messageID?: string }) => {
+        options.beforeFork?.();
+        const summaryRun = summaryReady;
+        summaryReady = false;
         const id = summaryRun ? summaryForkID : backupID;
         forks.push(id);
         if (summaryRun) summaryFork = rewriteFork(messages, id);
+        else backupFork = rewriteFork(messages, id);
+        history?.delete(id);
+        history?.fork(sessionID, id, request.messageID);
         return { data: { ...sourceSession, id } as Session };
       },
       update: async (request: { sessionID: string }) => ({
@@ -1289,7 +1467,13 @@ function trimCommandHarness(
         if (request.sessionID === summaryForkID) {
           modelCalls.push("summary");
           options.duringSummary?.();
-          return summaryReply(summaryFork!, request, summaryForkID);
+          const fork = history ? history.read(summaryForkID) : summaryFork!;
+          const reply = summaryReply(fork, request, summaryForkID);
+          if (history)
+            fork
+              .slice(-2)
+              .forEach((item, index) => history.write(item, 100 + index));
+          return reply;
         }
         prompts.push(request);
         noticeCount += 1;
@@ -1301,11 +1485,24 @@ function trimCommandHarness(
           messageID,
         })) as Part[];
         messages.push(message(messageID, "user", parts));
+        if (history)
+          history.write(
+            {
+              info: {
+                ...messages.at(-1)!.info,
+                sessionID,
+                time: { created: 100 + noticeCount },
+              },
+              parts,
+            },
+            100 + noticeCount,
+          );
         return { data: { info: { id: messageID }, parts } };
       },
       delete: async (request: { sessionID: string }) => {
         deletedSessions.push(request.sessionID);
         if (request.sessionID === summaryForkID) summaryFork = [];
+        history?.delete(request.sessionID);
         if (request.sessionID === backupID && options.backupDeleteError) {
           throw options.backupDeleteError;
         }
@@ -1315,7 +1512,16 @@ function trimCommandHarness(
     part: {
       update: async (request: { part: Part }) => {
         if (options.partUpdateError) throw options.partUpdateError;
+        history?.updatePart(request.part);
         return { data: request.part };
+      },
+    },
+    sync: {
+      replay: async (request: {
+        events: Parameters<NonNullable<typeof history>["replay"]>[0];
+      }) => {
+        history!.replay(request.events);
+        return { data: { sessionID: request.events[0]!.aggregateID } };
       },
     },
     tui: {
@@ -1345,6 +1551,7 @@ function trimCommandHarness(
     deletedSessions,
     forks,
     modelCalls,
+    history,
     setRevert(value: { messageID: string }) {
       revert = value;
     },

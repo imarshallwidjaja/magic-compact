@@ -1,5 +1,6 @@
 import type { Session, TextPart } from "@opencode-ai/sdk/v2";
 import { unwrap, type V2Client } from "../api";
+import { forkSession } from "./fork";
 import {
   BOUNDARY_METADATA,
   POST_COMPACTION_NOTICE,
@@ -33,10 +34,9 @@ export async function createBackup(
   v2: V2Client,
   sourceSession: Session,
   compactionCount: number,
+  messages: MessageWithParts[],
 ): Promise<Session> {
-  const backupSession = unwrap(
-    await v2.session.fork({ sessionID: sourceSession.id }),
-  );
+  const backupSession = await forkSession(v2, sourceSession, messages);
 
   try {
     await copyCache(sourceSession.id, backupSession.id);

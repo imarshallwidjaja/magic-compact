@@ -194,6 +194,7 @@ export async function executeMagicCompact(
       v2,
       sourceSession,
       currentCompactionCount,
+      sourceMessages,
     );
     await revalidateCompactionSource(v2, sessionID, sourcePlan);
     if (unwrap(await v2.session.get({ sessionID })).revert) {

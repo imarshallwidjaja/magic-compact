@@ -27,6 +27,7 @@ import {
   injectSummaries,
 } from "../src/compact/compact";
 import { projectManifestCoveredMedia } from "../src/compact/media";
+import { forkSession } from "../src/compact/fork";
 import {
   MAGIC_COMPACT_SUMMARIZER_PROMPT,
   POST_COMPACTION_NOTICE,
@@ -36,6 +37,7 @@ import {
   buildTurns,
   createCompactionPlan,
   NativeCheckpointChangedError,
+  snapshotSourceMessages,
   type CompactionPlan,
   type MessageWithParts,
   type Turn,
@@ -73,7 +75,12 @@ import {
   writeStats,
 } from "../src/storage/stats";
 import { RetentionClassificationError } from "../src/retention/classifier";
-import { scoredJevFetch, summaryReply, type JevCall } from "./retention-host";
+import {
+  persistedForkHistory,
+  scoredJevFetch,
+  summaryReply,
+  type JevCall,
+} from "./retention-host";
 
 type TurnResult = {
   ordinal: number;
@@ -106,6 +113,306 @@ afterAll(async () => {
   if (originalDataHome === undefined) delete process.env.XDG_DATA_HOME;
   else process.env.XDG_DATA_HOME = originalDataHome;
   await rm(storageDirectory, { recursive: true, force: true });
+});
+
+describe("chronological forks", () => {
+  const source = () => {
+    const messages = [
+      message("chronology-user", "user", [
+        textPart("request", "chronology-user", "Exact request"),
+      ]),
+      message("chronology-assistant", "assistant", [
+        imagePart(
+          "image",
+          "chronology-assistant",
+          "data:image/png;base64,exact",
+        ),
+        toolPart("tool", "chronology-assistant", {
+          status: "completed",
+          input: { path: "/file" },
+          output: "Exact result",
+          metadata: {},
+          time: { start: 1, end: 2 },
+        }),
+      ]),
+    ];
+    messages.forEach((message, index) => {
+      message.info.time = { created: index === 0 ? 7 : 1 };
+    });
+    if (messages[1]!.info.role === "assistant")
+      messages[1]!.info.parentID = messages[0]!.info.id;
+    const marker = nativeMarker("marker", messages[0]!.info.id);
+    marker.info.time = { created: 8 };
+    const summary = nativeSummary("summary", "marker");
+    summary.info.time = { created: 9 };
+    const history = [...messages, marker, summary];
+    history.forEach(item => {
+      item.info.sessionID = "source";
+    });
+    return history;
+  };
+
+  test.each([false, true])(
+    "initializes backups with exact content, rewritten links and persisted chronology (replay: %s)",
+    async replay => {
+      const messages = source();
+      if (!replay)
+        messages.forEach((item, index) => {
+          item.info.time = { created: index };
+        });
+      const host = chronologyHost(messages);
+      const before = structuredClone(host.history.read("source"));
+      try {
+        await createBackup(host.v2, sourceSession(), 2, messages);
+        const backup = host.history.read("backup");
+        expect(backup.map(item => item.info.role)).toEqual(
+          messages.map(item => item.info.role),
+        );
+        expect(backup.map(item => item.info.time)).toEqual(
+          messages.map(item => item.info.time),
+        );
+        expect(backup[0]!.parts[0]).toMatchObject({
+          type: "text",
+          text: "Exact request",
+        });
+        expect(backup[1]!.parts.map(part => part.type)).toEqual([
+          "file",
+          "tool",
+        ]);
+        expect(backup[1]!.parts[0]).toMatchObject({
+          url: "data:image/png;base64,exact",
+        });
+        expect(backup[1]!.parts[1]).toMatchObject({
+          state:
+            messages[1]!.parts[1]!.type === "tool"
+              ? messages[1]!.parts[1]!.state
+              : undefined,
+        });
+        expect((backup[1]!.info as { parentID: string }).parentID).toBe(
+          backup[0]!.info.id,
+        );
+        expect(backup[2]!.parts[0]).toMatchObject({
+          tail_start_id: backup[0]!.info.id,
+        });
+        expect((backup[3]!.info as { parentID: string }).parentID).toBe(
+          backup[2]!.info.id,
+        );
+        expect(host.history.read("source")).toEqual(before);
+        expect(await readCache("backup")).not.toBeNull();
+        expect(await readStats("backup")).not.toBeNull();
+      } finally {
+        host.history.close();
+      }
+    },
+  );
+
+  for (const replay of [false, true]) {
+    test.each([
+      "missing-parent",
+      "forward-parent",
+      "self-parent",
+      "empty-parent",
+      "missing-tail",
+      "forward-tail",
+      "self-tail",
+      "empty-tail",
+    ])(
+      `rejects %s source references before backup initialization (replay: ${replay})`,
+      async kind => {
+        const messages = source();
+        if (!replay)
+          messages.forEach((item, index) => {
+            item.info.time = { created: index };
+          });
+        const assistant = messages[1]!.info;
+        const marker = messages[2]!.parts[0]!;
+        if (assistant.role === "assistant" && kind.endsWith("parent")) {
+          assistant.parentID =
+            kind === "missing-parent"
+              ? "missing"
+              : kind === "forward-parent"
+                ? messages[2]!.info.id
+                : kind === "self-parent"
+                  ? assistant.id
+                  : "";
+        }
+        if (marker.type === "compaction" && kind.endsWith("tail")) {
+          marker.tail_start_id =
+            kind === "missing-tail"
+              ? "missing"
+              : kind === "forward-tail"
+                ? messages[3]!.info.id
+                : kind === "self-tail"
+                  ? messages[2]!.info.id
+                  : "";
+        }
+        const host = chronologyHost(messages);
+        try {
+          await expect(
+            createBackup(host.v2, sourceSession(), 1, messages),
+          ).rejects.toThrow("chronological fork initialization failed");
+          expect(host.deleted).toEqual(["backup"]);
+          expect(host.history.read("backup")).toEqual([]);
+          expect(host.history.read("source")).toEqual(messages);
+          expect(await readCache("backup")).toBeNull();
+          expect(await readStats("backup")).toBeNull();
+        } finally {
+          host.history.close();
+        }
+      },
+    );
+  }
+
+  test("rejects source content drift during replay before backup initialization", async () => {
+    const messages = source();
+    const host = chronologyHost(messages);
+    host.afterReplay = () => {
+      const first = host.history.read("source")[0]!;
+      if (first.parts[0]!.type === "text")
+        first.parts[0]!.text = "Concurrent request edit";
+      host.history.write(first);
+    };
+    try {
+      await expect(
+        createBackup(host.v2, sourceSession(), 1, messages),
+      ).rejects.toThrow("chronological fork initialization failed");
+      expect(host.deleted).toEqual(["backup"]);
+      expect(host.history.read("source")[0]!.parts[0]).toMatchObject({
+        text: "Concurrent request edit",
+      });
+      expect(await readCache("backup")).toBeNull();
+      expect(await readStats("backup")).toBeNull();
+    } finally {
+      host.history.close();
+    }
+  });
+
+  test("keeps persisted replay chronology when source timestamps race", async () => {
+    const messages = source();
+    const host = chronologyHost(messages);
+    host.beforeFork = () => {
+      const first = host.history.read("source")[0]!;
+      first.info.time = { created: 99 };
+      host.history.write(first);
+    };
+    host.afterReplay = () => {
+      const second = host.history.read("source")[1]!;
+      second.info.time = { created: 100 };
+      host.history.write(second);
+    };
+    try {
+      await createBackup(host.v2, sourceSession(), 1, messages);
+      const backup = host.history.read("backup");
+      expect(backup.map(item => item.info.time)).toEqual(
+        messages.map(item => item.info.time),
+      );
+      expect(backup.map(item => item.info.role)).toEqual(
+        messages.map(item => item.info.role),
+      );
+      expect((backup[1]!.info as { parentID: string }).parentID).toBe(
+        backup[0]!.info.id,
+      );
+      expect(
+        host.history.read("source").map(item => item.info.time.created),
+      ).toEqual([99, 100, 8, 9]);
+      expect(snapshotSourceMessages(host.history.read("source"))).toEqual(
+        snapshotSourceMessages(messages),
+      );
+      expect(host.deleted).toEqual([]);
+    } finally {
+      host.history.close();
+    }
+  });
+
+  test.each([
+    "role",
+    "parent",
+    "part-id",
+    "part-owner",
+    "part-type",
+    "content",
+    "order",
+  ])(
+    "rejects %s corruption on persisted reload before backup initialization",
+    async kind => {
+      const messages = source();
+      const host = chronologyHost(messages);
+      host.afterReplay = () => {
+        const fork = host.history.read("backup");
+        const target = fork[1]!;
+        if (kind === "role") target.info.role = "user";
+        if (kind === "parent" && target.info.role === "assistant")
+          target.info.parentID = "foreign-parent";
+        if (kind === "part-id") target.parts[0]!.id = "foreign-part";
+        if (kind === "part-owner")
+          target.parts[0]!.messageID = "foreign-message";
+        if (kind === "part-type") target.parts[0]!.type = "text";
+        if (kind === "content" && target.parts[0]!.type === "file")
+          target.parts[0]!.url = "changed";
+        if (kind === "order")
+          host.history.deleteMessage("backup", target.info.id);
+        host.history.write(target, kind === "order" ? 20 : 1);
+      };
+      try {
+        await expect(
+          createBackup(host.v2, sourceSession(), 1, messages),
+        ).rejects.toThrow("chronological fork initialization failed");
+        expect(host.deleted).toEqual(["backup"]);
+        expect(host.history.read("source")).toEqual(messages);
+        expect(await readCache("backup")).toBeNull();
+        expect(await readStats("backup")).toBeNull();
+      } finally {
+        host.history.close();
+      }
+    },
+  );
+
+  test("awaits partial replay cleanup and reports a sanitized orphan if deletion fails", async () => {
+    const messages = source();
+    const host = chronologyHost(messages);
+    host.afterReplay = () => {
+      throw new Error("private replay body");
+    };
+    host.deleteError = new Error("private cleanup body");
+    try {
+      let failure: unknown;
+      try {
+        await forkSession(host.v2, sourceSession(), messages);
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(AggregateError);
+      expect(nestedErrorMessages(failure).join(" ")).not.toContain("private");
+      expect(String(failure)).toContain("partial fork backup manually");
+      expect(host.deleted).toEqual(["backup"]);
+      expect(host.history.read("source")).toEqual(messages);
+    } finally {
+      host.history.close();
+    }
+  });
+
+  test("rejects a native backup reordered by a timestamp race without replacing the source", async () => {
+    const messages = source();
+    messages.forEach((message, index) => {
+      message.info.time = { created: index };
+    });
+    const host = chronologyHost(messages);
+    host.beforeFork = () => {
+      const first = host.history.read("source")[0]!;
+      first.info.time = { created: 99 };
+      host.history.write(first);
+    };
+    try {
+      await expect(
+        createBackup(host.v2, sourceSession(), 1, messages),
+      ).rejects.toThrow("chronological fork initialization failed");
+      expect(host.deleted).toEqual(["backup"]);
+      expect(host.history.read("source")[0]!.info.time.created).toBe(99);
+      expect(await readCache("backup")).toBeNull();
+    } finally {
+      host.history.close();
+    }
+  });
 });
 
 describe("native generation batch planning", () => {
@@ -580,6 +887,44 @@ describe("native generation batch planning", () => {
 });
 
 describe("bounded native compaction generation", () => {
+  test("generates from persisted chronology despite reversed JSON creation times", async () => {
+    const turn = candidateTurn("chronology", "Continue exact task", [
+      toolPart("tool", "chronology-assistant", {
+        status: "completed",
+        input: {},
+        output: "listing",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      }),
+    ]);
+    turn.user[0]!.info.time = { created: 7 };
+    turn.assistants[0]!.info.time = { created: 1 };
+    turn.user[0]!.info.sessionID = "source";
+    turn.assistants[0]!.info.sessionID = "source";
+    if (turn.assistants[0]!.info.role === "assistant")
+      turn.assistants[0]!.info.parentID = turn.user[0]!.info.id;
+    const harness = generationHarness([turn], responseFor([turn]), {
+      persisted: true,
+    });
+    const before = structuredClone(turn);
+    try {
+      await expect(
+        generateCompactionSummaries(
+          harness.v2,
+          sourceSession(),
+          generationPlan([turn]),
+        ),
+      ).resolves.toHaveLength(1);
+      expect(
+        harness.promptHistories[0]!.messages.map(item => item.info.role),
+      ).toEqual(["user", "assistant"]);
+      expect(harness.messageDeletes).toEqual([]);
+      expect(harness.deletes).toEqual(["generation-fork"]);
+      expect(turn).toEqual(before);
+    } finally {
+      harness.history!.close();
+    }
+  });
   test("registers a hidden summarizer that denies operational tools and uses retained fork history", async () => {
     const hooks = await server({} as PluginInput);
     const config = {} as Config;
@@ -815,7 +1160,9 @@ describe("bounded native compaction generation", () => {
     expect(harness.events).toEqual([
       "agents",
       "providers",
+      "messages",
       "fork",
+      "messages",
       "deny",
       "messages",
       "messages",
@@ -4004,6 +4351,7 @@ describe("compaction orchestration", () => {
     const client = {
       session: {
         fork: async () => ({ data: { ...sourceSession(), id: "backup" } }),
+        messages: async () => ({ data: [] }),
         update: async (request: { metadata?: { magicCompact?: unknown } }) => {
           backupMetadata = request.metadata?.magicCompact;
           return { data: { ...sourceSession(), id: "backup" } };
@@ -4012,7 +4360,7 @@ describe("compaction orchestration", () => {
       },
     } as unknown as V2Client;
 
-    await createBackup(client, sourceSession(), 3);
+    await createBackup(client, sourceSession(), 3, []);
 
     expect(backupMetadata).toEqual({
       sourceSessionId: "source",
@@ -4073,6 +4421,7 @@ describe("compaction orchestration", () => {
     const cleanClient = {
       session: {
         fork: async () => ({ data: { ...sourceSession(), id: "backup" } }),
+        messages: async () => ({ data: [] }),
         update: async () => {
           throw new Error("backup metadata update failed");
         },
@@ -4083,9 +4432,9 @@ describe("compaction orchestration", () => {
       },
     } as unknown as V2Client;
 
-    await expect(createBackup(cleanClient, sourceSession(), 1)).rejects.toThrow(
-      "backup metadata update failed",
-    );
+    await expect(
+      createBackup(cleanClient, sourceSession(), 1, []),
+    ).rejects.toThrow("backup metadata update failed");
     expect(deletedSessions).toEqual(["backup"]);
     expect(await readCache("backup")).toBeNull();
     expect(await readStats("backup")).toBeNull();
@@ -4095,6 +4444,7 @@ describe("compaction orchestration", () => {
     const aggregateClient = {
       session: {
         fork: async () => ({ data: { ...sourceSession(), id: "backup" } }),
+        messages: async () => ({ data: [] }),
         update: async () => {
           await rm(backupCachePath, { force: true });
           await mkdir(backupCachePath, { recursive: true });
@@ -4109,7 +4459,7 @@ describe("compaction orchestration", () => {
     } as unknown as V2Client;
     let failure: unknown;
     try {
-      await createBackup(aggregateClient, sourceSession(), 1);
+      await createBackup(aggregateClient, sourceSession(), 1, []);
     } catch (error) {
       failure = error;
     } finally {
@@ -4318,6 +4668,7 @@ function generationHarness(
   turns: Turn[],
   response: GenerationResponse,
   options: {
+    persisted?: boolean;
     providerError?: Error;
     providerDelayMs?: number;
     forkGate?: Promise<void>;
@@ -4396,6 +4747,9 @@ function generationHarness(
       ? [...options.nextTurn.user, ...options.nextTurn.assistants]
       : []),
   ];
+  const history = options.persisted
+    ? persistedForkHistory(sourceMessages)
+    : undefined;
   const modelImageCapability =
     "modelImageCapability" in options ? options.modelImageCapability : true;
   const configuredAgent = {
@@ -4481,6 +4835,11 @@ function generationHarness(
             ? structuredClone(options.forkMessages)
             : rewriteForkMessages(sourceMessages, forkID),
         );
+        history?.fork(
+          "source",
+          forkID,
+          request.messageID as string | undefined,
+        );
         activeForks += 1;
         peakActiveForks = Math.max(peakActiveForks, activeForks);
         return { data: { ...sourceSession(), id: forkID } };
@@ -4493,10 +4852,15 @@ function generationHarness(
       },
       messages: async (request: { sessionID: string }) => {
         events.push("messages");
+        if (request.sessionID === "source")
+          return { data: structuredClone(sourceMessages) };
         const loads = (messageLoadsByFork.get(request.sessionID) ?? 0) + 1;
         messageLoadsByFork.set(request.sessionID, loads);
-        const stored = forkMessagesByID.get(request.sessionID) ?? [];
-        if (loads === 2) {
+        const stored = history
+          ? history.read(request.sessionID)
+          : (forkMessagesByID.get(request.sessionID) ?? []);
+        if (history) forkMessagesByID.set(request.sessionID, stored);
+        if (loads === (options.persisted ? 4 : 3)) {
           options.mutateRetainedMessages?.(stored, request.sessionID);
         }
         return {
@@ -4587,6 +4951,7 @@ function generationHarness(
         events.push("delete");
         if (options.deleteError) throw options.deleteError;
         if (forkMessagesByID.delete(sessionID)) activeForks -= 1;
+        history?.delete(sessionID);
         return { data: true };
       },
       deleteMessage: async (request: {
@@ -4600,6 +4965,7 @@ function generationHarness(
           messages?.findIndex(message => message.info.id === request.messageID)
           ?? -1;
         if (messages && index >= 0) messages.splice(index, 1);
+        history?.deleteMessage(request.sessionID, request.messageID);
         return { data: true };
       },
     },
@@ -4616,6 +4982,7 @@ function generationHarness(
           .get(request.sessionID)
           ?.find(message => message.info.id === request.messageID);
         target?.parts.push(request.part);
+        history?.updatePart(request.part);
         return { data: request.part };
       },
       delete: async (request: {
@@ -4627,8 +4994,17 @@ function generationHarness(
         return { data: true };
       },
     },
+    sync: {
+      replay: async (request: {
+        events: Parameters<NonNullable<typeof history>["replay"]>[0];
+      }) => {
+        history!.replay(request.events);
+        return { data: { sessionID: request.events[0]!.aggregateID } };
+      },
+    },
   } as unknown as V2Client;
   return {
+    history,
     v2,
     events,
     creates,
@@ -4654,6 +5030,47 @@ function generationHarness(
       return peakActivePrompts;
     },
   };
+}
+
+function chronologyHost(source: MessageWithParts[]) {
+  const history = persistedForkHistory(source);
+  const host = {
+    history,
+    deleted: [] as string[],
+    afterReplay: undefined as (() => void | Promise<void>) | undefined,
+    beforeFork: undefined as (() => void) | undefined,
+    deleteError: undefined as Error | undefined,
+    v2: undefined as unknown as V2Client,
+  };
+  host.v2 = {
+    session: {
+      fork: async (request: { sessionID: string; messageID?: string }) => {
+        host.beforeFork?.();
+        history.fork(request.sessionID, "backup", request.messageID);
+        return { data: { ...sourceSession(), id: "backup" } };
+      },
+      messages: async (request: { sessionID: string }) => ({
+        data: history.read(request.sessionID),
+      }),
+      update: async () => ({ data: {} }),
+      delete: async (request: { sessionID: string }) => {
+        host.deleted.push(request.sessionID);
+        if (host.deleteError) throw host.deleteError;
+        history.delete(request.sessionID);
+        return { data: true };
+      },
+    },
+    sync: {
+      replay: async (request: {
+        events: Parameters<typeof history.replay>[0];
+      }) => {
+        history.replay(request.events);
+        await host.afterReplay?.();
+        return { data: { sessionID: request.events[0]!.aggregateID } };
+      },
+    },
+  } as unknown as V2Client;
+  return host;
 }
 
 function responseFor(turns: Turn[]): GenerationResponse {
@@ -4693,9 +5110,7 @@ function generationPlan(
     sourceTurnStartIndex: 0,
     effectiveSourceTurnStartIndex: 0,
     effectiveSourceTurnEndIndex: turns.length + (nextTurn ? 1 : 0),
-    sourceSnapshot: structuredClone(
-      messages.map(item => ({ info: item.info, parts: item.parts })),
-    ) as CompactionPlan["sourceSnapshot"],
+    sourceSnapshot: snapshotSourceMessages(messages),
   } as CompactionPlan;
 }
 
@@ -5085,6 +5500,9 @@ function rewriteForkMessages(
       id: `fork-part-${++partIndex}`,
       sessionID,
       messageID,
+      ...(part.type === "compaction" && part.tail_start_id
+        ? { tail_start_id: messageIDs.get(part.tail_start_id) }
+        : {}),
     })) as Part[];
     return { info, parts };
   });
@@ -5275,6 +5693,8 @@ function commandHarness(
         },
       }),
       messages: async (request: { sessionID: string }) => {
+        if (request.sessionID === "backup")
+          return { data: structuredClone(backupMessages ?? []) };
         if (request.sessionID.startsWith("generation-fork")) {
           return {
             data: structuredClone(
@@ -5349,7 +5769,7 @@ function commandHarness(
         }
         forks.push("backup");
         events.push("backup-fork");
-        backupMessages = structuredClone(messages);
+        backupMessages = rewriteForkMessages(messages, "backup");
         backupCreated = true;
         return { data: { ...sourceSession(), id: "backup" } };
       },

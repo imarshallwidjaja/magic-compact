@@ -24,6 +24,7 @@ import {
 } from "../src/retention/summary";
 import {
   compactionAgent,
+  persistedForkHistory,
   providerCatalog,
   rewriteFork,
   SESSION_SUMMARY_TEXT,
@@ -652,6 +653,51 @@ describe("retention candidates", () => {
 });
 
 describe("retention session summary", () => {
+  test("preserves persisted source chronology when JSON creation times disagree", async () => {
+    const source = sourceHistory();
+    source[0]!.info.time = { created: 7 };
+    source[1]!.info.time = { created: 1 };
+    source[2]!.info.time = { created: 8 };
+    const host = summaryHost(source, { persisted: true });
+    const before = structuredClone(source);
+    try {
+      await expect(
+        generateSessionSummary(host.v2, session(), source),
+      ).resolves.toBe(SESSION_SUMMARY_TEXT);
+      expect(host.promptHistories[0]!.map(item => item.info.role)).toEqual([
+        "user",
+        "assistant",
+        "user",
+      ]);
+      expect(source).toEqual(before);
+    } finally {
+      host.history?.close();
+    }
+  });
+
+  test("retains sanitized partial-fork cleanup guidance when chronology replay fails", async () => {
+    const source = sourceHistory();
+    source.forEach((item, index) => {
+      item.info.time = { created: index === 0 ? 7 : index };
+    });
+    const host = summaryHost(source, { persisted: true });
+    host.v2.sync.replay = async () => {
+      throw new Error("private replay body");
+    };
+    host.deleteError = new Error("private delete body");
+    try {
+      const error = await promiseError(
+        generateSessionSummary(host.v2, session(), source),
+      );
+      expect(String(error)).toContain("delete partial fork fork-1 manually");
+      expect(String(error)).toContain("/magic-trim --heuristic");
+      expect(String(error)).not.toContain("private");
+      expect(host.prompts).toEqual([]);
+      expect(host.calls).toEqual(["fork:source", "delete:fork-1"]);
+    } finally {
+      host.history!.close();
+    }
+  });
   test("prompts one deny-all fork of the whole session through the native compaction agent", async () => {
     const host = summaryHost(sourceHistory());
     let ownedDuringPrompt = false;
@@ -1279,10 +1325,14 @@ function summaryHost(
   catalog: {
     limit?: { context: number; input?: number; output?: number };
     image?: boolean;
+    persisted?: boolean;
   } = {},
 ) {
   const forks = new Map<string, MessageWithParts[]>();
+  const history = catalog.persisted ? persistedForkHistory(source) : undefined;
   const host = {
+    history,
+    promptHistories: [] as MessageWithParts[][],
     source,
     calls: [] as string[],
     prompts: [] as Record<string, unknown>[],
@@ -1306,6 +1356,11 @@ function summaryHost(
         host.calls.push(`fork:${request.sessionID}`);
         const id = `fork-${forks.size + 1}`;
         forks.set(id, rewriteFork(source, id));
+        history?.fork(
+          request.sessionID,
+          id,
+          (request as { messageID?: string }).messageID,
+        );
         return { data: { id, directory: "/workspace" } };
       },
       update: async (request: { permission?: unknown }) => {
@@ -1313,15 +1368,23 @@ function summaryHost(
         return { data: {} };
       },
       messages: async (request: { sessionID: string }) => ({
-        data: structuredClone(forks.get(request.sessionID)),
+        data: history
+          ? history.read(request.sessionID)
+          : structuredClone(forks.get(request.sessionID)),
       }),
       prompt: async (request: Record<string, unknown>) => {
         host.prompts.push(request);
         const forkID = String(request["sessionID"]);
         await host.onPrompt?.(forkID);
         if (host.promptError) throw host.promptError;
-        const fork = forks.get(forkID)!;
+        const fork = history ? history.read(forkID) : forks.get(forkID)!;
+        host.promptHistories.push(structuredClone(fork));
         const reply = summaryReply(fork, request as never, forkID);
+        if (history) {
+          fork
+            .slice(-2)
+            .forEach((item, index) => history.write(item, 100 + index));
+        }
         host.afterPrompt?.(fork, forkID);
         return reply;
       },
@@ -1333,7 +1396,16 @@ function summaryHost(
         host.calls.push(`delete:${request.sessionID}`);
         if (host.deleteError) throw host.deleteError;
         forks.delete(request.sessionID);
+        history?.delete(request.sessionID);
         return { data: true };
+      },
+    },
+    sync: {
+      replay: async (request: {
+        events: Parameters<NonNullable<typeof history>["replay"]>[0];
+      }) => {
+        history!.replay(request.events);
+        return { data: { sessionID: request.events[0]!.aggregateID } };
       },
     },
   } as unknown as V2Client;
