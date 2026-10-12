@@ -780,7 +780,7 @@ describe("magic trim", () => {
         expect(harness.selectedSessions).toEqual([]);
         expect(harness.deletedSessions).toEqual([harness.backupID]);
         expect(String(failure)).toContain(
-          "chronological fork initialization failed",
+          "chronological fork initialization failed (source history changed)",
         );
         expect(harness.history!.read(harness.backupID)).toEqual([]);
         expect(await readCache(harness.backupID)).toBeNull();

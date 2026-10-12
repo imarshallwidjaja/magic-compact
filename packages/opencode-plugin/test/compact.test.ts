@@ -27,7 +27,11 @@ import {
   injectSummaries,
 } from "../src/compact/compact";
 import { projectManifestCoveredMedia } from "../src/compact/media";
-import { forkSession } from "../src/compact/fork";
+import {
+  ForkCleanupError,
+  ForkHistoryError,
+  forkSession,
+} from "../src/compact/fork";
 import {
   MAGIC_COMPACT_SUMMARIZER_PROMPT,
   POST_COMPACTION_NOTICE,
@@ -250,7 +254,9 @@ describe("chronological forks", () => {
         try {
           await expect(
             createBackup(host.v2, sourceSession(), 1, messages),
-          ).rejects.toThrow("chronological fork initialization failed");
+          ).rejects.toThrow(
+            "chronological fork initialization failed (source history was invalid)",
+          );
           expect(host.deleted).toEqual(["backup"]);
           expect(host.history.read("backup")).toEqual([]);
           expect(host.history.read("source")).toEqual(messages);
@@ -275,7 +281,9 @@ describe("chronological forks", () => {
     try {
       await expect(
         createBackup(host.v2, sourceSession(), 1, messages),
-      ).rejects.toThrow("chronological fork initialization failed");
+      ).rejects.toThrow(
+        "chronological fork initialization failed (source history changed)",
+      );
       expect(host.deleted).toEqual(["backup"]);
       expect(host.history.read("source")[0]!.parts[0]).toMatchObject({
         text: "Concurrent request edit",
@@ -356,7 +364,9 @@ describe("chronological forks", () => {
       try {
         await expect(
           createBackup(host.v2, sourceSession(), 1, messages),
-        ).rejects.toThrow("chronological fork initialization failed");
+        ).rejects.toThrow(
+          "chronological fork initialization failed (replayed fork did not match the plan)",
+        );
         expect(host.deleted).toEqual(["backup"]);
         expect(host.history.read("source")).toEqual(messages);
         expect(await readCache("backup")).toBeNull();
@@ -381,8 +391,9 @@ describe("chronological forks", () => {
       } catch (error) {
         failure = error;
       }
-      expect(failure).toBeInstanceOf(AggregateError);
+      expect(failure).toBeInstanceOf(ForkCleanupError);
       expect(nestedErrorMessages(failure).join(" ")).not.toContain("private");
+      expect(String(failure)).toContain("(history replay failed)");
       expect(String(failure)).toContain("partial fork backup manually");
       expect(host.deleted).toEqual(["backup"]);
       expect(host.history.read("source")).toEqual(messages);
@@ -405,13 +416,245 @@ describe("chronological forks", () => {
     try {
       await expect(
         createBackup(host.v2, sourceSession(), 1, messages),
-      ).rejects.toThrow("chronological fork initialization failed");
+      ).rejects.toThrow(
+        "chronological fork initialization failed (native fork did not match the source)",
+      );
       expect(host.deleted).toEqual(["backup"]);
       expect(host.history.read("source")[0]!.info.time.created).toBe(99);
       expect(await readCache("backup")).toBeNull();
     } finally {
       host.history.close();
     }
+  });
+
+  describe("history reads", () => {
+    const TIMEOUT_MS = 40;
+    const never = () => new Promise<never>(() => {});
+    const FAULTS = {
+      reject: () => Promise.reject(new Error("private read body")),
+      error: () => ({ error: { message: "private read body" } }),
+      timeout: never,
+    } as const;
+    const prepared = (replay: boolean) => {
+      const messages = source();
+      if (!replay)
+        messages.forEach((item, index) => {
+          item.info.time = { created: index };
+        });
+      return { messages, host: chronologyHost(messages) };
+    };
+    const rejection = async (promise: Promise<unknown>) => {
+      try {
+        await promise;
+      } catch (error) {
+        return error;
+      }
+      throw new Error("Expected rejection.");
+    };
+    const wait = (ms: number) =>
+      new Promise(resolve => setTimeout(resolve, ms));
+
+    test.each(
+      [false, true].flatMap(replay =>
+        Array.from({ length: replay ? 3 : 1 }, (_, index) => index + 1).flatMap(
+          read =>
+            (["reject", "error", "timeout"] as const).map(
+              fault => [replay, read, fault] as const,
+            ),
+        ),
+      ),
+    )(
+      "recovers a failed first attempt without repeating fork or replay (replay: %p, read %i, %s)",
+      async (replay, read, fault) => {
+        const { messages, host } = prepared(replay);
+        host.readOverride = (_sessionID, number) =>
+          number === read ? FAULTS[fault]() : undefined;
+        try {
+          const fork = await forkSession(
+            host.v2,
+            sourceSession(),
+            messages,
+            TIMEOUT_MS,
+          );
+          expect(fork.id).toBe("backup");
+          expect(host.reads).toHaveLength((replay ? 3 : 1) + 1);
+          expect(host.forkCalls).toBe(1);
+          expect(host.replayCalls).toBe(replay ? 1 : 0);
+          expect(host.deleted).toEqual([]);
+          expect(host.history.read("source")).toEqual(messages);
+        } finally {
+          host.history.close();
+        }
+      },
+    );
+
+    test.each([
+      ["timeout", "history read timed out", "read-timeout"],
+      ["reject", "history read failed", "read-failed"],
+      ["error", "history read failed", "read-failed"],
+    ] as const)(
+      "stops after two %s attempts with a sanitized reason and awaited cleanup",
+      async (fault, detail, reason) => {
+        for (const replay of [false, true]) {
+          const { messages, host } = prepared(replay);
+          host.readOverride = (_sessionID, number) =>
+            number <= 2 ? FAULTS[fault]() : undefined;
+          const started = Date.now();
+          try {
+            const failure = await rejection(
+              forkSession(host.v2, sourceSession(), messages, TIMEOUT_MS),
+            );
+            expect(failure).toBeInstanceOf(ForkHistoryError);
+            expect((failure as ForkHistoryError).reason).toBe(reason);
+            expect(String(failure)).toContain(`(${detail})`);
+            expect(String(failure)).not.toContain("private");
+            // Each attempt gets its own full deadline.
+            if (fault === "timeout")
+              expect(Date.now() - started).toBeGreaterThanOrEqual(
+                2 * TIMEOUT_MS - 5,
+              );
+            expect(host.reads).toHaveLength(2);
+            expect(host.forkCalls).toBe(1);
+            expect(host.replayCalls).toBe(0);
+            expect(host.deleted).toEqual(["backup"]);
+            expect(host.history.read("source")).toEqual(messages);
+          } finally {
+            host.history.close();
+          }
+        }
+      },
+    );
+
+    test("allows each logical read its own two attempts and no more", async () => {
+      const { messages, host } = prepared(true);
+      host.readOverride = (_sessionID, number) =>
+        number === 2 || number === 3 ? FAULTS.reject() : undefined;
+      try {
+        const failure = await rejection(
+          forkSession(host.v2, sourceSession(), messages, TIMEOUT_MS),
+        );
+        expect((failure as ForkHistoryError).reason).toBe("read-failed");
+        // Empty-cut read, then two failed verification attempts.
+        expect(host.reads).toHaveLength(3);
+        expect(host.forkCalls).toBe(1);
+        expect(host.replayCalls).toBe(1);
+        expect(host.deleted).toEqual(["backup"]);
+      } finally {
+        host.history.close();
+      }
+    });
+
+    test("measures each attempt against its own full deadline", async () => {
+      const { messages, host } = prepared(false);
+      host.readOverride = async (_sessionID, number) => {
+        if (number === 1) return never();
+        // Longer than half a deadline: a shared window would already be spent.
+        await wait(TIMEOUT_MS * 0.75);
+        return undefined;
+      };
+      try {
+        const started = Date.now();
+        await forkSession(host.v2, sourceSession(), messages, TIMEOUT_MS);
+        expect(Date.now() - started).toBeGreaterThan(TIMEOUT_MS);
+        expect(host.reads).toHaveLength(2);
+      } finally {
+        host.history.close();
+      }
+    });
+
+    test.each(["stale data", "rejection"] as const)(
+      "ignores an abandoned first read that settles late with %s",
+      async late => {
+        const { messages, host } = prepared(false);
+        let settle!: (value: unknown) => void;
+        let fail!: (error: unknown) => void;
+        const abandoned = new Promise((resolve, reject) => {
+          settle = resolve;
+          fail = reject;
+        });
+        host.readOverride = (_sessionID, number) =>
+          number === 1 ? abandoned : undefined;
+        try {
+          const fork = await forkSession(
+            host.v2,
+            sourceSession(),
+            messages,
+            TIMEOUT_MS,
+          );
+          if (late === "rejection") fail(new Error("private late body"));
+          else settle({ data: [] });
+          await wait(10);
+          expect(fork.id).toBe("backup");
+          expect(host.reads).toHaveLength(2);
+          expect(host.deleted).toEqual([]);
+          expect(host.forkCalls).toBe(1);
+        } finally {
+          host.history.close();
+        }
+      },
+    );
+
+    test.each([
+      ["a mismatched native fork", false, ["mismatch"], "native-mismatch"],
+      ["a successful response without data", false, ["empty"], "read-invalid"],
+      [
+        "a mismatch after a failed first attempt",
+        false,
+        ["fail", "mismatch"],
+        "native-mismatch",
+      ],
+      ["a non-empty replay cut", true, ["nonempty"], "cut-not-empty"],
+      [
+        "a non-empty replay cut after a failed first attempt",
+        true,
+        ["fail", "nonempty"],
+        "cut-not-empty",
+      ],
+    ] as const)("never retries %s", async (_name, replay, script, reason) => {
+      const { messages, host } = prepared(replay);
+      host.readOverride = (_sessionID, number) => {
+        const step = script[number - 1];
+        if (step === "fail") return FAULTS.reject();
+        if (step === "empty") return {};
+        if (step === "nonempty") return { data: host.history.read("source") };
+        return { data: [] };
+      };
+      try {
+        const failure = await rejection(
+          forkSession(host.v2, sourceSession(), messages, TIMEOUT_MS),
+        );
+        expect((failure as ForkHistoryError).reason).toBe(reason);
+        expect(host.reads).toHaveLength(script.length);
+        expect(host.forkCalls).toBe(1);
+        expect(host.replayCalls).toBe(0);
+        expect(host.deleted).toEqual(["backup"]);
+      } finally {
+        host.history.close();
+      }
+    });
+
+    test("keeps the read reason in the aggregate when partial-fork deletion fails", async () => {
+      const { messages, host } = prepared(false);
+      host.readOverride = () => FAULTS.timeout();
+      host.deleteError = new Error("private cleanup body");
+      try {
+        const failure = await rejection(
+          forkSession(host.v2, sourceSession(), messages, TIMEOUT_MS),
+        );
+        expect(failure).toBeInstanceOf(ForkCleanupError);
+        const [primary] = (failure as ForkCleanupError).errors;
+        expect(primary).toBeInstanceOf(ForkHistoryError);
+        expect((primary as ForkHistoryError).reason).toBe("read-timeout");
+        expect(String(failure)).toContain("(history read timed out)");
+        expect(String(failure)).toContain(
+          "delete partial fork backup manually",
+        );
+        expect(nestedErrorMessages(failure).join(" ")).not.toContain("private");
+        expect(host.deleted).toEqual(["backup"]);
+      } finally {
+        host.history.close();
+      }
+    });
   });
 });
 
@@ -2311,7 +2554,9 @@ describe("bounded native compaction generation", () => {
         sourceSession(),
         generationPlan([turn]),
       ),
-    ).rejects.toThrow("fork history shape verification failed");
+    ).rejects.toThrow(
+      "fork history verification failed (native fork did not match the source)",
+    );
     expect(shapeHarness.prompts).toEqual([]);
     expect(shapeHarness.aborts).toEqual([]);
     expect(shapeHarness.deletes).toEqual(["generation-fork"]);
@@ -2329,6 +2574,44 @@ describe("bounded native compaction generation", () => {
     expect(markerHarness.prompts).toEqual([]);
     expect(markerHarness.aborts).toEqual([]);
     expect(markerHarness.deletes).toEqual(["generation-fork"]);
+  });
+
+  test("recovers one failed fork history read and reports a persistent timeout before the model request", async () => {
+    const turn = candidateTurn("read", "read request", []);
+    const recovered = generationHarness([turn], responseFor([turn]), {
+      forkReadFault: load =>
+        load === 1 ? Promise.reject(new Error("private read body")) : undefined,
+    });
+    await generateCompactionSummaries(
+      recovered.v2,
+      sourceSession(),
+      generationPlan([turn]),
+    );
+    expect(recovered.forks).toHaveLength(1);
+    expect(recovered.prompts).toHaveLength(1);
+    expect(recovered.deletes).toEqual(["generation-fork"]);
+
+    const stalled = generationHarness([turn], responseFor([turn]), {
+      forkReadFault: () => new Promise(() => {}),
+    });
+    const failure = await generateCompactionSummaries(
+      stalled.v2,
+      sourceSession(),
+      generationPlan([turn]),
+      { controlTimeoutMs: 20 },
+    ).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(String(failure)).toContain(
+      "fork history verification timed out (history read timed out)",
+    );
+    expect(String(failure)).not.toContain("shape");
+    expect(String(failure)).not.toContain("private");
+    expect(stalled.forks).toHaveLength(1);
+    expect(stalled.updates).toEqual([]);
+    expect(stalled.prompts).toEqual([]);
+    expect(stalled.deletes).toEqual(["generation-fork"]);
   });
 
   test.each([
@@ -4700,6 +4983,8 @@ function generationHarness(
       messages: MessageWithParts[],
       sessionID: string,
     ) => void;
+    // Awaited before the numbered (1-based) fork history read is answered.
+    forkReadFault?: (load: number) => Promise<unknown> | undefined;
   } = {},
 ) {
   const events: string[] = [];
@@ -4856,6 +5141,7 @@ function generationHarness(
           return { data: structuredClone(sourceMessages) };
         const loads = (messageLoadsByFork.get(request.sessionID) ?? 0) + 1;
         messageLoadsByFork.set(request.sessionID, loads);
+        await options.forkReadFault?.(loads);
         const stored = history
           ? history.read(request.sessionID)
           : (forkMessagesByID.get(request.sessionID) ?? []);
@@ -5040,18 +5326,28 @@ function chronologyHost(source: MessageWithParts[]) {
     afterReplay: undefined as (() => void | Promise<void>) | undefined,
     beforeFork: undefined as (() => void) | undefined,
     deleteError: undefined as Error | undefined,
+    // Replaces the numbered (1-based) history read's response; undefined reads
+    // the fixture. Never-settling or late-settling replacements are allowed.
+    readOverride: undefined as
+      ((sessionID: string, read: number) => unknown) | undefined,
+    reads: [] as string[],
+    forkCalls: 0,
+    replayCalls: 0,
     v2: undefined as unknown as V2Client,
   };
   host.v2 = {
     session: {
       fork: async (request: { sessionID: string; messageID?: string }) => {
+        host.forkCalls += 1;
         host.beforeFork?.();
         history.fork(request.sessionID, "backup", request.messageID);
         return { data: { ...sourceSession(), id: "backup" } };
       },
-      messages: async (request: { sessionID: string }) => ({
-        data: history.read(request.sessionID),
-      }),
+      messages: async (request: { sessionID: string }) => {
+        const read = host.reads.push(request.sessionID);
+        const replacement = await host.readOverride?.(request.sessionID, read);
+        return replacement ?? { data: history.read(request.sessionID) };
+      },
       update: async () => ({ data: {} }),
       delete: async (request: { sessionID: string }) => {
         host.deleted.push(request.sessionID);
@@ -5064,6 +5360,7 @@ function chronologyHost(source: MessageWithParts[]) {
       replay: async (request: {
         events: Parameters<typeof history.replay>[0];
       }) => {
+        host.replayCalls += 1;
         history.replay(request.events);
         await host.afterReplay?.();
         return { data: { sessionID: request.events[0]!.aggregateID } };

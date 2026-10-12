@@ -689,6 +689,7 @@ describe("retention session summary", () => {
       const error = await promiseError(
         generateSessionSummary(host.v2, session(), source),
       );
+      expect(String(error)).toContain("(history replay failed)");
       expect(String(error)).toContain("delete partial fork fork-1 manually");
       expect(String(error)).toContain("/magic-trim --heuristic");
       expect(String(error)).not.toContain("private");
@@ -698,6 +699,40 @@ describe("retention session summary", () => {
       host.history!.close();
     }
   });
+  test("recovers one failed fork history read and names a persistent failure", async () => {
+    const stall = (
+      host: ReturnType<typeof summaryHost>,
+      failures: number,
+    ): void => {
+      const read = host.v2.session.messages.bind(host.v2.session);
+      let seen = 0;
+      host.v2.session.messages = (async (request: { sessionID: string }) => {
+        if (request.sessionID !== "source" && (seen += 1) <= failures)
+          throw new Error("private read body");
+        return read(request as never);
+      }) as never;
+    };
+    const recovered = summaryHost(sourceHistory());
+    stall(recovered, 1);
+    await expect(
+      generateSessionSummary(recovered.v2, session(), recovered.source),
+    ).resolves.toBe(SESSION_SUMMARY_TEXT);
+    expect(recovered.calls.filter(call => call.startsWith("fork:"))).toEqual([
+      "fork:source",
+    ]);
+
+    const failed = summaryHost(sourceHistory());
+    stall(failed, 2);
+    const error = await promiseError(
+      generateSessionSummary(failed.v2, session(), failed.source),
+    );
+    expect((error as SessionSummaryError).stage).toBe("history");
+    expect(String(error)).toContain("(history: history read failed)");
+    expect(String(error)).not.toContain("private");
+    expect(failed.prompts).toEqual([]);
+    expect(failed.calls).toEqual(["fork:source", "delete:fork-1"]);
+  });
+
   test("prompts one deny-all fork of the whole session through the native compaction agent", async () => {
     const host = summaryHost(sourceHistory());
     let ownedDuringPrompt = false;

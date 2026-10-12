@@ -5,22 +5,42 @@ import type { V2Client } from "../api";
 import { attemptWithinDeadline, CONTROL_OPERATION_TIMEOUT_MS } from "../util";
 import { snapshotSourceMessages, type MessageWithParts } from "./plan";
 
+// Fixed, content-free causes shown to operators; never raw host bodies.
+const FORK_FAILURE_DETAIL = {
+  "fork-invalid": "host returned an invalid fork",
+  "source-invalid": "source history was invalid",
+  "read-timeout": "history read timed out",
+  "read-failed": "history read failed",
+  "read-invalid": "history read returned invalid data",
+  "native-mismatch": "native fork did not match the source",
+  "cut-not-empty": "replay fork was not empty",
+  "replay-failed": "history replay failed",
+  "replay-mismatch": "replayed fork did not match the plan",
+  "source-drift": "source history changed",
+} as const;
+
+export type ForkFailureReason = keyof typeof FORK_FAILURE_DETAIL;
+
 export class ForkHistoryError extends Error {
-  constructor() {
-    super("Magic Compact chronological fork initialization failed.");
+  readonly detail: string;
+
+  constructor(readonly reason: ForkFailureReason) {
+    const detail = FORK_FAILURE_DETAIL[reason];
+    super(
+      `Magic Compact chronological fork initialization failed (${detail}).`,
+    );
     this.name = "ForkHistoryError";
+    this.detail = detail;
   }
 }
 
 // Already sanitized; callers must retain the owned ID needed for cleanup.
 export class ForkCleanupError extends AggregateError {
-  constructor(sourceID: string, forkID: string) {
+  constructor(sourceID: string, forkID: string, reason: ForkFailureReason) {
+    const failure = new ForkHistoryError(reason);
     super(
-      [
-        new ForkHistoryError(),
-        new Error(`Partial fork ${forkID} could not be deleted.`),
-      ],
-      `Magic Compact chronological fork initialization and cleanup failed. Source session ${sourceID} was left unchanged; delete partial fork ${forkID} manually.`,
+      [failure, new Error(`Partial fork ${forkID} could not be deleted.`)],
+      `Magic Compact chronological fork initialization and cleanup failed (${failure.detail}). Source session ${sourceID} was left unchanged; delete partial fork ${forkID} manually.`,
     );
     this.name = "ForkCleanupError";
   }
@@ -59,26 +79,47 @@ export async function forkSession(
       ...(needsReplay ? { messageID: messages[0]!.info.id } : {}),
     }),
   );
-  if (!fork.id || fork.id === source.id) throw new ForkHistoryError();
+  if (!fork.id || fork.id === source.id)
+    throw new ForkHistoryError("fork-invalid");
 
   try {
-    const load = async (sessionID = fork.id) => {
-      const outcome = await attemptWithinDeadline(
-        signal =>
-          v2.session.messages({ sessionID, ...route }, { signal }).then(unwrap),
-        controlTimeoutMs,
-      );
-      if (outcome.kind !== "success")
-        throw new Error("Fork history reload failed.");
-      return outcome.value;
+    // Reads are idempotent, so a timed-out or rejected request gets exactly one
+    // more attempt with a fresh deadline. A response that arrives is final:
+    // verification below never reloads or repairs it.
+    const load = async (sessionID = fork.id): Promise<MessageWithParts[]> => {
+      let reason: "read-timeout" | "read-failed" = "read-failed";
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const outcome = await attemptWithinDeadline(
+          signal =>
+            v2.session
+              .messages({ sessionID, ...route }, { signal })
+              .then(response => {
+                if (response.error) throw response.error;
+                return response.data;
+              }),
+          controlTimeoutMs,
+        );
+        if (outcome.kind === "success") {
+          if (!Array.isArray(outcome.value))
+            throw new ForkHistoryError("read-invalid");
+          return outcome.value;
+        }
+        reason = outcome.kind === "timed-out" ? "read-timeout" : "read-failed";
+      }
+      throw new ForkHistoryError(reason);
     };
     if (!needsReplay) {
-      assertNativeFork(await load(), messages, fork.id);
+      const actual = await load();
+      classified("native-mismatch", () =>
+        assertNativeFork(actual, messages, fork.id),
+      );
       return fork;
     }
     if ((await load()).length !== 0)
-      throw new Error("Fork cut did not yield empty history.");
-    const expected = rewriteHistory(messages, source.id, fork.id);
+      throw new ForkHistoryError("cut-not-empty");
+    const expected = classified("source-invalid", () =>
+      rewriteHistory(messages, source.id, fork.id),
+    );
     const events: ReplayEvents = [];
     const append = (type: string, data: Record<string, unknown>) => {
       events.push({
@@ -115,32 +156,46 @@ export async function forkSession(
         events,
       }),
     );
-    if (
-      replay.sessionID !== fork.id
-      || !isDeepStrictEqual(await load(), expected)
-    ) {
-      throw new Error("Fork history identity mismatch.");
-    }
+    const replayed = replay.sessionID === fork.id ? await load() : undefined;
+    if (!replayed || !isDeepStrictEqual(replayed, expected))
+      throw new ForkHistoryError("replay-mismatch");
     // Replay copied planned records, not the live source. Recheck correspondence
     // before this fork can become a recovery backup; timing churn is normalized
     // separately from the exact persisted chronology/content check above.
+    const live = await load(source.id);
     if (
-      !isDeepStrictEqual(
-        snapshotSourceMessages(await load(source.id)),
-        sourceSnapshot,
+      !classified("source-drift", () =>
+        isDeepStrictEqual(snapshotSourceMessages(live), sourceSnapshot),
       )
     ) {
-      throw new Error("Fork source history changed.");
+      throw new ForkHistoryError("source-drift");
     }
     return fork;
-  } catch {
-    const failure = new ForkHistoryError();
+  } catch (error) {
+    // Only the replay request is unclassified here; reads, comparisons and
+    // source validation throw ForkHistoryError themselves.
+    const failure =
+      error instanceof ForkHistoryError
+        ? error
+        : new ForkHistoryError("replay-failed");
     try {
       unwrap(await v2.session.delete({ sessionID: fork.id, ...route }));
     } catch {
-      throw new ForkCleanupError(source.id, fork.id);
+      throw new ForkCleanupError(source.id, fork.id, failure.reason);
     }
     throw failure;
+  }
+}
+
+// Comparison helpers read host-supplied records; unexpected shapes are the
+// caller's named mismatch, not an unclassified error.
+function classified<T>(reason: ForkFailureReason, test: () => T): T {
+  try {
+    return test();
+  } catch (error) {
+    throw error instanceof ForkHistoryError
+      ? error
+      : new ForkHistoryError(reason);
   }
 }
 
@@ -149,7 +204,8 @@ function assertNativeFork(
   source: MessageWithParts[],
   forkID: string,
 ): void {
-  if (actual.length !== source.length) throw new ForkHistoryError();
+  if (actual.length !== source.length)
+    throw new ForkHistoryError("native-mismatch");
   const ids = new Map<string, string>();
   const messageIDs = new Set<string>();
   const partIDs = new Set<string>();
@@ -161,7 +217,7 @@ function assertNativeFork(
       || copy.info.sessionID !== forkID
       || copy.parts.length !== message.parts.length
     )
-      throw new ForkHistoryError();
+      throw new ForkHistoryError("native-mismatch");
     messageIDs.add(copy.info.id);
     const parentID =
       message.info.role === "assistant"
@@ -172,7 +228,7 @@ function assertNativeFork(
       && message.info.parentID !== undefined
       && !parentID
     )
-      throw new ForkHistoryError();
+      throw new ForkHistoryError("source-invalid");
     ids.set(message.info.id, copy.info.id);
     return {
       info: {
@@ -189,7 +245,7 @@ function assertNativeFork(
           || copied.sessionID !== forkID
           || copied.messageID !== copy.info.id
         )
-          throw new ForkHistoryError();
+          throw new ForkHistoryError("native-mismatch");
         partIDs.add(copied.id);
         const rewritten = {
           ...part,
@@ -203,7 +259,7 @@ function assertNativeFork(
         ) {
           const tail = ids.get(rewritten.tail_start_id);
           if (!tail || rewritten.tail_start_id === message.info.id)
-            throw new ForkHistoryError();
+            throw new ForkHistoryError("source-invalid");
           rewritten.tail_start_id = tail;
         }
         return rewritten;
@@ -216,7 +272,7 @@ function assertNativeFork(
       snapshotSourceMessages(expected),
     )
   )
-    throw new ForkHistoryError();
+    throw new ForkHistoryError("native-mismatch");
 }
 
 function rewriteHistory(

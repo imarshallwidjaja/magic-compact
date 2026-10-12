@@ -131,12 +131,13 @@ export class SessionSummaryError extends Error {
     readonly stage: SessionSummaryStage,
     readonly status?: number,
     overflow = false,
+    detail?: string,
   ) {
     super(
       `${
         stage === "budget" || overflow
           ? "The session is too large for the configured compaction model to summarize for task-aware retention."
-          : `Task-aware retention session summary failed (${stage}${status === undefined ? "" : ` ${status}`}).`
+          : `Task-aware retention session summary failed (${stage}${status === undefined ? "" : ` ${status}`}${detail === undefined ? "" : `: ${detail}`}).`
       } ${RETENTION_FAILURE_GUIDANCE}`,
     );
     this.name = "SessionSummaryError";
@@ -207,6 +208,8 @@ export async function generateSessionSummary(
     throw new SessionSummaryError(
       error instanceof ForkHistoryError ? "history" : "fork",
       safeStatus(error),
+      false,
+      error instanceof ForkHistoryError ? error.detail : undefined,
     );
   }
   const owned = { nativeCompaction: false };

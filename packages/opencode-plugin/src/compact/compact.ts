@@ -655,7 +655,9 @@ async function requestCompactionGeneration(
     throw lifecycleFailure(
       sourceSession.id,
       error instanceof ForkHistoryError ? "history" : "fork",
-      "rejection",
+      error instanceof ForkHistoryError && error.reason === "read-timeout"
+        ? "timeout"
+        : "rejection",
       error,
     );
   }
@@ -1637,6 +1639,15 @@ function lifecycleFailure(
   error?: unknown,
 ): GenerationLifecycleError {
   const status = safeStatus(error);
+  if (error instanceof ForkHistoryError) {
+    return new GenerationLifecycleError(
+      sourceSessionID,
+      stage,
+      kind,
+      status,
+      `Compaction generation fork history verification ${kind === "timeout" ? "timed out" : "failed"} (${error.detail}).`,
+    );
+  }
   const overflow = stage === "provider" && isContextOverflow(error, status);
   const truncated = stage === "provider" && isOutputTruncation(error);
   const missingStructuredOutput =
