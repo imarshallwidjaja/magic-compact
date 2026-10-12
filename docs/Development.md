@@ -77,7 +77,7 @@ CI and release workflows install with `bun install --frozen-lockfile`. Run the s
 - `bun run typecheck` - TypeScript type checking.
 - `bun run lint` - ESLint checks.
 - `bun run format` - Prettier formatting.
-- `bun run format:check` - Prettier check without writing.
+- `bun run format:check` - Prettier check without writing. It checks only Git-tracked files (`git ls-files`), so ignored scratch directories and local config are skipped; `.prettierignore` still excludes vendored and license files, and unknown file types are ignored.
 - `bun test packages/opencode-plugin/test` - full plugin suite. Tests use fakes and in-memory SQLite, so they need no `TYPESAFE_API_KEY` or network.
 - `bun test packages/opencode-plugin/test/compact.test.ts` - focused compaction suite.
 - `bun test packages/opencode-plugin/test/trim.test.ts` - focused trim suite.

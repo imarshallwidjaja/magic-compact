@@ -10,7 +10,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "format:check": "prettier --check .",
+    "format:check": "git ls-files -z | xargs -0 prettier --check --ignore-unknown",
     "prepare": "git config core.hooksPath .githooks",
     "release-opencode": "sh scripts/release-opencode.sh"
   },
