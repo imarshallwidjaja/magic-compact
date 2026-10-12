@@ -14,6 +14,8 @@ Agents MUST read these files before working on platform behavior, and MUST updat
 - `docs/Core.md` — core behavior and safety guarantees.
 - `docs/OpenCode.md` — OpenCode runtime behavior specification.
 
+`.github/workflows/check.yml` and the check steps in `.github/workflows/publish-opencode.yml` run the same commands before merge and before `npm publish`. Change them together.
+
 ---
 
 ## Architecture

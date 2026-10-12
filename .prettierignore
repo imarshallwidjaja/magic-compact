@@ -7,3 +7,5 @@ src-*/
 internal/
 .githooks/
 bun.lock
+.agents/skills/typesafe-ai/SKILL.md
+.hive/

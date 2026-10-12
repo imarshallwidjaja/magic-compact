@@ -7,6 +7,7 @@ The distribution package is `arkive-compact`, the repository is `https://github.
 ## Requirements
 
 - Bun
+- Node.js 24 (the CI and release workflows use it)
 
 ## Setup
 
@@ -15,6 +16,8 @@ Install dependencies from the repository root:
 ```bash
 bun install
 ```
+
+CI and release workflows install with `bun install --frozen-lockfile`. Run the same command locally to confirm `bun.lock` matches the manifests.
 
 ## Repository Layout
 
@@ -74,9 +77,15 @@ bun install
 - `bun run typecheck` - TypeScript type checking.
 - `bun run lint` - ESLint checks.
 - `bun run format` - Prettier formatting.
+- `bun run format:check` - Prettier check without writing.
+- `bun test packages/opencode-plugin/test` - full plugin suite. Tests use fakes and in-memory SQLite, so they need no `TYPESAFE_API_KEY` or network.
 - `bun test packages/opencode-plugin/test/compact.test.ts` - focused compaction suite.
 - `bun test packages/opencode-plugin/test/trim.test.ts` - focused trim suite.
 - `bun test packages/opencode-plugin/test/retention.test.ts` - focused retention classifier suite.
+
+## Continuous Integration
+
+`.github/workflows/check.yml` runs on pushes to `main`, pull requests, and manual dispatch. After a frozen-lockfile install it runs `bun run format:check`, `bun run typecheck`, `bun run lint`, and `bun test packages/opencode-plugin/test`. `publish-opencode.yml` runs the same four commands before `npm publish`, so a failing check stops publication. Keep the two command lists in sync.
 
 ## Notes
 
@@ -121,7 +130,7 @@ Release versions are exact numeric triplets in `X.Y.Z` form. The release helper 
 The normal release path is the tag-triggered GitHub Actions workflow:
 
 1. Verify that `packages/opencode-plugin/package.json` has the intended `arkive-compact@X.Y.Z` version.
-2. Run the checks documented under Common Commands, including the focused test suites.
+2. Run the checks documented under Common Commands, including the full plugin suite, and confirm the `Check` workflow passes on the release commit. The publish workflow reruns these checks before `npm publish`.
 3. Confirm npm Trusted Publishing is configured for `imarshallwidjaja/magic-compact` with workflow `publish-opencode.yml`, npm publish permission, and no environment; the workflow needs no npm token.
 4. Invoke `bun run release-opencode -- X.Y.Z`.
 5. Monitor the tag-triggered publish and GitHub Release workflow.
