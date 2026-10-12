@@ -26,7 +26,6 @@ import {
   compactionAgent,
   persistedForkHistory,
   providerCatalog,
-  rewriteFork,
   SESSION_SUMMARY_TEXT,
   summaryReply,
 } from "./retention-host";
@@ -658,7 +657,7 @@ describe("retention session summary", () => {
     source[0]!.info.time = { created: 7 };
     source[1]!.info.time = { created: 1 };
     source[2]!.info.time = { created: 8 };
-    const host = summaryHost(source, { persisted: true });
+    const host = summaryHost(source);
     const before = structuredClone(source);
     try {
       await expect(
@@ -671,7 +670,7 @@ describe("retention session summary", () => {
       ]);
       expect(source).toEqual(before);
     } finally {
-      host.history?.close();
+      host.history.close();
     }
   });
 
@@ -680,7 +679,7 @@ describe("retention session summary", () => {
     source.forEach((item, index) => {
       item.info.time = { created: index === 0 ? 7 : index };
     });
-    const host = summaryHost(source, { persisted: true });
+    const host = summaryHost(source);
     host.v2.sync.replay = async () => {
       throw new Error("private replay body");
     };
@@ -696,7 +695,7 @@ describe("retention session summary", () => {
       expect(host.prompts).toEqual([]);
       expect(host.calls).toEqual(["fork:source", "delete:fork-1"]);
     } finally {
-      host.history!.close();
+      host.history.close();
     }
   });
   test("recovers one failed fork history read and names a persistent failure", async () => {
@@ -1245,13 +1244,16 @@ function tool(
   };
 }
 
+// The host stamps every stored message with a creation time.
+const created = () => ({ created: 1 });
+
 function userMessage(
   id: string,
   text: string,
   synthetic = false,
 ): MessageWithParts {
   return {
-    info: { id, sessionID: "source", role: "user" } as Message,
+    info: { id, sessionID: "source", role: "user", time: created() } as Message,
     parts: [
       {
         id: `${id}_text`,
@@ -1267,7 +1269,12 @@ function userMessage(
 
 function assistantMessage(id: string, parts: Part[]): MessageWithParts {
   return {
-    info: { id, sessionID: "source", role: "assistant" } as Message,
+    info: {
+      id,
+      sessionID: "source",
+      role: "assistant",
+      time: created(),
+    } as Message,
     parts: parts.map(part => ({ ...part, messageID: id })),
   };
 }
@@ -1307,7 +1314,12 @@ function checkpointHistory(options: {
     withImage(userMessage("msg_u2", "Add tests."), options.tailImage),
     assistantMessage("msg_a2", [tool("read", {}, "tail", false, "prt_tail")]),
     {
-      info: { id: "msg_c1", sessionID: "source", role: "user" } as Message,
+      info: {
+        id: "msg_c1",
+        sessionID: "source",
+        role: "user",
+        time: created(),
+      } as Message,
       parts: [
         {
           id: "prt_c1",
@@ -1324,6 +1336,7 @@ function checkpointHistory(options: {
         id: "msg_s1",
         sessionID: "source",
         role: "assistant",
+        time: created(),
         parentID: "msg_c1",
         summary: true,
         finish: "stop",
@@ -1360,11 +1373,10 @@ function summaryHost(
   catalog: {
     limit?: { context: number; input?: number; output?: number };
     image?: boolean;
-    persisted?: boolean;
   } = {},
 ) {
-  const forks = new Map<string, MessageWithParts[]>();
-  const history = catalog.persisted ? persistedForkHistory(source) : undefined;
+  let forkCount = 0;
+  const history = persistedForkHistory(source);
   const host = {
     history,
     promptHistories: [] as MessageWithParts[][],
@@ -1389,9 +1401,8 @@ function summaryHost(
     session: {
       fork: async (request: { sessionID: string }) => {
         host.calls.push(`fork:${request.sessionID}`);
-        const id = `fork-${forks.size + 1}`;
-        forks.set(id, rewriteFork(source, id));
-        history?.fork(
+        const id = `fork-${++forkCount}`;
+        history.fork(
           request.sessionID,
           id,
           (request as { messageID?: string }).messageID,
@@ -1403,24 +1414,20 @@ function summaryHost(
         return { data: {} };
       },
       messages: async (request: { sessionID: string }) => ({
-        data: history
-          ? history.read(request.sessionID)
-          : structuredClone(forks.get(request.sessionID)),
+        data: history.read(request.sessionID),
       }),
       prompt: async (request: Record<string, unknown>) => {
         host.prompts.push(request);
         const forkID = String(request["sessionID"]);
         await host.onPrompt?.(forkID);
         if (host.promptError) throw host.promptError;
-        const fork = history ? history.read(forkID) : forks.get(forkID)!;
+        const fork = history.read(forkID);
         host.promptHistories.push(structuredClone(fork));
         const reply = summaryReply(fork, request as never, forkID);
-        if (history) {
-          fork
-            .slice(-2)
-            .forEach((item, index) => history.write(item, 100 + index));
-        }
         host.afterPrompt?.(fork, forkID);
+        // The host persists the reply and any tampering made after it.
+        history.delete(forkID);
+        fork.forEach((item, index) => history.write(item, index));
         return reply;
       },
       abort: async (request: { sessionID: string }) => {
@@ -1430,16 +1437,15 @@ function summaryHost(
       delete: async (request: { sessionID: string }) => {
         host.calls.push(`delete:${request.sessionID}`);
         if (host.deleteError) throw host.deleteError;
-        forks.delete(request.sessionID);
-        history?.delete(request.sessionID);
+        history.delete(request.sessionID);
         return { data: true };
       },
     },
     sync: {
       replay: async (request: {
-        events: Parameters<NonNullable<typeof history>["replay"]>[0];
+        events: Parameters<typeof history.replay>[0];
       }) => {
-        history!.replay(request.events);
+        history.replay(request.events);
         return { data: { sessionID: request.events[0]!.aggregateID } };
       },
     },

@@ -42,104 +42,131 @@ export function providerCatalog(
   };
 }
 
-// OpenCode forks copy history under new message and part IDs.
-export function rewriteFork(
-  messages: MessageWithParts[],
-  forkID: string,
-): MessageWithParts[] {
-  let partIndex = 0;
-  const ids = new Map(
-    messages.map((item, index) => [
-      item.info.id,
-      `${forkID}-message-${index + 1}`,
-    ]),
-  );
-  return structuredClone(messages).map((item, index) => {
-    const id = `${forkID}-message-${index + 1}`;
-    return {
-      info: {
-        ...item.info,
-        id,
-        sessionID: forkID,
-        ...(item.info.role === "assistant" && item.info.parentID
-          ? { parentID: ids.get(item.info.parentID) ?? item.info.parentID }
-          : {}),
-      } as Message,
-      parts: item.parts.map(part => ({
-        ...part,
-        id: `${forkID}-part-${++partIndex}`,
-        sessionID: forkID,
-        messageID: id,
-        ...(part.type === "compaction" && part.tail_start_id
-          ? { tail_start_id: ids.get(part.tail_start_id) }
-          : {}),
-      })) as Part[],
-    };
-  });
+// Millisecond clock for the fake host's ID generator. With a step, every ID
+// minted after `afterWrites` of them comes from `ms` earlier, as when the host
+// clock is corrected backwards in the middle of a native fork.
+export function hostClock(step?: { afterWrites: number; ms: number }) {
+  const start = 1_760_000_000_000;
+  let writes = 0;
+  return () => start - (step && writes++ >= step.afterWrites ? step.ms : 0);
 }
 
-// Mirrors the pinned host's projection: initial inserts take JSON creation
-// time, later message updates replace only JSON, and reads sort row time/id.
-// Source rows deliberately use durable input order independently of JSON time.
-export function persistedForkHistory(source: MessageWithParts[]) {
+const ID_ALPHABET =
+  "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+// Mirrors the pinned host's persistence (OpenCode 1.18.30): ascending IDs are
+// clock milliseconds * 4096 plus a counter that resets whenever the clock
+// value changes; message rows are read by (time_created, id) with the initial
+// insert taking the JSON creation time and later updates replacing only JSON;
+// parts are separate rows read by ID. Source fixtures keep durable input order
+// for messages and for parts whose IDs are not host IDs.
+export function persistedForkHistory(
+  source: MessageWithParts[],
+  options: { clock?: () => number } = {},
+) {
+  const clock = options.clock ?? hostClock();
   const db = new Database(":memory:");
   db.run(
     "create table message (id text primary key, session text, created integer, data text)",
   );
-  const insert = db.query(
+  db.run(
+    "create table part (id text primary key, message text, rank text, data text)",
+  );
+  const insertMessage = db.query(
     "insert into message values (?, ?, ?, ?) on conflict(id) do update set data=excluded.data",
   );
-  const rows = db.query(
-    "select data from message where session=? order by created,id",
+  const insertPart = db.query(
+    "insert into part values (?, ?, ?, ?) on conflict(id) do update set data=excluded.data",
   );
+  const messageRows = db.query(
+    "select id, data from message where session=? order by created,id",
+  );
+  const partRows = db.query(
+    "select data from part where message=? order by rank",
+  );
+  let lastTimestamp = 0;
+  let counter = 0;
+  const hostID = (prefix: "msg" | "prt") => {
+    const now = clock();
+    if (now !== lastTimestamp) {
+      lastTimestamp = now;
+      counter = 0;
+    }
+    counter += 1;
+    const ordinal = (
+      (BigInt(now) * 0x1000n + BigInt(counter))
+      & ((1n << 48n) - 1n)
+    )
+      .toString(16)
+      .padStart(12, "0");
+    const suffix = Array.from(
+      crypto.getRandomValues(new Uint8Array(14)),
+      byte => ID_ALPHABET[byte % ID_ALPHABET.length],
+    ).join("");
+    return `${prefix}_${ordinal}${suffix}`;
+  };
+  const putMessage = (info: Message, created = info.time?.created ?? 0) => {
+    insertMessage.run(info.id, info.sessionID, created, JSON.stringify(info));
+  };
+  const putPart = (part: Part, rank: string) => {
+    insertPart.run(part.id, part.messageID, rank, JSON.stringify(part));
+  };
+  // Replaces the stored message, parts included.
   const write = (
     message: MessageWithParts,
     created = message.info.time?.created ?? 0,
   ) => {
-    insert.run(
-      message.info.id,
-      message.info.sessionID,
-      created,
-      JSON.stringify(message),
+    db.query("delete from part where message=?").run(message.info.id);
+    putMessage(message.info, created);
+    message.parts.forEach((part, index) =>
+      putPart(part, String(index).padStart(8, "0")),
     );
   };
   source.forEach((message, index) => write(message, index));
   const read = (sessionID: string) =>
-    (rows.all(sessionID) as Array<{ data: string }>).map(
-      row => JSON.parse(row.data) as MessageWithParts,
+    (messageRows.all(sessionID) as Array<{ id: string; data: string }>).map(
+      row => ({
+        info: JSON.parse(row.data) as Message,
+        parts: (partRows.all(row.id) as Array<{ data: string }>).map(
+          part => JSON.parse(part.data) as Part,
+        ),
+      }),
     );
-  let nextID = 0;
+  // Session.fork: copies in source read order, minting a fresh ascending ID per
+  // message and part. The cut is exclusive and found by message ID.
   const fork = (sourceID: string, forkID: string, messageID?: string) => {
     const messages = read(sourceID);
-    const end = messageID
+    const target = messageID
       ? messages.findIndex(item => item.info.id === messageID)
       : messages.length;
-    const copied = rewriteFork(
-      messages.slice(0, end < 0 ? messages.length : end),
-      forkID,
-    );
-    // Real ascending IDs preserve creation order even when timestamps tie.
-    const ids = new Map(
-      copied.map(message => [
-        message.info.id,
-        `msg_${(++nextID).toString(16).padStart(12, "0")}${"A".repeat(14)}`,
-      ]),
-    );
-    for (const message of copied) {
-      const oldID = message.info.id;
-      message.info.id = ids.get(oldID)!;
-      if (message.info.role === "assistant" && message.info.parentID) {
-        message.info.parentID =
-          ids.get(message.info.parentID) ?? message.info.parentID;
+    const ids = new Map<string, string>();
+    for (const item of messages.slice(
+      0,
+      target < 0 ? messages.length : target,
+    )) {
+      const id = hostID("msg");
+      ids.set(item.info.id, id);
+      const parentID =
+        item.info.role === "assistant" && item.info.parentID
+          ? ids.get(item.info.parentID)
+          : undefined;
+      putMessage({
+        ...item.info,
+        sessionID: forkID,
+        id,
+        ...(parentID ? { parentID } : {}),
+      } as Message);
+      for (const part of item.parts) {
+        const copy = {
+          ...part,
+          id: hostID("prt"),
+          messageID: id,
+          sessionID: forkID,
+        } as Part;
+        if (copy.type === "compaction" && copy.tail_start_id)
+          copy.tail_start_id = ids.get(copy.tail_start_id);
+        putPart(copy, copy.id);
       }
-      for (const part of message.parts) {
-        part.id = `prt_${(++nextID).toString(16).padStart(12, "0")}${"A".repeat(14)}`;
-        part.messageID = message.info.id;
-        if (part.type === "compaction" && part.tail_start_id) {
-          part.tail_start_id = ids.get(part.tail_start_id);
-        }
-      }
-      write(message);
     }
   };
   const replay = (
@@ -157,18 +184,10 @@ export function persistedForkHistory(source: MessageWithParts[]) {
       if (event.data.sessionID !== event.aggregateID)
         throw new Error("wrong aggregate");
       if (event.type === "message.updated.1") {
-        const info = event.data.info as Message;
-        const previous = read(event.aggregateID).find(
-          item => item.info.id === info.id,
-        );
-        write({ info, parts: previous?.parts ?? [] });
+        putMessage(event.data.info as Message);
       } else if (event.type === "message.part.updated.1") {
         const part = event.data.part as Part;
-        const message = read(event.aggregateID).find(
-          item => item.info.id === part.messageID,
-        )!;
-        message.parts.push(part);
-        write(message);
+        putPart(part, part.id);
       } else throw new Error("unexpected replay type");
     });
   };
@@ -177,22 +196,24 @@ export function persistedForkHistory(source: MessageWithParts[]) {
     write,
     fork,
     replay,
+    // The host orders parts by ID, so an inserted part ranks by its own ID.
     updatePart(part: Part) {
-      const message = read(part.sessionID).find(
-        item => item.info.id === part.messageID,
-      )!;
-      const index = message.parts.findIndex(item => item.id === part.id);
-      if (index < 0) message.parts.push(part);
-      else message.parts[index] = part;
-      write(message);
+      const existing = db
+        .query("select rank from part where id=?")
+        .get(part.id) as { rank: string } | null;
+      putPart(part, existing?.rank ?? part.id);
     },
     deleteMessage(sessionID: string, messageID: string) {
+      db.query("delete from part where message=?").run(messageID);
       db.query("delete from message where session=? and id=?").run(
         sessionID,
         messageID,
       );
     },
     delete(sessionID: string) {
+      db.query(
+        "delete from part where message in (select id from message where session=?)",
+      ).run(sessionID);
       db.query("delete from message where session=?").run(sessionID);
     },
     close() {

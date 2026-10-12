@@ -26,6 +26,7 @@ import {
   pruneSummarizedTurns,
   type PruneProjection,
 } from "./compact/prune";
+import { preservedTurnsFeedback, type PreservedTurns } from "./stats/constants";
 import {
   countModelFacingContentTokens,
   countSessionTokenProjection,
@@ -96,15 +97,20 @@ export async function executeMagicCompact(
   let sourceSession: Session | null = null;
   let sourceWritesStarted = false;
   let compactedTurnCount: number;
+  let preserved: PreservedTurns;
   let retention: RetentionPlan = HEURISTIC_RETENTION;
 
   try {
     // Check if there's anything to compact
     const sourcePlan = await createCompactionPlan(v2, sessionID, keepTurns);
+    preserved = {
+      requested: keepTurns,
+      preserved: sourcePlan.preservedTurnCount,
+    };
     if (sourcePlan.summarizedTurns.length === 0) {
       await toastFeedback.showTerminal({
         title: "Magic Compact",
-        message: COMPACT_NOOP,
+        message: noopFeedback(preserved),
         variant: "info",
         duration: 5000,
       });
@@ -163,7 +169,7 @@ export async function executeMagicCompact(
     ) {
       await toastFeedback.showTerminal({
         title: "Magic Compact",
-        message: COMPACT_NOOP,
+        message: noopFeedback(preserved),
         variant: "info",
         duration: 5000,
       });
@@ -235,6 +241,7 @@ export async function executeMagicCompact(
       projection.afterTokens,
       currentCompactionCount,
       selection.turns.length,
+      preserved,
     );
     const actual = await countSessionTokenProjection(v2, sessionID);
     if (
@@ -273,11 +280,19 @@ export async function executeMagicCompact(
 
   await toastFeedback.showTerminal({
     title: "Magic Compact",
-    message: `Compacted ${compactedTurnCount} assistant turn(s). ${retentionFeedback(retention)}`,
+    message: `Compacted ${compactedTurnCount} request turn(s). ${preservedTurnsFeedback(preserved)} ${retentionFeedback(retention)}`,
     variant: "info",
     duration: 5000,
   });
   return true;
+}
+
+// Nothing preserved means N did not shape the outcome, so the message stays
+// the plain no-op text.
+function noopFeedback(preserved: PreservedTurns): string {
+  return preserved.preserved === 0
+    ? COMPACT_NOOP
+    : `${COMPACT_NOOP} ${preservedTurnsFeedback(preserved)}`;
 }
 
 function postWriteFailure(

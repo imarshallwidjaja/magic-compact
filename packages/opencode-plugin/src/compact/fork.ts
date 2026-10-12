@@ -12,8 +12,7 @@ const FORK_FAILURE_DETAIL = {
   "read-timeout": "history read timed out",
   "read-failed": "history read failed",
   "read-invalid": "history read returned invalid data",
-  "native-mismatch": "native fork did not match the source",
-  "cut-not-empty": "replay fork was not empty",
+  "cut-not-empty": "fork was not empty",
   "replay-failed": "history replay failed",
   "replay-mismatch": "replayed fork did not match the plan",
   "source-drift": "source history changed",
@@ -50,8 +49,13 @@ type ReplayEvents = NonNullable<
   NonNullable<Parameters<V2Client["sync"]["replay"]>[0]>["events"]
 >;
 
-// OpenCode 1.18.30 reads row time_created/id, but native forks insert copied
-// JSON time.created. An updated JSON timestamp can therefore reverse history.
+// OpenCode 1.18.30 mints a native fork's message and part IDs one record at a
+// time from the host clock and reads parts back in ID order, so a clock that
+// steps backwards while the fork is copied reverses history. Messages also sort
+// by a row creation time taken from the copied JSON. The host's copy therefore
+// never populates a fork: the native fork is cut before the first planned
+// message, so it holds only the session, and the planned history is written
+// once through host replay with IDs minted here from a single clock reading.
 export async function forkSession(
   v2: V2Client,
   source: Session,
@@ -62,21 +66,20 @@ export async function forkSession(
     directory: source.directory,
     ...(source.workspaceID ? { workspace: source.workspaceID } : {}),
   };
-  const needsReplay = messages.some(
-    (message, index) =>
-      index > 0
-      && message.info.time?.created < messages[index - 1]!.info.time?.created,
+  // Source identity and references are validated before the host is touched.
+  const sourceSnapshot = classified("source-invalid", () =>
+    snapshotSourceMessages(messages),
   );
-  const sourceSnapshot = needsReplay
-    ? snapshotSourceMessages(messages)
-    : undefined;
+  const plan = classified("source-invalid", () =>
+    planHistory(messages, source.id),
+  );
   const fork = unwrap(
     await v2.session.fork({
       sessionID: source.id,
       ...route,
-      // The native cut is exclusive. Keep host-owned session creation, title,
-      // metadata and routing, but don't insert timestamp-reordered messages.
-      ...(needsReplay ? { messageID: messages[0]!.info.id } : {}),
+      // The native cut is exclusive. It keeps host-owned session creation,
+      // title, metadata and routing. An empty history has nothing to cut.
+      ...(messages.length > 0 ? { messageID: messages[0]!.info.id } : {}),
     }),
   );
   if (!fork.id || fork.id === source.id)
@@ -108,60 +111,55 @@ export async function forkSession(
       }
       throw new ForkHistoryError(reason);
     };
-    if (!needsReplay) {
-      const actual = await load();
-      classified("native-mismatch", () =>
-        assertNativeFork(actual, messages, fork.id),
-      );
-      return fork;
-    }
     if ((await load()).length !== 0)
       throw new ForkHistoryError("cut-not-empty");
-    const expected = classified("source-invalid", () =>
-      rewriteHistory(messages, source.id, fork.id),
-    );
-    const events: ReplayEvents = [];
-    const append = (type: string, data: Record<string, unknown>) => {
-      events.push({
-        id: `evt_${randomUUID()}`,
-        aggregateID: fork.id,
-        seq: events.length + 1,
-        type,
-        data: { sessionID: fork.id, ...data },
-      });
-    };
-    // An empty native fork has only session.created.1 at seq 0. Replay uses
-    // consecutive event sequences and rejects a competing writer's sequence.
-    for (const [index, message] of expected.entries()) {
-      // Seed the immutable row ordering key, then restore the exact JSON info.
-      // Both updates are host operations; no source record or DB is patched.
-      append("message.updated.1", {
-        info: {
-          ...message.info,
-          time: { ...message.info.time, created: index },
-        },
-      });
-      append("message.updated.1", { info: message.info });
-      for (const part of message.parts) {
-        append("message.part.updated.1", { part, time: Date.now() });
+    if (messages.length > 0) {
+      const expected = plan(fork.id);
+      const events: ReplayEvents = [];
+      const append = (type: string, data: Record<string, unknown>) => {
+        events.push({
+          id: `evt_${randomUUID()}`,
+          aggregateID: fork.id,
+          seq: events.length + 1,
+          type,
+          data: { sessionID: fork.id, ...data },
+        });
+      };
+      // An empty native fork has only session.created.1 at seq 0. Replay uses
+      // consecutive event sequences and rejects a competing writer's sequence.
+      for (const [index, message] of expected.entries()) {
+        // Seed the immutable row ordering key, then restore the exact JSON
+        // info. Both updates are host operations; no source record or DB is
+        // patched.
+        append("message.updated.1", {
+          info: {
+            ...message.info,
+            time: { ...message.info.time, created: index },
+          },
+        });
+        append("message.updated.1", { info: message.info });
+        for (const part of message.parts) {
+          append("message.part.updated.1", { part, time: Date.now() });
+        }
       }
+      // Like fork creation, replay is awaited directly: timing out could lose
+      // ownership of a still-writing server operation during cleanup.
+      const replay = unwrap(
+        await v2.sync.replay({
+          query_directory: route.directory,
+          ...(route.workspace ? { workspace: route.workspace } : {}),
+          body_directory: route.directory,
+          events,
+        }),
+      );
+      const replayed = replay.sessionID === fork.id ? await load() : undefined;
+      if (!replayed || !isDeepStrictEqual(replayed, expected))
+        throw new ForkHistoryError("replay-mismatch");
     }
-    // Like fork creation, replay is awaited directly: timing out could lose
-    // ownership of a still-writing server operation during cleanup.
-    const replay = unwrap(
-      await v2.sync.replay({
-        query_directory: route.directory,
-        ...(route.workspace ? { workspace: route.workspace } : {}),
-        body_directory: route.directory,
-        events,
-      }),
-    );
-    const replayed = replay.sessionID === fork.id ? await load() : undefined;
-    if (!replayed || !isDeepStrictEqual(replayed, expected))
-      throw new ForkHistoryError("replay-mismatch");
-    // Replay copied planned records, not the live source. Recheck correspondence
-    // before this fork can become a recovery backup; timing churn is normalized
-    // separately from the exact persisted chronology/content check above.
+    // The fork holds planned records, not the live source. Recheck
+    // correspondence before it can become a recovery backup; timing churn is
+    // normalized separately from the exact persisted chronology/content check
+    // above.
     const live = await load(source.id);
     if (
       !classified("source-drift", () =>
@@ -199,87 +197,13 @@ function classified<T>(reason: ForkFailureReason, test: () => T): T {
   }
 }
 
-function assertNativeFork(
-  actual: MessageWithParts[],
-  source: MessageWithParts[],
-  forkID: string,
-): void {
-  if (actual.length !== source.length)
-    throw new ForkHistoryError("native-mismatch");
-  const ids = new Map<string, string>();
-  const messageIDs = new Set<string>();
-  const partIDs = new Set<string>();
-  const expected = source.map((message, index) => {
-    const copy = actual[index]!;
-    if (
-      !copy.info.id
-      || messageIDs.has(copy.info.id)
-      || copy.info.sessionID !== forkID
-      || copy.parts.length !== message.parts.length
-    )
-      throw new ForkHistoryError("native-mismatch");
-    messageIDs.add(copy.info.id);
-    const parentID =
-      message.info.role === "assistant"
-        ? ids.get(message.info.parentID)
-        : undefined;
-    if (
-      message.info.role === "assistant"
-      && message.info.parentID !== undefined
-      && !parentID
-    )
-      throw new ForkHistoryError("source-invalid");
-    ids.set(message.info.id, copy.info.id);
-    return {
-      info: {
-        ...message.info,
-        id: copy.info.id,
-        sessionID: forkID,
-        ...(parentID ? { parentID } : {}),
-      } as Message,
-      parts: message.parts.map((part, partIndex) => {
-        const copied = copy.parts[partIndex]!;
-        if (
-          !copied.id
-          || partIDs.has(copied.id)
-          || copied.sessionID !== forkID
-          || copied.messageID !== copy.info.id
-        )
-          throw new ForkHistoryError("native-mismatch");
-        partIDs.add(copied.id);
-        const rewritten = {
-          ...part,
-          id: copied.id,
-          sessionID: forkID,
-          messageID: copy.info.id,
-        } as Part;
-        if (
-          rewritten.type === "compaction"
-          && rewritten.tail_start_id !== undefined
-        ) {
-          const tail = ids.get(rewritten.tail_start_id);
-          if (!tail || rewritten.tail_start_id === message.info.id)
-            throw new ForkHistoryError("source-invalid");
-          rewritten.tail_start_id = tail;
-        }
-        return rewritten;
-      }),
-    };
-  });
-  if (
-    !isDeepStrictEqual(
-      snapshotSourceMessages(actual),
-      snapshotSourceMessages(expected),
-    )
-  )
-    throw new ForkHistoryError("native-mismatch");
-}
-
-function rewriteHistory(
+// Validates the source and mints the copy's message and part IDs: one clock
+// reading plus a counter, so IDs ascend in planned order however the host clock
+// moves. The copy takes its session once the native fork exists.
+function planHistory(
   messages: MessageWithParts[],
   sourceID: string,
-  forkID: string,
-): MessageWithParts[] {
+): (forkID: string) => MessageWithParts[] {
   const seenMessages = new Set<string>();
   const seenParts = new Set<string>();
   const ids = new Map<string, string>();
@@ -293,7 +217,7 @@ function rewriteHistory(
       "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     return `${prefix}_${ordinal}${Array.from(randomBytes(14), byte => alphabet[byte % alphabet.length]).join("")}`;
   };
-  return structuredClone(messages).map(message => {
+  const rewritten = structuredClone(messages).map(message => {
     const originalID = message.info.id;
     if (
       !originalID
@@ -320,7 +244,6 @@ function rewriteHistory(
     const info = {
       ...message.info,
       id: messageID,
-      sessionID: forkID,
       ...(parentID ? { parentID } : {}),
     } as Message;
     const parts = message.parts.map(part => {
@@ -333,25 +256,22 @@ function rewriteHistory(
         throw new Error("Invalid source part identity.");
       }
       seenParts.add(part.id);
-      const rewritten = {
-        ...part,
-        id: id("prt"),
-        sessionID: forkID,
-        messageID,
-      } as Part;
-      if (
-        rewritten.type === "compaction"
-        && rewritten.tail_start_id !== undefined
-      ) {
-        const tail = ids.get(rewritten.tail_start_id);
-        if (!tail || rewritten.tail_start_id === originalID)
+      const copy = { ...part, id: id("prt"), messageID } as Part;
+      if (copy.type === "compaction" && copy.tail_start_id !== undefined) {
+        const tail = ids.get(copy.tail_start_id);
+        if (!tail || copy.tail_start_id === originalID)
           throw new Error("Invalid source compaction tail.");
-        rewritten.tail_start_id = tail;
+        copy.tail_start_id = tail;
       }
-      return rewritten;
+      return copy;
     });
     return { info, parts };
   });
+  return forkID =>
+    rewritten.map(({ info, parts }) => ({
+      info: { ...info, sessionID: forkID } as Message,
+      parts: parts.map(part => ({ ...part, sessionID: forkID }) as Part),
+    }));
 }
 
 function unwrap<T>(response: { data?: T; error?: unknown }): T {

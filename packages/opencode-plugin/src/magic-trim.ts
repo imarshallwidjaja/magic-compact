@@ -94,6 +94,10 @@ export async function executeMagicTrim(
   });
   let backupSession: Session | null = null;
   let sourceSession: Session | null = null;
+  // Until the first source write is attempted the live source is authoritative
+  // and the backup is only a copy to discard. From then on the source may be
+  // partly trimmed and the backup is the recovery target.
+  let sourceWritesStarted = false;
 
   try {
     const plan = await createTrimPlan(v2, sessionID, keepTurns);
@@ -123,41 +127,22 @@ export async function executeMagicTrim(
       getCompactionCount(sourceSession),
       plan.messages,
     );
+    backupSession = backup;
     if (retention.evaluated > 0) {
       // Classification is slow, so the source must still match the planned
-      // history before any write. A failed check leaves the source untouched
-      // and removes the unneeded backup. SDK errors can carry session
-      // content, so these failures keep only fixed text and a status.
-      let revalidationError: Error | undefined;
-      try {
-        await assertTrimSourceStillPlanned(v2, sessionID, plan);
-      } catch (error) {
-        revalidationError = error as Error;
-      }
-      if (revalidationError) {
-        try {
-          await deleteBackup(v2, backup.id);
-        } catch {
-          throw new AggregateError(
-            [
-              revalidationError,
-              new Error(
-                `Unneeded backup session ${backup.id} could not be deleted.`,
-              ),
-            ],
-            `${String(revalidationError)} Source session ${sessionID} was left unchanged, but unneeded backup session ${backup.id} could not be deleted; delete it manually.`,
-          );
-        }
-        throw revalidationError;
-      }
+      // history before any write. SDK errors can carry session content, so
+      // these failures keep only fixed text and a status.
+      await assertTrimSourceStillPlanned(v2, sessionID, plan);
     }
-    backupSession = backup;
 
     const beforeTokens = await countSessionTokens(v2, sessionID);
     const trimmedToolCalls = await trimToolParts(
       { v2, sessionID },
       plan.trimmedTurns,
       retention.keep,
+      () => {
+        sourceWritesStarted = true;
+      },
     );
     const retentionLine = retentionFeedback(retention, plan.messages);
     if (trimmedToolCalls === 0) {
@@ -204,7 +189,14 @@ export async function executeMagicTrim(
     return true;
   } catch (error) {
     let failure = error;
-    if (sourceSession && backupSession) {
+    if (sourceSession && backupSession && !sourceWritesStarted) {
+      failure = await discardUnusedBackup(
+        v2,
+        sourceSession.id,
+        backupSession.id,
+        error,
+      );
+    } else if (sourceSession && backupSession) {
       try {
         await applyBackup(v2, sourceSession, backupSession);
       } catch (recoveryError) {
@@ -228,6 +220,32 @@ export async function executeMagicTrim(
     });
     throw failure;
   }
+}
+
+// The failure to report when no source write was attempted: `cause` itself
+// once the unused backup is deleted, otherwise an aggregate naming both
+// sessions. The backup's own deletion error can carry session content, so only
+// fixed text survives.
+async function discardUnusedBackup(
+  v2: V2Client,
+  sourceSessionID: string,
+  backupSessionID: string,
+  cause: unknown,
+): Promise<unknown> {
+  try {
+    await deleteBackup(v2, backupSessionID);
+  } catch {
+    return new AggregateError(
+      [
+        cause,
+        new Error(
+          `Unneeded backup session ${backupSessionID} could not be deleted.`,
+        ),
+      ],
+      `${String(cause)} Source session ${sourceSessionID} was left unchanged, but unneeded backup session ${backupSessionID} could not be deleted; delete it manually.`,
+    );
+  }
+  return cause;
 }
 
 // Throws only TrimRevalidationError, TrimSourceChangedError, or the fixed

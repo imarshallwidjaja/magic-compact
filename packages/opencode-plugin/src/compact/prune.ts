@@ -194,20 +194,33 @@ function assertNoNativeArtifacts(turns: Turn[]): void {
   }
 }
 
+// `onFirstWrite` runs once, immediately before the first source part update is
+// attempted, so the caller can tell a trim that never wrote from one whose
+// write may have partly applied.
 export async function trimToolParts(
   context: PruneContext,
   turns: Turn[],
   keep: ReadonlySet<string>,
+  onFirstWrite: () => void = () => {},
 ): Promise<number> {
   let trimmed = 0;
+  let writing = false;
+  const beforeUpdate = () => {
+    if (writing) return;
+    writing = true;
+    onFirstWrite();
+  };
   for (const turn of turns) {
     for (const assistant of turn.assistants) {
       for (const part of assistant.parts) {
         if (
           part.type === "tool"
           && !keep.has(part.id)
-          && (await pruneToolPart(context, part, entry =>
-            allocateOmission(context.sessionID, entry),
+          && (await pruneToolPart(
+            context,
+            part,
+            entry => allocateOmission(context.sessionID, entry),
+            beforeUpdate,
           ))
         ) {
           trimmed += 1;
@@ -236,10 +249,12 @@ async function pruneToolPart(
   context: PruneContext,
   part: ToolPart,
   allocate: (entry: { content: string }) => Promise<string>,
+  beforeUpdate: () => void,
 ): Promise<boolean> {
   const changed = await prepareToolPart(part, allocate);
   if (!changed) return false;
 
+  beforeUpdate();
   unwrap(
     await context.v2.part.update({
       sessionID: context.sessionID,

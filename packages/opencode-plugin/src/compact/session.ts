@@ -22,6 +22,7 @@ import {
   STATS_METADATA,
   statsMessage,
   trimStatsMessage,
+  type PreservedTurns,
 } from "../stats/constants";
 
 export type MagicCompactMetadata = {
@@ -271,6 +272,7 @@ export async function injectCompactStatsNotice(
   afterTokens: number,
   compactionCount: number,
   summarizedTurnCount: number,
+  preserved: PreservedTurns,
 ): Promise<void> {
   unwrap(
     await v2.session.prompt({
@@ -284,6 +286,7 @@ export async function injectCompactStatsNotice(
             beforeTokens,
             afterTokens,
             summarizedTurnCount,
+            preserved,
           ),
           ignored: true,
           metadata: STATS_METADATA,

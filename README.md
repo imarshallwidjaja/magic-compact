@@ -20,7 +20,7 @@ Instead of collapsing an entire session into a single generic summary, Magic Com
 
 Exact user messages remain in context. Magic Compact resolves the model and variant explicitly configured on OpenCode's native compaction agent plus its live provider limits once; it never silently falls back to the source session model. It estimates ordinary model-visible text with the local tokenizer, charges real file parts and tool attachments as typed media, and estimates `data:` strings embedded in tool values by encoded length without tokenizing their payloads. Selected turns stay chronological and whole, with exactly one target turn per generation request, a 400K normal estimated-input target scaled down for smaller models, and at most five independent requests in flight. The fixed 8K reserve covers only non-explicit host, system, and provider overhead. Separately, every batch tokenizes its complete rendered explicit request exactly once, including static instructions, the repeated global index, target JSON, conservative fixed-shape markers and marker injections, exact ordinals, media counts, punctuation, and any following-halo stop record.
 
-Each selected turn requires a fresh full-source fork and isolation, plus a request that repeats the fixed instructions, response schema, global index, and any optional neighboring context. Long histories therefore increase both model input and control work for copying, verifying, isolating, and deleting forks. The repeated index cost grows with both the number of selected targets and the number of indexed turns.
+Each selected turn requires a fresh full-source fork and isolation, plus a request that repeats the fixed instructions, response schema, global index, and any optional neighboring context. Long histories therefore increase both model input and control work for copying, verifying, isolating, and deleting forks. Each fork is populated by one host replay of the planned history rather than the host's native copy, so that work grows with the stored message and part count, and each fork rereads the source once to confirm it has not changed. The repeated index cost grows with both the number of selected targets and the number of indexed turns.
 
 Before batch execution, Magic Compact builds one immutable global orientation index from every complete turn in the effective post-checkpoint source history. This includes eligible targets, opaque existing-summary turns, and the retained complete tail, but excludes an active incomplete turn. Each `{sourceOrdinal, anchor}` entry contains only the stable one-based source-turn position and the escaped first ordinary user-text line capped at 160 characters. Every batch receives the same byte-identical map.
 
@@ -96,7 +96,9 @@ Compact and trim show a long-lived view-only progress toast while they run, then
 
 To compact, run `/magic-compact [N]` with an optional argument indicating how many turns to preserve.
 
-- `N` is the number of recent assistant turns to preserve as-is. Default: `0` (summarize everything).
+- `N` is the number of recent request turns to preserve whole. A request turn is one user request plus every assistant message and tool call that follows it until the next user request, so a single preserved turn can hold a large share of the context. Default: `0` (summarize everything, including the most recent complete turn). A trailing user request with no assistant reply is never counted.
+- Success feedback and the ignored compaction notice report how many request turns were summarized and how many whole turns `N` preserved. The no-op message also states the preserved turns whenever `N` kept any, as when `N` covers every eligible turn; run `/magic-compact 0` to include them.
+- The notice reports `Stored history (estimate)`: canonical counts of the whole stored session. A session with a native checkpoint stores a prefix that OpenCode does not send to the model, so these totals include that hidden prefix and can exceed the request size the model receives. They are estimates, not provider usage, and OpenCode's context meter can differ.
 - Task-aware retention runs first when any summarized turn has a tool call whose content pruning would change: one whole-session summary from the native compaction model, then one TypeSafe Jev judgment per such call. A call kept whole still counts toward the per-turn and overall savings checks, so keeping it can leave its turn unsummarized or fail the savings gate. A missing key or any summary or classification failure stops the command before generation, backup, or writes.
 - A backup session is created before the first source write. Pre-backup failures leave the current source unchanged, and every failure after backup creation preserves both the live source and its named backup for manual recovery.
 - Summary generation and the useful-savings projection run before backup creation without mutating the source. A backup still exists before the first durable compaction write.
@@ -106,7 +108,8 @@ To compact, run `/magic-compact [N]` with an optional argument indicating how ma
 Examples:
 
 - `/magic-compact` — summarize all old assistant turns.
-- `/magic-compact 3` — keep the 3 most recent assistant turns, summarize the rest.
+- `/magic-compact 1` — keep the most recent request turn whole, summarize the older eligible turns.
+- `/magic-compact 3` — keep the 3 most recent request turns whole, summarize the rest.
 
 ### Pending reverts
 
@@ -124,8 +127,9 @@ Run `/magic-trim [N] [--heuristic]` to apply the same tool I/O pruning rules wit
 - `N` preserves tool I/O in the most recent assistant turns. Default: `0` (trim all eligible turns).
 - By default, trimming applies task-aware retention like `/magic-compact`: when a tool call's content would change, it asks the native compaction model for one whole-session summary and TypeSafe Jev for one judgment per such call, then keeps confidently useful calls whole. A missing key or any summary or classification failure stops before the backup or any write.
 - `--heuristic` skips retention and makes no model or TypeSafe request. Trimming never generates turn summaries or creates a compaction boundary.
-- A backup session is created before trimming. When retention ran, the source must still match the history it was classified against, with no pending revert, before the first write; otherwise the backup is removed and the source is left unchanged. If no tool state changes, Magic Compact deletes that unnecessary backup before reporting the no-op; failures after mutation retain the existing promoted-backup recovery path.
+- A backup session is created before trimming. When retention ran, the source must still match the history it was classified against, with no pending revert, before the first write. Any failure before the first source write is attempted, including a failed source read, removes the unused backup and leaves the live source and any concurrent messages unchanged; if that removal fails, the error names both session IDs for manual cleanup. If no tool state changes, Magic Compact deletes that unnecessary backup before reporting the no-op. A failure once the first write has been attempted retains the existing promoted-backup recovery path.
 - Token reductions are included in `/magic-stats` on the exact canonical active-content basis. The ignored trim notice is stored for display but excluded from that model-facing count.
+- The trim notice reports `Stored history (estimate)` with the same meaning as the compaction notice. Trimming tool output that sits in a prefix a native checkpoint hides from the model reduces these stored totals even though the model's request does not change.
 
 Examples:
 
@@ -147,7 +151,7 @@ Held-out evaluation kept 10 unique calls, nine labelled useful, with 32% consens
 
 Run `/magic-stats` to show cumulative token savings for the current conversation. Net tokens physically pruned and inline-image tokens projected out of model requests are persisted and reported separately, as are their subsequent cache-read savings.
 
-Reported token counts are canonical active-content estimates, not provider usage. Model-facing before/after counts use the same pure manifest projection as OpenCode's request transform, include model-facing synthetic content such as the compaction boundary, exclude ignored user reporting notices including the notice that displays the count, and include ignored assistant text. OpenCode's context meter is a provider usage snapshot and can remain stale after in-place compaction until a later assistant response refreshes it. Magic Compact never mutates provider usage metadata or fabricates an after-provider count.
+Reported token counts are canonical active-content estimates, not provider usage. `/magic-stats` totals and the compact and trim notices all count the whole stored history, including any prefix a native checkpoint hides from the model, so they describe stored size rather than the request the model receives. Model-facing before/after counts use the same pure manifest projection as OpenCode's request transform, include model-facing synthetic content such as the compaction boundary, exclude ignored user reporting notices including the notice that displays the count, and include ignored assistant text. OpenCode's context meter is a provider usage snapshot and can remain stale after in-place compaction until a later assistant response refreshes it. Magic Compact never mutates provider usage metadata or fabricates an after-provider count.
 
 ### The Omitted Content Tool
 

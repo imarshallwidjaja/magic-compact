@@ -16,6 +16,9 @@ export type Turn = {
 export type CompactionPlan = {
   summarizedTurns: Turn[];
   nextTurn: Turn | null;
+  // Complete request turns kept whole by N; fewer than N when N exceeds the
+  // eligible turns.
+  preservedTurnCount: number;
   sourceTurnStartIndex: number;
   effectiveSourceTurnStartIndex: number;
   effectiveSourceTurnEndIndex: number;
@@ -106,6 +109,7 @@ export async function createCompactionPlan(
   return {
     summarizedTurns,
     nextTurn,
+    preservedTurnCount: turns.length - compactionEndIndex,
     sourceTurnStartIndex,
     effectiveSourceTurnStartIndex,
     effectiveSourceTurnEndIndex,

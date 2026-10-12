@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import type {
   Message,
@@ -31,7 +31,6 @@ import {
   compactionAgent,
   persistedForkHistory,
   providerCatalog,
-  rewriteFork,
   scoredJevFetch,
   SESSION_SUMMARY_TEXT,
   summaryReply,
@@ -455,7 +454,7 @@ describe("magic trim", () => {
       expect(notice.text).toContain(`Retention | ${HEURISTIC_FEEDBACK}`);
       expect(countCanonicalContentTokens(messages)).toBe(afterTokens);
       expect(notice.text).toContain("Magic Trim");
-      expect(notice.text).toContain("Context | ");
+      expect(notice.text).toContain("Stored history (estimate) | ");
       expect(notice.text).toContain("% trimmed (");
       expect(notice.text).toContain("Changes | Tool calls trimmed: 1");
       expect(notice.text).not.toContain("Cache Savings");
@@ -516,10 +515,10 @@ describe("magic trim", () => {
       message("usr_noop_delete", "user", []),
       message("ast_noop_delete", "assistant", [alreadyTrimmed]),
     ];
-    const before = structuredClone(messages);
     const harness = trimCommandHarness(sessionID, messages, {
       backupDeleteError: new Error("raw backup delete failure"),
     });
+    const before = structuredClone(messages);
     let failure: unknown;
 
     try {
@@ -680,7 +679,6 @@ describe("magic trim", () => {
           });
         });
       const harness = trimCommandHarness(sessionID, messages, {
-        persisted,
         partUpdateError: new Error("trim root failure"),
         selectError: new Error("raw select failure"),
       });
@@ -710,7 +708,7 @@ describe("magic trim", () => {
         expect(harness.toasts[1]?.message).toContain(sessionID);
         expect(harness.toasts[1]?.message).toContain(harness.backupID);
         if (persisted) {
-          const backup = harness.history!.read(harness.backupID);
+          const backup = harness.history.read(harness.backupID);
           expect(backup.map(item => item.info.role)).toEqual([
             "user",
             "assistant",
@@ -720,14 +718,14 @@ describe("magic trim", () => {
           );
         }
       } finally {
-        harness.history?.close();
+        harness.history.close();
         await cleanupTrimSessions(sessionID, harness.backupID);
       }
     },
   );
 
   test.each(["heuristic", "no-candidates"] as const)(
-    "preserves an independently appended source before replay-backed %s trim can recover a stale backup",
+    "preserves an independently appended source before a %s trim can recover a stale backup",
     async mode => {
       const sessionID = `ses_trim_replay_drift_${randomUUID().replaceAll("-", "")}`;
       const messages = [
@@ -759,11 +757,10 @@ describe("magic trim", () => {
       appended.info.time = { created: 20 };
       appended.parts[0]!.sessionID = sessionID;
       const harness = trimCommandHarness(sessionID, messages, {
-        persisted: true,
-        beforeFork: () => harness.history!.write(appended),
+        beforeFork: () => messages.push(appended),
         partUpdateError: new Error("injected trim failure"),
       });
-      const before = harness.history!.read(sessionID);
+      const before = structuredClone(messages);
       let failure: unknown;
       try {
         try {
@@ -776,20 +773,108 @@ describe("magic trim", () => {
         } catch (error) {
           failure = error;
         }
-        expect(harness.history!.read(sessionID)).toEqual([...before, appended]);
+        expect(messages).toEqual([...before, appended]);
         expect(harness.selectedSessions).toEqual([]);
         expect(harness.deletedSessions).toEqual([harness.backupID]);
         expect(String(failure)).toContain(
           "chronological fork initialization failed (source history changed)",
         );
-        expect(harness.history!.read(harness.backupID)).toEqual([]);
+        expect(harness.history.read(harness.backupID)).toEqual([]);
         expect(await readCache(harness.backupID)).toBeNull();
         expect(await readStats(harness.backupID)).toBeNull();
         expect(await readStats(sessionID)).toBeNull();
         expect(harness.modelCalls).toEqual([]);
         expect(harness.prompts).toEqual([]);
       } finally {
-        harness.history!.close();
+        harness.history.close();
+        await cleanupTrimSessions(sessionID, harness.backupID);
+      }
+    },
+  );
+
+  // The backup only becomes the recovery target once the first source write is
+  // attempted. A read that fails before then must not swap the stale backup in
+  // for a source that still holds a concurrently appended message.
+  test.each([
+    ["a heuristic trim", "heuristic", false],
+    ["a no-candidates trim", "no-candidates", false],
+    ["a heuristic trim with failed backup cleanup", "heuristic", true],
+  ] as const)(
+    "%s whose source read fails before its first write keeps the live source",
+    async (_name, mode, cleanupFails) => {
+      const sessionID = `ses_trim_prewrite_${randomUUID().replaceAll("-", "")}`;
+      const messages = [
+        message("usr_1", "user", [userText("usr_1", "Add the parser.")]),
+        message("ast_1", "assistant", [
+          completedTool(
+            "tool_1",
+            mode === "heuristic" ? "read" : "question",
+            "large output ".repeat(100),
+          ),
+        ]),
+      ];
+      const concurrent = message("usr_concurrent", "user", [
+        userText("usr_concurrent", "concurrent request"),
+      ]);
+      concurrent.info.sessionID = sessionID;
+      concurrent.info.time = { created: 50 };
+      concurrent.parts[0]!.sessionID = sessionID;
+      const readFailure = new Error("source history read failed");
+      const harness = trimCommandHarness(sessionID, messages, {
+        duringBackupMetadata: () => {
+          if (!messages.includes(concurrent)) messages.push(concurrent);
+        },
+        sourceReload: {
+          target: "messages",
+          read: async () => {
+            throw readFailure;
+          },
+        },
+        ...(cleanupFails
+          ? {
+              backupDeleteError: new Error(PRIVATE_BODY, {
+                cause: PRIVATE_BODY,
+              }),
+            }
+          : {}),
+      });
+      const before = structuredClone(messages);
+      let failure: unknown;
+
+      try {
+        try {
+          await executeMagicTrim(harness.v2, sessionID, 0, {
+            retention:
+              mode === "heuristic"
+                ? { mode: "heuristic" }
+                : { mode: "task-aware", apiKey: undefined },
+          });
+        } catch (error) {
+          failure = error;
+        }
+
+        if (cleanupFails) {
+          expect(failure).toBeInstanceOf(AggregateError);
+          expect((failure as AggregateError).errors[0]).toBe(readFailure);
+          expect(String(failure)).toContain(sessionID);
+          expect(String(failure)).toContain(harness.backupID);
+          expect(String(failure)).toContain("delete it manually");
+          expect(reachableStrings(failure).join("\n")).not.toContain(
+            PRIVATE_BODY,
+          );
+        } else {
+          expect(failure).toBe(readFailure);
+        }
+        expect(harness.partUpdates).toEqual([]);
+        expect(messages).toEqual([...before, concurrent]);
+        expect(harness.deletedSessions).toEqual([harness.backupID]);
+        expect(harness.selectedSessions).toEqual([]);
+        expect(harness.prompts).toEqual([]);
+        expect(await readStats(sessionID)).toBeNull();
+        expect(harness.toasts.at(-1)?.message).toContain(
+          "source history read failed",
+        );
+      } finally {
         await cleanupTrimSessions(sessionID, harness.backupID);
       }
     },
@@ -879,7 +964,7 @@ describe("magic trim task-aware retention", () => {
         part.messageID = item.info.id;
       });
     });
-    const harness = trimCommandHarness(sessionID, source, { persisted: true });
+    const harness = trimCommandHarness(sessionID, source);
     const originalUser = structuredClone(source[0]);
     const retention = {
       mode: "task-aware" as const,
@@ -889,16 +974,16 @@ describe("magic trim task-aware retention", () => {
     try {
       for (const attempt of [0, 1]) {
         if (attempt === 1) {
-          const assistant = harness.history!.read(sessionID)[6]!;
+          const assistant = source[6]!;
           const part = readTool("read_new", "new obsolete listing");
           part.sessionID = sessionID;
           part.messageID = assistant.info.id;
-          harness.history!.updatePart(part);
+          assistant.parts.push(part);
         }
         await expect(
           executeMagicTrim(harness.v2, sessionID, 0, { retention }),
         ).resolves.toBe(true);
-        const backup = harness.history!.read(harness.backupID);
+        const backup = harness.history.read(harness.backupID);
         expect(backup.slice(0, 7).map(item => item.info.role)).toEqual(
           source.slice(0, 7).map(item => item.info.role),
         );
@@ -907,7 +992,7 @@ describe("magic trim task-aware retention", () => {
           type: "text",
           text: "Keep the exact user request.",
         });
-        expect(harness.history!.read(sessionID)[0]).toEqual(originalUser);
+        expect(source[0]).toEqual(originalUser);
         expect((backup[6]!.info as { parentID: string }).parentID).toBe(
           backup[0]!.info.id,
         );
@@ -917,7 +1002,7 @@ describe("magic trim task-aware retention", () => {
       ).toHaveLength(2);
       expect(harness.selectedSessions).toEqual([]);
     } finally {
-      harness.history!.close();
+      harness.history.close();
       await cleanupTrimSessions(sessionID, harness.backupID);
     }
   });
@@ -978,9 +1063,9 @@ describe("magic trim task-aware retention", () => {
       message("usr_2", "user", [userText("usr_2", "Now fix its tests.")]),
       message("ast_2", "assistant", []),
     ];
-    const usefulBefore = structuredClone(useful);
     const calls: JevCall[] = [];
     const harness = trimCommandHarness(sessionID, messages);
+    const usefulBefore = structuredClone(useful);
 
     try {
       await expect(
@@ -996,10 +1081,13 @@ describe("magic trim task-aware retention", () => {
         }),
       ).resolves.toBeTrue();
 
-      expect(useful).toEqual(usefulBefore);
-      if (stale.state.status !== "completed") throw new Error("completed");
-      expect(stale.state.output).toContain("Historical read contents omitted");
-      expect(stale.state.metadata["magicCompact"]).toEqual({ trimmed: true });
+      expect(storedTool(harness.messages, "tool_useful")).toEqual(usefulBefore);
+      const trimmed = storedTool(harness.messages, "tool_stale");
+      if (trimmed.state.status !== "completed") throw new Error("completed");
+      expect(trimmed.state.output).toContain(
+        "Historical read contents omitted",
+      );
+      expect(trimmed.state.metadata["magicCompact"]).toEqual({ trimmed: true });
       expect(calls.map(call => call.candidate.output.slice(0, 6))).toEqual([
         "useful",
         "stale ",
@@ -1039,8 +1127,8 @@ describe("magic trim task-aware retention", () => {
           readTool("tool_read", "large output ".repeat(100)),
         ]),
       ];
-      const before = structuredClone(messages);
       const harness = trimCommandHarness(sessionID, messages);
+      const before = structuredClone(messages);
       try {
         expect(
           await executeMagicTrim(harness.v2, sessionID, 0, {
@@ -1126,8 +1214,86 @@ describe("magic trim task-aware retention", () => {
 
       expect(harness.modelCalls).toEqual([]);
       expect(harness.forks).toEqual([harness.backupID]);
-      if (tool.state.status !== "completed") throw new Error("completed");
-      expect(tool.state.output).toContain("Historical read contents omitted");
+      const trimmed = storedTool(harness.messages, "tool_read");
+      if (trimmed.state.status !== "completed") throw new Error("completed");
+      expect(trimmed.state.output).toContain(
+        "Historical read contents omitted",
+      );
+    } finally {
+      await cleanupTrimSessions(sessionID, harness.backupID);
+    }
+  });
+
+  // A native checkpoint can retain a tail that starts at the assistant carrying
+  // a media capsule while its images stay in the hidden prefix. The stored
+  // history is valid and trim counts stored history, so it must succeed and
+  // report the whole stored totals.
+  test("trims a stored history whose native retained tail starts at a media capsule", async () => {
+    const sessionID = `ses_trim_media_tail_${randomUUID().replaceAll("-", "")}`;
+    const url = "data:image/png;base64,Zm9v";
+    const messages = [
+      message("usr_media", "user", [
+        userText("usr_media", "review"),
+        {
+          id: "prt_image",
+          sessionID: "session",
+          messageID: "usr_media",
+          type: "file",
+          mime: "image/png",
+          url,
+        } as Part,
+      ]),
+      message("ast_media", "assistant", [
+        {
+          ...userText("ast_media", "Historical summary"),
+          id: "prt_-magic_capsule_v3_ast_media",
+          metadata: {
+            magicCompact: {
+              summary: true,
+              capsule: true,
+              agentic: true,
+              version: 3,
+              mediaManifest: {
+                version: 1,
+                images: [
+                  {
+                    ordinal: 1,
+                    mime: "image/png",
+                    urlSha256: createHash("sha256").update(url).digest("hex"),
+                  },
+                ],
+              },
+            },
+          },
+        },
+        readTool("tool_read", "large output ".repeat(100)),
+      ]),
+      ...checkpointedSession()
+        .slice(4)
+        .map(item => structuredClone(item)),
+    ];
+    const marker = messages.find(item => item.info.id === "usr_marker")!;
+    (marker.parts[0] as unknown as { tail_start_id: string }).tail_start_id =
+      "ast_media";
+    const harness = trimCommandHarness(sessionID, messages);
+    const storedBefore = countCanonicalContentTokens(messages);
+
+    try {
+      expect(
+        await executeMagicTrim(harness.v2, sessionID, 0, HEURISTIC_OPTIONS),
+      ).toBeTrue();
+
+      const notice = messages
+        .at(-1)!
+        .parts.find((part): part is TextPart => part.type === "text")!;
+      const storedAfter = countCanonicalContentTokens(messages);
+      expect(storedAfter).toBeLessThan(storedBefore);
+      expect(notice.text).toBe(
+        trimStatsMessage(storedBefore, storedAfter, 2, HEURISTIC_FEEDBACK),
+      );
+      expect((await readStats(sessionID))?.totalTokensPruned).toBe(
+        storedBefore - storedAfter,
+      );
     } finally {
       await cleanupTrimSessions(sessionID, harness.backupID);
     }
@@ -1146,8 +1312,8 @@ describe("magic trim task-aware retention", () => {
           readTool("tool_read", "large output ".repeat(100)),
         ]),
       ];
-      const before = structuredClone(messages);
       const harness = trimCommandHarness(sessionID, messages);
+      const before = structuredClone(messages);
       let failure: unknown;
 
       try {
@@ -1186,29 +1352,47 @@ describe("magic trim task-aware retention", () => {
     },
   );
 
-  test.each(["source drift", "a pending revert"] as const)(
-    "%s during classification fails before writes and removes the backup",
-    async change => {
+  test.each([
+    [
+      "source drift during classification",
+      "summary",
+      "chronological fork initialization failed (source history changed)",
+    ],
+    [
+      "source drift while the backup is initialized",
+      "backup",
+      "OpenCode source changed during Magic Trim",
+    ],
+    ["a pending revert during classification", "revert", TRIM_PENDING_REVERT],
+  ] as const)(
+    "%s fails before writes and removes the backup",
+    async (_name, when, expected) => {
       const sessionID = `ses_trim_retention_race_${randomUUID().replaceAll("-", "")}`;
       const tool = readTool("tool_read", "large output ".repeat(100));
       const messages = [
         message("usr_1", "user", [userText("usr_1", "Add the parser.")]),
         message("ast_1", "assistant", [tool]),
       ];
-      const toolBefore = structuredClone(tool);
+      const appendConcurrent = () => {
+        const concurrent = message("usr_concurrent", "user", [
+          userText("usr_concurrent", "concurrent request"),
+        ]);
+        concurrent.info.sessionID = sessionID;
+        concurrent.info.time = { created: 50 };
+        concurrent.parts[0]!.sessionID = sessionID;
+        messages.push(concurrent);
+      };
       const harness = trimCommandHarness(sessionID, messages, {
         duringSummary: () => {
-          if (change === "source drift") {
-            messages.push(
-              message("usr_concurrent", "user", [
-                userText("usr_concurrent", "concurrent request"),
-              ]),
-            );
-          } else {
-            harness.setRevert({ messageID: "ast_1" });
-          }
+          if (when === "summary") appendConcurrent();
+          if (when === "revert") harness.setRevert({ messageID: "ast_1" });
+        },
+        // The backup fork has already rechecked the source by this update.
+        duringBackupMetadata: () => {
+          if (when === "backup") appendConcurrent();
         },
       });
+      const toolBefore = structuredClone(tool);
 
       try {
         await expect(
@@ -1219,11 +1403,7 @@ describe("magic trim task-aware retention", () => {
               fetch: scoredJevFetch(() => 0.1),
             },
           }),
-        ).rejects.toThrow(
-          change === "source drift"
-            ? "OpenCode source changed during Magic Trim"
-            : TRIM_PENDING_REVERT,
-        );
+        ).rejects.toThrow(expected);
 
         expect(tool).toEqual(toolBefore);
         expect(harness.deletedSessions).toEqual([
@@ -1265,7 +1445,6 @@ describe("magic trim task-aware retention", () => {
           readTool("tool_read", "large output ".repeat(100)),
         ]),
       ];
-      const before = structuredClone(messages);
       const harness = trimCommandHarness(sessionID, messages, {
         sourceReload: {
           target,
@@ -1292,6 +1471,7 @@ describe("magic trim task-aware retention", () => {
             }
           : {}),
       });
+      const before = structuredClone(messages);
       let failure: unknown;
 
       try {
@@ -1356,7 +1536,6 @@ function reachableStrings(value: unknown, seen = new Set<unknown>()): string[] {
 }
 
 type TrimCommandHarnessOptions = {
-  persisted?: boolean;
   toastMode?: "hang" | "fail";
   partUpdateError?: Error;
   selectError?: Error;
@@ -1364,7 +1543,9 @@ type TrimCommandHarnessOptions = {
   beforeFork?: () => void;
   // Runs while the retention summary request is in flight.
   duringSummary?: () => void;
-  // Replaces source reads made after the retention summary.
+  // Runs when the backup's metadata is written, after its source recheck.
+  duringBackupMetadata?: () => void;
+  // Replaces source reads made after the backup is initialized.
   sourceReload?: {
     target: "messages" | "session";
     read: () => Promise<unknown>;
@@ -1376,9 +1557,18 @@ function trimCommandHarness(
   messages: MessageWithParts[],
   options: TrimCommandHarnessOptions = {},
 ) {
-  const history = options.persisted
-    ? persistedForkHistory(messages)
-    : undefined;
+  // The host stores every message under its session with a creation time.
+  // `messages` is the live source; its records are copied into the host fake
+  // when a fork is requested.
+  messages.forEach((item, index) => {
+    item.info.sessionID = sessionID;
+    item.info.time ??= { created: index + 1 };
+    for (const part of item.parts) {
+      part.sessionID = sessionID;
+      part.messageID = item.info.id;
+    }
+  });
+  const history = persistedForkHistory(messages);
   const backupID = `${sessionID}_backup`;
   const sourceSession = {
     id: sessionID,
@@ -1392,9 +1582,9 @@ function trimCommandHarness(
   const forks: string[] = [];
   const modelCalls: string[] = [];
   const summaryForkID = `${sessionID}_summary`;
-  let summaryFork: MessageWithParts[] | undefined;
-  let backupFork: MessageWithParts[] | undefined;
   let summaryReady = false;
+  let backupInitialized = false;
+  const partUpdates: string[] = [];
   let revert: { messageID: string } | undefined;
   let noticeCount = 0;
   const v2 = {
@@ -1416,25 +1606,19 @@ function trimCommandHarness(
         if (
           request.sessionID === sessionID
           && options.sourceReload?.target === "messages"
-          && modelCalls.includes("summary")
+          && backupInitialized
         ) {
           return options.sourceReload.read();
         }
         return {
-          data: history
-            ? history.read(request.sessionID)
-            : request.sessionID === summaryForkID
-              ? structuredClone(summaryFork)
-              : request.sessionID === backupID
-                ? structuredClone(backupFork)
-                : messages,
+          data:
+            request.sessionID === sessionID
+              ? structuredClone(messages)
+              : history.read(request.sessionID),
         };
       },
       get: async () => {
-        if (
-          options.sourceReload?.target === "session"
-          && modelCalls.includes("summary")
-        ) {
+        if (options.sourceReload?.target === "session" && backupInitialized) {
           return options.sourceReload.read();
         }
         return {
@@ -1448,15 +1632,21 @@ function trimCommandHarness(
         summaryReady = false;
         const id = summaryRun ? summaryForkID : backupID;
         forks.push(id);
-        if (summaryRun) summaryFork = rewriteFork(messages, id);
-        else backupFork = rewriteFork(messages, id);
-        history?.delete(id);
-        history?.fork(sessionID, id, request.messageID);
+        history.delete(sessionID);
+        messages.forEach((item, index) => history.write(item, index));
+        history.delete(id);
+        history.fork(sessionID, id, request.messageID);
         return { data: { ...sourceSession, id } as Session };
       },
-      update: async (request: { sessionID: string }) => ({
-        data: { ...sourceSession, id: request.sessionID } as Session,
-      }),
+      update: async (request: { sessionID: string }) => {
+        if (request.sessionID === backupID) {
+          options.duringBackupMetadata?.();
+          backupInitialized = true;
+        }
+        return {
+          data: { ...sourceSession, id: request.sessionID } as Session,
+        };
+      },
       abort: async () => ({ data: true }),
       prompt: async (request: {
         sessionID: string;
@@ -1467,12 +1657,11 @@ function trimCommandHarness(
         if (request.sessionID === summaryForkID) {
           modelCalls.push("summary");
           options.duringSummary?.();
-          const fork = history ? history.read(summaryForkID) : summaryFork!;
+          const fork = history.read(summaryForkID);
           const reply = summaryReply(fork, request, summaryForkID);
-          if (history)
-            fork
-              .slice(-2)
-              .forEach((item, index) => history.write(item, 100 + index));
+          fork
+            .slice(-2)
+            .forEach((item, index) => history.write(item, 100 + index));
           return reply;
         }
         prompts.push(request);
@@ -1484,25 +1673,15 @@ function trimCommandHarness(
           sessionID,
           messageID,
         })) as Part[];
-        messages.push(message(messageID, "user", parts));
-        if (history)
-          history.write(
-            {
-              info: {
-                ...messages.at(-1)!.info,
-                sessionID,
-                time: { created: 100 + noticeCount },
-              },
-              parts,
-            },
-            100 + noticeCount,
-          );
+        const notice = message(messageID, "user", parts);
+        notice.info.sessionID = sessionID;
+        notice.info.time = { created: 100 + noticeCount };
+        messages.push(notice);
         return { data: { info: { id: messageID }, parts } };
       },
       delete: async (request: { sessionID: string }) => {
         deletedSessions.push(request.sessionID);
-        if (request.sessionID === summaryForkID) summaryFork = [];
-        history?.delete(request.sessionID);
+        history.delete(request.sessionID);
         if (request.sessionID === backupID && options.backupDeleteError) {
           throw options.backupDeleteError;
         }
@@ -1511,16 +1690,25 @@ function trimCommandHarness(
     },
     part: {
       update: async (request: { part: Part }) => {
+        partUpdates.push(request.part.id);
         if (options.partUpdateError) throw options.partUpdateError;
-        history?.updatePart(request.part);
+        const stored = messages.find(
+          item => item.info.id === request.part.messageID,
+        );
+        const index = stored?.parts.findIndex(
+          item => item.id === request.part.id,
+        );
+        if (stored && index !== undefined && index >= 0)
+          stored.parts[index] = request.part;
+        else stored?.parts.push(request.part);
         return { data: request.part };
       },
     },
     sync: {
       replay: async (request: {
-        events: Parameters<NonNullable<typeof history>["replay"]>[0];
+        events: Parameters<typeof history.replay>[0];
       }) => {
-        history!.replay(request.events);
+        history.replay(request.events);
         return { data: { sessionID: request.events[0]!.aggregateID } };
       },
     },
@@ -1549,6 +1737,7 @@ function trimCommandHarness(
     toasts,
     selectedSessions,
     deletedSessions,
+    partUpdates,
     forks,
     modelCalls,
     history,
@@ -1632,6 +1821,15 @@ function turn(...parts: Part[]): Turn {
   };
 }
 
+// The stored copy of a tool part; the host never edits the caller's objects.
+function storedTool(messages: MessageWithParts[], id: string): ToolPart {
+  const part = messages
+    .flatMap(item => item.parts)
+    .find((item): item is ToolPart => item.type === "tool" && item.id === id);
+  if (!part) throw new Error(`Missing stored tool ${id}.`);
+  return part;
+}
+
 function readTool(id: string, output: string): ToolPart {
   return completedTool(id, "read", output);
 }
@@ -1666,6 +1864,44 @@ function taskTool(id: string, prompt: string): ToolPart {
     prompt,
   };
   return tool;
+}
+
+// Hidden prefix, a retained tail and a completed native checkpoint, then a
+// suffix turn.
+function checkpointedSession(): MessageWithParts[] {
+  const marker = message("usr_marker", "user", [
+    {
+      id: "prt_marker",
+      sessionID: "session",
+      messageID: "usr_marker",
+      type: "compaction",
+      auto: true,
+      tail_start_id: "usr_tail",
+    } as unknown as Part,
+  ]);
+  const summary = message("ast_summary", "assistant", [
+    { ...userText("ast_summary", "checkpoint"), id: "prt_summary" },
+  ]);
+  summary.info = {
+    ...summary.info,
+    parentID: "usr_marker",
+    summary: true,
+    finish: "stop",
+  } as Message;
+  return [
+    message("usr_hidden", "user", [userText("usr_hidden", "hidden request")]),
+    message("ast_hidden", "assistant", [
+      readTool("tool_hidden", "hidden history ".repeat(400)),
+    ]),
+    message("usr_tail", "user", [userText("usr_tail", "retained request")]),
+    message("ast_tail", "assistant", [userText("ast_tail", "retained answer")]),
+    marker,
+    summary,
+    message("usr_suffix", "user", [userText("usr_suffix", "latest request")]),
+    message("ast_suffix", "assistant", [
+      readTool("tool_suffix", "latest history ".repeat(400)),
+    ]),
+  ];
 }
 
 function v0SummaryPartID(messageID: string): string {

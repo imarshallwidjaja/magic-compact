@@ -43,16 +43,32 @@ function contextReductionLine(
   return `${formatTokenCount(beforeTokens)} → ${formatTokenCount(afterTokens)} tokens | ${percent}% trimmed (~${formatTokenCount(savedTokens)} removed)`;
 }
 
+export type PreservedTurns = { requested: number; preserved: number };
+
+export function preservedTurnsFeedback({
+  requested,
+  preserved,
+}: PreservedTurns): string {
+  if (preserved === 0) return `N=${requested} preserved no request turns.`;
+  return `N=${requested} preserved ${preserved} recent request turn(s) whole. A request turn is one user request plus every assistant and tool step until the next user request; /magic-compact 0 also summarizes the most recent turn.`;
+}
+
+// Counts cover the whole stored history, including any prefix a native
+// checkpoint hides from the model, so they are not the model's request size.
+const CONTEXT_LABEL = "Stored history (estimate)";
+
 export function statsMessage(
   compactionCount: number,
   beforeTokens: number,
   afterTokens: number,
   summarizedTurnCount: number,
+  preserved: PreservedTurns,
 ): string {
   return [
     `Magic Compaction #${compactionCount}`,
-    `Context | ${contextReductionLine(beforeTokens, afterTokens)}`,
-    `Changes | Assistant turns summarized: ${summarizedTurnCount}`,
+    `${CONTEXT_LABEL} | ${contextReductionLine(beforeTokens, afterTokens)}`,
+    `Changes | Request turns summarized: ${summarizedTurnCount}`,
+    `Preserved | ${preservedTurnsFeedback(preserved)}`,
   ].join("\n");
 }
 
@@ -64,7 +80,7 @@ export function trimStatsMessage(
 ): string {
   return [
     "Magic Trim",
-    `Context | ${contextReductionLine(beforeTokens, afterTokens)}`,
+    `${CONTEXT_LABEL} | ${contextReductionLine(beforeTokens, afterTokens)}`,
     `Changes | Tool calls trimmed: ${trimmedToolCallCount}`,
     `Retention | ${retentionFeedback}`,
   ].join("\n");
