@@ -2,6 +2,11 @@ import type { AssistantMessage, Message, Part } from "@opencode-ai/sdk/v2";
 import { isDeepStrictEqual } from "node:util";
 import { unwrap, type V2Client } from "../api";
 import { isRecord } from "../util";
+import {
+  compactionTurnRange,
+  groupTurns,
+  trimmedTurnRange,
+} from "../policy/turns";
 
 export type MessageWithParts = {
   info: Message;
@@ -25,10 +30,6 @@ export type CompactionPlan = {
   sourceSnapshot: SourceSnapshot;
 };
 
-export type CompactionSourceInsertion =
-  | { type: "part"; messageID: string; part: Part }
-  | { type: "message"; messageID: string; parts: Part[] };
-
 export type SourceSnapshot = Array<{ info: unknown; parts: unknown[] }>;
 
 export class NativeCheckpointChangedError extends Error {
@@ -36,26 +37,6 @@ export class NativeCheckpointChangedError extends Error {
     const detail = cause instanceof Error ? ` ${cause.message}` : "";
     super(`OpenCode source changed during Magic Compact.${detail}`, { cause });
     this.name = "NativeCheckpointChangedError";
-  }
-}
-
-export class CompactionPruneSourceDriftError extends Error {
-  constructor(cause?: unknown) {
-    const detail = cause instanceof Error ? ` ${cause.message}` : "";
-    super(
-      `OpenCode source changed after summary insertion and before pruning.${detail}`,
-      { cause },
-    );
-    this.name = "CompactionPruneSourceDriftError";
-  }
-}
-
-export class TrimSourceChangedError extends Error {
-  constructor() {
-    super(
-      "OpenCode source changed during Magic Trim; the source session was left unchanged.",
-    );
-    this.name = "TrimSourceChangedError";
   }
 }
 
@@ -70,7 +51,13 @@ export async function createCompactionPlan(
   sessionID: string,
   keepTurns: number,
 ): Promise<CompactionPlan> {
-  const messages = await loadMessages(v2, sessionID);
+  return planCompaction(await loadMessages(v2, sessionID), keepTurns);
+}
+
+export function planCompaction(
+  messages: MessageWithParts[],
+  keepTurns: number,
+): CompactionPlan {
   const sourceTurns = buildTurns(messages);
   const { summaryIndex } = inspectNativeCheckpoints(messages);
   const suffixStart = summaryIndex === null ? 0 : summaryIndex + 1;
@@ -79,8 +66,6 @@ export async function createCompactionPlan(
   const boundaryTurnIndex = turns.findLastIndex(turn =>
     turn.user.some(msg => msg.parts.some(isBoundaryPart)),
   );
-  const compactionStartIndex = boundaryTurnIndex === -1 ? 0 : boundaryTurnIndex;
-
   removeTrailingAssistantlessTurn(turns);
 
   const firstEffectiveTurn = turns[0];
@@ -95,10 +80,9 @@ export async function createCompactionPlan(
   const effectiveSourceTurnEndIndex =
     effectiveSourceTurnStartIndex + turns.length;
 
-  const compactionEndIndex =
-    keepTurns <= 0
-      ? turns.length
-      : Math.max(compactionStartIndex, turns.length - keepTurns);
+  const range = compactionTurnRange(turns.length, boundaryTurnIndex, keepTurns);
+  const compactionStartIndex = range.start;
+  const compactionEndIndex = range.end;
 
   const summarizedTurns = turns.slice(compactionStartIndex, compactionEndIndex);
 
@@ -109,7 +93,7 @@ export async function createCompactionPlan(
   return {
     summarizedTurns,
     nextTurn,
-    preservedTurnCount: turns.length - compactionEndIndex,
+    preservedTurnCount: range.preserved,
     sourceTurnStartIndex,
     effectiveSourceTurnStartIndex,
     effectiveSourceTurnEndIndex,
@@ -122,29 +106,18 @@ export async function createTrimPlan(
   sessionID: string,
   keepTurns: number,
 ): Promise<TrimPlan> {
-  const messages = await loadMessages(v2, sessionID);
-  const turns = buildTurns(messages);
-  removeTrailingAssistantlessTurn(turns);
-  const trimEndIndex = Math.max(0, turns.length - keepTurns);
+  return planTrim(await loadMessages(v2, sessionID), keepTurns);
+}
 
+export function planTrim(
+  messages: MessageWithParts[],
+  keepTurns: number,
+): TrimPlan {
   return {
-    trimmedTurns: turns.slice(0, trimEndIndex),
+    trimmedTurns: trimmedTurnRange(buildTurns(messages), keepTurns),
     messages,
     sourceSnapshot: snapshotSourceMessages(messages),
   };
-}
-
-// Trim spans the whole session and never validates native checkpoints, so
-// its drift guard compares the same normalized fields without inspecting them.
-export function assertTrimSourceUnchanged(
-  messages: MessageWithParts[],
-  plan: TrimPlan,
-): void {
-  if (
-    !isDeepStrictEqual(snapshotSourceMessages(messages), plan.sourceSnapshot)
-  ) {
-    throw new TrimSourceChangedError();
-  }
 }
 
 async function loadMessages(
@@ -159,28 +132,11 @@ async function loadMessages(
 }
 
 export function buildTurns(messages: MessageWithParts[]): Turn[] {
-  const turns: Turn[] = [];
-  let currentTurn: Turn | null = null;
-
-  for (const message of messages) {
-    if (message.info.role === "user") {
-      if (currentTurn && currentTurn.assistants.length > 0) {
-        currentTurn = null;
-      }
-      if (!currentTurn) {
-        currentTurn = { user: [], assistants: [] };
-        turns.push(currentTurn);
-      }
-      currentTurn.user.push(message);
-      continue;
-    }
-
-    if (message.info.role === "assistant" && currentTurn) {
-      currentTurn.assistants.push(message);
-    }
-  }
-
-  return turns;
+  return groupTurns(messages, message =>
+    message.info.role === "user" || message.info.role === "assistant"
+      ? message.info.role
+      : "other",
+  );
 }
 
 export function assertCompactionSourceUnchanged(
@@ -214,59 +170,6 @@ export function assertForkMessageShape(
     ) {
       throw new Error("Compaction generation fork history shape mismatch.");
     }
-  }
-}
-
-export function assertCompactionSourceAfterInsertions(
-  messages: MessageWithParts[],
-  plan: CompactionPlan,
-  insertions: CompactionSourceInsertion[],
-): void {
-  const remaining = structuredClone(messages);
-  for (const insertion of insertions) {
-    if (insertion.type === "message") {
-      const matches = remaining
-        .map((message, index) => ({ message, index }))
-        .filter(item => item.message.info.id === insertion.messageID);
-      if (
-        matches.length !== 1
-        || matches[0]!.message.info.role !== "user"
-        || !isDeepStrictEqual(
-          matches[0]!.message.parts.map(sourcePart),
-          insertion.parts.map(sourcePart),
-        )
-      ) {
-        throw new CompactionPruneSourceDriftError();
-      }
-      remaining.splice(matches[0]!.index, 1);
-      continue;
-    }
-
-    const messageMatches = remaining.filter(
-      message => message.info.id === insertion.messageID,
-    );
-    if (messageMatches.length !== 1) {
-      throw new CompactionPruneSourceDriftError();
-    }
-    const message = messageMatches[0]!;
-    const partMatches = message.parts
-      .map((part, index) => ({ part, index }))
-      .filter(item => item.part.id === insertion.part.id);
-    if (
-      partMatches.length !== 1
-      || !isDeepStrictEqual(
-        sourcePart(partMatches[0]!.part),
-        sourcePart(insertion.part),
-      )
-    ) {
-      throw new CompactionPruneSourceDriftError();
-    }
-    message.parts.splice(partMatches[0]!.index, 1);
-  }
-  try {
-    assertCompactionSourceUnchanged(remaining, plan);
-  } catch (error) {
-    throw new CompactionPruneSourceDriftError(error);
   }
 }
 

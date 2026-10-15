@@ -15,7 +15,7 @@ function formatTokenCount(tokens: number): string {
 }
 
 const PROVIDER_METER_NOTE =
-  "Counts are canonical active-content estimates; this ignored reporting notice is excluded. They are not provider usage. OpenCode's context meter is a provider usage snapshot and can stay stale after in-place compaction until a later assistant response refreshes it.";
+  "Counts are canonical active-content estimates; this ignored reporting notice is excluded. They are not provider usage. OpenCode's context meter is a provider usage snapshot; in a successor session it can show the copied last response's usage until a later assistant response refreshes it.";
 
 export function statsSummaryMessage(
   compactionCount: number,

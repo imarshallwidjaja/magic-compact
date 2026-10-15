@@ -10,7 +10,7 @@ import {
   type MessageWithParts,
 } from "../src/compact/plan";
 import { trimWouldChangeContent } from "../src/compact/prune";
-import server from "../src/index";
+import server from "../src/host-v1";
 import {
   decideRetention,
   findRetentionCandidates,
@@ -23,7 +23,7 @@ import {
   SessionSummaryError,
 } from "../src/retention/summary";
 import {
-  compactionAgent,
+  summarizerAgent,
   persistedForkHistory,
   providerCatalog,
   SESSION_SUMMARY_TEXT,
@@ -732,7 +732,7 @@ describe("retention session summary", () => {
     expect(failed.calls).toEqual(["fork:source", "delete:fork-1"]);
   });
 
-  test("prompts one deny-all fork of the whole session through the native compaction agent", async () => {
+  test("prompts one deny-all fork of the whole session through the summarizer agent", async () => {
     const host = summaryHost(sourceHistory());
     let ownedDuringPrompt = false;
     host.onPrompt = async forkID => {
@@ -752,8 +752,8 @@ describe("retention session summary", () => {
     const prompt = host.prompts[0]!;
     expect(prompt).toMatchObject({
       sessionID: "fork-1",
-      agent: "compaction",
-      model: compactionAgent().model,
+      agent: "magic-compact-summarizer",
+      model: summarizerAgent().model,
       variant: "low",
       parts: [{ type: "text", text: SESSION_SUMMARY_PROMPT }],
     });
@@ -1392,7 +1392,7 @@ function summaryHost(
     v2: undefined as unknown as V2Client,
   };
   host.v2 = {
-    app: { agents: async () => ({ data: [compactionAgent()] }) },
+    app: { agents: async () => ({ data: [summarizerAgent()] }) },
     provider: {
       list: async () => ({
         data: providerCatalog(catalog.limit, catalog.image),

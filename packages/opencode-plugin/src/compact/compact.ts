@@ -4,10 +4,8 @@ import type {
   Session,
   TextPart,
 } from "@opencode-ai/sdk/v2";
-import { randomBytes } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { unwrap, type V2Client } from "../api";
-import { countGptTokens } from "../stats/tokenize";
 import {
   attemptWithinDeadline,
   CONTROL_OPERATION_TIMEOUT_MS,
@@ -17,7 +15,6 @@ import {
   MAGIC_COMPACT_SUMMARIZER_AGENT,
   boundaryPartID,
   summaryEnvelopePartID,
-  summaryEnvelopeTextPart,
   turnHasPersistedSummary,
 } from "./constants";
 import {
@@ -32,6 +29,32 @@ import {
   type NativeGenerationBatch,
 } from "./batch";
 import { createMediaManifest, type MediaManifest } from "./media";
+import {
+  buildGenerationPrompt,
+  capCodePoints,
+  containsString,
+  createGenerationNonce,
+  diagnosticCategories,
+  diagnosticChain,
+  estimateGenerationExplicitRequestTokens,
+  estimateGenerationResponseProtocolTokens,
+  frameSummary,
+  GENERATION_RESPONSE_SCHEMA,
+  GenerationMarkerNonceCollisionError,
+  GenerationResponseValidationError,
+  generationTurnMarker,
+  type GenerationTurnResult,
+  GLOBAL_ANCHOR_CHARACTER_LIMIT,
+  globalTurnIndexPrompt,
+  isContextOverflow,
+  isOutputTruncation,
+  parseGenerationResponse,
+  safeStatus,
+  selectGenerationNonce,
+  validationCategoryText,
+  validationFailure,
+} from "../policy/generation";
+
 import { ForkCleanupError, ForkHistoryError, forkSession } from "./fork";
 import {
   assertForkMessageShape,
@@ -46,50 +69,12 @@ const GENERATION_PERMISSION: PermissionRuleset = [
   { permission: "*", pattern: "*", action: "deny" },
   { permission: "StructuredOutput", pattern: "*", action: "allow" },
 ];
-// Every generation request owns one target turn, so the schema asks for one
-// result. OpenCode transmits it as the model-visible StructuredOutput tool
-// schema without enforcing it; parseGenerationResponse remains the authority.
+// OpenCode transmits the response schema as the model-visible
+// StructuredOutput tool schema without enforcing it.
 const GENERATION_FORMAT = {
   type: "json_schema" as const,
-  schema: {
-    type: "object",
-    properties: {
-      turns: {
-        type: "array",
-        minItems: 1,
-        maxItems: 1,
-        items: {
-          type: "object",
-          properties: {
-            ordinal: { type: "integer" },
-            marker: { type: "string" },
-            summary: { type: "string" },
-            visualDescriptions: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  ordinal: { type: "integer" },
-                  description: { type: "string" },
-                },
-                required: ["ordinal", "description"],
-                additionalProperties: false,
-              },
-            },
-          },
-          required: ["ordinal", "marker", "summary", "visualDescriptions"],
-          additionalProperties: false,
-        },
-      },
-    },
-    required: ["turns"],
-    additionalProperties: false,
-  },
+  schema: GENERATION_RESPONSE_SCHEMA,
 };
-const GLOBAL_ANCHOR_CHARACTER_LIMIT = 160;
-const GENERATION_NONCE_ATTEMPTS = 8;
-const GENERATION_NONCE_PATTERN = /^[A-Za-z0-9_-]{22}$/u;
-
 export type CompactionSettings = {
   model: { providerID: string; modelID: string };
   variant?: string;
@@ -113,12 +98,10 @@ type GenerationCandidate = {
 type GenerationBatchPlan = NativeGenerationBatch<GenerationCandidate> & {
   retainedMessageIndexes: number[];
   targetUserMessageIndexes: number[];
-  followingHalo?: { userMessageIndex: number };
 };
 
 type GenerationBatch = GenerationBatchPlan & {
   generationNonce: string;
-  stopMarker: string;
   prompt: string;
 };
 
@@ -134,11 +117,6 @@ type ForkMessageIdentity = {
     type: string;
     tailStartID: string | undefined;
   }>;
-};
-
-type GenerationTurnResult = {
-  summary: string;
-  visualDescriptions: Array<{ ordinal: number; description: string }>;
 };
 
 type SummaryGenerationOptions = {
@@ -166,6 +144,23 @@ export type GeneratedSummary = {
   text: string;
   mediaManifest?: MediaManifest;
 } | null;
+
+// Generation forks still owned by a running command. Native compaction of one
+// would send an extra model request and replace its retained history, so the
+// plugin's compacting hook ends the fork's prompt loop as a context overflow,
+// which reports trim-first guidance.
+const ownedGenerationForks = new Set<string>();
+
+export function rejectNativeCompactionOfGenerationFork(
+  sessionID: string,
+): void {
+  if (!ownedGenerationForks.has(sessionID)) return;
+  const error = new Error(
+    "Magic Compact owns this generation session; native compaction is blocked.",
+  );
+  error.name = "ContextOverflowError";
+  throw error;
+}
 
 export async function generateCompactionSummaries(
   v2: V2Client,
@@ -217,7 +212,6 @@ export async function generateCompactionSummaries(
     explicitRequestTokens: batchCandidates =>
       estimateGenerationExplicitRequestTokens(
         batchCandidates,
-        "",
         globalTurnIndexPrompt,
       ),
     responseProtocolTokens: estimateGenerationResponseProtocolTokens,
@@ -226,9 +220,7 @@ export async function generateCompactionSummaries(
     candidates,
     budget,
     protocol,
-  ).map(batch =>
-    createGenerationBatch(batch, plan, budget, globalTurnIndexPrompt),
-  );
+  ).map(batch => createGenerationBatch(batch, plan, budget));
   const generationNonces = new Set<string>();
   const batches = batchPlans.map(batch =>
     finalizeGenerationBatch(
@@ -303,44 +295,10 @@ export async function generateCompactionSummaries(
   return generated;
 }
 
-export async function injectSummaries(
-  v2: V2Client,
-  sessionID: string,
-  compactionTurns: Turn[],
-  summaries: GeneratedSummary[],
-): Promise<TextPart[]> {
-  const inserted: TextPart[] = [];
-  for (const [index, turn] of compactionTurns.entries()) {
-    const summary = summaries[index];
-    if (summary === undefined || summary === null) {
-      throw new Error("Missing summary for assistant turn.");
-    }
-    const firstAssistant = turn.assistants[0];
-    if (!firstAssistant) throw new Error("Turn missing assistant message.");
-    const part = summaryEnvelopeTextPart(
-      firstAssistant.info.id,
-      sessionID,
-      summary.text,
-      summary.mediaManifest,
-    );
-    unwrap(
-      await v2.part.update({
-        sessionID,
-        messageID: firstAssistant.info.id,
-        partID: part.id,
-        part,
-      }),
-    );
-    inserted.push(part);
-  }
-  return inserted;
-}
-
 function createGenerationBatch(
   batch: NativeGenerationBatch<GenerationCandidate>,
   plan: CompactionPlan,
   budget: NativeBatchBudget,
-  globalTurnIndexPrompt: string,
 ): GenerationBatchPlan {
   const sourceMessages = plan.sourceSnapshot as MessageWithParts[];
   const sourceTurns = buildTurns(sourceMessages);
@@ -348,7 +306,6 @@ function createGenerationBatch(
     batch.candidates.map(candidate => candidate.sourceTurnIndex),
   );
   const firstTurnIndex = batch.candidates[0]!.sourceTurnIndex;
-  const lastTurnIndex = batch.candidates.at(-1)!.sourceTurnIndex;
   if (
     [...retainedTurnIndexes].some(turnIndex =>
       turnHasNativeCheckpointArtifact(sourceTurns[turnIndex]),
@@ -359,45 +316,7 @@ function createGenerationBatch(
     );
   }
   let retainedInput = batch.estimatedInputTokens;
-  let estimatedExplicitRequestTokens = batch.estimatedExplicitRequestTokens;
   let inputLimit = batch.inputLimit;
-  let followingHalo: GenerationBatchPlan["followingHalo"];
-  const followingTurn = sourceTurns[lastTurnIndex + 1];
-  if (
-    followingTurn
-    && !retainedTurnIndexes.has(lastTurnIndex + 1)
-    && !turnHasNativeCheckpointArtifact(followingTurn)
-  ) {
-    const followingCost = estimateNativeTurnCost(followingTurn).inputTokens;
-    const stopMarker = generationStopMarker(
-      NATIVE_BATCH_PLANNING_NONCE,
-      batch.candidates.at(-1)!.ordinal + 1,
-    );
-    const followingExplicitRequestTokens =
-      estimateGenerationExplicitRequestTokens(
-        batch.candidates,
-        stopMarker,
-        globalTurnIndexPrompt,
-      );
-    const followingInput =
-      retainedInput
-      - estimatedExplicitRequestTokens
-      + followingExplicitRequestTokens
-      + followingCost;
-    if (followingInput <= budget.haloInputLimit) {
-      const userMessageIndex = sourceMessages.indexOf(followingTurn.user[0]!);
-      if (userMessageIndex < 0) {
-        throw new Error(
-          "Compaction generation halo is missing from source order.",
-        );
-      }
-      retainedInput = followingInput;
-      estimatedExplicitRequestTokens = followingExplicitRequestTokens;
-      inputLimit = budget.haloInputLimit;
-      retainedTurnIndexes.add(lastTurnIndex + 1);
-      followingHalo = { userMessageIndex };
-    }
-  }
   const precedingTurn = sourceTurns[firstTurnIndex - 1];
   if (
     precedingTurn
@@ -439,11 +358,9 @@ function createGenerationBatch(
   return {
     ...batch,
     estimatedInputTokens: retainedInput,
-    estimatedExplicitRequestTokens,
     inputLimit,
     retainedMessageIndexes,
     targetUserMessageIndexes,
-    ...(followingHalo ? { followingHalo } : {}),
   };
 }
 
@@ -464,17 +381,9 @@ function finalizeGenerationBatch(
     ...candidate,
     marker: generationTurnMarker(generationNonce, candidate.ordinal),
   }));
-  const stopMarker = batch.followingHalo
-    ? generationStopMarker(generationNonce, candidates.at(-1)!.ordinal + 1)
-    : "";
-  const prompt = buildGenerationPrompt(
-    candidates,
-    stopMarker,
-    globalTurnIndexPrompt,
-  );
+  const prompt = buildGenerationPrompt(candidates, globalTurnIndexPrompt);
   const exactExplicitRequestTokens = estimateGenerationExplicitRequestTokens(
     candidates,
-    stopMarker,
     globalTurnIndexPrompt,
   );
   const exactInputTokens =
@@ -511,7 +420,6 @@ function finalizeGenerationBatch(
     ...batch,
     candidates,
     generationNonce,
-    stopMarker,
     prompt,
   };
 }
@@ -662,6 +570,7 @@ async function requestCompactionGeneration(
     );
   }
 
+  ownedGenerationForks.add(fork.id);
   let operationError: Error | undefined;
   const recordOperationError = (error: Error): void => {
     operationError = error;
@@ -669,7 +578,6 @@ async function requestCompactionGeneration(
   };
   let results: GenerationTurnResult[] | undefined;
   const generationNonce = batch.generationNonce;
-  const stopMarker = batch.stopMarker;
   let retainedIdentity: ForkMessageIdentity[] | undefined;
   const permissionOutcome = await attemptWithinDeadline(
     signal =>
@@ -801,7 +709,6 @@ async function requestCompactionGeneration(
               retainedOutcome.value,
               fork.id,
               batch,
-              stopMarker,
             );
             for (const target of markerTargets) {
               const markerOutcome = await attemptWithinDeadline(
@@ -904,6 +811,7 @@ async function requestCompactionGeneration(
     unwrapLifecycleResponse(
       await v2.session.delete({ sessionID: fork.id, ...route }),
     );
+    ownedGenerationForks.delete(fork.id);
   } catch (error) {
     deleteError = lifecycleFailure(
       sourceSession.id,
@@ -1035,7 +943,6 @@ function generationMarkerTargets(
   messages: MessageWithParts[],
   forkSessionID: string,
   batch: GenerationBatch,
-  stopMarker: string,
 ): Array<{ message: MessageWithParts; part: TextPart }> {
   const targets = batch.candidates.map((candidate, index) => {
     const message = retainedForkMessage(
@@ -1050,27 +957,9 @@ function generationMarkerTargets(
         message.info.id,
         candidate.marker,
         candidate.ordinal,
-        false,
       ),
     };
   });
-  if (batch.followingHalo) {
-    const message = retainedForkMessage(
-      messages,
-      batch,
-      batch.followingHalo.userMessageIndex,
-    );
-    targets.push({
-      message,
-      part: generationMarkerPart(
-        forkSessionID,
-        message.info.id,
-        stopMarker,
-        batch.candidates.at(-1)!.ordinal + 1,
-        true,
-      ),
-    });
-  }
   for (const target of targets) {
     if (target.message.parts.some(part => part.id === target.part.id)) {
       throw new Error("Compaction generation fork marker collision.");
@@ -1098,10 +987,9 @@ function generationMarkerPart(
   messageID: string,
   text: string,
   ordinal: number,
-  stop: boolean,
 ): TextPart {
   return {
-    id: `prt_-magic_generation_${stop ? "stop" : "turn"}_${ordinal}_${messageID}`,
+    id: `prt_-magic_generation_turn_${ordinal}_${messageID}`,
     sessionID,
     messageID,
     type: "text",
@@ -1111,68 +999,12 @@ function generationMarkerPart(
       magicCompact: {
         generationMarker: true,
         ordinal,
-        ...(stop ? { stop: true } : {}),
       },
     },
   };
 }
 
-function generationTurnMarker(nonce: string, ordinal: number): string {
-  return `<magic-compact-turn nonce="${nonce}" ordinal="${ordinal}" />`;
-}
-
-function generationStopMarker(nonce: string, ordinal: number): string {
-  return `<magic-compact-stop nonce="${nonce}" ordinal="${ordinal}" />`;
-}
-
-function createGenerationNonce(): string {
-  return randomBytes(16).toString("base64url");
-}
-
-function selectGenerationNonce(
-  histories: unknown[],
-  nonceFactory: () => string,
-  generationNonces: Set<string>,
-): string {
-  for (let attempt = 0; attempt < GENERATION_NONCE_ATTEMPTS; attempt += 1) {
-    const nonce = nonceFactory();
-    if (!GENERATION_NONCE_PATTERN.test(nonce)) {
-      throw new Error("Compaction generation marker nonce is invalid.");
-    }
-    if (
-      !generationNonces.has(nonce)
-      && !histories.some(history => containsString(history, nonce))
-    ) {
-      generationNonces.add(nonce);
-      return nonce;
-    }
-  }
-  throw new GenerationMarkerNonceCollisionError();
-}
-
-function containsString(value: unknown, needle: string): boolean {
-  const pending = [value];
-  const seen = new Set<object>();
-  while (pending.length > 0) {
-    const current = pending.pop();
-    if (typeof current === "string") {
-      if (current.includes(needle)) return true;
-      continue;
-    }
-    if (
-      (typeof current !== "object" && typeof current !== "function")
-      || current === null
-      || seen.has(current)
-    ) {
-      continue;
-    }
-    seen.add(current);
-    for (const key of Object.keys(current)) {
-      pending.push(ownDataProperty(current, key));
-    }
-  }
-  return false;
-}
+export const SUMMARIZER_MODEL_REQUIRED = `Magic Compact requires an explicit model on its ${MAGIC_COMPACT_SUMMARIZER_AGENT} agent. Set agent["${MAGIC_COMPACT_SUMMARIZER_AGENT}"].model (and optionally variant) in your OpenCode config.`;
 
 export async function resolveCompactionSettings(
   v2: V2Client,
@@ -1191,28 +1023,25 @@ export async function resolveCompactionSettings(
     );
   } catch {
     throw new Error(
-      "Magic Compact could not resolve the native compaction agent.",
+      `Magic Compact could not resolve the ${MAGIC_COMPACT_SUMMARIZER_AGENT} agent.`,
     );
   }
-  const compactionAgent = agents.find(
-    (agent: Agent) =>
-      agent.name === "compaction"
-      && agent.native === true
-      && agent.hidden === true,
+  const summarizer = agents.find(
+    (agent: Agent) => agent.name === MAGIC_COMPACT_SUMMARIZER_AGENT,
   );
-  if (!compactionAgent) {
+  if (!summarizer) {
     throw new Error(
-      "Magic Compact requires the native hidden compaction agent, but it is missing or disabled.",
+      `Magic Compact requires its ${MAGIC_COMPACT_SUMMARIZER_AGENT} agent, but it is missing or disabled.`,
     );
   }
+  // No fallback: the source session's model and OpenCode's native compaction
+  // agent are never used in its place.
   if (
-    !compactionAgent.model
-    || !compactionAgent.model.providerID.trim()
-    || !compactionAgent.model.modelID.trim()
+    !summarizer.model
+    || !summarizer.model.providerID.trim()
+    || !summarizer.model.modelID.trim()
   ) {
-    throw new Error(
-      "Magic Compact requires an explicit model on the native compaction agent.",
-    );
+    throw new Error(SUMMARIZER_MODEL_REQUIRED);
   }
   let catalog: ReturnType<typeof unwrap>;
   try {
@@ -1235,13 +1064,12 @@ export async function resolveCompactionSettings(
     isRecord(catalog) && Array.isArray(catalog["all"])
       ? catalog["all"].find(
           value =>
-            isRecord(value)
-            && value["id"] === compactionAgent.model!.providerID,
+            isRecord(value) && value["id"] === summarizer.model!.providerID,
         )
       : undefined;
   const models = isRecord(provider) ? provider["models"] : undefined;
   const descriptor = isRecord(models)
-    ? models[compactionAgent.model.modelID]
+    ? models[summarizer.model.modelID]
     : undefined;
   const limit = isRecord(descriptor) ? descriptor["limit"] : undefined;
   if (
@@ -1260,8 +1088,8 @@ export async function resolveCompactionSettings(
     ? capabilities["input"]
     : undefined;
   return {
-    model: compactionAgent.model,
-    ...(compactionAgent.variant ? { variant: compactionAgent.variant } : {}),
+    model: summarizer.model,
+    ...(summarizer.variant ? { variant: summarizer.variant } : {}),
     descriptor: {
       limit: {
         context: limit["context"],
@@ -1326,64 +1154,6 @@ export function historyMayExposeImages(sourceSnapshot: unknown): boolean {
   });
 }
 
-// `stopMarker` is empty when the batch retains no following halo.
-function buildGenerationPrompt(
-  candidates: GenerationCandidate[],
-  stopMarker: string,
-  globalTurnIndexPrompt: string,
-): string {
-  return [
-    "Generate one continuation summary for the indexed target turn using the retained native fork history.",
-    "Submit the object required by your system prompt through StructuredOutput. Its turns array must contain exactly one object, for the single target index entry below.",
-    globalTurnIndexPrompt,
-    "Use the ephemeral markers only as ordering guides. Echo each exact marker token and target ordinal; marker echo is allowed. Never include the active generation nonce or marker token in summaries or visual descriptions; useful source identifiers may remain when you include them.",
-    JSON.stringify({
-      turns: candidates.map(candidate => ({
-        ordinal: candidate.ordinal,
-        marker: candidate.marker,
-        expectedInlineImages: candidate.expectedInlineImages,
-      })),
-      ...(stopMarker === "" ? {} : { nextTurn: { marker: stopMarker } }),
-    }),
-  ].join("\n");
-}
-
-function estimateGenerationExplicitRequestTokens(
-  candidates: GenerationCandidate[],
-  stopMarker: string,
-  globalTurnIndexPrompt: string,
-): number {
-  return (
-    countGptTokens(JSON.stringify(GENERATION_FORMAT.schema))
-    + countGptTokens(
-      buildGenerationPrompt(candidates, stopMarker, globalTurnIndexPrompt),
-    )
-    + candidates.reduce(
-      (total, candidate) => total + countGptTokens(candidate.marker),
-      0,
-    )
-    + (stopMarker === "" ? 0 : countGptTokens(stopMarker))
-  );
-}
-
-function estimateGenerationResponseProtocolTokens(
-  candidates: GenerationCandidate[],
-): number {
-  return countGptTokens(
-    JSON.stringify({
-      turns: candidates.map(candidate => ({
-        ordinal: candidate.ordinal,
-        marker: candidate.marker,
-        summary: "",
-        visualDescriptions: Array.from(
-          { length: candidate.expectedInlineImages },
-          (_, index) => ({ ordinal: index + 1, description: "" }),
-        ),
-      })),
-    }),
-  );
-}
-
 function buildGlobalTurnIndexPrompt(plan: CompactionPlan): string {
   const sourceTurns = buildTurns(
     plan.sourceSnapshot as unknown as MessageWithParts[],
@@ -1397,111 +1167,7 @@ function buildGlobalTurnIndexPrompt(plan: CompactionPlan): string {
         GLOBAL_ANCHOR_CHARACTER_LIMIT,
       ),
     }));
-  return [
-    "The globalTurnIndex is an orientation-only user-anchor map. Its sourceOrdinal values are immutable source-history positions, not target ordinals, and it does not supply distant assistant or tool detail. Each entry contains only its sourceOrdinal and bounded user anchor:",
-    JSON.stringify({ globalTurnIndex }),
-  ].join("\n");
-}
-
-function parseGenerationResponse(
-  parsed: unknown,
-  candidates: GenerationCandidate[],
-  nonce: string,
-): GenerationTurnResult[] {
-  if (parsed === undefined)
-    throw validationFailure("missing structured output");
-  if (
-    !isPlainRecord(parsed)
-    || !hasExactKeys(parsed, ["turns"])
-    || !Array.isArray(parsed["turns"])
-  ) {
-    throw validationFailure("invalid envelope");
-  }
-  if (parsed["turns"].length !== candidates.length) {
-    throw validationFailure("turn count mismatch", {
-      expected: candidates.length,
-      received: parsed["turns"].length,
-    });
-  }
-
-  return parsed["turns"].map((value, index) => {
-    const candidate = candidates[index]!;
-    if (
-      !isPlainRecord(value)
-      || !hasExactKeys(value, [
-        "marker",
-        "ordinal",
-        "summary",
-        "visualDescriptions",
-      ])
-      || !Array.isArray(value["visualDescriptions"])
-    ) {
-      throw validationFailure("invalid turn shape or identity", {
-        field: "shape",
-        ordinal: candidate.ordinal,
-      });
-    }
-    const identityField =
-      value["ordinal"] !== candidate.ordinal
-        ? "ordinal"
-        : value["marker"] !== candidate.marker
-          ? "marker"
-          : undefined;
-    if (identityField) {
-      throw validationFailure("invalid turn shape or identity", {
-        field: identityField,
-        ordinal: candidate.ordinal,
-      });
-    }
-    if (typeof value["summary"] !== "string" || !value["summary"].trim()) {
-      throw validationFailure("invalid summary");
-    }
-    const expectedImages = candidate.mediaManifest?.images.length ?? 0;
-    if (value["visualDescriptions"].length !== expectedImages) {
-      throw validationFailure("invalid visual coverage");
-    }
-    const summary = value["summary"].trim();
-    if (summary.includes(nonce)) {
-      throw validationFailure("nonce leakage");
-    }
-    const visualDescriptions = value["visualDescriptions"].map(
-      (description, imageIndex) => {
-        if (
-          !isPlainRecord(description)
-          || !hasExactKeys(description, ["description", "ordinal"])
-          || description["ordinal"] !== imageIndex + 1
-          || typeof description["description"] !== "string"
-          || !description["description"].trim()
-        ) {
-          throw validationFailure("invalid visual coverage");
-        }
-        const text = description["description"].trim();
-        if (text.includes(nonce)) {
-          throw validationFailure("nonce leakage");
-        }
-        return {
-          ordinal: imageIndex + 1,
-          description: text,
-        };
-      },
-    );
-    return {
-      summary,
-      visualDescriptions,
-    };
-  });
-}
-
-function frameSummary(result: GenerationTurnResult): string {
-  if (result.visualDescriptions.length === 0) return result.summary;
-  return [
-    result.summary,
-    "",
-    "Visual summary:",
-    ...result.visualDescriptions.map(
-      item => `${item.ordinal}. ${item.description}`,
-    ),
-  ].join("\n");
+  return globalTurnIndexPrompt(globalTurnIndex);
 }
 
 function firstOrdinaryUserLine(turn: Turn): string {
@@ -1514,10 +1180,6 @@ function firstOrdinaryUserLine(turn: Turn): string {
         && part.ignored !== true,
     )?.text;
   return (text ?? "").split(/\r\n|\r|\n/u, 1)[0] ?? "";
-}
-
-function capCodePoints(value: string, characterLimit: number): string {
-  return Array.from(value).slice(0, characterLimit).join("");
 }
 
 function assertGeneratedPartIDsAvailable(plan: CompactionPlan): void {
@@ -1544,77 +1206,7 @@ function assertGeneratedPartIDsAvailable(plan: CompactionPlan): void {
   }
 }
 
-type ValidationCategory =
-  | "missing structured output"
-  | "invalid envelope"
-  | "turn count mismatch"
-  | "invalid turn shape or identity"
-  | "invalid summary"
-  | "invalid visual coverage"
-  | "nonce leakage";
-
-type TurnCounts = { expected: number; received: number };
-
-// Names the first failed check and its target ordinal, never response content.
-type TurnIdentityFailure = {
-  field: "shape" | "ordinal" | "marker";
-  ordinal: number;
-};
-
-class GenerationResponseValidationError extends Error {
-  constructor(
-    readonly category: ValidationCategory,
-    readonly detail?: TurnCounts | TurnIdentityFailure,
-  ) {
-    super();
-  }
-}
-
-function validationFailure(
-  category: ValidationCategory,
-  detail?: TurnCounts | TurnIdentityFailure,
-): Error {
-  return new GenerationResponseValidationError(category, detail);
-}
-
-function validationCategoryText(
-  error: GenerationResponseValidationError,
-): string {
-  if (error.detail && "expected" in error.detail) {
-    return `${error.category} (expected ${error.detail.expected}, received ${error.detail.received})`;
-  }
-  if (error.detail) {
-    return `${error.category} (${error.detail.field} at target ordinal ${error.detail.ordinal})`;
-  }
-  return error.category;
-}
-
-function hasExactKeys(
-  value: Record<string, unknown>,
-  expected: string[],
-): boolean {
-  const keys = Object.keys(value).sort();
-  const sortedExpected = [...expected].sort();
-  return (
-    keys.length === sortedExpected.length
-    && keys.every((key, index) => key === sortedExpected[index])
-  );
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  if (!isRecord(value) || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
 type LifecycleFailureKind = "timeout" | "rejection";
-
-class GenerationMarkerNonceCollisionError extends Error {
-  constructor() {
-    super("Compaction generation marker nonce collision.");
-    this.name = "GenerationMarkerNonceCollisionError";
-  }
-}
 
 class GenerationLifecycleError extends Error {
   readonly status: number | undefined;
@@ -1736,117 +1328,10 @@ function lifecycleMessage(
   return "Compaction generation fork deletion failed.";
 }
 
-export function safeStatus(error: unknown): number | undefined {
-  for (const item of diagnosticChain(error)) {
-    const data = ownDataProperty(item, "data");
-    const value =
-      ownDataProperty(item, "status")
-      ?? ownDataProperty(item, "statusCode")
-      ?? ownDataProperty(data, "statusCode");
-    if (
-      typeof value === "number"
-      && Number.isInteger(value)
-      && value >= 100
-      && value <= 599
-    ) {
-      return value;
-    }
-  }
-  return undefined;
-}
-
-export function isContextOverflow(
-  error: unknown,
-  status: number | undefined,
-): boolean {
-  return (
-    status === 413
-    || diagnosticChain(error).some(item => {
-      const categories = diagnosticCategories(item);
-      return categories.some(category =>
-        [
-          "contextoverflowerror",
-          "context_length_exceeded",
-          "context_window_exceeded",
-          "prompt_too_long",
-          "input_too_long",
-        ].includes(category),
-      );
-    })
-  );
-}
-
-function isOutputTruncation(value: unknown): boolean {
-  const outputCategories = [
-    "length",
-    "max_token",
-    "max_tokens",
-    "max_output_tokens",
-    "output_length",
-    "output_length_exceeded",
-    "messageoutputlengtherror",
-  ];
-  if (typeof value === "string" && outputCategories.includes(category(value))) {
-    return true;
-  }
-  return diagnosticChain(value).some(item => {
-    return diagnosticCategories(item).some(itemCategory =>
-      outputCategories.includes(itemCategory),
-    );
-  });
-}
-
-function diagnosticChain(value: unknown): unknown[] {
-  const chain: unknown[] = [];
-  const pending = [value];
-  const seen = new Set<object>();
-  while (pending.length > 0 && chain.length < 32) {
-    const current = pending.shift();
-    if (current === undefined) continue;
-    if (
-      (typeof current === "object" || typeof current === "function")
-      && current !== null
-    ) {
-      if (seen.has(current)) continue;
-      seen.add(current);
-    }
-    chain.push(current);
-    pending.push(
-      ownDataProperty(current, "cause"),
-      ownDataProperty(current, "error"),
-      ownDataProperty(current, "data"),
-    );
-  }
-  return chain;
-}
-
-function diagnosticCategories(value: unknown): string[] {
-  return ["name", "code", "type", "reason"].flatMap(key => {
-    const item = ownDataProperty(value, key);
-    return typeof item === "string" ? [category(item)] : [];
-  });
-}
-
 function isStructuredOutputError(value: unknown): boolean {
   return diagnosticChain(value).some(item =>
     diagnosticCategories(item).includes("structuredoutputerror"),
   );
-}
-
-function category(value: string): string {
-  return value.trim().toLowerCase().replaceAll("-", "_");
-}
-
-function ownDataProperty(value: unknown, key: string): unknown {
-  if ((typeof value !== "object" && typeof value !== "function") || !value) {
-    return undefined;
-  }
-  try {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    return descriptor && "value" in descriptor ? descriptor.value : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 function unwrapLifecycleResponse<T, E>(response: { data?: T; error?: E }): T {

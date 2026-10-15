@@ -17,6 +17,8 @@
     }
   },
   "files": [
+    "index.ts",
+    "tui.ts",
     "src",
     "LICENSE.md",
     "NOTICE.md"
@@ -51,11 +53,16 @@
   "homepage": "https://github.com/imarshallwidjaja/magic-compact#readme",
   "author": "imarshallwidjaja",
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.17.9"
+    "@opencode-ai/plugin": ">=1.18.30 <2"
   },
   "dependencies": {
-    "@opencode-ai/sdk": "^1.17.9",
+    "@opencode-ai/sdk": "1.18.30",
+    "@opencode/client": "2.0.28",
     "gpt-tokenizer": "3.4.0",
     "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.18.30",
+    "@opencode/plugin": "2.0.28"
   }
 }

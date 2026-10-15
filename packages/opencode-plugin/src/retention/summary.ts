@@ -17,11 +17,10 @@ import {
   assertConfiguredModelSupportsImages,
   assertForkRecordIdentity,
   historyMayExposeImages,
-  isContextOverflow,
   resolveCompactionSettings,
-  safeStatus,
   type CompactionSettings,
 } from "../compact/compact";
+import { isContextOverflow, safeStatus } from "../policy/generation";
 import {
   assertForkMessageShape,
   nativeModelVisibleMessages,
@@ -33,52 +32,23 @@ import {
   ForkHistoryError,
   forkSession,
 } from "../compact/fork";
+import {
+  MAGIC_COMPACT_SUMMARIZER_AGENT,
+  SESSION_SUMMARY_PROMPT,
+} from "../compact/constants";
 import { countGptTokens } from "../stats/tokenize";
 import { attemptWithinDeadline, CONTROL_OPERATION_TIMEOUT_MS } from "../util";
+import {
+  SessionSummaryError,
+  type SessionSummaryStage,
+} from "../policy/retention";
 import { RETENTION_FAILURE_GUIDANCE } from "./classifier";
 
-// Verbatim SUMMARY_TEMPLATE from OpenCode
-// packages/core/src/session/compaction.ts at 830d5eb535 (OpenCode 1.18.30).
-const NATIVE_SUMMARY_TEMPLATE = `Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
-<template>
-## Objective
-- [one or two brief sentences describing what the user is trying to accomplish]
+export { SESSION_SUMMARY_PROMPT };
 
-## Important Details
-- [constraints/preferences, decisions and why, important facts/assumptions, exact context needed to continue, or "(none)"]
-
-## Work State
-### Completed
-- [finished work, verified facts, or changes made; otherwise "(none)"]
-
-### Active
-- [current work, partial changes, or investigation state; otherwise "(none)"]
-
-### Blocked
-- [blockers, failing commands, or unknowns; otherwise "(none)"]
-
-## Next Move
-1. [immediate concrete action, or "(none)"]
-2. [next action if known, or "(none)"]
-
-## Relevant Files
-- [file or directory path: why it matters, or "(none)"]
-</template>
-
-Rules:
-- Keep every section, even when empty.
-- Use terse bullets, not prose paragraphs.
-- Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers when known.
-- Do not mention the summary process or that context was compacted.`;
-
-export const SESSION_SUMMARY_PROMPT = [
-  "Create a new anchored summary from the entire conversation history above, including the most recent messages, so another coding agent can continue the work.",
-  NATIVE_SUMMARY_TEMPLATE,
-].join("\n\n");
-
-const SUMMARY_AGENT = "compaction";
+const SUMMARY_AGENT = MAGIC_COMPACT_SUMMARIZER_AGENT;
 // The session rule is required: the prompting agent's own permissions would
-// otherwise override the native compaction agent's deny rules.
+// otherwise override the summarizer agent's deny rules.
 const SUMMARY_FORK_PERMISSION: PermissionRuleset = [
   { permission: "*", pattern: "*", action: "deny" },
 ];
@@ -114,35 +84,7 @@ export function rejectNativeCompactionOfSummaryFork(sessionID: string): void {
   throw new SessionSummaryError("budget");
 }
 
-export type SessionSummaryStage =
-  | "budget"
-  | "fork"
-  | "permission"
-  | "history"
-  | "provider"
-  | "validation"
-  | "abort"
-  | "delete";
-
-// Messages are fixed text plus an optional HTTP status; they never carry
-// session content, model output, or provider bodies.
-export class SessionSummaryError extends Error {
-  constructor(
-    readonly stage: SessionSummaryStage,
-    readonly status?: number,
-    overflow = false,
-    detail?: string,
-  ) {
-    super(
-      `${
-        stage === "budget" || overflow
-          ? "The session is too large for the configured compaction model to summarize for task-aware retention."
-          : `Task-aware retention session summary failed (${stage}${status === undefined ? "" : ` ${status}`}${detail === undefined ? "" : `: ${detail}`}).`
-      } ${RETENTION_FAILURE_GUIDANCE}`,
-    );
-    this.name = "SessionSummaryError";
-  }
-}
+export { SessionSummaryError, type SessionSummaryStage };
 
 export type SessionSummaryOptions = {
   controlTimeoutMs?: number;
@@ -175,7 +117,7 @@ export async function generateSessionSummary(
   } catch (error) {
     // These configuration messages are fixed text without session content.
     throw new Error(
-      `${error instanceof Error ? error.message : "Magic Compact could not resolve the native compaction agent."} ${RETENTION_FAILURE_GUIDANCE}`,
+      `${error instanceof Error ? error.message : "Magic Compact could not resolve its summarizer agent."} ${RETENTION_FAILURE_GUIDANCE}`,
       { cause: error },
     );
   }
@@ -324,7 +266,7 @@ export async function generateSessionSummary(
 }
 
 // Accepts the fork only when it is the rewritten source history plus exactly
-// the one prompt and one ordinary compaction-agent reply. Native overflow
+// the one prompt and one ordinary summarizer-agent reply. Native overflow
 // compaction or replay adds markers, summaries, or a re-created prompt, and a
 // partial native summary must never stand in for the whole session.
 function acceptedSummary(

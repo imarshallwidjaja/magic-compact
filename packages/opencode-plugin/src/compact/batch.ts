@@ -107,16 +107,26 @@ export function estimateNativeTurnCost(turn: Turn): NativeTurnCost {
   );
   return {
     inputTokens: estimate.inputTokens,
-    outputTokens:
-      Math.max(
-        NATIVE_BATCH_MIN_TURN_OUTPUT,
-        Math.min(
-          NATIVE_BATCH_MAX_TURN_TEXT_OUTPUT,
-          Math.ceil(estimate.textTokens * 0.05),
-        ),
-      )
-      + estimate.mediaCount * NATIVE_BATCH_MEDIA_DESCRIPTION_OUTPUT,
+    outputTokens: estimateTurnOutputTokens(
+      estimate.textTokens,
+      estimate.mediaCount,
+    ),
   };
+}
+
+// The summary output a turn is expected to need, from its visible text and
+// its inline media count. Both hosts use this estimate.
+export function estimateTurnOutputTokens(
+  textTokens: number,
+  mediaCount: number,
+): number {
+  return (
+    Math.max(
+      NATIVE_BATCH_MIN_TURN_OUTPUT,
+      Math.min(NATIVE_BATCH_MAX_TURN_TEXT_OUTPUT, Math.ceil(textTokens * 0.05)),
+    )
+    + mediaCount * NATIVE_BATCH_MEDIA_DESCRIPTION_OUTPUT
+  );
 }
 
 // Estimates native model input for a whole message history with the same

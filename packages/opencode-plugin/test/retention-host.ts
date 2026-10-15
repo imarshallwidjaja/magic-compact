@@ -11,10 +11,10 @@ import {
 export const SESSION_SUMMARY_TEXT =
   "## Objective\n- Continue the current parser work.";
 
-export function compactionAgent() {
+export function summarizerAgent() {
   return {
-    name: "compaction",
-    native: true,
+    name: "magic-compact-summarizer",
+    native: false,
     hidden: true,
     model: { providerID: "summary-provider", modelID: "summary-model" },
     variant: "low",
@@ -222,7 +222,7 @@ export function persistedForkHistory(
   };
 }
 
-// Appends the prompt and an ordinary compaction-agent reply, as OpenCode does
+// Appends the prompt and an ordinary summarizer-agent reply, as OpenCode does
 // for a successful summary request, and returns the prompt response body.
 export function summaryReply(
   fork: MessageWithParts[],
@@ -251,8 +251,8 @@ export function summaryReply(
     sessionID: forkID,
     role: "assistant",
     parentID: userID,
-    agent: "compaction",
-    mode: "compaction",
+    agent: "magic-compact-summarizer",
+    mode: "magic-compact-summarizer",
     finish: "stop",
   } as Message;
   const parts = [

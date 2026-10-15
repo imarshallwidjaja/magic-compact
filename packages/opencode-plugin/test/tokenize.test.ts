@@ -3,6 +3,8 @@ import type { Message } from "@opencode-ai/sdk/v2";
 import * as gptTokenizer from "gpt-tokenizer";
 import type { V2Client } from "../src/api";
 import type { MessageWithParts } from "../src/compact/plan";
+import { mediaPlaceholderText, projectsSmaller } from "../src/policy/media";
+import { countV2PayloadTokens } from "../src/v2/history";
 import {
   countCanonicalContentTokens,
   countGptTokens,
@@ -204,6 +206,36 @@ describe("canonical token counting", () => {
       encodeSpy.mockRestore();
       countSpy.mockRestore();
       withinSpy.mockRestore();
+    }
+  });
+
+  test("decides projection of a large payload without tokenizing it", () => {
+    const payload = "A".repeat(1_000_000);
+    const countSpy = spyOn(gptTokenizer, "countTokens");
+    try {
+      expect(
+        projectsSmaller(mediaPlaceholderText(1, "image/png"), payload),
+      ).toBe(true);
+      expect(
+        countSpy.mock.calls.every(([text]) => (text as string).length < 1_000),
+      ).toBe(true);
+    } finally {
+      countSpy.mockRestore();
+    }
+  });
+
+  // A uniform run is quadratic for the tokenizer as one piece: 400 KB of one
+  // letter took about 100 s when measured.
+  test("counts a file payload in fixed segments, once per distinct payload", () => {
+    const payload = "A".repeat(400_000);
+    expect(countV2PayloadTokens(payload)).toBe(50_000);
+    const countSpy = spyOn(gptTokenizer, "countTokens");
+    try {
+      expect(countV2PayloadTokens(payload)).toBe(50_000);
+      expect(countSpy).not.toHaveBeenCalled();
+      expect(countV2PayloadTokens("iVBORw0K")).toBe(countGptTokens("iVBORw0K"));
+    } finally {
+      countSpy.mockRestore();
     }
   });
 

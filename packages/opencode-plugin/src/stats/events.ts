@@ -1,6 +1,5 @@
-import type { AssistantMessage, Event } from "@opencode-ai/sdk";
+import type { Event } from "@opencode-ai/sdk";
 import { readStats, writeStats } from "../storage/stats";
-import type { ConversationStats } from "../storage/stats";
 
 export async function handleStatsEvent(event: Event): Promise<void> {
   if (event.type !== "message.updated") {
@@ -8,43 +7,32 @@ export async function handleStatsEvent(event: Event): Promise<void> {
   }
 
   const info = event.properties.info;
-  if (info.role !== "assistant") {
+  if (info.role !== "assistant" || !info.time.completed) {
     return;
   }
 
-  const stats = await readStats(info.sessionID);
-  if (!stats) {
-    return;
-  }
-
-  const nextStats = applyAssistantMessageStats(stats, info);
-  if (!nextStats) {
-    return;
-  }
-
-  await writeStats(info.sessionID, nextStats);
+  await recordAssistantCompletion(info.sessionID, info.id);
 }
 
-function applyAssistantMessageStats(
-  stats: ConversationStats,
-  info: AssistantMessage,
-): ConversationStats | null {
-  if (!info.time.completed) {
-    return null;
+// Adds the conversation's current savings once per completed assistant
+// message. `statsKey` names the session's stats file.
+export async function recordAssistantCompletion(
+  statsKey: string,
+  messageID: string,
+): Promise<void> {
+  const stats = await readStats(statsKey);
+  if (!stats || stats.processedAssistantMessageIds.includes(messageID)) {
+    return;
   }
 
-  if (stats.processedAssistantMessageIds.includes(info.id)) {
-    return null;
-  }
-
-  return {
+  await writeStats(statsKey, {
     ...stats,
     cachedTokensSaved: stats.cachedTokensSaved + stats.totalTokensPruned,
     cachedMediaTokensSaved:
       (stats.cachedMediaTokensSaved ?? 0) + (stats.mediaTokensProjected ?? 0),
     processedAssistantMessageIds: [
       ...stats.processedAssistantMessageIds,
-      info.id,
+      messageID,
     ],
-  };
+  });
 }

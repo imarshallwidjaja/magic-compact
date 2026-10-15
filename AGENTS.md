@@ -16,6 +16,11 @@ Agents MUST read these files before working on platform behavior, and MUST updat
 
 `.github/workflows/check.yml` and the check steps in `.github/workflows/publish-opencode.yml` run the same commands before merge and before `npm publish`. Change them together.
 
+## Host Integration
+
+- Use public host APIs only. V1 compact and trim require a verified listener; V2 requires a verified registered-service or explicit endpoint connection. See `docs/OpenCode.md` for setup and identity checks.
+- When changing host adapters or package entrypoints, test the packed artifact in containers on both supported hosts. Do not use a live host session for qualification.
+
 ---
 
 ## Architecture
@@ -36,7 +41,7 @@ Magic Compact performs per-turn conversation compaction while preserving the con
 - Replace old assistant turns with validated per-turn continuation summaries.
 - Keep useful tool calls visible while removing bulky tool I/O. Task-aware retention (TypeSafe Jev, `TYPESAFE_API_KEY` in the OpenCode server environment) can keep a call whole; `--heuristic` skips it.
 - Store omitted tool I/O outside context but make it retrievable.
-- Keep a recovery path available on failure.
+- Write compact and trim results to a verified successor session; never mutate or delete the original session or its child sessions.
 
 ## Task-Aware Retention
 

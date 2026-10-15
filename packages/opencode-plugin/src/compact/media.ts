@@ -1,7 +1,11 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import type { Part, TextPart } from "@opencode-ai/sdk/v2";
-import { countGptTokens } from "../stats/tokenize";
+import {
+  mediaManifestMismatch,
+  mediaPlaceholderText,
+  projectsSmaller,
+} from "../policy/media";
 import { buildTurns, type MessageWithParts, type Turn } from "./plan";
 
 export const MEDIA_MANIFEST_VERSION = 1;
@@ -50,7 +54,7 @@ export function projectManifestCoveredMedia(
     if (coverage === undefined) continue;
     for (const { image, entry } of coverage) {
       const placeholder = mediaPlaceholder(image.part, entry);
-      if (countGptTokens(placeholder.text) < countGptTokens(image.part.url)) {
+      if (projectsSmaller(placeholder.text, image.part.url)) {
         image.message.parts[image.partIndex] = placeholder;
       }
     }
@@ -94,18 +98,18 @@ function manifestCoverage(turn: Turn):
     }),
   );
   if (manifests.length === 0) return undefined;
-  if (manifests.length !== 1) throw manifestMismatch();
+  if (manifests.length !== 1) throw mediaManifestMismatch();
   const envelope = manifests[0]!;
   const manifest = parseManifest(envelope.manifest, envelope.version);
   const images = inlineImages(turn, envelope.version);
-  if (images.length !== manifest.images.length) throw manifestMismatch();
+  if (images.length !== manifest.images.length) throw mediaManifestMismatch();
   return images.map((image, index) => {
     const entry = manifest.images[index]!;
     if (
       image.part.mime !== entry.mime
       || hashURL(image.part.url) !== entry.urlSha256
     ) {
-      throw manifestMismatch();
+      throw mediaManifestMismatch();
     }
     return { image, entry };
   });
@@ -158,7 +162,7 @@ function parseManifest(value: unknown, summaryVersion: 2 | 3): MediaManifest {
     || !Array.isArray(value["images"])
     || value["images"].length === 0
   ) {
-    throw manifestMismatch();
+    throw mediaManifestMismatch();
   }
   const seenPartIDs = new Set<string>();
   const images = value["images"].map((entry, index) => {
@@ -179,7 +183,7 @@ function parseManifest(value: unknown, summaryVersion: 2 | 3): MediaManifest {
       || typeof entry["urlSha256"] !== "string"
       || !/^[a-f0-9]{64}$/u.test(entry["urlSha256"])
     ) {
-      throw manifestMismatch();
+      throw mediaManifestMismatch();
     }
     if (summaryVersion === 2) seenPartIDs.add(entry["partId"] as string);
     return {
@@ -200,7 +204,7 @@ function mediaPlaceholder(
     sessionID: part.sessionID,
     messageID: part.messageID,
     type: "text",
-    text: `[Historical inline image ${entry.ordinal} (${entry.mime}) was summarized by Magic Compact; its payload is projected out of this model request.]`,
+    text: mediaPlaceholderText(entry.ordinal, entry.mime),
     synthetic: true,
   };
 }
@@ -220,8 +224,4 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   }
   const prototype = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
-}
-
-function manifestMismatch(): Error {
-  return new Error("Magic Compact media manifest mismatch.");
 }

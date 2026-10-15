@@ -1,37 +1,34 @@
-import type { Message, Session, TextPart } from "@opencode-ai/sdk/v2";
-import { unwrap, type V2Client } from "./api";
+import type { V2Client } from "./api";
+import { COMPACT_NOOP } from "./commands";
 import {
   generateCompactionSummaries,
   type GeneratedSummary,
-  injectSummaries,
 } from "./compact/compact";
+import { getCompactionCount } from "./compact/session";
 import {
-  createBackup,
-  getCompactionCount,
-  injectPostCompactionNotice,
-  injectCompactStatsNotice,
-  recordPruningStats,
-  revalidateCompactionSource,
-  revalidateCompactionSourceAfterInsertions,
-  updateCompactionMetadata,
-} from "./compact/session";
-import {
-  createCompactionPlan,
+  planCompaction,
   type CompactionPlan,
   type MessageWithParts,
   type Turn,
 } from "./compact/plan";
+import { createPruneProjection, type PruneProjection } from "./compact/prune";
 import {
-  createPruneProjection,
-  pruneSummarizedTurns,
-  type PruneProjection,
-} from "./compact/prune";
-import { preservedTurnsFeedback, type PreservedTurns } from "./stats/constants";
+  appendedNoticeMessage,
+  applySuccessorEdits,
+  assertSourceUnchanged,
+  createSuccessor,
+  readSourceAtRest,
+  withExclusiveSource,
+  type Successor,
+  type SuccessorEdit,
+} from "./compact/successor";
 import {
-  countModelFacingContentTokens,
-  countSessionTokenProjection,
-  type ModelFacingTokenCount,
-} from "./stats/tokenize";
+  preservedTurnsFeedback,
+  STATS_METADATA,
+  statsMessage,
+  type PreservedTurns,
+} from "./stats/constants";
+import { countModelFacingContentTokens } from "./stats/tokenize";
 import {
   BOUNDARY_METADATA,
   POST_COMPACTION_NOTICE,
@@ -39,6 +36,10 @@ import {
   summaryEnvelopeTextPart,
   turnHasPersistedSummary,
 } from "./compact/constants";
+import {
+  COMPACT_INSUFFICIENT_SAVINGS,
+  hasUsefulSavings,
+} from "./policy/successor";
 import {
   CONTROL_OPERATION_TIMEOUT_MS,
   createToastFeedback,
@@ -53,14 +54,9 @@ import {
   type RetentionPolicy,
 } from "./retention/retention";
 
-export const COMPACT_SUCCESS = "Magic compaction successful.";
-export const COMPACT_NOOP = "No assistant turns are old enough to compact.";
-export const COMPACT_PENDING_REVERT =
-  "Magic Compact cannot run while the session has a pending revert. Resolve the pending revert first, then retry.";
-export const COMPACT_INSUFFICIENT_SAVINGS =
-  "Magic Compact projected no useful canonical active-content savings; the source session was left unchanged.";
-const MINIMUM_USEFUL_SAVINGS_RATIO = 0.2;
-const MINIMUM_USEFUL_SAVINGS_TOKENS = 32;
+export { COMPACT_NOOP, compactSuccess } from "./commands";
+export { COMPACT_INSUFFICIENT_SAVINGS };
+const COMMAND = "Magic Compact";
 
 type CompactionSelection = {
   turns: Turn[];
@@ -75,12 +71,14 @@ export type MagicCompactExecutionOptions = {
   controlTimeoutMs?: number;
 };
 
+// Returns the ready successor, or null for a no-op. The source session and its
+// children are only read.
 export async function executeMagicCompact(
   v2: V2Client,
   sessionID: string,
   keepTurns: number,
   options: MagicCompactExecutionOptions,
-): Promise<boolean> {
+): Promise<Successor | null> {
   const controlTimeoutMs =
     options.controlTimeoutMs ?? CONTROL_OPERATION_TIMEOUT_MS;
   if (!Number.isFinite(controlTimeoutMs) || controlTimeoutMs <= 0) {
@@ -88,203 +86,164 @@ export async function executeMagicCompact(
   }
   const toastFeedback = createToastFeedback(v2, controlTimeoutMs);
   await toastFeedback.showProgress({
-    title: "Magic Compact",
+    title: COMMAND,
     message: "Compacting session...",
     variant: "info",
     duration: IN_PROGRESS_TOAST_DURATION_MS,
   });
-  let backupSession: Session | null = null;
-  let sourceSession: Session | null = null;
-  let sourceWritesStarted = false;
-  let compactedTurnCount: number;
+  let successor: Successor;
+  let summarizedTurnCount: number;
   let preserved: PreservedTurns;
   let retention: RetentionPlan = HEURISTIC_RETENTION;
 
   try {
-    // Check if there's anything to compact
-    const sourcePlan = await createCompactionPlan(v2, sessionID, keepTurns);
-    preserved = {
-      requested: keepTurns,
-      preserved: sourcePlan.preservedTurnCount,
-    };
-    if (sourcePlan.summarizedTurns.length === 0) {
-      await toastFeedback.showTerminal({
-        title: "Magic Compact",
-        message: noopFeedback(preserved),
-        variant: "info",
-        duration: 5000,
-      });
-      return false;
-    }
-
-    sourceSession = unwrap(
-      await v2.session.get({
-        sessionID,
-      }),
-    );
-    if (sourceSession.revert) {
-      throw new Error(COMPACT_PENDING_REVERT);
-    }
-    const currentCompactionCount = getCompactionCount(sourceSession) + 1;
-    const sourceMessages = unwrap(await v2.session.messages({ sessionID }));
-    const before = countModelFacingContentTokens(sourceMessages);
-    const beforePhysicalTokens = before.tokens + before.projectedMediaTokens;
-
-    await revalidateCompactionSource(v2, sessionID, sourcePlan);
-
-    if (options.retention.mode === "task-aware") {
-      // Opaque summary-bearing turns are never pruned, so they hold no
-      // candidates. Retention runs before per-turn generation and backup.
-      retention = await decideRetention(
+    const outcome = await withExclusiveSource(COMMAND, sessionID, async () => {
+      const source = await readSourceAtRest(
         v2,
-        sourceSession,
-        sourceMessages,
-        await findRetentionCandidates(
-          sourceMessages,
-          sourcePlan.summarizedTurns.filter(
-            turn => !turnHasPersistedSummary(turn),
+        COMMAND,
+        sessionID,
+        controlTimeoutMs,
+      );
+      const plan = planCompaction(source.messages, keepTurns);
+      preserved = {
+        requested: keepTurns,
+        preserved: plan.preservedTurnCount,
+      };
+      if (plan.summarizedTurns.length === 0) return null;
+
+      const before = countModelFacingContentTokens(source.messages);
+      if (options.retention.mode === "task-aware") {
+        // Opaque summary-bearing turns are never pruned, so they hold no
+        // candidates. Retention runs before per-turn generation.
+        retention = await decideRetention(
+          v2,
+          source.session,
+          source.messages,
+          await findRetentionCandidates(
+            source.messages,
+            plan.summarizedTurns.filter(turn => !turnHasPersistedSummary(turn)),
           ),
-        ),
-        options.retention,
+          options.retention,
+          { controlTimeoutMs },
+        );
+      }
+      const summaries = await generateCompactionSummaries(
+        v2,
+        source.session,
+        plan,
         { controlTimeoutMs },
       );
-    }
+      const selection = await selectProfitableTurns(
+        plan,
+        summaries,
+        sessionID,
+        retention.keep,
+      );
+      if (selection.turns.length === 0) {
+        if (summaries.every(summary => summary === null)) return null;
+        throw new Error(COMPACT_INSUFFICIENT_SAVINGS);
+      }
 
-    const summaries = await generateCompactionSummaries(
-      v2,
-      sourceSession,
-      sourcePlan,
-      { controlTimeoutMs },
-    );
+      const compacted = applySuccessorEdits(
+        source.messages,
+        compactionEdits(source, plan, selection),
+      );
+      const after = countModelFacingContentTokens(compacted);
+      const eligibleTokens = countModelFacingContentTokens(
+        selection.turns.flatMap(turn => turn.assistants),
+      ).tokens;
+      if (!hasUsefulSavings(before.tokens - after.tokens, eligibleTokens)) {
+        throw new Error(COMPACT_INSUFFICIENT_SAVINGS);
+      }
+      if (after.projectedMediaTokens < before.projectedMediaTokens) {
+        throw new Error(
+          "Magic Compact media projection unexpectedly decreased.",
+        );
+      }
 
-    const selection = await selectProfitableTurns(
-      sourcePlan,
-      summaries,
-      sessionID,
-      retention.keep,
-    );
-    if (
-      selection.turns.length === 0
-      && summaries.every(summary => summary === null)
-    ) {
+      const compactionCount = getCompactionCount(source.session) + 1;
+      // The ignored notice is excluded from canonical counts, so it does not
+      // change the `after` it reports.
+      const history = applySuccessorEdits(compacted, [
+        {
+          type: "append-message",
+          message: appendedNoticeMessage(source, "stats", [
+            {
+              type: "text",
+              text: statsMessage(
+                compactionCount,
+                before.tokens,
+                after.tokens,
+                selection.turns.length,
+                preserved,
+              ),
+              ignored: true,
+              metadata: STATS_METADATA,
+            },
+          ]),
+        },
+      ]);
+      const created = await createSuccessor(v2, {
+        command: COMMAND,
+        source,
+        history,
+        operation: "compact",
+        compactionCount,
+        omissions: selection.pruning.mutations.flatMap(mutation =>
+          mutation.type === "update-part" ? mutation.omissions : [],
+        ),
+        tokensPruned:
+          before.tokens
+          + before.projectedMediaTokens
+          - (after.tokens + after.projectedMediaTokens),
+        mediaTokensProjected: after.projectedMediaTokens,
+        recheckSource: async () =>
+          assertSourceUnchanged(
+            COMMAND,
+            source,
+            await readSourceAtRest(v2, COMMAND, sessionID, controlTimeoutMs),
+          ),
+        controlTimeoutMs,
+      });
+      const actual = countModelFacingContentTokens(created.messages);
+      if (
+        actual.tokens !== after.tokens
+        || actual.projectedMediaTokens !== after.projectedMediaTokens
+      ) {
+        throw new Error(
+          `Compaction token projection mismatch in successor session ${created.session.id}.`,
+        );
+      }
+      summarizedTurnCount = selection.turns.length;
+      return created;
+    });
+    if (outcome === null) {
       await toastFeedback.showTerminal({
-        title: "Magic Compact",
-        message: noopFeedback(preserved),
+        title: COMMAND,
+        message: noopFeedback(preserved!),
         variant: "info",
         duration: 5000,
       });
-      return false;
+      return null;
     }
-
-    const projection = await projectCompaction(
-      sourceMessages,
-      sourcePlan,
-      selection,
-      sessionID,
-      before,
-      beforePhysicalTokens,
-    );
-    const eligibleTokens = countModelFacingContentTokens(
-      selection.turns.flatMap(turn => turn.assistants),
-    ).tokens;
-    const projectedSavings = before.tokens - projection.afterTokens;
-    const minimumSavings = Math.max(
-      MINIMUM_USEFUL_SAVINGS_TOKENS,
-      Math.ceil(eligibleTokens * MINIMUM_USEFUL_SAVINGS_RATIO),
-    );
-    if (projectedSavings < minimumSavings) {
-      throw new Error(COMPACT_INSUFFICIENT_SAVINGS);
-    }
-
-    backupSession = await createBackup(
-      v2,
-      sourceSession,
-      currentCompactionCount,
-      sourceMessages,
-    );
-    await revalidateCompactionSource(v2, sessionID, sourcePlan);
-    if (unwrap(await v2.session.get({ sessionID })).revert) {
-      throw new Error(COMPACT_PENDING_REVERT);
-    }
-
-    sourceWritesStarted = true;
-    const insertedSummaries = await injectSummaries(
-      v2,
-      sessionID,
-      selection.turns,
-      selection.summaries,
-    );
-
-    // Mark the new compaction boundary for future recompactions
-    // Message placed outside of summarization range so unaffected by pruning
-    const boundaryInsertion = await injectPostCompactionNotice(
-      v2,
-      sessionID,
-      sourcePlan.nextTurn,
-    );
-
-    await revalidateCompactionSourceAfterInsertions(v2, sessionID, sourcePlan, [
-      ...insertedSummaries.map(part => ({
-        type: "part" as const,
-        messageID: part.messageID,
-        part,
-      })),
-      boundaryInsertion,
-    ]);
-    await pruneSummarizedTurns({ v2, sessionID }, selection.pruning);
-
-    await updateCompactionMetadata(v2, sourceSession, currentCompactionCount);
-    await injectCompactStatsNotice(
-      v2,
-      sessionID,
-      before.tokens,
-      projection.afterTokens,
-      currentCompactionCount,
-      selection.turns.length,
-      preserved,
-    );
-    const actual = await countSessionTokenProjection(v2, sessionID);
-    if (
-      actual.tokens !== projection.afterTokens
-      || actual.projectedMediaTokens !== projection.projectedMediaTokens
-    ) {
-      throw new Error(
-        "Compaction token projection mismatch after source writes.",
-      );
-    }
-    await recordPruningStats({
-      sessionID,
-      sourceSessionID: sessionID,
-      tokensPruned: projection.physicalTokensPruned,
-      mediaTokensProjected: projection.projectedMediaTokens,
-    });
-    compactedTurnCount = selection.turns.length;
+    successor = outcome;
   } catch (error) {
-    let failure = error;
-    if (
-      sourceWritesStarted
-      && sourceSession !== null
-      && backupSession !== null
-    ) {
-      failure = postWriteFailure(sourceSession.id, backupSession.id);
-    }
-
     await toastFeedback.showTerminal({
       title: "Magic Compact Failed",
-      message: String(failure),
+      message: String(error),
       variant: "error",
       duration: 8000,
     });
-    throw failure;
+    throw error;
   }
 
   await toastFeedback.showTerminal({
-    title: "Magic Compact",
-    message: `Compacted ${compactedTurnCount} request turn(s). ${preservedTurnsFeedback(preserved)} ${retentionFeedback(retention)}`,
+    title: COMMAND,
+    message: `Compacted ${summarizedTurnCount!} request turn(s) into successor session ${successor.session.id}. ${preservedTurnsFeedback(preserved!)} ${retentionFeedback(retention)}`,
     variant: "info",
     duration: 5000,
   });
-  return true;
+  return successor;
 }
 
 // Nothing preserved means N did not shape the outcome, so the message stays
@@ -295,13 +254,67 @@ function noopFeedback(preserved: PreservedTurns): string {
     : `${COMPACT_NOOP} ${preservedTurnsFeedback(preserved)}`;
 }
 
-function postWriteFailure(
-  sourceSessionID: string,
-  backupSessionID: string,
-): Error {
-  return new Error(
-    `Magic Compact failed after source writes began. The live source session ${sourceSessionID} and backup session ${backupSessionID} were both preserved; inspect both and recover manually from backup ${backupSessionID}.`,
-  );
+// Summaries lead their first assistant message and the boundary leads the next
+// user message, matching where earlier in-place releases stored them.
+function compactionEdits(
+  source: Parameters<typeof appendedNoticeMessage>[0],
+  plan: CompactionPlan,
+  selection: CompactionSelection,
+): SuccessorEdit[] {
+  const sessionID = source.session.id;
+  const edits: SuccessorEdit[] = [];
+  for (const [index, turn] of selection.turns.entries()) {
+    const assistant = turn.assistants[0];
+    const summary = selection.summaries[index];
+    if (!assistant || !summary)
+      throw new Error("Missing summary for assistant turn.");
+    edits.push({
+      type: "prepend-part",
+      messageID: assistant.info.id,
+      part: summaryEnvelopeTextPart(
+        assistant.info.id,
+        sessionID,
+        summary.text,
+        summary.mediaManifest,
+      ),
+    });
+  }
+  for (const mutation of selection.pruning.mutations) {
+    if (mutation.type === "update-part") {
+      edits.push({
+        type: "replace-part",
+        messageID: mutation.messageID,
+        part: mutation.replacement,
+      });
+    } else {
+      edits.push(mutation);
+    }
+  }
+  const boundary = {
+    type: "text" as const,
+    text: POST_COMPACTION_NOTICE,
+    synthetic: true,
+    metadata: BOUNDARY_METADATA,
+  };
+  const nextUser = plan.nextTurn?.user[0];
+  if (nextUser) {
+    edits.push({
+      type: "prepend-part",
+      messageID: nextUser.info.id,
+      part: {
+        ...boundary,
+        id: boundaryPartID(nextUser.info.id),
+        sessionID,
+        messageID: nextUser.info.id,
+      },
+    });
+  } else {
+    edits.push({
+      type: "append-message",
+      message: appendedNoticeMessage(source, "boundary", [boundary]),
+    });
+  }
+  return edits;
 }
 
 async function selectProfitableTurns(
@@ -347,7 +360,7 @@ function injectProjectedSummary(
   const projected = structuredClone(turn);
   const firstAssistant = projected.assistants[0];
   if (!firstAssistant) throw new Error("Turn missing assistant message.");
-  firstAssistant.parts.push(
+  firstAssistant.parts.unshift(
     summaryEnvelopeTextPart(
       firstAssistant.info.id,
       sessionID,
@@ -359,89 +372,8 @@ function injectProjectedSummary(
 }
 
 function countTurnModelFacingTokens(turn: Turn): number {
-  return countModelFacingContentTokens([...turn.user, ...turn.assistants])
-    .tokens;
-}
-
-async function projectCompaction(
-  sourceMessages: MessageWithParts[],
-  plan: CompactionPlan,
-  selection: CompactionSelection,
-  sessionID: string,
-  before: ModelFacingTokenCount,
-  beforePhysicalTokens: number,
-) {
-  const messages = structuredClone(sourceMessages);
-  const byID = new Map(messages.map(message => [message.info.id, message]));
-  const summarizedIDs = new Set(
-    selection.turns.flatMap(turn =>
-      [...turn.user, ...turn.assistants].map(message => message.info.id),
-    ),
-  );
-  let appendedBoundary: MessageWithParts | null = null;
-  if (plan.nextTurn) {
-    const nextUser = byID.get(plan.nextTurn.user[0]!.info.id)!;
-    nextUser.parts.push({
-      id: boundaryPartID(nextUser.info.id),
-      sessionID,
-      messageID: nextUser.info.id,
-      type: "text",
-      text: POST_COMPACTION_NOTICE,
-      synthetic: true,
-      metadata: BOUNDARY_METADATA,
-    });
-  } else {
-    appendedBoundary = projectedNoticeMessage(
-      sessionID,
-      "magic-projected-boundary",
-      POST_COMPACTION_NOTICE,
-      BOUNDARY_METADATA,
-    );
-  }
-  const projectedByID = new Map(
-    selection.pruning.turns
-      .flatMap(turn => [...turn.user, ...turn.assistants])
-      .map(message => [message.info.id, message]),
-  );
-  const projectedMessages = messages.flatMap(message => {
-    if (!summarizedIDs.has(message.info.id)) return [message];
-    const projected = projectedByID.get(message.info.id);
-    return projected ? [projected] : [];
-  });
-  if (appendedBoundary) projectedMessages.push(appendedBoundary);
-  const after = countModelFacingContentTokens(projectedMessages);
-  const afterPhysicalTokens = after.tokens + after.projectedMediaTokens;
-  const physicalTokensPruned = beforePhysicalTokens - afterPhysicalTokens;
-  const newMediaTokensProjected =
-    after.projectedMediaTokens - before.projectedMediaTokens;
-  if (newMediaTokensProjected < 0) {
-    throw new Error("Magic Compact media projection unexpectedly decreased.");
-  }
-  return {
-    afterTokens: after.tokens,
-    projectedMediaTokens: after.projectedMediaTokens,
-    physicalTokensPruned,
-  };
-}
-
-function projectedNoticeMessage(
-  sessionID: string,
-  messageID: string,
-  text: string,
-  metadata: Record<string, unknown>,
-): MessageWithParts {
-  return {
-    info: { id: messageID, role: "user" } as Message,
-    parts: [
-      {
-        id: `${messageID}-part`,
-        sessionID,
-        messageID,
-        type: "text",
-        text,
-        synthetic: true,
-        metadata,
-      } satisfies TextPart,
-    ],
-  };
+  return countModelFacingContentTokens([
+    ...turn.user,
+    ...turn.assistants,
+  ] as MessageWithParts[]).tokens;
 }

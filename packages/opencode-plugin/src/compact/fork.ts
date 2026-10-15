@@ -2,6 +2,7 @@ import type { Message, Part, Session } from "@opencode-ai/sdk/v2";
 import { randomBytes, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { V2Client } from "../api";
+import { ContentFreeError } from "../policy/successor";
 import { attemptWithinDeadline, CONTROL_OPERATION_TIMEOUT_MS } from "../util";
 import { snapshotSourceMessages, type MessageWithParts } from "./plan";
 
@@ -19,17 +20,16 @@ const FORK_FAILURE_DETAIL = {
 } as const;
 
 export type ForkFailureReason = keyof typeof FORK_FAILURE_DETAIL;
+export type ForkFailureDetail = (typeof FORK_FAILURE_DETAIL)[ForkFailureReason];
 
-export class ForkHistoryError extends Error {
-  readonly detail: string;
-
+export class ForkHistoryError extends ContentFreeError {
   constructor(readonly reason: ForkFailureReason) {
     const detail = FORK_FAILURE_DETAIL[reason];
     super(
       `Magic Compact chronological fork initialization failed (${detail}).`,
+      detail,
     );
     this.name = "ForkHistoryError";
-    this.detail = detail;
   }
 }
 
@@ -86,78 +86,20 @@ export async function forkSession(
     throw new ForkHistoryError("fork-invalid");
 
   try {
-    // Reads are idempotent, so a timed-out or rejected request gets exactly one
-    // more attempt with a fresh deadline. A response that arrives is final:
-    // verification below never reloads or repairs it.
-    const load = async (sessionID = fork.id): Promise<MessageWithParts[]> => {
-      let reason: "read-timeout" | "read-failed" = "read-failed";
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const outcome = await attemptWithinDeadline(
-          signal =>
-            v2.session
-              .messages({ sessionID, ...route }, { signal })
-              .then(response => {
-                if (response.error) throw response.error;
-                return response.data;
-              }),
-          controlTimeoutMs,
-        );
-        if (outcome.kind === "success") {
-          if (!Array.isArray(outcome.value))
-            throw new ForkHistoryError("read-invalid");
-          return outcome.value;
-        }
-        reason = outcome.kind === "timed-out" ? "read-timeout" : "read-failed";
-      }
-      throw new ForkHistoryError(reason);
-    };
+    const load = (sessionID = fork.id) =>
+      loadHistory(v2, sessionID, route, controlTimeoutMs);
     if ((await load()).length !== 0)
       throw new ForkHistoryError("cut-not-empty");
     if (messages.length > 0) {
       const expected = plan(fork.id);
-      const events: ReplayEvents = [];
-      const append = (type: string, data: Record<string, unknown>) => {
-        events.push({
-          id: `evt_${randomUUID()}`,
-          aggregateID: fork.id,
-          seq: events.length + 1,
-          type,
-          data: { sessionID: fork.id, ...data },
-        });
-      };
-      // An empty native fork has only session.created.1 at seq 0. Replay uses
-      // consecutive event sequences and rejects a competing writer's sequence.
-      for (const [index, message] of expected.entries()) {
-        // Seed the immutable row ordering key, then restore the exact JSON
-        // info. Both updates are host operations; no source record or DB is
-        // patched.
-        append("message.updated.1", {
-          info: {
-            ...message.info,
-            time: { ...message.info.time, created: index },
-          },
-        });
-        append("message.updated.1", { info: message.info });
-        for (const part of message.parts) {
-          append("message.part.updated.1", { part, time: Date.now() });
-        }
-      }
       // Like fork creation, replay is awaited directly: timing out could lose
       // ownership of a still-writing server operation during cleanup.
-      const replay = unwrap(
-        await v2.sync.replay({
-          query_directory: route.directory,
-          ...(route.workspace ? { workspace: route.workspace } : {}),
-          body_directory: route.directory,
-          events,
-        }),
-      );
-      const replayed = replay.sessionID === fork.id ? await load() : undefined;
-      if (!replayed || !isDeepStrictEqual(replayed, expected))
+      await replayHistory(v2, fork.id, expected, route);
+      if (!isDeepStrictEqual(await load(), expected))
         throw new ForkHistoryError("replay-mismatch");
     }
     // The fork holds planned records, not the live source. Recheck
-    // correspondence before it can become a recovery backup; timing churn is
+    // correspondence before it becomes a generation or summary input; timing churn is
     // normalized separately from the exact persisted chronology/content check
     // above.
     const live = await load(source.id);
@@ -197,10 +139,86 @@ function classified<T>(reason: ForkFailureReason, test: () => T): T {
   }
 }
 
+export type HistoryRoute = { directory: string; workspace?: string };
+
+// Reads are idempotent, so a timed-out or rejected request gets exactly one
+// more attempt with a fresh deadline. A response that arrives is final:
+// callers never reload or repair it.
+export async function loadHistory(
+  v2: V2Client,
+  sessionID: string,
+  route: HistoryRoute,
+  controlTimeoutMs: number,
+): Promise<MessageWithParts[]> {
+  let reason: "read-timeout" | "read-failed" = "read-failed";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const outcome = await attemptWithinDeadline(
+      signal =>
+        v2.session
+          .messages({ sessionID, ...route }, { signal })
+          .then(response => {
+            if (response.error) throw response.error;
+            return response.data;
+          }),
+      controlTimeoutMs,
+    );
+    if (outcome.kind === "success") {
+      if (!Array.isArray(outcome.value))
+        throw new ForkHistoryError("read-invalid");
+      return outcome.value;
+    }
+    reason = outcome.kind === "timed-out" ? "read-timeout" : "read-failed";
+  }
+  throw new ForkHistoryError(reason);
+}
+
+// Appends a planned history to an empty session through host replay. An empty
+// native session has only session.created.1 at seq 0; replay uses consecutive
+// event sequences and rejects a competing writer's sequence. The caller
+// verifies the persisted result.
+export async function replayHistory(
+  v2: V2Client,
+  sessionID: string,
+  expected: MessageWithParts[],
+  route: HistoryRoute,
+): Promise<void> {
+  const events: ReplayEvents = [];
+  const append = (type: string, data: Record<string, unknown>) => {
+    events.push({
+      id: `evt_${randomUUID()}`,
+      aggregateID: sessionID,
+      seq: events.length + 1,
+      type,
+      data: { sessionID, ...data },
+    });
+  };
+  for (const [index, message] of expected.entries()) {
+    // Seed the immutable row ordering key, then restore the exact JSON info.
+    // Both updates are host operations; no source record or DB is patched.
+    append("message.updated.1", {
+      info: { ...message.info, time: { ...message.info.time, created: index } },
+    });
+    append("message.updated.1", { info: message.info });
+    for (const part of message.parts) {
+      append("message.part.updated.1", { part, time: Date.now() });
+    }
+  }
+  const replay = unwrap(
+    await v2.sync.replay({
+      query_directory: route.directory,
+      ...(route.workspace ? { workspace: route.workspace } : {}),
+      body_directory: route.directory,
+      events,
+    }),
+  );
+  if (replay.sessionID !== sessionID)
+    throw new ForkHistoryError("replay-mismatch");
+}
+
 // Validates the source and mints the copy's message and part IDs: one clock
 // reading plus a counter, so IDs ascend in planned order however the host clock
-// moves. The copy takes its session once the native fork exists.
-function planHistory(
+// moves. The copy takes its session once the target session exists.
+export function planHistory(
   messages: MessageWithParts[],
   sourceID: string,
 ): (forkID: string) => MessageWithParts[] {

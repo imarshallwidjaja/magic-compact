@@ -1,21 +1,17 @@
-import type { Session } from "@opencode-ai/sdk/v2";
-import { unwrap, type V2Client } from "./api";
-import { safeStatus } from "./compact/compact";
+import type { V2Client } from "./api";
+import { TRIM_NOOP } from "./commands";
+import { planTrim } from "./compact/plan";
+import { projectToolTrim } from "./compact/prune";
+import { getCompactionCount } from "./compact/session";
 import {
-  assertTrimSourceUnchanged,
-  createTrimPlan,
-  TrimSourceChangedError,
-  type TrimPlan,
-} from "./compact/plan";
-import { trimToolParts } from "./compact/prune";
-import {
-  applyBackup,
-  createBackup,
-  deleteBackup,
-  getCompactionCount,
-  injectTrimStatsNotice,
-  recordPruningStats,
-} from "./compact/session";
+  appendedNoticeMessage,
+  applySuccessorEdits,
+  assertSourceUnchanged,
+  createSuccessor,
+  readSourceAtRest,
+  withExclusiveSource,
+  type Successor,
+} from "./compact/successor";
 import {
   decideRetention,
   findRetentionCandidates,
@@ -24,62 +20,37 @@ import {
   type RetentionPlan,
   type RetentionPolicy,
 } from "./retention/retention";
-import { countSessionTokens } from "./stats/tokenize";
+import { STATS_METADATA, trimStatsMessage } from "./stats/constants";
+import { countModelFacingContentTokens } from "./stats/tokenize";
 import {
   CONTROL_OPERATION_TIMEOUT_MS,
   createToastFeedback,
   IN_PROGRESS_TOAST_DURATION_MS,
 } from "./util";
 
-export const TRIM_SUCCESS = "Magic trimming successful.";
-export const TRIM_NOOP = "No eligible tool calls need trimming.";
-export const TRIM_PENDING_REVERT =
-  "Magic Trim cannot classify tool calls while the session has a pending revert. Resolve the pending revert first, then retry.";
-export const TRIM_ARGUMENTS_ERROR =
-  "/magic-trim accepts an optional non-negative integer and an optional --heuristic flag.";
+const COMMAND = "Magic Trim";
+
+export {
+  parseMagicTrimArguments,
+  TRIM_ARGUMENTS_ERROR,
+  TRIM_NOOP,
+  trimSuccess,
+} from "./commands";
 
 export type MagicTrimExecutionOptions = {
   retention: RetentionPolicy;
   controlTimeoutMs?: number;
 };
 
-// Fixed text plus an optional HTTP status; never an SDK error or body.
-export class TrimRevalidationError extends Error {
-  constructor(
-    readonly target: "messages" | "session",
-    readonly status?: number,
-  ) {
-    super(
-      `Magic Trim could not reload the source ${target} to recheck it before writing${status === undefined ? "" : ` (HTTP ${status})`}. The source session was left unchanged.`,
-    );
-    this.name = "TrimRevalidationError";
-  }
-}
-
-export function parseMagicTrimArguments(raw: string): {
-  keepTurns: number;
-  heuristic: boolean;
-} {
-  let keepTurns: number | undefined;
-  let heuristic = false;
-  for (const token of raw.trim().split(/\s+/u).filter(Boolean)) {
-    if (token === "--heuristic" && !heuristic) {
-      heuristic = true;
-    } else if (/^\d+$/u.test(token) && keepTurns === undefined) {
-      keepTurns = Number(token);
-    } else {
-      throw new Error(TRIM_ARGUMENTS_ERROR);
-    }
-  }
-  return { keepTurns: keepTurns ?? 0, heuristic };
-}
-
+// Returns the ready successor, or null for a no-op. Trim covers the complete
+// stored history, independent of compaction boundaries, and never writes the
+// source session.
 export async function executeMagicTrim(
   v2: V2Client,
   sessionID: string,
   keepTurns: number,
   options: MagicTrimExecutionOptions,
-): Promise<boolean> {
+): Promise<Successor | null> {
   const controlTimeoutMs =
     options.controlTimeoutMs ?? CONTROL_OPERATION_TIMEOUT_MS;
   if (!Number.isFinite(controlTimeoutMs) || controlTimeoutMs <= 0) {
@@ -87,206 +58,123 @@ export async function executeMagicTrim(
   }
   const toastFeedback = createToastFeedback(v2, controlTimeoutMs);
   await toastFeedback.showProgress({
-    title: "Magic Trim",
+    title: COMMAND,
     message: "Trimming session...",
     variant: "info",
     duration: IN_PROGRESS_TOAST_DURATION_MS,
   });
-  let backupSession: Session | null = null;
-  let sourceSession: Session | null = null;
-  // Until the first source write is attempted the live source is authoritative
-  // and the backup is only a copy to discard. From then on the source may be
-  // partly trimmed and the backup is the recovery target.
-  let sourceWritesStarted = false;
 
   try {
-    const plan = await createTrimPlan(v2, sessionID, keepTurns);
-    sourceSession = unwrap(await v2.session.get({ sessionID }));
-    let retention: RetentionPlan = HEURISTIC_RETENTION;
-    if (options.retention.mode === "task-aware") {
-      const found = await findRetentionCandidates(
-        plan.messages,
-        plan.trimmedTurns,
-      );
-      if (found.candidates.length > 0 && sourceSession.revert) {
-        throw new Error(TRIM_PENDING_REVERT);
-      }
-      retention = await decideRetention(
+    const outcome = await withExclusiveSource(COMMAND, sessionID, async () => {
+      const source = await readSourceAtRest(
         v2,
-        sourceSession,
-        plan.messages,
-        found,
-        options.retention,
-        { controlTimeoutMs },
+        COMMAND,
+        sessionID,
+        controlTimeoutMs,
       );
-    }
+      const plan = planTrim(source.messages, keepTurns);
+      let retention: RetentionPlan = HEURISTIC_RETENTION;
+      if (options.retention.mode === "task-aware") {
+        retention = await decideRetention(
+          v2,
+          source.session,
+          source.messages,
+          await findRetentionCandidates(source.messages, plan.trimmedTurns),
+          options.retention,
+          { controlTimeoutMs },
+        );
+      }
+      const retentionLine = retentionFeedback(retention, source.messages);
+      const trim = await projectToolTrim(
+        plan.trimmedTurns,
+        sessionID,
+        retention.keep,
+      );
+      if (trim.replacements.length === 0) {
+        return { successor: null, retentionLine };
+      }
 
-    const backup = await createBackup(
-      v2,
-      sourceSession,
-      getCompactionCount(sourceSession),
-      plan.messages,
-    );
-    backupSession = backup;
-    if (retention.evaluated > 0) {
-      // Classification is slow, so the source must still match the planned
-      // history before any write. SDK errors can carry session content, so
-      // these failures keep only fixed text and a status.
-      await assertTrimSourceStillPlanned(v2, sessionID, plan);
-    }
+      const trimmed = applySuccessorEdits(
+        source.messages,
+        trim.replacements.map(part => ({
+          type: "replace-part" as const,
+          messageID: part.messageID,
+          part,
+        })),
+      );
+      const before = countModelFacingContentTokens(source.messages);
+      const after = countModelFacingContentTokens(trimmed);
+      const history = applySuccessorEdits(trimmed, [
+        {
+          type: "append-message",
+          message: appendedNoticeMessage(source, "stats", [
+            {
+              type: "text",
+              text: trimStatsMessage(
+                before.tokens,
+                after.tokens,
+                trim.replacements.length,
+                retentionLine,
+              ),
+              ignored: true,
+              metadata: STATS_METADATA,
+            },
+          ]),
+        },
+      ]);
+      const successor = await createSuccessor(v2, {
+        command: COMMAND,
+        source,
+        history,
+        operation: "trim",
+        compactionCount: getCompactionCount(source.session),
+        omissions: trim.omissions,
+        tokensPruned: before.tokens - after.tokens,
+        mediaTokensProjected: after.projectedMediaTokens,
+        recheckSource: async () =>
+          assertSourceUnchanged(
+            COMMAND,
+            source,
+            await readSourceAtRest(v2, COMMAND, sessionID, controlTimeoutMs),
+          ),
+        controlTimeoutMs,
+      });
+      const actual = countModelFacingContentTokens(successor.messages).tokens;
+      if (actual !== after.tokens) {
+        throw new Error(
+          `Trim final canonical active token count did not match its projection in successor session ${successor.session.id} (projected ${after.tokens}, actual ${actual}).`,
+        );
+      }
+      return {
+        successor,
+        retentionLine,
+        trimmedToolCalls: trim.replacements.length,
+      };
+    });
 
-    const beforeTokens = await countSessionTokens(v2, sessionID);
-    const trimmedToolCalls = await trimToolParts(
-      { v2, sessionID },
-      plan.trimmedTurns,
-      retention.keep,
-      () => {
-        sourceWritesStarted = true;
-      },
-    );
-    const retentionLine = retentionFeedback(retention, plan.messages);
-    if (trimmedToolCalls === 0) {
-      const unneededBackup = backupSession;
-      backupSession = null;
-      await deleteBackup(v2, unneededBackup.id);
+    if (outcome.successor === null) {
       await toastFeedback.showTerminal({
-        title: "Magic Trim",
-        message: `${TRIM_NOOP} ${retentionLine}`,
+        title: COMMAND,
+        message: `${TRIM_NOOP} ${outcome.retentionLine}`,
         variant: "info",
         duration: 5000,
       });
-      return false;
+      return null;
     }
-
-    const afterTokens = await countSessionTokens(v2, sessionID);
-    await recordPruningStats({
-      sessionID,
-      sourceSessionID: sessionID,
-      tokensPruned: beforeTokens - afterTokens,
-    });
-
-    await injectTrimStatsNotice(
-      v2,
-      sessionID,
-      beforeTokens,
-      afterTokens,
-      trimmedToolCalls,
-      retentionLine,
-    );
-    const actualAfterTokens = await countSessionTokens(v2, sessionID);
-    if (actualAfterTokens !== afterTokens) {
-      throw new Error(
-        `Trim final canonical active token count did not match its projection (projected ${afterTokens}, actual ${actualAfterTokens}).`,
-      );
-    }
-
     await toastFeedback.showTerminal({
-      title: "Magic Trim",
-      message: `Trimmed ${trimmedToolCalls} tool call(s). ${retentionLine}`,
+      title: COMMAND,
+      message: `Trimmed ${outcome.trimmedToolCalls} tool call(s) into successor session ${outcome.successor.session.id}. ${outcome.retentionLine}`,
       variant: "info",
       duration: 5000,
     });
-    return true;
+    return outcome.successor;
   } catch (error) {
-    let failure = error;
-    if (sourceSession && backupSession && !sourceWritesStarted) {
-      failure = await discardUnusedBackup(
-        v2,
-        sourceSession.id,
-        backupSession.id,
-        error,
-      );
-    } else if (sourceSession && backupSession) {
-      try {
-        await applyBackup(v2, sourceSession, backupSession);
-      } catch (recoveryError) {
-        const recoveryGuidance = `Magic Trim automatic recovery failed. Inspect source session ${sourceSession.id} and backup session ${backupSession.id}, then recover manually.`;
-        const recoveryFailure = new Error(recoveryGuidance, {
-          cause: recoveryError,
-        });
-        failure = new AggregateError(
-          [error, recoveryFailure],
-          `Magic Trim failed: ${String(error)} ${recoveryGuidance}`,
-          { cause: error },
-        );
-      }
-    }
-
     await toastFeedback.showTerminal({
       title: "Magic Trim Failed",
-      message: String(failure),
+      message: String(error),
       variant: "error",
       duration: 8000,
     });
-    throw failure;
+    throw error;
   }
-}
-
-// The failure to report when no source write was attempted: `cause` itself
-// once the unused backup is deleted, otherwise an aggregate naming both
-// sessions. The backup's own deletion error can carry session content, so only
-// fixed text survives.
-async function discardUnusedBackup(
-  v2: V2Client,
-  sourceSessionID: string,
-  backupSessionID: string,
-  cause: unknown,
-): Promise<unknown> {
-  try {
-    await deleteBackup(v2, backupSessionID);
-  } catch {
-    return new AggregateError(
-      [
-        cause,
-        new Error(
-          `Unneeded backup session ${backupSessionID} could not be deleted.`,
-        ),
-      ],
-      `${String(cause)} Source session ${sourceSessionID} was left unchanged, but unneeded backup session ${backupSessionID} could not be deleted; delete it manually.`,
-    );
-  }
-  return cause;
-}
-
-// Throws only TrimRevalidationError, TrimSourceChangedError, or the fixed
-// pending-revert error.
-async function assertTrimSourceStillPlanned(
-  v2: V2Client,
-  sessionID: string,
-  plan: TrimPlan,
-): Promise<void> {
-  const messages = await revalidationRead("messages", () =>
-    v2.session.messages({ sessionID }),
-  );
-  try {
-    assertTrimSourceUnchanged(messages, plan);
-  } catch {
-    throw new TrimSourceChangedError();
-  }
-  const session = await revalidationRead("session", () =>
-    v2.session.get({ sessionID }),
-  );
-  if (session.revert) throw new Error(TRIM_PENDING_REVERT);
-}
-
-async function revalidationRead<T>(
-  target: TrimRevalidationError["target"],
-  request: () => Promise<{ data?: T; error?: unknown; response?: Response }>,
-): Promise<T> {
-  let result: Awaited<ReturnType<typeof request>>;
-  try {
-    result = await request();
-  } catch (error) {
-    throw new TrimRevalidationError(target, safeStatus(error));
-  }
-  if (result.error || result.data === undefined) {
-    const status = result.response?.status;
-    throw new TrimRevalidationError(
-      target,
-      Number.isInteger(status) && status! >= 100 && status! <= 599
-        ? status
-        : undefined,
-    );
-  }
-  return result.data;
 }

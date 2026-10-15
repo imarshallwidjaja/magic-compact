@@ -1,25 +1,18 @@
 import type { Part, ToolPart } from "@opencode-ai/sdk/v2";
-import { isDeepStrictEqual } from "node:util";
-import { unwrap, type V2Client } from "../api";
-import {
-  inputOmissionNotice,
-  isPersistedSummaryPart,
-  outputOmissionNotice,
-} from "./constants";
+import { isPersistedSummaryPart } from "./constants";
 import type { MessageWithParts, Turn } from "./plan";
-import {
-  allocateOmission,
-  commitPlannedOmission,
-  planOmission,
-  type PlannedOmission,
-} from "../storage/omission";
-import { isRecord, unwrapString } from "../util";
+import { planOmission, type PlannedOmission } from "../storage/omission";
+import { isRecord } from "../util";
 import { coveredAssistantImagePartIDs } from "./media";
-
-type PruneContext = {
-  v2: V2Client;
-  sessionID: string;
-};
+import { keepsHostInjectedText } from "../policy/host-text";
+import {
+  planToolTrim,
+  plannedOutputText,
+  toolTrimChangesContent,
+  type OmissionAllocator,
+  type ToolCallView,
+  type ToolRuleCategory,
+} from "../policy/tool-rules";
 
 export type PruneProjection = {
   turns: Turn[];
@@ -43,53 +36,6 @@ export type PruneMutation =
       type: "delete-message";
       messageID: string;
     };
-
-const DEFAULT_OUTPUT_DESCRIPTION =
-  "Output omitted due to a compaction operation.";
-
-const DEFAULT_LIMIT = { words: 128, chars: 1024 };
-const TASK_OUTPUT_LIMIT = { words: 512, chars: 4096 };
-
-export async function pruneSummarizedTurns(
-  context: PruneContext,
-  projection: PruneProjection,
-): Promise<void> {
-  for (const mutation of projection.mutations) {
-    if (mutation.type === "delete-part") {
-      unwrap(
-        await context.v2.part.delete({
-          sessionID: context.sessionID,
-          messageID: mutation.messageID,
-          partID: mutation.partID,
-        }),
-      );
-      continue;
-    }
-    if (mutation.type === "delete-message") {
-      unwrap(
-        await context.v2.session.deleteMessage({
-          sessionID: context.sessionID,
-          messageID: mutation.messageID,
-        }),
-      );
-      continue;
-    }
-    for (const omission of mutation.omissions) {
-      await commitPlannedOmission(context.sessionID, omission);
-    }
-    unwrap(
-      await context.v2.part.update({
-        sessionID: context.sessionID,
-        messageID: mutation.messageID,
-        partID: mutation.partID,
-        part: {
-          ...mutation.replacement,
-          sessionID: context.sessionID,
-        },
-      }),
-    );
-  }
-}
 
 // `keep` names tool parts that task-aware retention keeps whole: they stay
 // byte-identical, including their trim metadata, and produce no mutation.
@@ -194,108 +140,87 @@ function assertNoNativeArtifacts(turns: Turn[]): void {
   }
 }
 
-// `onFirstWrite` runs once, immediately before the first source part update is
-// attempted, so the caller can tell a trim that never wrote from one whose
-// write may have partly applied.
-export async function trimToolParts(
-  context: PruneContext,
+export type TrimProjection = {
+  // Replacement parts keyed by their source part ID, in source order.
+  replacements: ToolPart[];
+  omissions: PlannedOmission[];
+};
+
+// Applies the existing tool rules to clones of the completed tool parts in
+// `turns`, skipping parts that task-aware retention keeps whole. Omission IDs
+// are planned, not allocated; the caller commits them to the successor cache.
+export async function projectToolTrim(
   turns: Turn[],
+  sessionID: string,
   keep: ReadonlySet<string>,
-  onFirstWrite: () => void = () => {},
-): Promise<number> {
-  let trimmed = 0;
-  let writing = false;
-  const beforeUpdate = () => {
-    if (writing) return;
-    writing = true;
-    onFirstWrite();
-  };
+): Promise<TrimProjection> {
+  const replacements: ToolPart[] = [];
+  const omissions: PlannedOmission[] = [];
   for (const turn of turns) {
     for (const assistant of turn.assistants) {
       for (const part of assistant.parts) {
-        if (
-          part.type === "tool"
-          && !keep.has(part.id)
-          && (await pruneToolPart(
-            context,
-            part,
-            entry => allocateOmission(context.sessionID, entry),
-            beforeUpdate,
-          ))
-        ) {
-          trimmed += 1;
-        }
+        if (part.type !== "tool" || keep.has(part.id)) continue;
+        const replacement = structuredClone(part);
+        const partOmissions: PlannedOmission[] = [];
+        const changed = await prepareToolPart(replacement, async entry => {
+          const omission = planOmission(sessionID, entry);
+          partOmissions.push(omission);
+          return omission.contentID;
+        });
+        if (!changed) continue;
+        replacements.push(replacement);
+        omissions.push(...partOmissions);
       }
     }
   }
-  return trimmed;
+  return { replacements, omissions };
 }
 
 // True when the existing tool rules would change a completed part's model
 // input or output, not merely stamp its trim metadata. Runs the rules on a
 // clone and allocates no omission IDs.
 export async function trimWouldChangeContent(part: ToolPart): Promise<boolean> {
-  if (part.state.status !== "completed") return false;
-  const probe = structuredClone(part);
-  await prepareToolPart(probe, async () => "retention-probe");
-  return (
-    probe.state.status === "completed"
-    && (probe.state.output !== part.state.output
-      || !isDeepStrictEqual(probe.state.input, part.state.input))
-  );
+  const call = toolCallView(part);
+  return call !== null && (await toolTrimChangesContent(call));
 }
 
-async function pruneToolPart(
-  context: PruneContext,
-  part: ToolPart,
-  allocate: (entry: { content: string }) => Promise<string>,
-  beforeUpdate: () => void,
-): Promise<boolean> {
-  const changed = await prepareToolPart(part, allocate);
-  if (!changed) return false;
+// V1 tool names for the shared rule categories.
+const V1_TOOL_CATEGORIES: Readonly<Record<string, ToolRuleCategory>> = {
+  write: "write",
+  edit: "edit",
+  apply_patch: "patch",
+  bash: "shell",
+  task: "subagent",
+  read: "read",
+  todowrite: "todo",
+  question: "question",
+  skill: "skill",
+};
 
-  beforeUpdate();
-  unwrap(
-    await context.v2.part.update({
-      sessionID: context.sessionID,
-      messageID: part.messageID,
-      partID: part.id,
-      part: {
-        ...part,
-        sessionID: context.sessionID,
-      },
-    }),
-  );
-  return true;
+export function toolCallView(part: ToolPart): ToolCallView | null {
+  if (part.state.status !== "completed") return null;
+  const magicCompact = part.state.metadata["magicCompact"];
+  return {
+    category: Object.hasOwn(V1_TOOL_CATEGORIES, part.tool)
+      ? V1_TOOL_CATEGORIES[part.tool]!
+      : "other",
+    input: part.state.input,
+    output: part.state.output,
+    trimmed: isRecord(magicCompact) && magicCompact["trimmed"] === true,
+  };
 }
 
 async function prepareToolPart(
   part: ToolPart,
-  allocate: (entry: { content: string }) => Promise<string>,
+  allocate: OmissionAllocator,
 ): Promise<boolean> {
-  if (part.state.status !== "completed") {
-    return false;
-  }
+  const call = toolCallView(part);
+  if (call === null || part.state.status !== "completed") return false;
+  const plan = await planToolTrim(call, allocate);
+  if (plan === null) return false;
   const magicCompact = part.state.metadata["magicCompact"];
-  const alreadyTrimmed =
-    isRecord(magicCompact) && magicCompact["trimmed"] === true;
-
-  // Input rules are idempotent on their own results (placeholders, or a command
-  // already cut below its limit), so they still apply to parts marked by
-  // earlier rule sets. Output rules are not idempotent: read would re-wrap its
-  // own omission notice.
-  const inputNotice = await applyInputOmissions(part, allocate);
-  if (alreadyTrimmed && !inputNotice) {
-    return false;
-  }
-  if (!alreadyTrimmed) {
-    await applyOutputOmissions(part, allocate);
-  }
-
-  if (inputNotice) {
-    part.state.output = `${inputNotice}\n\n${part.state.output}`;
-  }
-
+  part.state.input = plan.input;
+  part.state.output = plannedOutputText(call, plan);
   part.state.metadata = {
     ...part.state.metadata,
     magicCompact: {
@@ -303,185 +228,13 @@ async function prepareToolPart(
       trimmed: true,
     },
   };
-
   return true;
-}
-
-async function applyInputOmissions(
-  part: ToolPart,
-  allocate: (entry: { content: string }) => Promise<string>,
-): Promise<string | null> {
-  if (part.state.status !== "completed") {
-    return null;
-  }
-
-  const input = part.state.input;
-
-  if (part.tool === "write") {
-    const content = unwrapString(input["content"]);
-    if (content && exceeds(content, DEFAULT_LIMIT)) {
-      const contentID = await allocate({ content });
-      input["content"] = "[Omitted]";
-      return inputOmissionNotice(
-        "File write contents omitted due to a compaction operation. If necessary, reread file to see current contents.",
-        Buffer.byteLength(content),
-        contentID,
-      );
-    }
-  }
-
-  if (part.tool === "apply_patch") {
-    const content = unwrapString(input["patchText"]);
-    if (content && exceeds(content, DEFAULT_LIMIT)) {
-      const contentID = await allocate({ content });
-      input["patchText"] = "[Omitted]";
-      return inputOmissionNotice(
-        "Patch text omitted due to compaction operation. If necessary, reread files to see current contents.",
-        Buffer.byteLength(content),
-        contentID,
-      );
-    }
-  }
-
-  if (part.tool === "bash") {
-    const content = unwrapString(input["command"]);
-    if (content && content.length > 1024) {
-      const contentID = await allocate({ content });
-      input["command"] =
-        `${content.slice(0, 512)}\n[REST OF COMMAND TRUNCATED]`;
-      return inputOmissionNotice(
-        "Bash command truncated due to compaction operation.",
-        Buffer.byteLength(content),
-        contentID,
-      );
-    }
-  }
-
-  if (part.tool === "edit") {
-    const oldString = unwrapString(input["oldString"]);
-    const newString = unwrapString(input["newString"]);
-    const combined = `${oldString}\n${newString}`;
-    if (exceeds(combined, DEFAULT_LIMIT)) {
-      const contentID = await allocate({
-        content: combined,
-      });
-      input["oldString"] = "[Omitted]";
-      input["newString"] = "[Omitted]";
-      return inputOmissionNotice(
-        "File edit oldString and newString omitted due to compaction operation. If necessary, reread file to see current contents.",
-        Buffer.byteLength(combined),
-        contentID,
-      );
-    }
-  }
-
-  if (part.tool === "task") {
-    const prompt = unwrapString(input["prompt"]);
-    if (prompt && exceeds(prompt, DEFAULT_LIMIT)) {
-      const contentID = await allocate({ content: prompt });
-      input["prompt"] =
-        `[Historical task prompt omitted; Content ID: ${contentID}. Retrieve the original with read_omitted_content before reuse.]`;
-      return inputOmissionNotice(
-        "Task prompt omitted due to compaction operation. If necessary, reread it via read_omitted_content.",
-        Buffer.byteLength(prompt),
-        contentID,
-      );
-    }
-  }
-
-  return null;
-}
-
-async function applyOutputOmissions(
-  part: ToolPart,
-  allocate: (entry: { content: string }) => Promise<string>,
-): Promise<void> {
-  if (part.state.status !== "completed") {
-    return;
-  }
-
-  const output = part.state.output;
-
-  if (part.tool === "question") {
-    return;
-  }
-
-  if (part.tool === "todowrite") {
-    part.state.output = "Successfully updated todos.";
-    return;
-  }
-
-  if (part.tool === "skill") {
-    part.state.output =
-      "Skill contents omitted due to compaction operation. If necessary, recall skill.";
-    return;
-  }
-
-  if (part.tool === "read") {
-    const contentID = await allocate({
-      content: output,
-    });
-    part.state.output = outputOmissionNotice(
-      "Historical read contents omitted due to compaction operation. Retrieve the exact captured result with read_omitted_content; reread the file for current contents.",
-      Buffer.byteLength(output),
-      contentID,
-    );
-    return;
-  }
-
-  if (part.tool === "task") {
-    if (exceeds(output, TASK_OUTPUT_LIMIT)) {
-      const contentID = await allocate({
-        content: output,
-      });
-      part.state.output = outputOmissionNotice(
-        "Task output omitted due to a compaction operation. If necessary, reread output via read_omitted_content tool.",
-        Buffer.byteLength(output),
-        contentID,
-      );
-    }
-    return;
-  }
-
-  if (!exceeds(output, DEFAULT_LIMIT)) {
-    return;
-  }
-
-  const contentID = await allocate({
-    content: output,
-  });
-  part.state.output = outputOmissionNotice(
-    DEFAULT_OUTPUT_DESCRIPTION,
-    Buffer.byteLength(output),
-    contentID,
-  );
 }
 
 function isImportantSyntheticPart(part: Part): boolean {
   return (
     part.type === "text"
     && part.synthetic === true
-    && (part.text === "The following tool was executed by the user"
-      || part.text.startsWith("<task ")
-      || part.text.includes(
-        "The user has changed the current working directory to",
-      )
-      || part.text.startsWith("The user made the following comment"))
+    && keepsHostInjectedText(part.text)
   );
-}
-
-function exceeds(
-  text: string,
-  limit: { words: number; chars: number },
-): boolean {
-  return wordCount(text) > limit.words || text.length > limit.chars;
-}
-
-function wordCount(text: string): number {
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return 0;
-  }
-
-  return trimmed.split(/\s+/).length;
 }
