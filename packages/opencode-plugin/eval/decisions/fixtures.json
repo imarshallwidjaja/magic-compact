@@ -1,0 +1,386 @@
+{
+  "schemaVersion": 1,
+  "datasetID": "magic-compact-retention-decisions-synthetic",
+  "version": "1.0.0",
+  "split": "smoke",
+  "description": "Hand-labelled synthetic keep/trim decisions for a fictional TypeScript library (ledgerkit). Every case is one completed tool call whose trim the production rules would change, with the latest request and session summary the production classifier sees. The pack was written alongside the classifier wording and is a smoke and development aid; it is not held out and must not be used to select a threshold.",
+  "snapshots": [
+    {
+      "snapshotID": "rounding-fix",
+      "context": {
+        "latestUserRequest": "The money rounding test is still failing. Fix `roundHalfEven` in src/money/round.ts so it rounds exact halves to the even cent, then rerun the money tests.",
+        "sessionSummary": "## Objective\n- Fix half-even rounding in ledgerkit's money module and get `bun test src/money` passing.\n\n## Progress\n- Located the bug: `roundHalfEven` in src/money/round.ts adds 0.5 before flooring, so exact halves always round up.\n- Rewrote `formatInvoiceTotal` in src/invoice/total.ts to sum unrounded values and call `roundHalfEven` once at the end. That change is done and `bun test src/invoice` passes.\n- Removed the now-unused `roundCents` helper from src/money/round.ts.\n- A finished earlier request tidied the invoice todo list; every item on it is completed.\n\n## Next\n- Replace the body of `roundHalfEven` with a half-to-even implementation.\n- Rerun `bun test src/money` and fix any remaining failures."
+      },
+      "cases": [
+        {
+          "caseID": "rounding-read-current-source",
+          "scenario": "latest-task-read",
+          "candidate": {
+            "tool": "read",
+            "input": {
+              "filePath": "src/money/round.ts"
+            },
+            "output": "<path>src/money/round.ts</path>\n<type>file</type>\n<content>\n1: // Money rounding helpers. Amounts are integer cents; inputs are decimal cents.\n2: export function roundHalfEven(cents: number): number {\n3:   // BUG: adding 0.5 before flooring rounds every exact half up.\n4:   return Math.floor(cents + 0.5);\n5: }\n6: \n7: export function toCents(amount: string): number {\n8:   const [whole = \"0\", fraction = \"\"] = amount.split(\".\");\n9:   const padded = (fraction + \"00\").slice(0, 2);\n10:   return Number(whole) * 100 + Number(padded);\n11: }\n12: \n13: export function formatCents(cents: number): string {\n14:   const sign = cents < 0 ? \"-\" : \"\";\n15:   const abs = Math.abs(cents);\n16:   return `${sign}${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, \"0\")}`;\n17: }\n\n(End of file - total 17 lines)\n</content>",
+            "turnRequest": "The money rounding test is still failing. Fix `roundHalfEven` in src/money/round.ts so it rounds exact halves to the even cent, then rerun the money tests.",
+            "requestsBeforeLatest": 0
+          },
+          "label": {
+            "keep": true,
+            "rationale": "Current contents of the file the pending fix edits, including the buggy function body."
+          }
+        },
+        {
+          "caseID": "rounding-read-superseded-total",
+          "scenario": "superseded-read",
+          "candidate": {
+            "tool": "read",
+            "input": {
+              "filePath": "src/invoice/total.ts"
+            },
+            "output": "<path>src/invoice/total.ts</path>\n<type>file</type>\n<content>\n1: import { roundCents } from \"../money/round\";\n2: \n3: export type Line = { unitCents: number; quantity: number; taxRate: number };\n4: \n5: // Old implementation: rounds every line, so totals drift by up to a cent per line.\n6: export function formatInvoiceTotal(lines: Line[]): number {\n7:   let total = 0;\n8:   for (const line of lines) {\n9:     const net = line.unitCents * line.quantity;\n10:     const tax = roundCents(net * line.taxRate);\n11:     total += roundCents(net) + tax;\n12:   }\n13:   return total;\n14: }\n\n(End of file - total 14 lines)\n</content>",
+            "turnRequest": "Stop the invoice totals from drifting by a cent.",
+            "requestsBeforeLatest": 2
+          },
+          "label": {
+            "keep": false,
+            "rationale": "Shows the old per-line rounding implementation, which the summary says was rewritten; the content no longer matches the file."
+          }
+        },
+        {
+          "caseID": "rounding-test-run-failing-latest",
+          "scenario": "latest-task-error",
+          "candidate": {
+            "tool": "bash",
+            "input": {
+              "command": "bun test src/money",
+              "description": "Run the money tests"
+            },
+            "output": "bun test v1.4.2\n\nsrc/money/round.test.ts:\n(pass) toCents > parses whole amounts [0.21ms]\n(pass) toCents > pads a single fraction digit [0.08ms]\n(pass) formatCents > pads small amounts [0.05ms]\n(fail) roundHalfEven > rounds 2.5 to 2 [1.12ms]\n  error: expect(received).toBe(expected)\n  Expected: 2\n  Received: 3\n      at <anonymous> (src/money/round.test.ts:14:36)\n(fail) roundHalfEven > rounds 0.5 to 0 [0.31ms]\n  error: expect(received).toBe(expected)\n  Expected: 0\n  Received: 1\n      at <anonymous> (src/money/round.test.ts:18:36)\n(pass) roundHalfEven > rounds 2.4 down [0.04ms]\n(pass) roundHalfEven > rounds 2.6 up [0.04ms]\n(pass) roundHalfEven > rounds 3.5 to 4 [0.03ms]\n\n 6 pass\n 2 fail\n 8 expect() calls\nRan 8 tests across 1 file. [24.00ms]\n\nFailure details:\n  src/money/round.test.ts:14  roundHalfEven(2.5) returned 3, the tie rounded up instead of to the even neighbor 2.\n  src/money/round.test.ts:18  roundHalfEven(0.5) returned 1, the tie rounded up instead of to the even neighbor 0.\n  Non-tie inputs (2.4, 2.6) and the tie 3.5 pass because rounding up happens to match the even neighbor.\nerror: Test run failed with 2 failures. The failing cases are exact halves: 2.5 and 0.5.",
+            "turnRequest": "The money rounding test is still failing. Fix `roundHalfEven` in src/money/round.ts so it rounds exact halves to the even cent, then rerun the money tests.",
+            "requestsBeforeLatest": 0
+          },
+          "label": {
+            "keep": true,
+            "rationale": "The current failing assertions (2.5 and 0.5) are the exact targets of the fix and the rerun comparison."
+          }
+        },
+        {
+          "caseID": "rounding-test-run-fixed-invoice",
+          "scenario": "superseded-error",
+          "candidate": {
+            "tool": "bash",
+            "input": {
+              "command": "bun test src/invoice",
+              "description": "Run the invoice tests"
+            },
+            "output": "bun test v1.4.2\n\nsrc/invoice/total.test.ts:\n(fail) formatInvoiceTotal > sums three lines without drift [2.40ms]\n  error: expect(received).toBe(expected)\n  Expected: 1000\n  Received: 1001\n      at <anonymous> (src/invoice/total.test.ts:22:31)\n(fail) formatInvoiceTotal > handles a zero-quantity line [0.40ms]\n  error: expect(received).toBe(expected)\n  Expected: 0\n  Received: 1\n      at <anonymous> (src/invoice/total.test.ts:30:31)\n(pass) formatInvoiceTotal > empty invoice is zero [0.05ms]\n(pass) formatInvoiceTotal > single line [0.06ms]\n\n 2 pass\n 2 fail\n 4 expect() calls\nRan 4 tests across 1 file. [31.00ms]\n\nFailure details:\n  src/invoice/total.test.ts:22  three lines of 333.33 each summed to 1001 cents instead of 1000.\n  src/invoice/total.test.ts:30  a zero-quantity line still added one cent of tax after rounding.\nThe drift comes from rounding each line before summing. Fix: sum unrounded values and round once at the end.\nSuggested change: in formatInvoiceTotal accumulate net and tax as plain numbers and call the rounding helper once on the final sum.",
+            "turnRequest": "Stop the invoice totals from drifting by a cent.",
+            "requestsBeforeLatest": 2
+          },
+          "label": {
+            "keep": false,
+            "rationale": "Failures of an earlier problem that the summary says is fixed and passing."
+          }
+        },
+        {
+          "caseID": "rounding-todo-all-completed",
+          "scenario": "bookkeeping",
+          "candidate": {
+            "tool": "todowrite",
+            "input": {
+              "todos": [
+                {
+                  "content": "Rewrite formatInvoiceTotal",
+                  "status": "completed",
+                  "priority": "medium"
+                },
+                {
+                  "content": "Remove roundCents helper",
+                  "status": "completed",
+                  "priority": "medium"
+                },
+                {
+                  "content": "Rerun invoice tests",
+                  "status": "completed",
+                  "priority": "medium"
+                }
+              ]
+            },
+            "output": "[\n  {\n    \"content\": \"Rewrite formatInvoiceTotal\",\n    \"status\": \"completed\",\n    \"priority\": \"medium\"\n  },\n  {\n    \"content\": \"Remove roundCents helper\",\n    \"status\": \"completed\",\n    \"priority\": \"medium\"\n  },\n  {\n    \"content\": \"Rerun invoice tests\",\n    \"status\": \"completed\",\n    \"priority\": \"medium\"\n  }\n]",
+            "turnRequest": "Stop the invoice totals from drifting by a cent.",
+            "requestsBeforeLatest": 2
+          },
+          "label": {
+            "keep": false,
+            "rationale": "A list whose items are all completed for a finished request; no open work to follow."
+          }
+        },
+        {
+          "caseID": "rounding-grep-call-sites",
+          "scenario": "duplicate-useful",
+          "candidate": {
+            "tool": "grep",
+            "input": {
+              "pattern": "roundHalfEven",
+              "path": "src"
+            },
+            "output": "Found 16 matches\nsrc/money/round.ts:\n  Line 2: export function roundHalfEven(cents: number): number {\nsrc/money/round.test.ts:\n  Line 3: import { roundHalfEven, toCents } from \"./round\";\n  Line 12: describe(\"roundHalfEven\", () => {\n  Line 14:   expect(roundHalfEven(2.5)).toBe(2);\n  Line 18:   expect(roundHalfEven(0.5)).toBe(0);\n  Line 22:   expect(roundHalfEven(2.4)).toBe(2);\n  Line 26:   expect(roundHalfEven(2.6)).toBe(3);\n  Line 30:   expect(roundHalfEven(3.5)).toBe(4);\nsrc/invoice/total.ts:\n  Line 1: import { roundHalfEven } from \"../money/round\";\n  Line 17:   return roundHalfEven(total);\nsrc/tax/apply.ts:\n  Line 4: import { roundHalfEven } from \"../money/round\";\n  Line 22:   const taxCents = roundHalfEven(netCents * rate);\nsrc/export/csv.ts:\n  Line 9: import { roundHalfEven } from \"../money/round\";\n  Line 31:   const cents = roundHalfEven(Number(row.amount) * 100);\nsrc/index.ts:\n  Line 6: export { roundHalfEven, toCents, formatCents } from \"./money/round\";\ndocs/money.md:\n  Line 41: `roundHalfEven` rounds exact halves to the nearest even cent (banker's rounding).",
+            "turnRequest": "The money rounding test is still failing. Fix `roundHalfEven` in src/money/round.ts so it rounds exact halves to the even cent, then rerun the money tests.",
+            "requestsBeforeLatest": 0
+          },
+          "label": {
+            "keep": true,
+            "rationale": "Lists the test lines and every caller of the function being changed; useful again even though a search could regenerate it."
+          }
+        }
+      ]
+    },
+    {
+      "snapshotID": "release-notes",
+      "context": {
+        "latestUserRequest": "Write the 2.3.0 release notes using the release checklist, and update the top section of CHANGELOG.md.",
+        "sessionSummary": "## Objective\n- Prepare the ledgerkit 2.3.0 release notes and CHANGELOG entry.\n\n## Progress\n- Loaded the `release-checklist` skill. Its steps (group by label, imperative bullets, contributor credits, issue links, breaking-change notes) still govern the remaining work.\n- A subagent surveyed the changelog conventions; its findings are the format to follow.\n- Added the 2.3.0 heading and the Added and Changed lists at the top of CHANGELOG.md. The older release sections below were not touched.\n- A finished earlier request migrated the invoices table with the `database-migration` skill; that migration is merged.\n\n## Next\n- Write the Fixed and Breaking changes sections, then the contributor credits.\n- Work through checklist steps 4 to 7."
+      },
+      "cases": [
+        {
+          "caseID": "release-skill-checklist",
+          "scenario": "procedure-in-use",
+          "candidate": {
+            "tool": "skill",
+            "input": {
+              "name": "release-checklist"
+            },
+            "output": "# Release checklist (ledgerkit)\n\nFollow these steps in order when preparing a release.\n\n1. Confirm the release branch is green: lint, typecheck and the full test suite.\n2. Collect every pull request merged since the previous tag with `gh pr list --state merged --search \"merged:>=<previous tag date>\"`.\n3. Group the pull requests by their label: `feature`, `fix`, `breaking`, `docs`, `internal`. Skip `internal` unless it changes behavior.\n4. Write one bullet per pull request in the form `- <summary> (#<number>)`, in the imperative mood, no trailing period.\n5. Credit external contributors at the end of the section as `Thanks to @user for #<number>`.\n6. For every `breaking` pull request, add a migration note under a `### Breaking changes` heading with before/after code.\n7. Link each referenced issue as `Fixes #<number>` on its own line under the bullet it belongs to.\n8. Bump the version in package.json only after the notes are reviewed; tag as `v<version>` and push the tag.\n\nNever invent entries: if a pull request has no label, ask the maintainer which group it belongs to.",
+            "turnRequest": "Write the 2.3.0 release notes using the release checklist, and update the top section of CHANGELOG.md.",
+            "requestsBeforeLatest": 0
+          },
+          "label": {
+            "keep": true,
+            "rationale": "A procedure the remaining work explicitly still follows (steps 4 to 7)."
+          }
+        },
+        {
+          "caseID": "release-todo-open-items",
+          "scenario": "open-plan",
+          "candidate": {
+            "tool": "todowrite",
+            "input": {
+              "todos": [
+                {
+                  "content": "Load release checklist",
+                  "status": "completed",
+                  "priority": "medium"
+                },
+                {
+                  "content": "Draft Added and Changed lists",
+                  "status": "completed",
+                  "priority": "medium"
+                },
+                {
+                  "content": "Write Fixed section",
+                  "status": "in_progress",
+                  "priority": "medium"
+                },
+                {
+                  "content": "Write Breaking changes section",
+                  "status": "pending",
+                  "priority": "medium"
+                },
+                {
+                  "content": "Add contributor credits",
+                  "status": "pending",
+                  "priority": "medium"
+                }
+              ]
+            },
+            "output": "[\n  {\n    \"content\": \"Load release checklist\",\n    \"status\": \"completed\",\n    \"priority\": \"medium\"\n  },\n  {\n    \"content\": \"Draft Added and Changed lists\",\n    \"status\": \"completed\",\n    \"priority\": \"medium\"\n  },\n  {\n    \"content\": \"Write Fixed section\",\n    \"status\": \"in_progress\",\n    \"priority\": \"medium\"\n  },\n  {\n    \"content\": \"Write Breaking changes section\",\n    \"status\": \"pending\",\n    \"priority\": \"medium\"\n  },\n  {\n    \"content\": \"Add contributor credits\",\n    \"status\": \"pending\",\n    \"priority\": \"medium\"\n  }\n]",
+            "turnRequest": "Write the 2.3.0 release notes using the release checklist, and update the top section of CHANGELOG.md.",
+            "requestsBeforeLatest": 0
+          },
+          "label": {
+            "keep": true,
+            "rationale": "Open items match the summary's next steps for the current request."
+          }
+        },
+        {
+          "caseID": "release-task-conventions-findings",
+          "scenario": "subagent-findings",
+          "candidate": {
+            "tool": "task",
+            "input": {
+              "description": "Survey changelog conventions",
+              "subagent_type": "explore",
+              "prompt": "Survey how changelog entries are written in this repository so the 2.3.0 notes can match.\n\nRead CHANGELOG.md and the last three GitHub release descriptions you can find in the repo docs.\nReport, as a concise list:\n- the heading format used for versions and dates,\n- the order of the sections inside a release (Added, Changed, Fixed, Breaking),\n- how issues and pull requests are linked,\n- how contributors are credited,\n- any wording conventions (tense, punctuation, capitalization).\n\nDo not edit any files. Return only the findings, with one short example line for each convention.\nIf conventions differ between releases, say which release is the most recent and follow that one.\n\nContext: the maintainers want 2.3.0 to read like 2.2.0. A reviewer will compare the new section with the previous one\nline by line, so exact punctuation and ordering matter more than completeness of the survey.\nAlso note any places where the existing entries disagree with each other, and list them separately at the end."
+            },
+            "output": "Findings (most recent release 2.2.0 is the reference):\n- Version heading: `## [2.2.0] - 2026-08-30` (square brackets around the version, ISO date).\n- Section order: Added, Changed, Fixed, Breaking changes. Empty sections are omitted.\n- Entries: `- Add cursor pagination to list endpoints (#412)`; imperative mood, no trailing period.\n- Links: issues use `Fixes #398` on a separate indented line under the bullet.\n- Contributors: final line of the release, `Thanks to @mira-k and @tobias-w for their contributions.`\n- Breaking changes: always include a fenced before/after snippet.\n- Capitalization: first word capitalized, product names as written (`ledgerkit`, `CSV`).",
+            "turnRequest": "Write the 2.3.0 release notes using the release checklist, and update the top section of CHANGELOG.md.",
+            "requestsBeforeLatest": 0
+          },
+          "label": {
+            "keep": true,
+            "rationale": "Findings that define the entry format the remaining sections must match."
+          }
+        },
+        {
+          "caseID": "release-skill-finished-migration",
+          "scenario": "finished-other-task",
+          "candidate": {
+            "tool": "skill",
+            "input": {
+              "name": "database-migration"
+            },
+            "output": "# database-migration\n\nUse this procedure when changing a database schema.\n\n1. Create a numbered SQL file in `migrations/` with an `up` and a `down` section.\n2. Never edit an applied migration; add a new one instead.\n3. Run `bun run db:migrate --dry-run` and read the plan before applying it.\n4. Apply the migration on a copy of the production snapshot and compare row counts before and after.\n5. Add a backfill script when a new column is NOT NULL, and run it in batches of 5,000 rows.\n6. Update the ORM models and the seed data, then run the integration tests against the migrated schema.\n7. Record the migration number in the pull request description.",
+            "turnRequest": "Migrate the invoices table to add a currency column.",
+            "requestsBeforeLatest": 3
+          },
+          "label": {
+            "keep": false,
+            "rationale": "Procedure for a migration the summary says is finished and merged; unrelated to the release notes."
+          }
+        },
+        {
+          "caseID": "release-read-changelog-partly-edited",
+          "scenario": "partly-edited-read",
+          "candidate": {
+            "tool": "read",
+            "input": {
+              "filePath": "CHANGELOG.md"
+            },
+            "output": "<path>CHANGELOG.md</path>\n<type>file</type>\n<content>\n1: # Changelog\n2: \n3: ## [Unreleased]\n4: \n5: ## [2.2.0] - 2026-08-30\n6: \n7: ### Added\n8: \n9: - Add cursor pagination to list endpoints (#412)\n10:   Fixes #398\n11: - Add `--dry-run` to the import command (#405)\n12: \n13: ### Changed\n14: \n15: - Use half-even rounding for tax lines (#401)\n16: \n17: ### Fixed\n18: \n19: - Fix CSV export dropping the final newline (#409)\n20: \n21: Thanks to @mira-k and @tobias-w for their contributions.\n22: \n23: ## [2.1.0] - 2026-06-12\n24: \n25: ### Added\n26: \n27: - Add currency formatting options (#377)\n28: \n29: ### Fixed\n30: \n31: - Fix negative amounts losing their sign in `formatCents` (#380)\n32: \n33: Thanks to @mira-k for their contribution.\n\n(End of file - total 33 lines)\n</content>",
+            "turnRequest": "Write the 2.3.0 release notes using the release checklist, and update the top section of CHANGELOG.md.",
+            "requestsBeforeLatest": 1
+          },
+          "label": {
+            "keep": true,
+            "rationale": "Only the top section was edited since; the older releases below are unchanged and are the format examples the remaining sections follow."
+          }
+        }
+      ]
+    },
+    {
+      "snapshotID": "pagination-work",
+      "context": {
+        "latestUserRequest": "Continue with the pagination work in src/api/list.ts. Add a `nextCursor` field to the response.",
+        "sessionSummary": "## Objective\n- Add cursor pagination to the ledgerkit list endpoint.\n\n## Progress\n- Chose opaque base64 cursors encoded from (createdAt, id) using the `cursor-codec` package, now installed.\n- A finished earlier request audited the ESLint config through a subagent; all of its findings were applied and merged.\n\n## Next\n- Add `nextCursor` to the response type and the handler in src/api/list.ts."
+      },
+      "cases": [
+        {
+          "caseID": "pagination-read-empty-index",
+          "scenario": "empty-result",
+          "candidate": {
+            "tool": "read",
+            "input": {
+              "filePath": "src/api/index.ts"
+            },
+            "output": "<path>src/api/index.ts</path>\n<type>file</type>\n<content>\n1: \n\n(End of file - total 1 lines)\n</content>",
+            "turnRequest": "Continue with the pagination work in src/api/list.ts. Add a `nextCursor` field to the response.",
+            "requestsBeforeLatest": 0
+          },
+          "label": {
+            "keep": false,
+            "rationale": "The file is empty; the result carries no content."
+          }
+        },
+        {
+          "caseID": "pagination-install-log",
+          "scenario": "bookkeeping",
+          "candidate": {
+            "tool": "bash",
+            "input": {
+              "command": "bun install cursor-codec",
+              "description": "Install the cursor codec package"
+            },
+            "output": "bun install v1.4.2\n\nResolving dependencies\nResolved, downloaded and extracted [118]\nSaved lockfile\n\n+ @types/node@22.9.0\n+ cursor-codec@1.0.3\n+ eslint@9.14.0\n+ eslint-config-prettier@9.1.0\n+ prettier@3.3.3\n+ typescript@5.6.3\n+ typescript-eslint@8.13.0\n\ninstalled cursor-codec@1.0.3 with binaries:\n - cursor-codec\n\n118 packages installed [1.84s]\n\nChecked 118 installs across 124 packages (no changes)\nPostinstall: husky - git hooks installed\nPostinstall: cursor-codec - native module build skipped (prebuilt binary found)\nPostinstall: prettier - nothing to do\nDone in 2.31s. No vulnerabilities found. 0 packages have install scripts that were blocked.\n\nLockfile: bun.lock updated (1 package added, 0 removed, 0 changed).\nCache: 116 packages restored from cache, 2 downloaded (cursor-codec, prettier).\nPeer dependencies: all satisfied. Deprecated packages: none. Funding messages: 0 packages are looking for funding.\nTip: run `bun pm ls` to list installed packages, or `bun outdated` to see which have newer versions.",
+            "turnRequest": "Choose a cursor format for list pagination.",
+            "requestsBeforeLatest": 1
+          },
+          "label": {
+            "keep": false,
+            "rationale": "Routine install progress with no errors or values the remaining work needs."
+          }
+        },
+        {
+          "caseID": "pagination-task-lint-audit-finished",
+          "scenario": "finished-other-task",
+          "candidate": {
+            "tool": "task",
+            "input": {
+              "description": "Audit ESLint config",
+              "subagent_type": "general",
+              "prompt": "Audit the ESLint configuration in this repository and report what is wrong.\n\nLook at eslint.config.js, package.json lint scripts, and any per-directory overrides.\nFor every problem report: the file, the rule or setting, why it is a problem, and the exact fix.\nCheck in particular for: duplicated rule blocks, rules that conflict with prettier, files that are\nignored by accident, and plugins that are installed but never used.\nDo not edit any file. Return a numbered list sorted by importance and nothing else.\n\nContext: the repository lints TypeScript with typescript-eslint and formats with prettier. Tests live in test/ and src/ next to\nthe code they cover. A finding is only useful if the fix is specific enough to apply without further investigation, so name\nthe exact line, option or package. Skip stylistic preferences that the existing configuration does not already enforce.\nReport at most ten findings. If you are unsure whether something is a problem, say so and explain what you checked."
+            },
+            "output": "1. eslint.config.js: the `ignores` list contains `src/api/**`, so the API code is never linted. Remove that entry.\n2. eslint.config.js: `no-unused-vars` is enabled twice (core rule and typescript-eslint). Disable the core rule.\n3. package.json: the `lint` script runs `eslint src` and skips `test/`. Change it to `eslint .`.\n4. eslint-config-prettier is installed but not applied. Add it as the last config entry.\n5. The plugin `eslint-plugin-import` is installed but unused. Remove it from devDependencies.\nStatus: all five items were applied in the previous request and merged.",
+            "turnRequest": "Audit and clean up the ESLint configuration.",
+            "requestsBeforeLatest": 2
+          },
+          "label": {
+            "keep": false,
+            "rationale": "Findings for a different request that the output and summary both say were applied and merged."
+          }
+        }
+      ]
+    },
+    {
+      "snapshotID": "retry-limits",
+      "context": {
+        "latestUserRequest": "Update the retry limits in config/limits.json so they match the table in docs/limits-table.md.",
+        "sessionSummary": "## Objective\n- Align the retry limits in config/limits.json with docs/limits-table.md.\n\n## Progress\n- Created docs/limits-table.md from the table the user pasted (per-service retry limits and backoff caps).\n- Reviewed config/limits.json: it still holds the old default of 3 retries and a 5000 ms cap for every service.\n- Searched the repository for other retry settings; the only matches are inside the vendor directory, which is not ours to change.\n\n## Next\n- Edit config/limits.json with the values from docs/limits-table.md, then run `bun run validate:config`."
+      },
+      "cases": [
+        {
+          "caseID": "limits-read-config",
+          "scenario": "recoverable-useful",
+          "candidate": {
+            "tool": "read",
+            "input": {
+              "filePath": "config/limits.json"
+            },
+            "output": "<path>config/limits.json</path>\n<type>file</type>\n<content>\n1: {\n2:   \"schemaVersion\": 2,\n3:   \"retry\": {\n4:     \"default\": { \"limit\": 3, \"backoffCapMs\": 5000 },\n5:     \"payments\": { \"limit\": 3, \"backoffCapMs\": 5000 },\n6:     \"ledger\": { \"limit\": 3, \"backoffCapMs\": 5000 },\n7:     \"exports\": { \"limit\": 3, \"backoffCapMs\": 5000 },\n8:     \"notifications\": { \"limit\": 3, \"backoffCapMs\": 5000 }\n9:   }\n10: }\n\n(End of file - total 10 lines)\n</content>",
+            "turnRequest": "Update the retry limits in config/limits.json so they match the table in docs/limits-table.md.",
+            "requestsBeforeLatest": 0
+          },
+          "label": {
+            "keep": true,
+            "rationale": "The file about to be edited; it can be reread, but its current structure and values are used again."
+          }
+        },
+        {
+          "caseID": "limits-write-table",
+          "scenario": "written-artifact",
+          "candidate": {
+            "tool": "write",
+            "input": {
+              "filePath": "docs/limits-table.md",
+              "content": "# Retry limits\n\nThese are the retry limits every service must use. They replace the old shared default of 3 retries.\n\n| Service       | Retry limit | Backoff cap (ms) | Notes                                         |\n| ------------- | ----------- | ---------------- | --------------------------------------------- |\n| default       | 2           | 4000             | Used when a service has no row below          |\n| payments      | 5           | 30000            | Idempotency keys are required before retrying |\n| ledger        | 4           | 15000            | Retry only on lock timeouts                   |\n| exports       | 1           | 2000             | Large jobs; the user can restart them         |\n| notifications | 6           | 60000            | Delivery is best effort and queued            |\n\nRules:\n- A service never retries on a 4xx response except 408 and 429.\n- The backoff cap applies to the delay between attempts, not to the total time.\n- Changing a value here requires the same change in config/limits.json in the same pull request."
+            },
+            "output": "Wrote file successfully.",
+            "turnRequest": "Update the retry limits in config/limits.json so they match the table in docs/limits-table.md.",
+            "requestsBeforeLatest": 0
+          },
+          "label": {
+            "keep": true,
+            "rationale": "The input holds the table of target values and rules the edit must reproduce."
+          }
+        },
+        {
+          "caseID": "limits-grep-vendor-retry",
+          "scenario": "topic-only",
+          "candidate": {
+            "tool": "grep",
+            "input": {
+              "pattern": "retry",
+              "path": "vendor"
+            },
+            "output": "Found 15 matches\nvendor/httpx/client.ts:\n  Line 41: const MAX_RETRY = 3; // retry transient network failures\n  Line 88:   retryDelayMs: 250,\n  Line 132:   if (attempt > this.options.retry) throw error;\nvendor/httpx/backoff.ts:\n  Line 6: export function retryBackoff(attempt: number): number {\n  Line 9:   return Math.min(30_000, 2 ** attempt * 250);\nvendor/queue/worker.ts:\n  Line 19:   retry: { limit: 5, backoff: \"exponential\" },\n  Line 77:   // retry the job when the lock is lost\nvendor/queue/README.md:\n  Line 12: Failed jobs are retried according to the `retry` option.\n  Line 30: Set `retry.limit` to 0 to disable retries.\nvendor/mailer/send.ts:\n  Line 51: for (let retry = 0; retry < 2; retry++) {\n  Line 66: // no retry after a permanent SMTP failure\nvendor/cache/redis.ts:\n  Line 14: retryStrategy: times => Math.min(times * 50, 2000),\n  Line 15: maxRetriesPerRequest: 3,\nvendor/cache/README.md:\n  Line 22: Connection errors are retried with the strategy above until `maxRetriesPerRequest` is reached.\n  Line 23: Set `retryStrategy` to a function returning `null` to stop retrying.",
+            "turnRequest": "Update the retry limits in config/limits.json so they match the table in docs/limits-table.md.",
+            "requestsBeforeLatest": 0
+          },
+          "label": {
+            "keep": false,
+            "rationale": "Matches only third-party vendor code that the summary says is out of scope; related by topic only."
+          }
+        }
+      ]
+    }
+  ]
+}

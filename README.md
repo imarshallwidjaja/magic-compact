@@ -293,6 +293,24 @@ Magic Compact Offers:
 
 If you want a lightweight, user-driven compaction tool with minimal ongoing overhead, Magic Compact is the better fit. If you want a full long-term memory system with background maintenance, Magic Context is the heavier alternative.
 
+## Model evaluations
+
+### Decision evaluation
+
+Task-aware retention asks a decision model whether the assistant would use a tool call's content again. The decision evaluation scores a model on that question with fixed cases: each gives the latest request, a session summary and one completed tool call, and compares the model's probability with a hand-written label. It measures the keep/trim decision only. It does not run `/magic-trim` end to end, judge summaries, or change the production model or its `0.80` threshold.
+
+It runs against any versioned TypeSafe Jev model (`jev-1.13.0` by default; aliases such as `jev-latest` are refused so runs stay repeatable) or the OpenAI Decisions API. Each provider needs its own API key in the environment: `TYPESAFE_API_KEY` or `OPENAI_API_KEY`. OpenCode sign-ins are not used.
+
+```bash
+bun run eval:decisions check
+bun run eval:decisions run --provider jev --model jev-1.14.0 --dry-run
+export TYPESAFE_API_KEY=<your TypeSafe key>
+bun run eval:decisions run --provider jev --model jev-1.14.0 --out /tmp/decisions/jev-1.14.0
+bun run eval:decisions report /tmp/decisions/jev-1.14.0
+```
+
+The first two commands are offline. The bundled pack has 17 synthetic smoke cases, so a score is a sanity check, not a held-out result. See [the decision evaluation](docs/DecisionEvaluation.md) for providers, dataset format, saved results, metrics and limits.
+
 ## License
 
 Arkive Compact is a modified distribution of [Magic Compact](https://github.com/aerovato/magic-compact). Original Magic Compact remains under the BSD 3-Clause License; the required notice is in [`NOTICE.md`](./NOTICE.md). This repository's modifications and packaging are not licensed. See [`LICENSE.md`](./LICENSE.md).

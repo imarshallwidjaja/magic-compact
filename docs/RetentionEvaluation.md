@@ -6,6 +6,8 @@ Task-aware retention lets `/magic-compact` and `/magic-trim` keep a tool call wh
 
 Both commands use `jev-1.13.0` with a whole-call keep threshold of `0.80`. The request and threshold were frozen before held-out inference. With native session summaries and independently labelled real-session snapshots, the held-out majority decision kept 10 unique calls: 9 useful and 1 superseded failed query. Consensus useful recall was 9/28 (32%). These observations cover four held-out projects; ten keeps do not establish a universal 90% precision guarantee or show that the model probabilities are calibrated in this domain.
 
+The threshold and these results come from the 64 development and 80 held-out real-session cases described below. A separate, public [decision evaluation](DecisionEvaluation.md) (`bun run eval:decisions`) sends 17 synthetic smoke cases to any versioned Jev model or to OpenAI Decisions. It is a repeatable sanity check of a decision model, not held-out data: its scores do not change the threshold, the question or the production model, and it never mixes with or relabels this cohort. Its question hash uses compact sorted-key JSON, so it is not comparable with the frozen question hash below.
+
 ## Production contract
 
 `packages/opencode-plugin/src/retention/classifier.ts` owns the classifier. `src/retention/summary.ts` produces the session summary, and `src/retention/retention.ts` wires both into `/magic-compact` and `/magic-trim`; `docs/OpenCode.md` describes that runtime flow.
