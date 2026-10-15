@@ -18,6 +18,8 @@ export type FakeReply =
     }
   | { error: { type: string; message: string } };
 
+type SummarizerModel = { providerID: string; id: string; variant?: string };
+
 export type FakeV2State = {
   pid: number;
   sessions: Map<string, SessionInfo>;
@@ -28,7 +30,11 @@ export type FakeV2State = {
   permissions: Map<string, unknown[]>;
   forms: Map<string, unknown[]>;
   shells: Array<Record<string, unknown>>;
-  summarizerModel?: { providerID: string; id: string; variant?: string };
+  // The summarizer at the server's default location.
+  summarizerModel?: SummarizerModel;
+  // Summarizers configured for a project directory. A request that names a
+  // directory with an entry here gets that model, like a project profile.
+  projectSummarizers?: Record<string, SummarizerModel>;
   modelLimit: { context: number; input?: number; output: number };
   modelInput: string[];
   // Every provider request the fake made, by session.
@@ -208,6 +214,11 @@ export function fakeV2Host(
     text: "reply",
   }),
 ): V2Host {
+  const summarizerAt = (location?: { directory?: string }) =>
+    (location?.directory === undefined
+      ? undefined
+      : state.projectSummarizers?.[location.directory])
+    ?? state.summarizerModel;
   const get = (sessionID: string) => {
     const session = state.sessions.get(sessionID);
     if (!session)
@@ -314,30 +325,36 @@ export function fakeV2Host(
       }),
     },
     agent: {
-      get: async () => ({
-        data: {
-          id: "magic-compact-summarizer",
-          ...(state.summarizerModel ? { model: state.summarizerModel } : {}),
-        },
-      }),
+      get: async (input: { location?: { directory?: string } }) => {
+        const model = summarizerAt(input.location);
+        return {
+          data: {
+            id: "magic-compact-summarizer",
+            ...(model ? { model } : {}),
+          },
+        };
+      },
     },
     model: {
-      list: async () => ({
-        location: LOCATION,
-        data: state.summarizerModel
-          ? [
-              {
-                ...state.summarizerModel,
-                limit: state.modelLimit,
-                capabilities: {
-                  tools: true,
-                  input: state.modelInput,
-                  output: ["text"],
+      list: async (input: { location?: { directory?: string } }) => {
+        const model = summarizerAt(input.location);
+        return {
+          location: LOCATION,
+          data: model
+            ? [
+                {
+                  ...model,
+                  limit: state.modelLimit,
+                  capabilities: {
+                    tools: true,
+                    input: state.modelInput,
+                    output: ["text"],
+                  },
                 },
-              },
-            ]
-          : [],
-      }),
+              ]
+            : [],
+        };
+      },
     },
     message: {
       list: async (input: { sessionID: string; cursor?: string }) => ({

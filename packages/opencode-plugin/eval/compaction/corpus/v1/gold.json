@@ -1,0 +1,214 @@
+{
+  "fixtureVersion": "arkive-model-comparison-fixtures/1",
+  "scoring": "see scoring.md",
+  "cases": {
+    "A": {
+      "title": "Technical continuation (text only)",
+      "textFacts": [
+        {
+          "id": "A-T1",
+          "critical": true,
+          "kind": "outcome",
+          "fact": "Root cause: TokenBucket.refill (gateway/ratelimit/bucket.go) truncated elapsed time to whole seconds and reset last_refill on every call, discarding sub-second time, so under steady traffic the bucket barely refilled. Fixed by computing the refill from elapsed milliseconds and advancing last_refill only by the time the added whole tokens represent (remainder carried over)."
+        },
+        {
+          "id": "A-T2",
+          "critical": true,
+          "kind": "decision-constraint",
+          "fact": "The interim burst_capacity increase from 40 to 80 in config/limits.yaml was abandoned and reverted; burst stays at 40 because the tenant contract caps it there, the hotfix plan is withdrawn, and limits.yaml is not part of the fix."
+        },
+        {
+          "id": "A-T3",
+          "critical": true,
+          "kind": "verification",
+          "fact": "go test ./gateway/ratelimit/... passed (23 tests, including the new refill and replay tests) and the -race run passed; the staging k6 load test (loadtest/tenant_burst.js) was NOT run, and real multi-node Redis was not tested (tests use miniredis)."
+        },
+        {
+          "id": "A-T4",
+          "critical": true,
+          "kind": "next-work",
+          "fact": "Next: get the expired staging/gateway-loadtest credentials rotated by the platform team, run the k6 staging load test with the acme-west profile and confirm zero 429s, and only then canary the fix to 5% of acme-west traffic before full rollout."
+        },
+        {
+          "id": "A-T5",
+          "critical": false,
+          "kind": "context",
+          "fact": "Symptom: after the v3.4 rollout acme-west got HTTP 429s below its contracted 5 requests/second (replay: 1,094 of 2,861 requests rejected on v3.4.0, none on v3.3.2)."
+        },
+        {
+          "id": "A-T6",
+          "critical": false,
+          "kind": "context",
+          "fact": "The clock-skew hypothesis was ruled out (largest NTP offset 1.7 ms; reproduced on a single node)."
+        },
+        {
+          "id": "A-T7",
+          "critical": false,
+          "kind": "constraint",
+          "fact": "The Redis key schema rl:{tenant}:{route}, the tokens/last_refill_ms fields and the integer token type were kept unchanged for compatibility with v3.4.0 nodes during the rolling deploy (fractional/float tokens rejected)."
+        },
+        {
+          "id": "A-T8",
+          "critical": false,
+          "kind": "state",
+          "fact": "The change is on draft PR #2214 (not merged), with new tests in gateway/ratelimit/bucket_test.go (e.g. TestRefillSubSecondIntervals, TestReplayAcmeWestWindow)."
+        }
+      ],
+      "visualFacts": [],
+      "criticalVisual": []
+    },
+    "B": {
+      "title": "Spatial diagnostic image (diagnostic, previously observed; not held out)",
+      "textFacts": [
+        {
+          "id": "B-T1",
+          "critical": true,
+          "kind": "outcome",
+          "fact": "Root cause: PR #881 changed format_row in reports/export/csv_writer.py to a naive datetime.fromtimestamp(row.event_ts), producing Australia/Sydney local time mislabelled with a Z suffix; the fix restores the explicit UTC conversion (tz=timezone.utc)."
+        },
+        {
+          "id": "B-T2",
+          "critical": true,
+          "kind": "decision-constraint",
+          "fact": "Converting in SQL (AT TIME ZONE 'UTC' in reports/export/query.sql) was tried and abandoned because the same query feeds the dashboard timeline; the conversion happens only at CSV serialization, query.sql is unchanged, the event_time header/ISO-8601 Z format must not change (finance loader contract), and the worker hosts keep TZ=Australia/Sydney."
+        },
+        {
+          "id": "B-T3",
+          "critical": true,
+          "kind": "verification",
+          "fact": "pytest tests/export passed (41 tests, including the two new regression tests); the full nightly job against a production snapshot was NOT run (read-replica window booked for tomorrow) and no backfill has been run."
+        },
+        {
+          "id": "B-T4",
+          "critical": true,
+          "kind": "next-work",
+          "fact": "Next: after PR #903 is approved and deployed, run python scripts/backfill_exports.py --from 2026-10-03 --to 2026-10-11 to regenerate the nine affected files, then tell the finance team which files were replaced."
+        },
+        {
+          "id": "B-T5",
+          "critical": false,
+          "kind": "context",
+          "fact": "Symptom: exported event_time values were 10 hours late on 2026-10-03/04 and 11 hours late from 2026-10-05 (Sydney DST start); nine nightly files (2026-10-03 to 2026-10-11) are affected, files up to 2026-10-02 are correct."
+        },
+        {
+          "id": "B-T6",
+          "critical": false,
+          "kind": "constraint",
+          "fact": "Setting TZ=UTC on the worker hosts was rejected because invoice-reminder and payroll cron jobs on those hosts are scheduled in Sydney local time."
+        },
+        {
+          "id": "B-T7",
+          "critical": false,
+          "kind": "state",
+          "fact": "New regression tests test_format_row_emits_utc and test_format_row_dst_boundary in tests/export/test_csv_writer.py fail on the PR #881 code and pass with the fix; the fix is in review as PR #903, not merged."
+        },
+        {
+          "id": "B-T8",
+          "critical": false,
+          "kind": "state",
+          "fact": "The region-health indicator, whose specification is the attached reference image, has not been started; it comes after the export fix ships."
+        }
+      ],
+      "visualFacts": [
+        {
+          "id": "B-V1",
+          "critical": false,
+          "fact": "The image is divided into two equal halves by a vertical split (left half and right half)."
+        },
+        {
+          "id": "B-V2",
+          "critical": true,
+          "fact": "The left half is solid red."
+        },
+        {
+          "id": "B-V3",
+          "critical": true,
+          "fact": "The right half is solid blue."
+        },
+        {
+          "id": "B-V4",
+          "critical": false,
+          "fact": "There is no text, label, icon or control in the image; it is two flat color fields."
+        }
+      ],
+      "criticalVisual": ["B-V2", "B-V3"]
+    },
+    "C": {
+      "title": "Task-relevant status table image + text",
+      "textFacts": [
+        {
+          "id": "C-T1",
+          "critical": true,
+          "kind": "outcome",
+          "fact": "CI and local development moved to Node 22.11.0 (.nvmrc, ci.yml matrix 22.x for x64 and arm64, engines >=22.11 <23), and node-sass was replaced by sass 1.80.6 (Dart Sass) with the .scss sources unchanged."
+        },
+        {
+          "id": "C-T2",
+          "critical": true,
+          "kind": "decision-constraint",
+          "fact": "Building node-sass@9 from source was tried and abandoned (6 min 40 s x64 build, node-gyp failure on arm64); no native Sass build, and no move to Node 24 because the LTS policy keeps Node 22 until April 2027."
+        },
+        {
+          "id": "C-T3",
+          "critical": true,
+          "kind": "verification",
+          "fact": "Locally on Node 22, npm ci and npm run build succeeded and npm test passed (312 tests in 52 suites); the x64 CI job on PR #418 is green; the arm64 CI job has NOT run (arm64 runner pool offline)."
+        },
+        {
+          "id": "C-T4",
+          "critical": true,
+          "kind": "next-work",
+          "fact": "Next: when the arm64 runner pool is back, re-run the arm64 job on PR #418 and merge PR #418 if it passes; the attached status table must be checked before the cutover is scheduled."
+        },
+        {
+          "id": "C-T5",
+          "critical": false,
+          "kind": "change",
+          "fact": "--openssl-legacy-provider was removed from NODE_OPTIONS in the build script (webpack 5.95 no longer needs it)."
+        },
+        {
+          "id": "C-T6",
+          "critical": false,
+          "kind": "change",
+          "fact": "Two whitespace-only snapshot changes in ui/__snapshots__/Button.test.js.snap (Dart Sass output) were reviewed and accepted."
+        },
+        {
+          "id": "C-T7",
+          "critical": false,
+          "kind": "context",
+          "fact": "The DEP0040 punycode deprecation warning comes from a transitive dependency (whatwg-url via node-fetch@2) and was left as harmless."
+        },
+        {
+          "id": "C-T8",
+          "critical": false,
+          "kind": "state",
+          "fact": "PR #418 is not merged; the main bundle grew from 1.41 MB to 1.42 MB."
+        }
+      ],
+      "visualFacts": [
+        {
+          "id": "C-V1",
+          "critical": true,
+          "fact": "Queue is in state Ready."
+        },
+        {
+          "id": "C-V2",
+          "critical": true,
+          "fact": "Queue has count 17."
+        },
+        {
+          "id": "C-V3",
+          "critical": true,
+          "fact": "Cache is in state Blocked."
+        },
+        {
+          "id": "C-V4",
+          "critical": true,
+          "fact": "Cache has count 3."
+        }
+      ],
+      "criticalVisual": ["C-V1", "C-V2", "C-V3", "C-V4"]
+    }
+  },
+  "goldSha256": "29758134b3515c2b113064f3e86818a42e4ac94b8da7af3ff11a24f95cdc81ab"
+}

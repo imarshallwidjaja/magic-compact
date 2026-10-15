@@ -121,15 +121,20 @@ export async function removeOwnedSession(
 
 const DENY_ALL = [{ action: "*", resource: "*", effect: "deny" as const }];
 
-// The operator-configured summarizer model. The source model and the native
+// The operator-configured summarizer model at the source session's location,
+// where a project's own agent settings apply. The source model and the native
 // compaction agent are never a fallback.
 export async function resolveV2Summarizer(
   host: V2Host,
+  location: { directory: string },
   controlTimeoutMs: number,
 ): Promise<ModelRef> {
   const outcome = await attemptWithinDeadline(
     signal =>
-      host.agent.get({ agentID: MAGIC_COMPACT_SUMMARIZER_AGENT }, { signal }),
+      host.agent.get(
+        { agentID: MAGIC_COMPACT_SUMMARIZER_AGENT, location },
+        { signal },
+      ),
     controlTimeoutMs,
   );
   const model =
@@ -149,13 +154,10 @@ export async function resolveV2SummarizerModel(
   source: V2Source,
   controlTimeoutMs: number,
 ): Promise<V2SummarizerModel> {
-  const ref = await resolveV2Summarizer(host, controlTimeoutMs);
+  const location = { directory: source.session.location.directory };
+  const ref = await resolveV2Summarizer(host, location, controlTimeoutMs);
   const outcome = await attemptWithinDeadline(
-    signal =>
-      host.model.list(
-        { location: { directory: source.session.location.directory } },
-        { signal },
-      ),
+    signal => host.model.list({ location }, { signal }),
     controlTimeoutMs,
   );
   const info =

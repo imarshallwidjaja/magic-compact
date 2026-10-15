@@ -295,6 +295,22 @@ If you want a lightweight, user-driven compaction tool with minimal ongoing over
 
 ## Model evaluations
 
+### Compaction evaluation
+
+The compaction evaluation measures how well a model works as the Magic Compact summarizer. It packs this checkout, loads it into an OpenCode server you already run on this machine, and runs `/magic-compact 1` on three frozen synthetic cases in fresh sessions of a private temporary project. Each attempt is checked mechanically against its source and, when you pass a judge model or import your own grades, scored against the cases' gold facts. Without grades the report says `Semantic: UNGRADED`.
+
+The model's provider must already be signed in to that server; the eval reads only the server's Basic Auth from `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD`, and never reads or copies provider credentials. It does not touch your existing sessions or global configuration. Supported servers are OpenCode 1.18.30, 1.19.0 and 2.0.28.
+
+```bash
+bun run eval:compact check
+mkdir -p runs
+bun run eval:compact run --server http://127.0.0.1:4096 --model anthropic/claude-haiku-5-5#low --out runs/haiku-low-preflight --dry-run
+bun run eval:compact run --server http://127.0.0.1:4096 --model anthropic/claude-haiku-5-5#low --out runs/haiku-low --repeat 2
+bun run eval:compact report runs/haiku-low
+```
+
+`check` is offline, and `--dry-run` stops after preflight without creating a session or calling a model. `--out` must not exist yet but its parent must, and a dry run still creates its own `--out` directory, so the preflight above has a name of its own. A run makes one paid summarizer request per attempt, and `--judge provider/model[#variant]` adds one paid request per delivered summary. Three synthetic cases describe one model on one host setup, not a general accuracy rate. See [the compaction evaluation](docs/CompactionEvaluation.md) for isolation, cleanup, mechanical checks, grading and host versions.
+
 ### Decision evaluation
 
 Task-aware retention asks a decision model whether the assistant would use a tool call's content again. The decision evaluation scores a model on that question with fixed cases: each gives the latest request, a session summary and one completed tool call, and compares the model's probability with a hand-written label. It measures the keep/trim decision only. It does not run `/magic-trim` end to end, judge summaries, or change the production model or its `0.80` threshold.

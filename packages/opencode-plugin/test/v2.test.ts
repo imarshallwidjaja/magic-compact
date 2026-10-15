@@ -992,6 +992,37 @@ describe("OpenCode 2 trim successors", () => {
     expect([...state.sessions.keys()]).toHaveLength(2);
   });
 
+  test("task-aware trim resolves the summarizer at the source session location", async () => {
+    const state = fakeV2State();
+    state.summarizerModel = { providerID: "probe", id: "default-model" };
+    state.projectSummarizers = {
+      "/other-project": { providerID: "probe", id: "other-model" },
+    };
+    sourceSession(state, "ses_src", toolHistory(), {
+      location: { directory: "/other-project" },
+    });
+    const owned = new OwnedSessions();
+    const host = fakeV2Host(state, owned, () => ({
+      text: "## Objective\n- Continue.",
+    }));
+    const agentLocations: unknown[] = [];
+    const agentGet = host.agent.get.bind(host.agent);
+    host.agent.get = (async (...args: Parameters<typeof agentGet>) => {
+      agentLocations.push(args[0].location);
+      return agentGet(...args);
+    }) as typeof host.agent.get;
+    const { successor } = await executeV2Trim(host, owned, "ses_src", 0, {
+      retention: {
+        mode: "task-aware",
+        apiKey: "test-key",
+        fetch: scoredJevFetch(() => 0.1),
+      },
+      controlTimeoutMs: 1_000,
+    });
+    expect(successor).not.toBeNull();
+    expect(agentLocations).toEqual([{ directory: "/other-project" }]);
+  });
+
   test("a summarizer that calls a tool is stopped before a second request and fails the command", async () => {
     const state = fakeV2State();
     sourceSession(state, "ses_src", toolHistory());
@@ -1431,6 +1462,68 @@ describe("OpenCode 2 compaction", () => {
     );
     expect(again.successor).toBeNull();
   });
+
+  // Two projects with different summarizer profiles and a wrong server default:
+  // each command must read the agent and the model list at the source
+  // session's own directory. A project without a profile gets the default.
+  const summarizerScopes = [
+    { directory: "/workspace", model: "workspace-model" },
+    { directory: "/other-project", model: "other-model" },
+    { directory: "/plain-project", model: "default-model" },
+  ];
+  const scopedSummarizerState = (directory: string) => {
+    const state = fakeV2State();
+    state.summarizerModel = { providerID: "probe", id: "default-model" };
+    state.projectSummarizers = {
+      "/workspace": { providerID: "probe", id: "workspace-model" },
+      "/other-project": { providerID: "probe", id: "other-model" },
+    };
+    return {
+      state,
+      session: (messages: V2Message[]) =>
+        sourceSession(state, "ses_src", messages, {
+          location: { directory },
+        }),
+    };
+  };
+  const spyOnSummarizerReads = (host: ReturnType<typeof fakeV2Host>) => {
+    const reads = {
+      agentLocations: [] as unknown[],
+      agentModels: [] as string[],
+      modelListLocations: [] as unknown[],
+    };
+    const agentGet = host.agent.get.bind(host.agent);
+    host.agent.get = (async (...args: Parameters<typeof agentGet>) => {
+      reads.agentLocations.push(args[0].location);
+      const result = await agentGet(...args);
+      reads.agentModels.push(result.data.model?.id ?? "none");
+      return result;
+    }) as typeof host.agent.get;
+    const modelList = host.model.list.bind(host.model);
+    host.model.list = (async (...args: Parameters<typeof modelList>) => {
+      reads.modelListLocations.push(args[0]?.location);
+      return modelList(...args);
+    }) as typeof host.model.list;
+    return reads;
+  };
+
+  for (const { directory, model } of summarizerScopes) {
+    test(`compact resolves the summarizer at the source session location ${directory}`, async () => {
+      const { state, session } = scopedSummarizerState(directory);
+      session([...turn(1), ...turn(2)]);
+      const owned = new OwnedSessions();
+      const host = fakeV2Host(state, owned, echoGeneration());
+      const reads = spyOnSummarizerReads(host);
+      const { successor } = await executeV2Compact(host, owned, "ses_src", 1, {
+        retention: { mode: "heuristic" },
+        controlTimeoutMs: 1_000,
+      });
+      expect(successor).not.toBeNull();
+      expect(reads.agentLocations).toEqual([{ directory }]);
+      expect(reads.modelListLocations).toEqual([{ directory }]);
+      expect(reads.agentModels).toEqual([model]);
+    });
+  }
 
   test("never falls back when the summarizer model is not configured", async () => {
     const state = fakeV2State();

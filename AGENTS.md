@@ -20,6 +20,7 @@ Agents MUST read these files before working on platform behavior, and MUST updat
 
 - Use public host APIs only. V1 compact and trim require a verified listener; V2 requires a verified registered-service or explicit endpoint connection. See `docs/OpenCode.md` for setup and identity checks.
 - When changing host adapters or package entrypoints, test the packed artifact in containers on both supported hosts. Do not use a live host session for qualification.
+- Compaction evals may use an authenticated local OpenCode server only with fresh, run-owned synthetic sessions in an isolated temporary project. Never supply existing user sessions or alter global configuration. Keep provider credentials in the server; qualify host-runner changes in containers first.
 
 ---
 

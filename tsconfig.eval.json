@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // The eval wrapper imports the packed subject under an alias that exists
+    // only inside the artifact cache; type it against this checkout's plugin.
+    "paths": {
+      "arkive-compact-eval-subject": ["./packages/opencode-plugin/src/index.ts"]
+    }
+  },
+  "include": [
+    "packages/opencode-plugin/eval/compaction/**/*.ts",
+    "packages/opencode-plugin/eval/decisions/**/*.ts",
+    "packages/opencode-plugin/test/compaction-eval.test.ts",
+    "packages/opencode-plugin/test/decision-eval.test.ts"
+  ]
+}

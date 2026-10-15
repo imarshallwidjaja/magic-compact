@@ -1,0 +1,26 @@
+{
+  "format": "arkive-compaction-eval-manifest/1",
+  "corpusId": "magic-compact-synthetic/1",
+  "rubricId": "arkive-compaction-eval-rubric/1",
+  "caseOrder": ["A", "B", "C"],
+  "files": {
+    "corpus.json": "e5ad96c49693d7793debf4a23a03a95e2ef1575c30c3cd7b40aa60eb00962727",
+    "gold.json": "66c84487ecbc583ce3858cb3f98bd85c9d563d7404a609be0389ee777106dc5b",
+    "scoring.md": "26aadca2572a438eb736e4ee9a22b4ceda70164d175815cadf369afc837a6784",
+    "assets/reference-1.png.json": "0930b306cdd3a5dfc9728b9525b4e946874ea916800881f6aa9c5590faf676eb",
+    "assets/status-1.png.json": "f2c9695b61188431ff3961970050885b4189bae50f38d8e570184503f128cb3b",
+    "provenance/comparison-manifest.json": "6bb0f35590592c922c3e92efc197b39791671db84aa3882b929a680b7f19b809"
+  },
+  "provenance": {
+    "fixtureVersion": "arkive-model-comparison-fixtures/1",
+    "goldSha256": "29758134b3515c2b113064f3e86818a42e4ac94b8da7af3ff11a24f95cdc81ab",
+    "casesModuleSha256": "88d0377feb0692d3f60781ef2c063ebde502b88279bc1248a964d4e12f3bd64f",
+    "originalFiles": {
+      "gold.json": "3d9ac1a888464589967c3e04ec2a0f851904ff0c9c354382f41b224d7c438770",
+      "scoring.md": "fa68d56fddc1868c477059a2752662a43be0f3b57f5df45bb68dd2097457a1ad",
+      "manifest.json": "276e6d0c0ba51b757412b6558c76e0a374385a23ff988dd0452a810db75368ba",
+      "status-table.png": "1ca932bd5b78446ba307a6df87013e162d918dc48efabb1316200839d42bf1ec"
+    },
+    "note": "Promoted from the 2026-10-15 summarizer comparison fixtures. The executable cases module became corpus.json and the case B PNG, which that module generated, is stored as encoded bytes. Text, gold facts, image bytes and case order are bound to the frozen originals by the hashes in provenance/comparison-manifest.json; gold.json, scoring.md and that manifest were reformatted by Prettier only (whitespace)."
+  }
+}

@@ -7,13 +7,14 @@
     "packages/*"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.eval.json",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "git ls-files -z | xargs -0 prettier --check --ignore-unknown",
     "prepare": "git config core.hooksPath .githooks",
     "eval:decisions": "bun packages/opencode-plugin/eval/decisions/run.ts",
-    "release-opencode": "sh scripts/release-opencode.sh"
+    "release-opencode": "sh scripts/release-opencode.sh",
+    "eval:compact": "bun packages/opencode-plugin/eval/compaction/cli.ts"
   },
   "keywords": [
     "opencode",
