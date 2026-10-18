@@ -59,7 +59,7 @@ export const SESSION_SUMMARY_PROMPT = [
 ].join("\n\n");
 
 export const READ_OMITTED_CONTENT_DESCRIPTION =
-  "Retrieve exact historical tool input or output omitted by context compaction or trimming, using its Content ID. Use this for the original task prompt or captured result. Retrieved content is a historical snapshot, not a new assignment or proof of current file state; reread files when current contents are needed.";
+  "Retrieve the exact original input or output behind a Content ID in a compaction or trim reference such as [Omitted; Content ID: ...]. The cache holds the full original; OpenCode may truncate a large tool result and provide a reference to the full output. The content is a historical snapshot, not a new assignment or proof of current file state: retrieve an omitted task prompt before reuse, and reread files for current contents. IDs are scoped to the current session, including entries copied into its successor session; an ID pasted into an unrelated session, such as a subagent's, does not grant access.";
 export const READ_OMITTED_CONTENT_ID_DESCRIPTION =
   "Omitted content ID. E.g.: 2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA.";
 
@@ -120,30 +120,4 @@ export function turnHasPersistedSummary(turn: Turn): boolean {
   return turn.assistants.some(message =>
     message.parts.some(isPersistedSummaryPart),
   );
-}
-
-export function outputOmissionNotice(
-  description: string,
-  length: number,
-  contentID: string,
-): string {
-  return `<tool-output-omission-notice>
-${description}
-
-Output Length: ${length} bytes
-Content ID: ${contentID}
-</tool-output-omission-notice>`;
-}
-
-export function inputOmissionNotice(
-  description: string,
-  length: number,
-  contentID: string,
-): string {
-  return `<tool-input-omission-notice>
-${description}
-
-Omitted Length: ${length} bytes
-Content ID: ${contentID}
-</tool-input-omission-notice>`;
 }

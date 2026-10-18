@@ -4237,6 +4237,10 @@ describe("compaction orchestration", () => {
       /[A-Za-z0-9_-]{1,12}:omitted-[A-Za-z0-9_-]{22}/u,
     )?.[0];
     expect(contentID).toBeDefined();
+    if (tool!.state.status !== "completed") throw new Error("Expected output.");
+    expect(tool!.state.output).toBe(
+      `[Historical read result omitted (${Buffer.byteLength(output)} bytes); Content ID: ${contentID}]`,
+    );
     expect(await readOmittedContent("successor", contentID!)).toBe(output);
     expect(await readOmittedContent("source", contentID!)).toBeNull();
     expect(JSON.stringify(await readCache("successor"))).not.toContain(
@@ -4412,7 +4416,7 @@ describe("compaction orchestration", () => {
     expect(messages).toEqual(before);
   });
 
-  test("omits a large task prompt on a previously trimmed part during compaction", async () => {
+  test("shortens a large task prompt on a previously trimmed part during compaction", async () => {
     const prompt = "delegation context packet ".repeat(60);
     const messages = compactableCommandMessages(
       "task-prompt",
@@ -4465,15 +4469,13 @@ describe("compaction orchestration", () => {
     expect(persisted!.state.metadata["magicCompact"]).toEqual({
       trimmed: true,
     });
-    expect(persisted!.state.output).toContain(
-      "Task prompt omitted due to compaction operation.",
-    );
-    const contentID = persisted!.state.output.match(
+    expect(persisted!.state.output).toBe("subagent result");
+    const contentID = (persisted!.state.input["prompt"] as string).match(
       /[A-Za-z0-9_-]{1,12}:omitted-[A-Za-z0-9_-]{22}/u,
     )?.[0];
     expect(contentID).toBeDefined();
     expect(persisted!.state.input["prompt"]).toBe(
-      `[Historical task prompt omitted; Content ID: ${contentID}. Retrieve the original with read_omitted_content before reuse.]`,
+      `[Historical task prompt omitted; Content ID: ${contentID}. Retrieve before reuse.]`,
     );
     expect(await readOmittedContent("successor", contentID!)).toBe(prompt);
     const cache = await readCache("successor");
@@ -6976,7 +6978,7 @@ describe("magic compact task-aware retention", () => {
       withoutPartIdentity(usefulTool),
     );
     expect(JSON.stringify(tools[1])).toContain(
-      "Historical read contents omitted",
+      "Historical read result omitted",
     );
     expect(harness.toasts.at(-1)?.message).toBe(
       `Compacted 2 request turn(s) into successor session successor. ${preservedTurnsFeedback({ requested: 0, preserved: 0 })} Task-aware retention kept 1 of 2 evaluated tool call(s) whole.`,

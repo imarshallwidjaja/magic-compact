@@ -548,6 +548,35 @@ describe("retention candidates", () => {
       false,
     ],
     [
+      "marked compact task prompt and report references",
+      tool(
+        "task",
+        {
+          prompt:
+            "[Historical task prompt omitted; Content ID: 2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA. Retrieve before reuse.]",
+          note: "[Omitted; Content ID: 2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA]",
+        },
+        "[Task output omitted (4900 bytes); child session: ses_2f3a9bC1; Content ID: 2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA]",
+        true,
+      ),
+      false,
+    ],
+    [
+      "marked compact edit references",
+      tool(
+        "edit",
+        {
+          oldString:
+            "[Omitted with newString; Content ID: 2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA]",
+          newString:
+            "[Omitted with oldString; Content ID: 2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA]",
+        },
+        "ok",
+        true,
+      ),
+      false,
+    ],
+    [
       "a marked bare task placeholder",
       tool("task", { prompt: "[Omitted]" }, long, true),
       false,

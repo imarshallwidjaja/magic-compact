@@ -6,8 +6,8 @@ import { isRecord } from "../util";
 import { coveredAssistantImagePartIDs } from "./media";
 import { keepsHostInjectedText } from "../policy/host-text";
 import {
+  childSessionID,
   planToolTrim,
-  plannedOutputText,
   toolTrimChangesContent,
   type OmissionAllocator,
   type ToolCallView,
@@ -200,13 +200,15 @@ const V1_TOOL_CATEGORIES: Readonly<Record<string, ToolRuleCategory>> = {
 export function toolCallView(part: ToolPart): ToolCallView | null {
   if (part.state.status !== "completed") return null;
   const magicCompact = part.state.metadata["magicCompact"];
+  const category = Object.hasOwn(V1_TOOL_CATEGORIES, part.tool)
+    ? V1_TOOL_CATEGORIES[part.tool]!
+    : "other";
   return {
-    category: Object.hasOwn(V1_TOOL_CATEGORIES, part.tool)
-      ? V1_TOOL_CATEGORIES[part.tool]!
-      : "other",
+    category,
     input: part.state.input,
     output: part.state.output,
     trimmed: isRecord(magicCompact) && magicCompact["trimmed"] === true,
+    childSessionID: childSessionID(category, part.state.metadata["sessionId"]),
   };
 }
 
@@ -220,7 +222,7 @@ async function prepareToolPart(
   if (plan === null) return false;
   const magicCompact = part.state.metadata["magicCompact"];
   part.state.input = plan.input;
-  part.state.output = plannedOutputText(call, plan);
+  part.state.output = plan.output ?? call.output;
   part.state.metadata = {
     ...part.state.metadata,
     magicCompact: {

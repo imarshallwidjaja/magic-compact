@@ -37,7 +37,7 @@ Fork creation and model requests have no local wall-clock deadline, so Magic Com
 - Lossless boundary — Preserve exact user messages, native checkpoint safety, source ordering, and retrievable omitted tool I/O instead of flattening history into one recap.
 - On-demand compaction overhead — Model and TypeSafe calls happen only when you run `/magic-compact` or `/magic-trim`, not during the normal agentic loop.
 - Preserved user messages — Exact requirements and guidance remain visible to the agent, verbatim.
-- Smart tool call pruning — Bulky completed tool I/O is replaced with omission notices, with original content cached and retrievable on demand via `read_omitted_content`.
+- Smart tool call pruning — Bulky completed tool I/O is replaced with compact recovery references, with original content cached and retrievable on demand via `read_omitted_content`.
 - Recompactable — Run `/magic-compact` again later to compact new turns while preserving prior summaries.
 - Trim without summarizing — OpenCode can prune historical tool I/O with `/magic-trim` while preserving assistant responses.
 - Task-aware retention — Before `/magic-compact` or `/magic-trim` changes a tool call, TypeSafe Jev judges whether its content is likely to help the current task. Calls it is confident about are kept whole for that run; the rest follow the normal pruning rules. `/magic-trim --heuristic` skips this step.
@@ -225,7 +225,7 @@ Reported token counts are canonical active-content estimates, not provider usage
 
 Magic Compact registers a `read_omitted_content` tool that the agent can call to retrieve any tool input or output that was pruned during compaction or trimming.
 
-Each omission notice in the conversation includes an integrity-protected Content ID such as `2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA`. The agent uses that ID to retrieve an exact original task prompt or captured result from the authorized current-session cache. Historical content is not a new assignment or proof of current file state; reread files when current contents are needed. OpenCode preserves historical v1 bare entries during migration and successor copying, but cannot retrieve them because they have no cryptographic binding. Unavailable or integrity-invalid entries fail closed instead of returning guessed bytes.
+Each recovery reference in the conversation includes an integrity-protected Content ID such as `2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA`, for example `[Omitted; Content ID: 2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA]`. The agent uses that ID to retrieve the exact original input or output from the authorized current-session cache. OpenCode may truncate a large tool result and provide a reference to the full output. A successor session holds copies of its source's entries; an ID copied into an unrelated session, such as a subagent's, does not grant access. Historical content is not a new assignment or proof of current file state; reread files when current contents are needed. OpenCode preserves historical v1 bare entries during migration and successor copying, but cannot retrieve them because they have no cryptographic binding. Unavailable or integrity-invalid entries fail closed instead of returning guessed bytes.
 
 ## Pruning Rules
 
@@ -244,16 +244,16 @@ Removed or condensed:
 
 - Assistant reasoning, text, and step markers — replaced by the per-turn summary; v3 manifest-covered inline image files stay persisted
 - Most synthetic/injected messages (file expansions, plan reminders, prior compaction notices, etc.)
-- Bulky completed tool I/O — replaced with an omission notice pointing to the cache
+- Bulky completed tool I/O — replaced with a recovery reference pointing to the cache
 
 ### Tool I/O Rules
 
 Completed tool outputs over 128 words or 1024 characters are omitted by default. A few tools have special handling.
 
-- `read` — output always omitted; retrieve the exact captured result by Content ID or reread for current file contents
-- `write` / `edit` / `apply_patch` — large file content omitted
-- `bash` — commands over 1024 characters are truncated
-- `task` — large prompts replaced with a historical placeholder containing their Content ID and a retrieval hint; output omitted above a higher threshold (512 words / 4096 characters)
+- `read` — output always replaced with a reference carrying its size and Content ID; retrieve the exact captured result or reread for current file contents
+- `write` / `edit` / `apply_patch` — large file content replaced in the input field itself with a reference (`edit` keeps one entry for `oldString` and `newString` together)
+- `bash` — commands over 1024 characters keep their first 512 characters followed by a truncation reference; the whole command is cached
+- `task` — large prompts replaced with a historical placeholder carrying their Content ID; output omitted above a higher threshold (512 words / 4096 characters), and the reference names the native child session when the host reports one
 - `question` — input and output preserved
 - `todowrite` / `skill` — output discarded without caching (redundant or reloadable)
 
@@ -261,7 +261,7 @@ Pending, running, and errored tool calls are always preserved as-is.
 
 Completed tool calls processed by pruning are marked so later trim and compaction operations do not output-trim them again. Idempotent input rules still apply to calls processed under earlier rules.
 
-Task prompt placeholders identify historical omissions, not runnable assignments. Retrieve the original before reuse. Earlier bare `[Omitted]` placeholders remain unchanged; their recovery ID, when available, stays in the output-side notice.
+Task prompt placeholders identify historical omissions, not runnable assignments. Retrieve the original before reuse. A new input reference sits in the field it replaced, so the output carries no separate input notice. Histories already trimmed keep their earlier XML notices, bare `[Omitted]` placeholders and long task placeholders unchanged; they are not reformatted.
 
 A call kept by task-aware retention is left exactly as it was, including its trim marker, and is judged again the next time either command runs. Nothing about the decision is stored.
 

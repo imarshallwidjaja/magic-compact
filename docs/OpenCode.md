@@ -60,7 +60,7 @@ After argument and execution-option validation, compact and trim show a long-liv
 3. Build turns for the complete stored session, independent of compaction boundaries, and keep the loaded messages as the planned source snapshot.
 4. Preserve the `N` most recent assistant turns.
 5. Read the source at rest (see Successor Sessions). Unless `--heuristic` was given, run task-aware retention over the older turns. Any retention failure ends the command here, before a successor.
-6. Apply the normal tool input and output trimming rules to clones of the older turns' completed tool parts, skipping parts kept by retention and planning, not allocating, omission IDs. Input trimming still applies to states already marked trimmed by an earlier run; output trimming applies only to unmarked states. Mark processed states with `state.metadata.magicCompact.trimmed === true`; kept parts are not marked.
+6. Apply the normal tool input and output trimming rules to clones of the older turns' completed tool parts, skipping parts kept by retention and planning, not allocating, omission IDs. Input trimming still applies to states already marked trimmed by an earlier run and changes only the input; output trimming applies only to unmarked states. Mark processed states with `state.metadata.magicCompact.trimmed === true`; kept parts are not marked.
 7. If no tool state would change, show the no-op toast; no successor is created.
 8. Replace each changed tool part in a clone of the source records, count the stored history before and after, and append an ignored notice reporting the `Stored history (estimate)` before/after counts, the trimmed amount and percentage, and the number of trimmed tool calls. Add one retention line matching terminal feedback, for example `Retention | Task-aware retention kept 4 of 9 evaluated tool call(s) whole (read 4).`
 9. Create the successor with `operation: "trim"`, the source's unchanged `compactionCount`, the planned omissions, and the stored reduction, then require its exact persisted history to count to the projection before showing success.
@@ -135,7 +135,7 @@ The source must be a root session (a forked root session qualifies) with no pend
 ### Tool calls
 
 - A tool call is identified by its message ID, its position in the message's content and its call ID. OpenCode 2's tool names map onto the rule categories (`write`, `edit`, `patch`, `shell`, `subagent`, `read`, `question`, `skill`); every other name, including code mode's aggregated `execute`, follows the default rule as one call.
-- The rules judge a completed call's input and its text output: the text content items joined with a blank line. A replaced output takes the place of the first text item and drops the other text items, and file items keep their positions. An input notice becomes a leading text item. Processed calls get `state.metadata.magicCompact.trimmed`. Task-aware retention classifies the same text rendering; it is never persisted.
+- The rules judge a completed call's input and its text output: the text content items joined with a blank line. A replaced output takes the place of the first text item and drops the other text items, and file items keep their positions. Input references live in the input and never add a content item. A subagent call's child session is `metadata.sessionID`, read only when it is a native `ses_` ID. Processed calls get `state.metadata.magicCompact.trimmed`. Task-aware retention classifies the same text rendering; it is never persisted.
 
 ### Compaction
 
@@ -200,7 +200,7 @@ The source must be a root session (a forked root session qualifies) with no pend
 
 - `read_omitted_content` accepts one `contentId` and receives `context.sessionID` from OpenCode.
 - Retrieval reads only the current session cache and never routes by the diagnostic ID prefix.
-- Retrieval returns an exact historical snapshot, not a new assignment or proof of current file state. Read notices offer exact captured-result retrieval and a separate reread for current contents.
+- Retrieval returns the whole exact historical snapshot from the cache, not a new assignment or proof of current file state. The plugin returns the full string. OpenCode's plugin tool wrapper may truncate a large result (default limits 2000 lines or 50 KiB) and provide a reference to the full saved output; see `fromPlugin` in [registry.ts](https://github.com/anomalyco/opencode/blob/830d5eb535/packages/opencode/src/tool/registry.ts) and [truncate.ts](https://github.com/anomalyco/opencode/blob/830d5eb535/packages/opencode/src/tool/truncate.ts). The tool description, shared by both hosts, explains the references once; it says that OpenCode may truncate a large result, to retrieve an omitted task prompt before reuse and to reread files for current contents. A Content ID works only in the session whose cache holds it, including entries copied into a successor; an ID copied into an unrelated session, such as a subagent's, is refused.
 - Missing authorization, no exact entry, invalid integrity, malformed cache, and bare legacy IDs return explicit unavailable/integrity diagnostics and never guessed bytes.
 
 ## Stats
@@ -226,18 +226,19 @@ The source must be a root session (a forked root session qualifies) with no pend
 
 ## Tool Rules
 
-- `write`: omit large `input.content` and cache it.
-- `edit`: omit large `oldString` and `newString` together and cache once.
-- `apply_patch`: omit large `input.patchText` and cache it.
-- `bash`: cache long commands and visibly truncate them.
-- `read`: always cache and omit output.
-- `task`: omit and cache large `input.prompt` once; replace it with a short historical placeholder containing the allocated Content ID and a `read_omitted_content` hint. The output-side input notice uses that same ID and still triggers persistence on already-trimmed states. Cache and omit output only above the higher task threshold, under a separate ID.
+- Every input omission replaces the field with its own reference, so the Content ID sits where the omitted content was. The model-facing output is unchanged by an input omission.
+- `write`: omit large `input.content` and cache it; the field becomes `[Omitted; Content ID: <id>]`.
+- `edit`: omit large `oldString` and `newString` together and cache once as `oldString`, a newline and `newString`; the fields become `[Omitted with newString; Content ID: <id>]` and `[Omitted with oldString; Content ID: <id>]`.
+- `apply_patch`: omit large `input.patchText` and cache it, with the `write` reference.
+- `bash`: cache a command over 1024 characters whole; keep its first 512 characters followed by `[Command truncated; Content ID: <id>]`.
+- `read`: always cache and omit output as `[Historical read result omitted (<bytes> bytes); Content ID: <id>]`.
+- `task`: omit and cache large `input.prompt` once as `[Historical task prompt omitted; Content ID: <id>. Retrieve before reuse.]`, a placeholder that is not a new assignment. Cache and omit output only above the higher task threshold, under a separate ID, as `[Task output omitted (<bytes> bytes); child session: <id>; Content ID: <id>]`. The child clause appears only when the host reported a native `ses_` child session ID in its own task metadata (`sessionId` on OpenCode 1, `sessionID` on OpenCode 2); other metadata, report text and requested resume IDs are never used.
 - `todowrite`: preserve input and replace output with a success message, no cache.
 - `question`: preserve input and output.
 - `skill`: preserve input and replace output with a reload hint, no cache.
-- Other completed tool outputs are cached and omitted above the default threshold.
+- Other completed tool outputs are cached and omitted above the default threshold as `[Output omitted (<bytes> bytes); Content ID: <id>]`.
 - Input rules are idempotent on their own result and still apply to states marked trimmed by an earlier run; output rules are skipped on marked states.
-- Earlier bare `[Omitted]` task inputs remain unchanged; no placeholder migration or new cache allocation occurs on repeat trimming.
+- Histories trimmed earlier keep their `<tool-input-omission-notice>` and `<tool-output-omission-notice>` blocks, bare `[Omitted]` inputs and long task placeholders unchanged; no migration, reallocation or reformatting occurs on repeat trimming.
 
 ## Error Handling
 

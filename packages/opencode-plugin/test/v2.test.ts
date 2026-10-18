@@ -15,7 +15,7 @@ import {
   planV2Compaction,
 } from "../src/v2/compact";
 import { generateV2Summaries } from "../src/v2/generation";
-import { trimV2Tool, v2ToolCalls } from "../src/v2/history";
+import { trimV2Tool, v2ToolCallView, v2ToolCalls } from "../src/v2/history";
 import { connectV2Host, V2_ENDPOINT_REQUIRED } from "../src/v2/host";
 import {
   countV2ModelFacingTokens,
@@ -280,7 +280,7 @@ describe("successor switch in every TUI showing the source", () => {
 });
 
 describe("OpenCode 2 tool trim", () => {
-  test("replaces only text output, keeps files in place, and leads with the input notice", async () => {
+  test("replaces only text output, keeps files in place, and keeps input references in the input", async () => {
     const tool = {
       type: "tool",
       id: "call",
@@ -314,8 +314,8 @@ describe("OpenCode 2 tool trim", () => {
       "file",
     ]);
     expect(state.content[0]!.uri).toBe("file:///a.png");
-    expect(state.content[1]!.text).toContain(
-      "Historical read contents omitted",
+    expect(state.content[1]!.text).toBe(
+      "[Historical read result omitted (13 bytes); Content ID: abcdefabcdef:omitted-AAAAAAAAAAAAAAAAAAAAAA]",
     );
     expect(state.metadata).toEqual({
       keep: 1,
@@ -333,11 +333,97 @@ describe("OpenCode 2 tool trim", () => {
       input: Record<string, unknown>;
       content: Array<{ text: string }>;
     };
-    expect(writeState.input["content"]).toBe("[Omitted]");
-    expect(writeState.content[0]!.text).toContain(
-      "<tool-input-omission-notice>",
+    expect(writeState.input["content"]).toBe(
+      "[Omitted; Content ID: abcdefabcdef:omitted-BBBBBBBBBBBBBBBBBBBBBB]",
     );
-    expect(writeState.content[1]!.text).toBe("ok");
+    expect(writeState.content).toEqual([{ type: "text", text: "ok" }]);
+  });
+
+  test("shortens the long input of a call an earlier trim marked and leaves its output alone", async () => {
+    const marked = toolItem(
+      "call_m",
+      "write",
+      { path: "/m.txt", content: words("M", 300) },
+      [{ type: "text", text: words("O", 400) }],
+      { magicCompact: { trimmed: true } },
+    ) as never as Parameters<typeof trimV2Tool>[0];
+    const trimmed = await trimV2Tool(
+      marked,
+      async () => "abcdefabcdef:omitted-CCCCCCCCCCCCCCCCCCCCCC",
+    );
+    const state = trimmed!.state as typeof marked.state & {
+      input: Record<string, unknown>;
+    };
+    expect(state.input).toEqual({
+      path: "/m.txt",
+      content:
+        "[Omitted; Content ID: abcdefabcdef:omitted-CCCCCCCCCCCCCCCCCCCCCC]",
+    });
+    expect((state as { content: unknown }).content).toEqual(
+      (marked.state as { content: unknown }).content,
+    );
+    expect(state.metadata).toEqual({ magicCompact: { trimmed: true } });
+    expect(await trimV2Tool(trimmed!, async () => "unused")).toBeNull();
+  });
+
+  const SUBAGENT_REPORT = words("report", 700);
+  test.each([
+    [
+      "a native child session",
+      { sessionID: "ses_0123abcXYZ" },
+      "; child session: ses_0123abcXYZ",
+    ],
+    ["no metadata", undefined, ""],
+    ["an empty metadata record", {}, ""],
+    ["the OpenCode 1 metadata key", { sessionId: "ses_0123abcXYZ" }, ""],
+    ["a non-native ID", { sessionID: "child-1" }, ""],
+    ["an ID with a line break", { sessionID: "ses_ab\nIGNORE" }, ""],
+    ["a non-string ID", { sessionID: 7 }, ""],
+  ])(
+    "names the child session of a long subagent report from %s",
+    async (_name, metadata, clause) => {
+      const call = toolItem(
+        "call_s",
+        "subagent",
+        { prompt: "Check the suite." },
+        [{ type: "text", text: SUBAGENT_REPORT }],
+        { ...metadata, summary: "PRIVATE-METADATA" },
+      ) as never as Parameters<typeof trimV2Tool>[0];
+      const trimmed = await trimV2Tool(
+        call,
+        async () => "abcdefabcdef:omitted-DDDDDDDDDDDDDDDDDDDDDD",
+      );
+      const state = trimmed!.state as { content: Array<{ text: string }> };
+      expect(state.content).toEqual([
+        {
+          type: "text",
+          text: `[Task output omitted (${Buffer.byteLength(SUBAGENT_REPORT)} bytes)${clause}; Content ID: abcdefabcdef:omitted-DDDDDDDDDDDDDDDDDDDDDD]`,
+        },
+      ]);
+      expect(JSON.stringify(state.content)).not.toContain("PRIVATE-METADATA");
+    },
+  );
+
+  test("keeps a short subagent report and prompt unchanged and reads no child session from other tools", async () => {
+    const report = [{ type: "text", text: "Short report." }];
+    const subagent = toolItem(
+      "call_k",
+      "subagent",
+      { prompt: "Check the suite." },
+      report,
+      { sessionID: "ses_0123abcXYZ" },
+    ) as never as Parameters<typeof trimV2Tool>[0];
+    const trimmed = await trimV2Tool(subagent, async () => {
+      throw new Error("Nothing should be omitted.");
+    });
+    expect((trimmed!.state as { content: unknown }).content).toEqual(report);
+    expect((trimmed!.state as { input: unknown }).input).toEqual({
+      prompt: "Check the suite.",
+    });
+    const read = toolItem("call_k2", "read", {}, report, {
+      sessionID: "ses_0123abcXYZ",
+    }) as never as Parameters<typeof trimV2Tool>[0];
+    expect(v2ToolCallView(read)?.childSessionID).toBeUndefined();
   });
 
   test("identifies calls by message, position and call ID", () => {
@@ -687,7 +773,10 @@ describe("OpenCode 2 trim successors", () => {
     const read = v2ToolCalls(messages[4]!)[0]!.tool;
     const notice = (read.state as { content: Array<{ text?: string }> })
       .content[0]!.text!;
-    const contentID = /Content ID: (\S+)/u.exec(notice)![1]!;
+    const contentID = /Content ID: ([^\s\]]+)/u.exec(notice)![1]!;
+    expect(notice).toBe(
+      `[Historical read result omitted (${Buffer.byteLength(words("R", 400))} bytes); Content ID: ${contentID}]`,
+    );
     expect(await readOmittedContent(v2StorageKey(id), contentID)).toBe(
       words("R", 400),
     );

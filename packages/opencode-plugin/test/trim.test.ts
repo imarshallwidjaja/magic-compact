@@ -48,11 +48,16 @@ import {
   readStats,
   writeStats,
 } from "../src/storage/stats";
+import { planToolTrim, type ToolRuleCategory } from "../src/policy/tool-rules";
 import { trimStatsMessage } from "../src/stats/constants";
-import { countCanonicalContentTokens } from "../src/stats/tokenize";
+import {
+  countCanonicalContentTokens,
+  countGptTokens,
+} from "../src/stats/tokenize";
 
 const HEURISTIC_OPTIONS = { retention: { mode: "heuristic" } } as const;
 const HEURISTIC_FEEDBACK = "Heuristic mode: tool calls not evaluated.";
+const OMISSION_ID = /[A-Za-z0-9_-]{1,12}:omitted-[A-Za-z0-9_-]{22}/gu;
 
 describe("magic trim", () => {
   test("preserves the requested assistant-turn tail", async () => {
@@ -153,82 +158,111 @@ describe("magic trim", () => {
       expect(tool.state.status).toBe("completed");
       if (tool.state.status !== "completed")
         throw new Error("Expected completion");
-      expect(tool.state.output).toContain(
-        `Content ID: ${sessionID.slice(-12)}:omitted-`,
+      const contentID = /Content ID: ([^\s\]]+)\]$/u.exec(
+        tool.state.output,
+      )?.[1];
+      expect(contentID).toMatch(
+        new RegExp(`^${sessionID.slice(-12)}:omitted-[A-Za-z0-9_-]{22}$`, "u"),
       );
-      expect(tool.state.output).toContain("Output Length: 3 bytes");
-      expect(tool.state.output).toContain("Historical read contents omitted");
-      expect(tool.state.output).toContain("exact captured result");
-      expect(tool.state.output).toContain(
-        "reread the file for current contents",
+      expect(tool.state.output).toBe(
+        `[Historical read result omitted (3 bytes); Content ID: ${contentID}]`,
       );
-      expect(tool.state.output).not.toContain("Stale");
+      expect(await readOmittedContent(sessionID, contentID!)).toBe("\u20ac");
     } finally {
       await rm(cachePath(sessionID), { force: true });
     }
   });
 
-  test.each([
-    [
-      "short output",
-      "delegation context packet ".repeat(60),
-      "subagent result",
-    ],
-    [
-      "large output",
-      "delegation context packet ".repeat(60),
-      "report ".repeat(700),
-    ],
-    ["word-limit prompt", "x ".repeat(129), "subagent result"],
-  ])(
-    "recovers task prompts with %s and trims only once",
-    async (_name, prompt, output) => {
-      const sessionID = `ses_trim_task_input_${randomUUID().replaceAll("-", "")}`;
-      const tool = taskTool("tool_task_input", prompt);
-      tool.state.output = output;
+  const longText = "delegation context packet ".repeat(60);
+  const longCommand = "echo delegation context packet; ".repeat(40);
+  const inputRules: Array<{
+    tool: string;
+    input: Record<string, unknown>;
+    original: string;
+    expected: (id: string) => Record<string, unknown>;
+  }> = [
+    {
+      tool: "write",
+      input: { filePath: "/w.ts", content: longText },
+      original: longText,
+      expected: id => ({
+        filePath: "/w.ts",
+        content: `[Omitted; Content ID: ${id}]`,
+      }),
+    },
+    {
+      tool: "apply_patch",
+      input: { patchText: longText },
+      original: longText,
+      expected: id => ({ patchText: `[Omitted; Content ID: ${id}]` }),
+    },
+    {
+      tool: "edit",
+      input: { filePath: "/e.ts", oldString: longText, newString: "small" },
+      original: `${longText}\nsmall`,
+      expected: id => ({
+        filePath: "/e.ts",
+        oldString: `[Omitted with newString; Content ID: ${id}]`,
+        newString: `[Omitted with oldString; Content ID: ${id}]`,
+      }),
+    },
+    {
+      tool: "bash",
+      input: { command: longCommand, description: "run checks" },
+      original: longCommand,
+      expected: id => ({
+        command: `${longCommand.slice(0, 512)}\n[Command truncated; Content ID: ${id}]`,
+        description: "run checks",
+      }),
+    },
+    {
+      tool: "task",
+      input: {
+        subagent_type: "forager-worker",
+        description: "delegated work",
+        prompt: longText,
+      },
+      original: longText,
+      expected: id => ({
+        subagent_type: "forager-worker",
+        description: "delegated work",
+        prompt: `[Historical task prompt omitted; Content ID: ${id}. Retrieve before reuse.]`,
+      }),
+    },
+  ];
+
+  test.each(
+    inputRules.flatMap(rule => [
+      [rule.tool, false, rule] as const,
+      [rule.tool, true, rule] as const,
+    ]),
+  )(
+    "puts one exact recovery reference in the %s input (earlier trim marker: %p) and trims only once",
+    async (_name, marked, rule) => {
+      const sessionID = `ses_trim_input_${randomUUID().replaceAll("-", "")}`;
+      const tool = completedTool("tool_input_rule", rule.tool, "short output");
+      if (tool.state.status !== "completed")
+        throw new Error("Expected completion");
+      tool.state.input = structuredClone(rule.input);
+      if (marked) tool.state.metadata["magicCompact"] = { trimmed: true };
 
       try {
-        await applyToolTrim(sessionID, [turn(tool)], new Set());
+        expect(await applyToolTrim(sessionID, [turn(tool)], new Set())).toBe(1);
 
-        expect(tool.state.status).toBe("completed");
-        if (tool.state.status !== "completed")
-          throw new Error("Expected completion");
-        expect(tool.state.input["description"]).toBe("delegated work");
-        expect(tool.state.input["subagent_type"]).toBe("forager-worker");
-        expect(
-          tool.state.output.startsWith("<tool-input-omission-notice>"),
-        ).toBeTrue();
-        expect(tool.state.output).toContain(
-          "Task prompt omitted due to compaction operation.",
+        const contentIDs = new Set(
+          JSON.stringify(tool.state.input).match(OMISSION_ID) ?? [],
         );
-        expect(tool.state.output).toContain(
-          `Content ID: ${sessionID.slice(-12)}:omitted-`,
+        expect(contentIDs.size).toBe(1);
+        const [contentID] = [...contentIDs];
+        expect(tool.state.input).toEqual(rule.expected(contentID!));
+        expect(tool.state.output).toBe("short output");
+        expect(tool.state.metadata["magicCompact"]).toEqual({ trimmed: true });
+        expect(await readOmittedContent(sessionID, contentID!)).toBe(
+          rule.original,
         );
         const cache = await readCache(sessionID);
-        const contentIDs = tool.state.output.match(
-          /[A-Za-z0-9_-]{1,12}:omitted-[A-Za-z0-9_-]{22}/gu,
-        )!;
-        const contentID = contentIDs[0]!;
-        const placeholder = tool.state.input["prompt"] as string;
-        expect(placeholder).toBe(
-          `[Historical task prompt omitted; Content ID: ${contentID}. Retrieve the original with read_omitted_content before reuse.]`,
-        );
-        expect(Buffer.byteLength(placeholder)).toBeLessThan(200);
-        expect(placeholder.length).toBeLessThan(1024);
-        expect(placeholder.split(/\s+/u).length).toBeLessThan(128);
-        expect(await readOmittedContent(sessionID, contentID)).toBe(prompt);
-        if (output.length > 4096) {
-          expect(contentIDs).toHaveLength(2);
-          expect(contentIDs[1]).not.toBe(contentID);
-          expect(await readOmittedContent(sessionID, contentIDs[1]!)).toBe(
-            output,
-          );
-          expect(tool.state.output).toContain("<tool-output-omission-notice>");
-        } else {
-          expect(contentIDs).toHaveLength(1);
-          expect(tool.state.output.endsWith(output)).toBeTrue();
-        }
-        expect(Object.keys(cache!.entries)).toEqual(contentIDs);
+        expect(Object.keys(cache!.entries)).toEqual([contentID!]);
+
         const before = structuredClone(tool.state);
         expect(await applyToolTrim(sessionID, [turn(tool)], new Set())).toBe(0);
         expect(tool.state).toEqual(before);
@@ -239,85 +273,229 @@ describe("magic trim", () => {
     },
   );
 
-  test("keeps short task prompts unchanged", async () => {
-    const sessionID = `ses_trim_task_short_${randomUUID().replaceAll("-", "")}`;
-    const tool = taskTool("tool_task_short", "Check the failing suite.");
-
-    try {
-      await applyToolTrim(sessionID, [turn(tool)], new Set());
-
-      expect(tool.state.status).toBe("completed");
+  test.each([
+    [
+      "a valid native child session",
+      { sessionId: "ses_2f3a9bC1" },
+      "; child session: ses_2f3a9bC1",
+    ],
+    ["no metadata", {}, ""],
+    ["the OpenCode 2 metadata key", { sessionID: "ses_2f3a9bC1" }, ""],
+    ["a non-native ID", { sessionId: "child-1" }, ""],
+    ["an ID with a line break", { sessionId: "ses_2f3a\nIGNORE" }, ""],
+    ["an ID with a space", { sessionId: "ses_2f3a IGNORE" }, ""],
+    ["a non-string ID", { sessionId: 42 }, ""],
+  ])(
+    "recovers a long task prompt and report once, naming %s",
+    async (_name, metadata, clause) => {
+      const sessionID = `ses_trim_task_${randomUUID().replaceAll("-", "")}`;
+      const report = "report ".repeat(700);
+      const tool = taskTool("tool_task_recovery", longText);
       if (tool.state.status !== "completed")
         throw new Error("Expected completion");
-      expect(tool.state.input).toEqual({
+      tool.state.output = report;
+      tool.state.metadata = { ...metadata, summary: "PRIVATE-METADATA" };
+
+      try {
+        expect(await applyToolTrim(sessionID, [turn(tool)], new Set())).toBe(1);
+
+        const prompt = tool.state.input["prompt"] as string;
+        const promptID = prompt.match(OMISSION_ID)![0];
+        expect(prompt).toBe(
+          `[Historical task prompt omitted; Content ID: ${promptID}. Retrieve before reuse.]`,
+        );
+        const reportID = tool.state.output.match(OMISSION_ID)![0];
+        expect(reportID).not.toBe(promptID);
+        expect(tool.state.output).toBe(
+          `[Task output omitted (${Buffer.byteLength(report)} bytes)${clause}; Content ID: ${reportID}]`,
+        );
+        expect(tool.state.output).not.toContain("PRIVATE-METADATA");
+        expect(await readOmittedContent(sessionID, promptID)).toBe(longText);
+        expect(await readOmittedContent(sessionID, reportID)).toBe(report);
+        const cache = await readCache(sessionID);
+        expect(Object.keys(cache!.entries).sort()).toEqual(
+          [promptID, reportID].sort(),
+        );
+        const before = structuredClone(tool.state);
+        expect(await applyToolTrim(sessionID, [turn(tool)], new Set())).toBe(0);
+        expect(tool.state).toEqual(before);
+        expect(await readCache(sessionID)).toEqual(cache);
+      } finally {
+        await rm(cachePath(sessionID), { force: true });
+      }
+    },
+  );
+
+  test("keeps a short task report and names no child session for other tools", async () => {
+    const sessionID = `ses_trim_task_short_${randomUUID().replaceAll("-", "")}`;
+    const task = taskTool("tool_task_short", "Check the failing suite.");
+    task.state.metadata = { sessionId: "ses_2f3a9bC1" };
+    const other = completedTool("tool_other_long", "grep", longText);
+    if (other.state.status !== "completed")
+      throw new Error("Expected completion");
+    other.state.metadata = { sessionId: "ses_2f3a9bC1" };
+
+    try {
+      await applyToolTrim(sessionID, [turn(task, other)], new Set());
+
+      expect(task.state.status).toBe("completed");
+      if (task.state.status !== "completed")
+        throw new Error("Expected completion");
+      expect(task.state.input).toEqual({
         subagent_type: "forager-worker",
         description: "delegated work",
         prompt: "Check the failing suite.",
       });
-      expect(tool.state.output).toBe("subagent result");
-      expect(await readCache(sessionID)).toBeNull();
+      expect(task.state.output).toBe("subagent result");
+      const contentID = other.state.output.match(OMISSION_ID)![0];
+      expect(other.state.output).toBe(
+        `[Output omitted (${Buffer.byteLength(longText)} bytes); Content ID: ${contentID}]`,
+      );
+      expect(await readOmittedContent(sessionID, contentID)).toBe(longText);
+      expect(Object.keys((await readCache(sessionID))!.entries)).toEqual([
+        contentID,
+      ]);
     } finally {
       await rm(cachePath(sessionID), { force: true });
     }
   });
 
-  test("applies idempotent input rules to tools marked by earlier trims", async () => {
-    const sessionID = `ses_trim_marked_input_${randomUUID().replaceAll("-", "")}`;
-    const prompt = "delegation context packet ".repeat(60);
-    const tool = taskTool("tool_marked_input", prompt);
-    const output = "already processed task output ".repeat(200);
-    tool.state.output = output;
-    tool.state.metadata["magicCompact"] = { trimmed: true };
-
-    try {
-      expect(await applyToolTrim(sessionID, [turn(tool)], new Set())).toBe(1);
-
-      expect(tool.state.status).toBe("completed");
-      if (tool.state.status !== "completed")
-        throw new Error("Expected completion");
-      expect(tool.state.input["description"]).toBe("delegated work");
-      expect(tool.state.input["subagent_type"]).toBe("forager-worker");
-      expect(tool.state.metadata["magicCompact"]).toEqual({ trimmed: true });
-      expect(
-        tool.state.output.startsWith("<tool-input-omission-notice>"),
-      ).toBeTrue();
-      expect(tool.state.output).toContain(
-        "Task prompt omitted due to compaction operation.",
-      );
-      const contentID = tool.state.output.match(
-        /[A-Za-z0-9_-]{1,12}:omitted-[A-Za-z0-9_-]{22}/u,
-      )?.[0];
-      expect(contentID).toBeDefined();
-      const placeholder = tool.state.input["prompt"];
-      expect(placeholder).toBe(
-        `[Historical task prompt omitted; Content ID: ${contentID}. Retrieve the original with read_omitted_content before reuse.]`,
-      );
-      expect(await readOmittedContent(sessionID, contentID!)).toBe(prompt);
-      expect(tool.state.output.endsWith(output)).toBeTrue();
-      expect(tool.state.output).not.toContain("<tool-output-omission-notice>");
-      const cache = await readCache(sessionID);
-      expect(Object.keys(cache!.entries)).toEqual([contentID!]);
-
-      expect(await applyToolTrim(sessionID, [turn(tool)], new Set())).toBe(0);
-      expect(tool.state.input["prompt"]).toBe(placeholder);
-      expect(await readCache(sessionID)).toEqual(cache);
-      expect(
-        tool.state.output.match(/<tool-input-omission-notice>/gu),
-      ).toHaveLength(1);
-    } finally {
-      await rm(cachePath(sessionID), { force: true });
-    }
-  });
-
-  test("preserves earlier bare task placeholders without migrating them", async () => {
-    const sessionID = `ses_trim_old_task_${randomUUID().replaceAll("-", "")}`;
-    const tool = taskTool("tool_old_task", "[Omitted]");
-    tool.state.metadata["magicCompact"] = { trimmed: true };
+  test("leaves question input and output untouched", async () => {
+    const sessionID = `ses_trim_question_${randomUUID().replaceAll("-", "")}`;
+    const tool = completedTool("tool_question", "question", longText);
+    if (tool.state.status !== "completed")
+      throw new Error("Expected completion");
+    tool.state.input = { questions: [{ question: longText }] };
     const before = structuredClone(tool.state);
 
-    expect(await applyToolTrim(sessionID, [turn(tool)], new Set())).toBe(0);
-    expect(tool.state).toEqual(before);
+    await applyToolTrim(sessionID, [turn(tool)], new Set());
+
+    expect(tool.state).toEqual({
+      ...before,
+      metadata: { magicCompact: { trimmed: true } },
+    });
     expect(await readCache(sessionID)).toBeNull();
+  });
+
+  test("leaves earlier notices, placeholders and bare markers unchanged", async () => {
+    const sessionID = `ses_trim_earlier_${randomUUID().replaceAll("-", "")}`;
+    const oldID = "2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA";
+    const earlier = [
+      taskTool("tool_old_bare", "[Omitted]"),
+      taskTool(
+        "tool_old_placeholder",
+        `[Historical task prompt omitted; Content ID: ${oldID}. Retrieve the original with read_omitted_content before reuse.]`,
+      ),
+      completedTool(
+        "tool_old_notice",
+        "write",
+        `<tool-input-omission-notice>\nFile write contents omitted.\n\nOmitted Length: 3000 bytes\nContent ID: ${oldID}\n</tool-input-omission-notice>\n\nWrote file.`,
+      ),
+    ];
+    for (const tool of earlier) {
+      if (tool.state.status !== "completed")
+        throw new Error("Expected completion");
+      tool.state.metadata["magicCompact"] = { trimmed: true };
+    }
+    const write = earlier[2]!;
+    if (write.state.status !== "completed")
+      throw new Error("Expected completion");
+    write.state.input = {
+      content: "[Omitted]",
+      filePath: "/w.ts",
+    };
+    const before = structuredClone(earlier);
+
+    expect(await applyToolTrim(sessionID, [turn(...earlier)], new Set())).toBe(
+      0,
+    );
+    expect(earlier).toEqual(before);
+    expect(await readCache(sessionID)).toBeNull();
+  });
+
+  test("recovery references cost fewer tokens than the notices they replaced", async () => {
+    const contentID = "2c4f6a8b0d1e:omitted-yH8kQ2pL5vN7sR4tU6wXzA";
+    const child = "ses_26c3e8f4bffeKXs0ovRyDPq4tw";
+    const report = "report ".repeat(700);
+    const listing = "line of output ".repeat(300);
+    const read = "x".repeat(2_000);
+    const bytes = (text: string) => Buffer.byteLength(text);
+    const outputNotice = (description: string, text: string) =>
+      `<tool-output-omission-notice>\n${description}\n\nOutput Length: ${bytes(text)} bytes\nContent ID: ${contentID}\n</tool-output-omission-notice>`;
+    const inputNotice = (description: string, text: string) =>
+      `<tool-input-omission-notice>\n${description}\n\nOmitted Length: ${bytes(text)} bytes\nContent ID: ${contentID}\n</tool-input-omission-notice>\n\n`;
+    const plan = async (
+      category: ToolRuleCategory,
+      input: Record<string, unknown>,
+      output: string,
+    ) =>
+      (await planToolTrim(
+        { category, input, output, trimmed: false, childSessionID: child },
+        async () => contentID,
+      ))!;
+    // Each row pairs the model-facing text the XML notices and bare
+    // placeholders used for an omission with the text the references use.
+    const write = await plan("write", { content: longText }, "ok");
+    const edit = await plan(
+      "edit",
+      { oldString: longText, newString: "small" },
+      "ok",
+    );
+    const task = await plan("subagent", { prompt: longText }, report);
+    const batch: Array<[string, string]> = [
+      [
+        [
+          "[Omitted]",
+          inputNotice(
+            "File write contents omitted due to a compaction operation. If necessary, reread file to see current contents.",
+            longText,
+          ),
+        ].join(""),
+        write.input["content"] as string,
+      ],
+      [
+        [
+          "[Omitted][Omitted]",
+          inputNotice(
+            "File edit oldString and newString omitted due to compaction operation. If necessary, reread file to see current contents.",
+            `${longText}\nsmall`,
+          ),
+        ].join(""),
+        `${edit.input["oldString"]}${edit.input["newString"]}`,
+      ],
+      [
+        [
+          `[Historical task prompt omitted; Content ID: ${contentID}. Retrieve the original with read_omitted_content before reuse.]`,
+          inputNotice(
+            "Task prompt omitted due to compaction operation. If necessary, reread it via read_omitted_content.",
+            longText,
+          ),
+          outputNotice(
+            "Task output omitted due to a compaction operation. If necessary, reread output via read_omitted_content tool.",
+            report,
+          ),
+        ].join(""),
+        `${task.input["prompt"]}${task.output}`,
+      ],
+      [
+        outputNotice(
+          "Historical read contents omitted due to compaction operation. Retrieve the exact captured result with read_omitted_content; reread the file for current contents.",
+          read,
+        ),
+        (await plan("read", {}, read)).output!,
+      ],
+      [
+        outputNotice("Output omitted due to a compaction operation.", listing),
+        (await plan("other", {}, listing)).output!,
+      ],
+    ];
+
+    for (const [before, after] of batch) {
+      expect(countGptTokens(after)).toBeLessThan(countGptTokens(before));
+    }
+    const before = batch.reduce((n, [text]) => n + countGptTokens(text), 0);
+    const after = batch.reduce((n, [, text]) => n + countGptTokens(text), 0);
+    expect(after).toBeLessThan(before * 0.65);
   });
 
   test("keeps output rules marker-guarded for tools marked by earlier trims", async () => {
@@ -713,9 +891,7 @@ describe("magic trim task-aware retention", () => {
       );
       const trimmed = harness.successorPart("tool_stale");
       if (trimmed.state.status !== "completed") throw new Error("completed");
-      expect(trimmed.state.output).toContain(
-        "Historical read contents omitted",
-      );
+      expect(trimmed.state.output).toContain("Historical read result omitted");
       expect(trimmed.state.metadata["magicCompact"]).toEqual({ trimmed: true });
       expect(calls.map(call => call.candidate.output.slice(0, 6))).toEqual([
         "useful",
@@ -844,9 +1020,7 @@ describe("magic trim task-aware retention", () => {
       expect(harness.forks).toEqual([]);
       const trimmed = harness.successorPart("tool_read");
       if (trimmed.state.status !== "completed") throw new Error("completed");
-      expect(trimmed.state.output).toContain(
-        "Historical read contents omitted",
-      );
+      expect(trimmed.state.output).toContain("Historical read result omitted");
     } finally {
       await cleanupTrimSessions(sessionID, ...harness.created);
     }

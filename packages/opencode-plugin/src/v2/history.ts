@@ -2,6 +2,7 @@ import type { SessionMessageAssistantTool } from "@opencode/client";
 import { createHash } from "node:crypto";
 import type { RetentionTurn } from "../policy/retention";
 import {
+  childSessionID,
   planToolTrim,
   type OmissionAllocator,
   type ToolCallView,
@@ -86,21 +87,26 @@ export function v2RetentionTurns(
 export function v2ToolCallView(tool: V2Tool): ToolCallView | null {
   if (tool.state.status !== "completed") return null;
   const magicCompact = tool.state.metadata?.["magicCompact"];
+  const category = Object.hasOwn(V2_TOOL_CATEGORIES, tool.name)
+    ? V2_TOOL_CATEGORIES[tool.name]!
+    : "other";
   return {
-    category: Object.hasOwn(V2_TOOL_CATEGORIES, tool.name)
-      ? V2_TOOL_CATEGORIES[tool.name]!
-      : "other",
+    category,
     input: tool.state.input,
     output: tool.state.content
       .flatMap(item => (item.type === "text" ? [item.text] : []))
       .join("\n\n"),
     trimmed: isRecord(magicCompact) && magicCompact["trimmed"] === true,
+    childSessionID: childSessionID(
+      category,
+      tool.state.metadata?.["sessionID"],
+    ),
   };
 }
 
 // Applies the rules to a clone of a completed call. A replaced output takes
 // the place of the first text item and drops the other text items; file items
-// keep their positions. An input notice becomes a leading text item.
+// keep their positions.
 export async function trimV2Tool(
   tool: V2Tool,
   allocate: OmissionAllocator,
@@ -124,9 +130,6 @@ export async function trimV2Tool(
             replacement,
             ...content.slice(first + 1).filter(item => item.type !== "text"),
           ];
-  }
-  if (plan.inputNotice) {
-    content = [{ type: "text", text: plan.inputNotice }, ...content];
   }
   const magicCompact = state.metadata?.["magicCompact"];
   return {
