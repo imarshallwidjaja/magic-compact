@@ -4,19 +4,25 @@ Task-aware retention lets `/magic-compact` and `/magic-trim` keep a tool call wh
 
 ## Status
 
-Both commands use `jev-1.13.0` with a whole-call keep threshold of `0.80`. The request and threshold were frozen before held-out inference. With native session summaries and independently labelled real-session snapshots, the held-out majority decision kept 10 unique calls: 9 useful and 1 superseded failed query. Consensus useful recall was 9/28 (32%). These observations cover four held-out projects; ten keeps do not establish a universal 90% precision guarantee or show that the model probabilities are calibrated in this domain.
+Both commands use `jev-1.13.0` with a whole-call keep threshold that defaults to `0.60`. The operator selected `0.60` on 2026-10-18 after the [development study](#default-keep-threshold-2026-10-18) below. It is not a held-out validation or a native-summary calibration. The server environment can override it with `MAGIC_COMPACT_KEEP_THRESHOLD_PERCENT`.
 
-The threshold and these results come from the 64 development and 80 held-out real-session cases described below. A separate, public [decision evaluation](DecisionEvaluation.md) (`bun run eval:decisions`) sends 17 synthetic smoke cases to any versioned Jev model or to OpenAI Decisions. It is a repeatable sanity check of a decision model, not held-out data: its scores do not change the threshold, the question or the production model, and it never mixes with or relabels this cohort. Its question hash uses compact sorted-key JSON, so it is not comparable with the frozen question hash below.
+The September evaluation froze the request and a `0.80` threshold before held-out inference, and its results below are for `0.80`. With native session summaries and independently labelled real-session snapshots, the held-out majority decision at `0.80` kept 10 unique calls: 9 useful and 1 superseded failed query. Consensus useful recall was 9/28 (32%). These observations cover four held-out projects; ten keeps do not establish a universal 90% precision guarantee or show that the model probabilities are calibrated in this domain.
+
+The September results come from the 64 development and 80 held-out real-session cases described below. A separate, public [decision evaluation](DecisionEvaluation.md) (`bun run eval:decisions`) sends 17 synthetic smoke cases to any versioned Jev model or to OpenAI Decisions. It is a repeatable sanity check of a decision model, not held-out data: its scores do not change the threshold, the question or the production model, and it never mixes with or relabels this cohort. Its question hash uses compact sorted-key JSON, so it is not comparable with the frozen question hash below.
+
+Changing the default or the Jev question again needs the evaluation protocol on this page, and neither is tuned against held-out results. The archived evaluations keep their own thresholds: `eval/retention/run.ts` holds `0.80` as a constant of the September protocol, and `eval/decisions` holds its `0.80` reference as a constant of the decision-evaluation protocol. Neither reads the runtime default or the environment override, so stored results keep their meaning.
 
 ## Production contract
 
 `packages/opencode-plugin/src/retention/classifier.ts` owns the classifier. `src/retention/summary.ts` produces the session summary, and `src/retention/retention.ts` wires both into `/magic-compact` and `/magic-trim`; `docs/OpenCode.md` describes that runtime flow.
 
-- `classifyRetention(context, candidates, options)` returns `{decisions, requests, inputTokens}`. `decisions` maps every candidate ID to `{useful, keep}`, where `useful` is Jev's Noul probability and `keep` is `useful >= threshold`.
+- `classifyRetention(context, candidates, options)` returns `{decisions, requests, inputTokens}`. `decisions` maps every candidate ID to `{useful, keep}`, where `useful` is Jev's Noul probability and `keep` is `useful >= keepThreshold`.
 - `context` is `{latestUserRequest, sessionSummary}`. `sessionSummary` is one fresh native whole-session summary, used temporarily for classification and never appended to the source conversation.
 - Each candidate is `{id, tool, input, output, turnRequest, requestsBeforeLatest}` and should be a completed tool part whose trim would change its content. `id` stays local; it is never sent to Jev.
 - `options.apiKey` is required. The plugin runtime supplies it from `TYPESAFE_API_KEY`; the module never reads the environment.
-- Every request carries one candidate and one Noul question that names `candidates[0]` in the state. The model is pinned to `jev-1.13.0` because the threshold was tuned against that version.
+- `options.keepThreshold` is a finite probability from 0 to 1 and defaults to `RETENTION_KEEP_THRESHOLD` (`0.60`). `NaN`, infinities, values outside the range and non-numbers fail with a `configuration` error before any summary or request, and `0` is a valid threshold, not a missing one. The threshold decides `keep` only: it is not part of a request, and the returned probabilities do not depend on it.
+- The plugin runtime derives the threshold from `MAGIC_COMPACT_KEEP_THRESHOLD_PERCENT` with `taskAwareRetentionPolicy` in `src/policy/retention.ts`, once per command invocation (see below).
+- Every request carries one candidate and one Noul question that names `candidates[0]` in the state. The model is pinned to `jev-1.13.0` because both thresholds were measured against that version.
 - Requests run with at most 4 in flight and a 30-second timeout each. There is no retry.
 - Any configuration, budget, timeout, network, HTTP, or response-validation failure throws `RetentionClassificationError` and returns no decisions. The first failure stops new requests; requests already in flight finish before the error is thrown. The error message is fixed text plus an optional HTTP status and suggests `/magic-trim --heuristic`.
 - A response is valid only when its `model` equals the pinned version, its answer keys exactly match the question keys, and each answer is a Noul with a probability in [0, 1].
@@ -25,10 +31,11 @@ The threshold and these results come from the 64 development and 80 held-out rea
 - The state-plus-longest-question limit is 28,000 bytes and the total state-plus-questions limit is 56,000. Bytes are not a documented token bound. The largest billed request in the 448 saved live-run request records was 7,035 tokens; `requestTokenEvidence` in `native-summary-results.json` records that maximum and the six raw-run file hashes. This is empirical headroom against Jev's 32K state-plus-question limit, not a guarantee for arbitrary input.
 - `TYPESAFE_API_KEY` must be available in the OpenCode server process. A native compaction model must be explicitly configured. With no candidates, retention makes no summary or TypeSafe request and needs no key. Otherwise any failure stops the command unchanged before backup or source writes. `/magic-trim [N] --heuristic` skips retention and makes no model calls.
 - Keeps veto the existing trim rules for this invocation, without size caps, persistent pins or automatic restoration. Below-threshold uncertainty follows those rules. Decisions are recomputed on the next invocation.
+- `MAGIC_COMPACT_KEEP_THRESHOLD_PERCENT` is optional and read from the OpenCode server process environment on every task-aware `/magic-compact` and `/magic-trim` invocation, on OpenCode 1 and OpenCode 2. It is a plain decimal percent from 0 to 100 inclusive: `70` means probability 0.70, `60.5` means 0.605, and `0` and `100` are valid. Surrounding whitespace is ignored. Unset uses the `0.60` default. An empty or whitespace-only value, a sign, `%`, an exponent, hex, `NaN`, `Infinity`, a value above 100 or any other form fails the command before the summary, any Jev request or any successor write, with a fixed message that names the variable and the range and never echoes the value. There is no fallback, clamp or coercion. `/magic-trim --heuristic` and `/magic-stats` neither read nor validate it. The comparison stays `>=`, and the pinned model, question, allocations, concurrency, timeout and no-retry settings are unchanged.
 
 ## Native-summary evaluation
 
-The September 30 evaluation used fresh snapshots from a read-only archive, with candidates selected by production `createTrimPlan` and `findRetentionCandidates` for `/magic-trim 0`. Native summaries came from `generateSessionSummary` on isolated OpenCode 1.18.30 with `openai/gpt-6-luna-fast`, variant `low`. The entire `ses_fad9f918...@g2` snapshot (20 cases) was excluded before inference because of future-content contamination. The remaining 144 cases cover seven sessions: 64 development cases from three sessions in one project, and 80 held-out cases from four sessions in four other projects.
+This evaluation froze and used `0.80`; its `metrics` and `score` commands keep that value as their own constant. The September 30 evaluation used fresh snapshots from a read-only archive, with candidates selected by production `createTrimPlan` and `findRetentionCandidates` for `/magic-trim 0`. Native summaries came from `generateSessionSummary` on isolated OpenCode 1.18.30 with `openai/gpt-6-luna-fast`, variant `low`. The entire `ses_fad9f918...@g2` snapshot (20 cases) was excluded before inference because of future-content contamination. The remaining 144 cases cover seven sessions: 64 development cases from three sessions in one project, and 80 held-out cases from four sessions in four other projects.
 
 Two independent blind annotators froze labels before seeing scores. The primary label is their agreement on true or false; disagreement or a null label remains unresolved. Development has 37 useful, 17 not useful and 10 unresolved cases. Held-out has 28 useful, 38 not useful and 14 unresolved. Annotator B disclosed partial inspection of about 20 long outputs, so the labels are not exhaustive line-by-line checks of every payload.
 
@@ -101,6 +108,43 @@ All 144 classifier requests returned HTTP 200, without failures or reruns, using
 [`chronology-results.json`](../packages/opencode-plugin/eval/retention/chronology-results.json) contains aggregate counts, gates, usage, field definition and full SHA-256 evidence bindings. Private content remains outside Git under `/tmp/opencode/retention-chronology-evaluation`; hashes cannot reconstruct it. The artifact binds the final pre-inference freeze. The protocol retains append/freeze history and discloses an earlier protocol version whose full difference was not retained.
 
 Limits: two development sessions/projects, mostly task and skill calls, some finished-task segments, no edit-tool cases or development reads later edited/reread. Two blind annotators produced 192 label rows across 96 cases (48 development, 48 fresh held-out) in 14 card-part dispatches; partial inspection was disclosed, with no post-score label changes. The baseline had one pass, so its variance is unknown. Held-out inference stopped because development failed. These results do not measure held-out/general production accuracy, replace September's native-summary results, or establish that 0.80 is universally unsuitable.
+
+## Default keep threshold (2026-10-18)
+
+On 2026-10-18 the operator set the default keep threshold to `0.60` after reviewing a development study, and added `MAGIC_COMPACT_KEEP_THRESHOLD_PERCENT` so a server can override it. The request, question, allocations, pinned model, concurrency, timeout and no-retry settings did not change. The September `0.80` freeze stays on record above, and no held-out data was used or re-scored. This is an operator choice made with the study below in view. It is not a new held-out validation or a native-summary calibration.
+
+### Study
+
+One completed-task snapshot of a real session held 294,691 stored tokens and 116 candidates, selected by the production trim rules. The study sent them to `jev-1.13.0` through the production classifier with an independent analyst-written session summary of 6,190 bytes. That is not a native `generateSessionSummary` summary, so the study measures the classifier alone, not end-to-end trim quality. Two independent AI label streams labelled every candidate before any score existed. They agreed on 21 useful and 86 not useful; 9 candidates were unresolved and are excluded from precision and recall. A chronological pass and a reversed pass made 232 Jev requests, all HTTP 200, with no retries. Each threshold was then applied offline to the stored probabilities.
+
+A cell shows the chronological pass, then the reversed pass, when they differ. Remaining tokens are the history size after trimming every non-kept candidate, counted locally with `gpt-tokenizer`; saved is the reduction from 294,691.
+
+| Threshold | Kept    | Useful kept | Not useful kept | Unresolved kept | Remaining tokens | Saved           |
+| --------- | ------- | ----------- | --------------- | --------------- | ---------------- | --------------- |
+| 0.80      | 0       | 0           | 0               | 0               | 56,129           | 80.95%          |
+| 0.70      | 1       | 1           | 0               | 0               | 60,219           | 79.57%          |
+| 0.60      | 5 / 4   | 5 / 4       | 0               | 0               | 74,275 / 72,664  | 74.80% / 75.34% |
+| 0.50      | 14 / 13 | 9           | 3               | 2 / 1           | 92,374 / 91,310  | 68.65% / 69.02% |
+
+At `0.80` both passes kept nothing, so the one candidate both annotators marked critical for the task was trimmed. At `0.60` that candidate was kept in both passes. One candidate changed decision between the two passes at `0.60` and one at `0.50`; the largest probability difference between passes was 0.07.
+
+### Limits
+
+- One snapshot from one session, 21 agreed useful candidates. `0.60` kept 4 or 5 of them with no false keep; that count cannot show a precision rate.
+- The labels are from AI streams, not people, and 9 candidates were unresolved.
+- The session summary was written by an analyst, not produced by the native summarizer the commands use.
+- The earlier proxy-summary held-out run below kept 10 useful and 6 or 7 not useful candidates at `0.60`. That request format no longer exists, but it is the one held-out observation at this cutoff, and the new default was not validated against it or against the September held-out cohort.
+- Jev probabilities are not shown to be calibrated in this domain, and supersession by later work remains a failure mode that a lower cutoff keeps more of.
+
+### Provenance
+
+The study directory stays outside Git, and its hashes cannot reconstruct private content. An independent offline recomputation of the labels, request parity with the production builder and every table cell passed 129 of 129 checks; it verified the mechanics, not label truth or the choice of threshold. SHA-256 of the files this section summarizes:
+
+- Session summary `d62e9f2cfa2771d203311a7208780fec77223062b9ab47c5c0a9cda8b61c3217`.
+- Labels freeze `a42d946ba923f38ed79e16cd18ac4e46ec92e927ac63eee8317533b1c98a6525`.
+- Run manifest `f57e2339a1e408825e735c360d5b7ac53faaae282879ae36ed11a48d2512f92b`.
+- Metrics `4ddad4c726f0a48afce2e6732699215ff7561aded134a87f1d64b56673291015`.
+- Threshold table `f3f55a55c96a989072bcb79c260ff7c7da464ab57a9ce58100998d910bd9f77c`.
 
 ## Historical proxy-summary evaluation
 

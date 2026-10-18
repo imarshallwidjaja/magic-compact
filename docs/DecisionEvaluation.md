@@ -2,7 +2,7 @@
 
 This evaluation measures how well a decision model answers the keep/trim question that task-aware retention asks. Each case fixes the context (the latest user request and a session summary) and one completed tool call. The model returns a probability that the assistant would use the call's content again, and the harness compares that probability with a hand-written label. It scores the decision only. It does not run `/magic-trim`, generate a summary, or judge the summary model, so a good result here says nothing about end-to-end trim quality.
 
-The harness reuses the production request builder in `src/retention/classifier.ts`, so every provider answers the same state, the same question text and the same criteria that the shipped classifier sends. Production code, its threshold and its question are unchanged. The existing 144-case native-summary cohort and its commands are described in [RetentionEvaluation.md](RetentionEvaluation.md); this evaluation has its own dataset, scripts and results and never mixes with that cohort or rewrites its labels.
+The harness reuses the production request builder in `src/retention/classifier.ts`, so every provider answers the same state, the same question text and the same criteria that the shipped classifier sends. This evaluation changes no production code, keep threshold or question. The existing 144-case native-summary cohort and its commands are described in [RetentionEvaluation.md](RetentionEvaluation.md); this evaluation has its own dataset, scripts and results and never mixes with that cohort or rewrites its labels.
 
 ## Commands
 
@@ -108,13 +108,15 @@ A custom dataset is sent in plain text to the provider you select. Do not use da
 
 ## Threshold
 
-`--threshold` (default `0.8`) turns a probability into keep (`>= threshold`) or trim. It is an evaluation reference: `0.8` is production's frozen value for `jev-1.13.0`. Other models or providers are not calibrated to it, so a comparison at `0.8` shows how each model behaves at that cutoff and does not say that `0.8` is right for them. The option changes nothing in production. For `heldout` datasets, `run` and `report` refuse any other value. For other splits, `report --threshold` re-reads stored probabilities at another cutoff; do not use that to tune production.
+`--threshold` (default `0.8`) turns a probability into keep (`>= threshold`) or trim. `0.8` is this evaluation's own reference cutoff, frozen by its protocol as `DECISION_EVALUATION_THRESHOLD` in `eval/decisions/dataset.ts`. It no longer equals production: runtime retention keeps at `>= 0.60` by default, and a server can override that with `MAGIC_COMPACT_KEEP_THRESHOLD_PERCENT` (see [RetentionEvaluation.md](RetentionEvaluation.md)). This harness never reads that variable, so results do not move with the runtime setting. Stored results, including the October 15 smoke run below, were scored at `0.8` and keep that meaning.
+
+To see how a model behaves at the runtime default, pass `--threshold 0.6` on a smoke or development dataset. That is a development comparison, not a held-out result and not a calibration. Other models or providers are not calibrated to either cutoff, so a comparison shows how each model behaves at that cutoff and does not say that it is right for them. The option changes nothing in production. For `heldout` datasets, `run` and `report` refuse any value other than `0.8`, including `0.6`. For other splits, `report --threshold` re-reads stored probabilities at another cutoff; do not use that to tune production.
 
 ## Results
 
 A run directory holds two files and is never overwritten.
 
-- `manifest.json` is written before the first request: provider, model, endpoint, dataset identity and hash, question hash, the canonical request-set hash, the translation version and hash, threshold, repeat, concurrency, timeout, and the planned cases with each case's canonical and provider request hashes.
+- `manifest.json` is written before the first request: provider, model, endpoint, dataset identity and hash, question hash, the canonical request-set hash, the translation version and hash, threshold, `production` (the pinned Jev model and the runtime default keep threshold when the run was planned, recorded apart from the evaluation `threshold`; manifests written when the default was `0.8` record that and still load), repeat, concurrency, timeout, and the planned cases with each case's canonical and provider request hashes.
 - `outcomes.jsonl` gets one line as each request settles. A line is `scored` (probability, requested and returned model, reported usage, latency), `refused`, `failed` (a fixed category and the HTTP status when there is one) or `not-attempted`.
 
 Requests are sent once. There is no automatic retry, and `--max-requests` refuses a plan larger than the cap before any request. A rejected key (401, 403) or a rate limit (429) stops new requests; those in flight finish and the rest are recorded as `not-attempted`, which states that they were never sent. Timeouts, other HTTP errors, malformed responses, model mismatches and refusals do not stop the remaining cases. Failure records never contain request text, response bodies, error messages or keys.
@@ -142,7 +144,7 @@ One live run per model sent the 17 bundled cases (dataset `magic-compact-retenti
 | `jev-1.13.0` | 17/17  | 0                 | 8   | 0   | 1   | 8   | 1.000     | 8/9    | 16/17    |
 | `jev-1.14.0` | 17/17  | 0                 | 8   | 0   | 1   | 8   | 1.000     | 8/9    | 16/17    |
 
-Keep decisions use the `0.8` reference threshold. Both models put the same useful case below it: `release-todo-open-items`, at 0.65 for `jev-1.13.0` and 0.52 for `jev-1.14.0`. Its label was not changed after the run. Seventeen synthetic cases written alongside the classifier wording cannot show held-out accuracy, calibration or a difference between the two versions, and production stays on `jev-1.13.0` at `0.80`.
+Keep decisions use the `0.8` reference threshold. Both models put the same useful case below it: `release-todo-open-items`, at 0.65 for `jev-1.13.0` and 0.52 for `jev-1.14.0`. Its label was not changed after the run. Seventeen synthetic cases written alongside the classifier wording cannot show held-out accuracy, calibration or a difference between the two versions, and production stays on `jev-1.13.0`. These figures were scored at `0.8`, before production's default became `0.60`.
 
 No live OpenAI Decisions run has been made, because no OpenAI API key was available. The OpenAI adapter is covered by tests against fakes that enforce its strict response contract and by `--dry-run`; anyone with a key can run it with the command above.
 

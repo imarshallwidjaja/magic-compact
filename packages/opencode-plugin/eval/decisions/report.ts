@@ -5,6 +5,7 @@
 // before the run died, which is different from a recorded not-attempted.
 import { RETENTION_KEEP_THRESHOLD } from "../../src/retention/classifier";
 import {
+  DECISION_EVALUATION_THRESHOLD,
   DecisionEvalError,
   datasetCases,
   type DecisionDataset,
@@ -262,7 +263,7 @@ export function renderReport(
     }
     if (dataset.split === "heldout") {
       throw new DecisionEvalError(
-        `Held-out results are reported at the frozen threshold ${RETENTION_KEEP_THRESHOLD}; --threshold is not available for them.`,
+        `Held-out results are reported at the frozen threshold ${DECISION_EVALUATION_THRESHOLD}; --threshold is not available for them.`,
       );
     }
   }
@@ -277,7 +278,7 @@ export function renderReport(
   const useful = [...labels.values()].filter(Boolean).length;
   const out: string[] = [
     `Dataset ${dataset.datasetID} ${dataset.version} (${dataset.split}): ${labels.size} cases, ${useful} labelled keep, ${labels.size - useful} labelled trim`,
-    `Threshold is an evaluation reference. The production keep threshold is ${RETENTION_KEEP_THRESHOLD} for the pinned Jev model; probabilities from other providers or models are not calibrated to it.`,
+    `Threshold is an evaluation reference. The production default keep threshold is ${RETENTION_KEEP_THRESHOLD} for the pinned Jev model and the server environment can override it; held-out results stay at ${DECISION_EVALUATION_THRESHOLD}. Probabilities from other providers or models are not calibrated to either.`,
   ];
   if (groups.length > 1) {
     out.push(

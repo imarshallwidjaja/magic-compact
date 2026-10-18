@@ -27,6 +27,7 @@ import {
   canonicalRequestSha256,
   datasetCases,
   DATASET_SPLITS,
+  DECISION_EVALUATION_THRESHOLD,
   datasetSha256,
   DecisionEvalError,
   requestSetSha256,
@@ -237,10 +238,10 @@ export function planRun(options: RunOptions): RunPlan {
   }
   if (
     dataset.split === "heldout"
-    && options.threshold !== RETENTION_KEEP_THRESHOLD
+    && options.threshold !== DECISION_EVALUATION_THRESHOLD
   ) {
     throw new DecisionEvalError(
-      `Held-out datasets are scored at the frozen threshold ${RETENTION_KEEP_THRESHOLD}; --threshold is not available for them.`,
+      `Held-out datasets are scored at the frozen threshold ${DECISION_EVALUATION_THRESHOLD}; --threshold is not available for them.`,
     );
   }
   integerOption("--repeat", options.repeat, 1, MAX_REPEAT);
@@ -511,10 +512,10 @@ export function loadRun(dir: string, dataset: DecisionDataset): LoadedRun {
   }
   if (
     manifest.dataset.split === "heldout"
-    && manifest.threshold !== RETENTION_KEEP_THRESHOLD
+    && manifest.threshold !== DECISION_EVALUATION_THRESHOLD
   ) {
     return reject(
-      `scored a held-out dataset at threshold ${manifest.threshold}, not the frozen ${RETENTION_KEEP_THRESHOLD}.`,
+      `scored a held-out dataset at threshold ${manifest.threshold}, not the frozen ${DECISION_EVALUATION_THRESHOLD}.`,
     );
   }
   const outcomes: Outcome[] = [];

@@ -7,11 +7,11 @@
 //   bun packages/opencode-plugin/eval/decisions/run.ts report RUN... [--dataset PATH] [--threshold T]
 import { parseArgs } from "node:util";
 import {
-  RETENTION_KEEP_THRESHOLD,
   RETENTION_MODEL,
   type RetentionFetch,
 } from "../../src/retention/classifier";
 import {
+  DECISION_EVALUATION_THRESHOLD,
   DEFAULT_DATASET_PATH,
   datasetCases,
   datasetSha256,
@@ -71,7 +71,7 @@ run options
   --dataset PATH      Dataset file, or "default" for the bundled synthetic pack.
   --out DIR           New result directory. Existing paths are never overwritten.
   --repeat N          Send each case N times (default 1, at most 10). Measures stability.
-  --threshold T       Reference keep threshold (default ${RETENTION_KEEP_THRESHOLD}). Evaluation only; it
+  --threshold T       Reference keep threshold (default ${DECISION_EVALUATION_THRESHOLD}). Evaluation only; it
                       changes nothing in production. Fixed for held-out datasets.
   --concurrency N     Requests in flight (default ${DEFAULT_CONCURRENCY}, at most 16).
   --max-requests N    Refuse a plan larger than N requests (default ${DEFAULT_MAX_REQUESTS}).
@@ -204,7 +204,7 @@ async function run(args: string[], deps: CliDeps): Promise<number> {
     model:
       values.model
       ?? (adapter.id === "jev" ? RETENTION_MODEL : OPENAI_DECISIONS_MODELS[0]),
-    threshold: numeric(values.threshold, RETENTION_KEEP_THRESHOLD),
+    threshold: numeric(values.threshold, DECISION_EVALUATION_THRESHOLD),
     repeat: numeric(values.repeat, 1),
     concurrency: numeric(values.concurrency, DEFAULT_CONCURRENCY),
     timeoutMs: numeric(values["timeout-ms"], DEFAULT_TIMEOUT_MS),

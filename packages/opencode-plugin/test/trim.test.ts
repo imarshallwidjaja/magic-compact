@@ -24,7 +24,11 @@ import {
   parseMagicTrimArguments,
 } from "../src/magic-trim";
 import type { PluginInput } from "@opencode-ai/plugin";
-import { RetentionClassificationError } from "../src/retention/classifier";
+import { taskAwareRetentionPolicy } from "../src/policy/retention";
+import {
+  RETENTION_KEEP_THRESHOLD_PERCENT_ENV,
+  RetentionClassificationError,
+} from "../src/retention/classifier";
 import {
   summarizerAgent,
   persistedForkHistory,
@@ -922,9 +926,14 @@ describe("magic trim task-aware retention", () => {
     }
   });
 
-  test.each([false, true])(
-    "reports zero or all keeps without adding no-op notices (keep=%s)",
-    async keep => {
+  test.each([
+    [0.1, undefined, false],
+    [0.95, undefined, true],
+    [0.7, undefined, true],
+    [0.7, "80", false],
+  ])(
+    "reports zero or all keeps by probability %p at percent %p without adding no-op notices (keep=%p)",
+    async (score, percent, keep) => {
       const sessionID = `ses_trim_keep_${randomUUID().replaceAll("-", "")}`;
       const messages = [
         message("usr_1", "user", [userText("usr_1", "Fix tests.")]),
@@ -935,14 +944,17 @@ describe("magic trim task-aware retention", () => {
       const harness = trimCommandHarness(sessionID, messages);
       const before = structuredClone(messages);
       try {
-        expect(
-          await executeMagicTrim(harness.v2, sessionID, 0, {
-            retention: {
-              mode: "task-aware",
-              apiKey: "test-key",
-              fetch: scoredJevFetch(() => (keep ? 0.95 : 0.1), []),
-            },
+        const retention = {
+          ...taskAwareRetentionPolicy({
+            TYPESAFE_API_KEY: "test-key",
+            ...(percent === undefined
+              ? {}
+              : { [RETENTION_KEEP_THRESHOLD_PERCENT_ENV]: percent }),
           }),
+          fetch: scoredJevFetch(() => score, []),
+        };
+        expect(
+          await executeMagicTrim(harness.v2, sessionID, 0, { retention }),
         ).toEqual(keep ? null : expect.anything());
         const feedback = `Task-aware retention kept ${keep ? 1 : 0} of 1 evaluated tool call(s) whole${keep ? " (read 1)" : ""}.`;
         expect(harness.toasts.at(-1)?.message).toBe(

@@ -153,7 +153,15 @@ Restart the OpenCode server process after setting it; restarting an attached TUI
 
 Retention uses the summarizer agent's model: it first generates a temporary whole-session summary on a fork, then sends one excerpted tool call at a time to pinned TypeSafe `jev-1.13.0`, with at most four requests in flight and no retries. No retention model calls occur when there are no candidates. In the real-session evaluation, native summary generation took 10.1 to 17.8 seconds including fork and cleanup; Jev added 0.96 to 1.59 seconds for 16 to 24 candidates. Those are measurements from one environment, not latency guarantees.
 
-The keep threshold is `0.80`, selected on development sessions before held-out inference. Each call is judged independently for likely reuse of concrete input or output: useful duplicates, recoverable content, still-relevant procedures and unchanged useful content in partly edited reads can qualify. Uncertainty follows the pruning rules. Fixed JSON-byte excerpts are latest request 5,000, summary 8,000, originating request 600, input 3,000 and output 9,000; short input fields up to 200 bytes stay whole when they fit. These limits have measured token headroom, not a tokenizer guarantee. A keep retains the whole current call, without a size cap or persistent pin. See [the evaluation](docs/RetentionEvaluation.md) for the 144-case protocol, observed results and limitations.
+The default keep threshold is `0.60`. The operator chose it on 2026-10-18 after a development study of one real session. It is not a held-out or native-summary calibration; the earlier `0.80` was the threshold frozen for the September held-out evaluation. Each call is judged independently for likely reuse of concrete input or output: useful duplicates, recoverable content, still-relevant procedures and unchanged useful content in partly edited reads can qualify. Uncertainty follows the pruning rules. Fixed JSON-byte excerpts are latest request 5,000, summary 8,000, originating request 600, input 3,000 and output 9,000; short input fields up to 200 bytes stay whole when they fit. These limits have measured token headroom, not a tokenizer guarantee. A keep retains the whole current call, without a size cap or persistent pin. See [the evaluation](docs/RetentionEvaluation.md) for the 144-case protocol, the development study behind `0.60`, observed results and limitations.
+
+To use a different threshold, set `MAGIC_COMPACT_KEEP_THRESHOLD_PERCENT` in the same server environment. The value is a plain decimal percent from 0 to 100 without a `%` sign, for example `60`, `70` or `60.5`; a call is kept when the probability is at or above it. The default needs no variable, so leave it unset to keep `0.60`.
+
+```bash
+export MAGIC_COMPACT_KEEP_THRESHOLD_PERCENT=70
+```
+
+The server reads the variable each time a command runs, so the value must be in the environment of the OpenCode server process. When that process runs as a service, such as under systemd, set the variable in the service's environment and restart the service after changing it; an attached shell's exports do not reach it. `/magic-compact` and `/magic-trim` use the same value on OpenCode 1 and OpenCode 2. An invalid value (empty, `60%`, above 100, not a number) fails the command before any summary or TypeSafe request and before any session change, and the message names the variable. `/magic-trim --heuristic` does not read it.
 
 Install `arkive-compact`; run `/magic-compact`, `/magic-trim`, and `/magic-stats`. The distribution rename does not add `/arkive-*` command aliases: the runtime remains Magic Compact.
 
@@ -313,7 +321,7 @@ bun run eval:compact report runs/haiku-low
 
 ### Decision evaluation
 
-Task-aware retention asks a decision model whether the assistant would use a tool call's content again. The decision evaluation scores a model on that question with fixed cases: each gives the latest request, a session summary and one completed tool call, and compares the model's probability with a hand-written label. It measures the keep/trim decision only. It does not run `/magic-trim` end to end, judge summaries, or change the production model or its `0.80` threshold.
+Task-aware retention asks a decision model whether the assistant would use a tool call's content again. The decision evaluation scores a model on that question with fixed cases: each gives the latest request, a session summary and one completed tool call, and compares the model's probability with a hand-written label. It measures the keep/trim decision only. It does not run `/magic-trim` end to end, judge summaries, or change the production model or its keep threshold.
 
 It runs against any versioned TypeSafe Jev model (`jev-1.13.0` by default; aliases such as `jev-latest` are refused so runs stay repeatable) or the OpenAI Decisions API. Each provider needs its own API key in the environment: `TYPESAFE_API_KEY` or `OPENAI_API_KEY`. OpenCode sign-ins are not used.
 
@@ -325,7 +333,7 @@ bun run eval:decisions run --provider jev --model jev-1.14.0 --out /tmp/decision
 bun run eval:decisions report /tmp/decisions/jev-1.14.0
 ```
 
-The first two commands are offline. The bundled pack has 17 synthetic smoke cases, so a score is a sanity check, not a held-out result. See [the decision evaluation](docs/DecisionEvaluation.md) for providers, dataset format, saved results, metrics and limits.
+The first two commands are offline. The bundled pack has 17 synthetic smoke cases, so a score is a sanity check, not a held-out result. Its `--threshold` reference is `0.8`, independent of production's default and of the environment override; `--threshold 0.6` compares a model at the production default on non-held-out data, and held-out datasets accept only `0.8`. See [the decision evaluation](docs/DecisionEvaluation.md) for providers, dataset format, saved results, metrics and limits.
 
 ## License
 

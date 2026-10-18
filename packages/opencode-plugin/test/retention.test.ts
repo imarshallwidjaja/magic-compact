@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { checkNative } from "../eval/retention/run";
 import type { PluginInput } from "@opencode-ai/plugin";
 import type { Message, Part, ToolPart } from "@opencode-ai/sdk/v2";
@@ -11,6 +12,10 @@ import {
 } from "../src/compact/plan";
 import { trimWouldChangeContent } from "../src/compact/prune";
 import server from "../src/host-v1";
+import {
+  decideRetentionWith,
+  taskAwareRetentionPolicy,
+} from "../src/policy/retention";
 import {
   decideRetention,
   findRetentionCandidates,
@@ -34,6 +39,7 @@ import {
   classifyRetention,
   excerpt,
   RETENTION_KEEP_THRESHOLD,
+  RETENTION_KEEP_THRESHOLD_PERCENT_ENV,
   RETENTION_MAX_CONCURRENCY,
   RETENTION_MODEL,
   RETENTION_STATE_AND_QUESTION_BYTE_LIMIT,
@@ -294,11 +300,8 @@ describe("retention request format", () => {
 });
 
 describe("retention classification", () => {
-  test("keeps only candidates at or above the calibrated threshold", async () => {
-    const scores: Record<string, number> = {
-      keep: RETENTION_KEEP_THRESHOLD,
-      trim: RETENTION_KEEP_THRESHOLD - 0.001,
-    };
+  test("without a threshold keeps only candidates at or above the 0.60 default", async () => {
+    const scores: Record<string, number> = { keep: 0.6, trim: 0.599 };
     const result = await classifyRetention(
       context,
       [candidate("a", "keep"), candidate("b", "trim")],
@@ -308,11 +311,8 @@ describe("retention classification", () => {
       },
     );
 
-    expect(result.decisions.get("a")).toEqual({
-      useful: RETENTION_KEEP_THRESHOLD,
-      keep: true,
-    });
-    expect(result.decisions.get("b")!.keep).toBe(false);
+    expect(result.decisions.get("a")).toEqual({ useful: 0.6, keep: true });
+    expect(result.decisions.get("b")).toEqual({ useful: 0.599, keep: false });
     expect(result.requests).toBe(2);
     expect(result.inputTokens).toBe(20);
   });
@@ -419,6 +419,293 @@ describe("retention classification", () => {
     );
     expect(error.kind).toBe("configuration");
     expect(calls).toBe(0);
+  });
+});
+
+describe("retention keep threshold", () => {
+  const percentEnv = (percent?: string) => ({
+    TYPESAFE_API_KEY: "test-key",
+    ...(percent === undefined
+      ? {}
+      : { [RETENTION_KEEP_THRESHOLD_PERCENT_ENV]: percent }),
+  });
+  const thrown = (run: () => unknown) => {
+    try {
+      run();
+    } catch (error) {
+      return error;
+    }
+    throw new Error("Expected a throw.");
+  };
+  // Scores each single-candidate request by the number in its output.
+  const scoredByOutput = jevFetch(body =>
+    Number(body.state.candidates[0]!.output.slice(1)),
+  );
+
+  test("defaults to the operator-selected 0.60 and reads the key", () => {
+    expect(RETENTION_KEEP_THRESHOLD).toBe(0.6);
+    expect(RETENTION_KEEP_THRESHOLD_PERCENT_ENV).toBe(
+      "MAGIC_COMPACT_KEEP_THRESHOLD_PERCENT",
+    );
+    expect(taskAwareRetentionPolicy(percentEnv())).toEqual({
+      mode: "task-aware",
+      apiKey: "test-key",
+      keepThreshold: 0.6,
+    });
+    expect(taskAwareRetentionPolicy({ TYPESAFE_API_KEY: "" }).apiKey).toBe(
+      undefined,
+    );
+  });
+
+  test.each([
+    ["60", 0.6],
+    ["70", 0.7],
+    ["80", 0.8],
+    ["60.5", 0.605],
+    ["60.1", 0.601],
+    ["0", 0],
+    ["100", 1],
+    ["100.0", 1],
+    ["060", 0.6],
+    [" 70\n", 0.7],
+  ])("reads %p percent as probability %p", (percent, expected) => {
+    expect(taskAwareRetentionPolicy(percentEnv(percent)).keepThreshold).toBe(
+      expected,
+    );
+  });
+
+  test.each([
+    "",
+    "  ",
+    "abc",
+    "NaN",
+    "Infinity",
+    "-1",
+    "-0",
+    "+60",
+    "101",
+    "100.5",
+    "60%",
+    "0x3c",
+    "6e1",
+    ".5",
+    "5.",
+    "60 70",
+    "6,5",
+    "\u0666\u0660",
+    "9".repeat(400),
+  ])("rejects percent %p without falling back to the default", percent => {
+    const error = thrown(() => taskAwareRetentionPolicy(percentEnv(percent)));
+    expect(error).toBeInstanceOf(RetentionClassificationError);
+    expect((error as RetentionClassificationError).kind).toBe(
+      "invalid-threshold-percent",
+    );
+    const message = (error as Error).message;
+    expect(message).toContain(RETENTION_KEEP_THRESHOLD_PERCENT_ENV);
+    expect(message).toContain("0 to 100");
+    expect(message).toContain("/magic-trim --heuristic");
+  });
+
+  test("the rejection never echoes the value and the key is not read first", () => {
+    let keyReads = 0;
+    const error = thrown(() =>
+      taskAwareRetentionPolicy({
+        get TYPESAFE_API_KEY() {
+          keyReads += 1;
+          return "sk-secret";
+        },
+        [RETENTION_KEEP_THRESHOLD_PERCENT_ENV]: "canary-77%",
+      }),
+    );
+    expect((error as Error).message).not.toMatch(/canary|77|sk-secret/);
+    expect(keyReads).toBe(0);
+  });
+
+  test.each([
+    [
+      undefined,
+      [
+        [0.599, false],
+        [0.6, true],
+        [0.601, true],
+      ],
+    ],
+    [
+      "80",
+      [
+        [0.799, false],
+        [0.8, true],
+      ],
+    ],
+    [
+      "0",
+      [
+        [0, true],
+        [0.3, true],
+      ],
+    ],
+    [
+      "100",
+      [
+        [0.999, false],
+        [1, true],
+      ],
+    ],
+  ] as const)(
+    "keeps at or above percent %p and leaves the probabilities unchanged",
+    async (percent, scores) => {
+      const { keepThreshold } = taskAwareRetentionPolicy(percentEnv(percent));
+      const result = await classifyRetention(
+        context,
+        scores.map(([score], index) => candidate(`c${index}`, `s${score}`)),
+        { apiKey: "key", keepThreshold, fetch: scoredByOutput },
+      );
+      scores.forEach(([score, keep], index) => {
+        expect(result.decisions.get(`c${index}`)).toEqual({
+          useful: score,
+          keep,
+        });
+      });
+    },
+  );
+
+  test("the threshold is never part of the Jev request", async () => {
+    const sent = async (keepThreshold?: number) => {
+      const bodies: string[] = [];
+      await classifyRetention(context, [candidate("a"), candidate("b")], {
+        apiKey: "key",
+        ...(keepThreshold === undefined ? {} : { keepThreshold }),
+        fetch: async (url, init) => {
+          bodies.push(String(init.body));
+          return jevFetch(() => 0.7)(url, init);
+        },
+      });
+      return bodies;
+    };
+    expect(await sent(0.8)).toEqual(await sent());
+    expect(await sent(0)).toEqual(await sent());
+  });
+
+  test.each([Number.NaN, -0.1, 1.01, Infinity, -Infinity])(
+    "rejects explicit threshold %p before any request",
+    async keepThreshold => {
+      let calls = 0;
+      const error = await failure(
+        classifyRetention(context, [candidate("a")], {
+          apiKey: "key",
+          keepThreshold,
+          fetch: jevFetch(() => 0.9, { onCall: () => (calls += 1) }),
+        }),
+      );
+      expect(error.kind).toBe("configuration");
+      expect(calls).toBe(0);
+    },
+  );
+
+  test("the policy rejects an invalid threshold before the session summary", async () => {
+    let summaries = 0;
+    const error = await failure(
+      decideRetentionWith(
+        { latestUserRequest: "", candidates: [candidate("a")] },
+        { mode: "task-aware", apiKey: "key", keepThreshold: Number.NaN },
+        async () => {
+          summaries += 1;
+          return "summary";
+        },
+      ),
+    );
+    expect(error.kind).toBe("configuration");
+    expect(summaries).toBe(0);
+  });
+
+  test.each([
+    [undefined, ["a"]],
+    ["60", ["a"]],
+    ["80", []],
+  ])(
+    "a 0.7 probability follows the configured percent %p",
+    async (percent, kept) => {
+      const plan = await decideRetentionWith(
+        { latestUserRequest: "Ship it.", candidates: [candidate("a")] },
+        {
+          ...taskAwareRetentionPolicy(percentEnv(percent)),
+          fetch: jevFetch(() => 0.7),
+        },
+        async () => "summary",
+      );
+      expect(plan.evaluated).toBe(1);
+      expect([...plan.keep]).toEqual(kept);
+    },
+  );
+});
+
+describe("retention keep threshold in the OpenCode 1 server environment", () => {
+  const command = (name: string, args = "") => ({
+    command: name,
+    arguments: args,
+    sessionID: "session",
+  });
+  const withPercent = async <T>(value: string, run: () => Promise<T>) => {
+    const previous = process.env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV];
+    process.env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV] = value;
+    try {
+      return await run();
+    } finally {
+      if (previous === undefined) {
+        delete process.env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV];
+      } else process.env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV] = previous;
+    }
+  };
+
+  test.each(["magic-compact", "magic-trim"])(
+    "%s rejects an invalid percent before it contacts the server",
+    async name => {
+      const hooks = await server({} as PluginInput);
+      const error = await withPercent("60%", () =>
+        promiseError(
+          hooks["command.execute.before"]!(command(name), { parts: [] }),
+        ),
+      );
+      expect(error).toBeInstanceOf(RetentionClassificationError);
+      expect(String(error)).toContain(RETENTION_KEEP_THRESHOLD_PERCENT_ENV);
+    },
+  );
+
+  test.each([
+    ["magic-trim", "--heuristic"],
+    ["magic-stats", ""],
+  ])("%s %s neither reads nor validates the percent", async (name, args) => {
+    const hooks = await server({} as PluginInput);
+    const error = await withPercent("60%", () =>
+      promiseError(
+        hooks["command.execute.before"]!(command(name, args), { parts: [] }),
+      ),
+    );
+    // The command proceeds to the listener, which this input cannot supply.
+    expect(error).not.toBeInstanceOf(RetentionClassificationError);
+    expect(String(error)).not.toContain(RETENTION_KEEP_THRESHOLD_PERCENT_ENV);
+  });
+});
+
+describe("native-summary evaluation metrics", () => {
+  test("keep the recorded 0.80 threshold, not the runtime default", () => {
+    const run = Bun.spawnSync([
+      process.execPath,
+      fileURLToPath(new URL("../eval/retention/run.ts", import.meta.url)),
+      "metrics",
+    ]);
+    expect(run.exitCode).toBe(0);
+    const [development, heldout] = JSON.parse(
+      `[${run.stdout.toString().replace(/\}\s*\n\{/u, "},{")}]`,
+    ) as Array<{ split: string; majority: Record<string, number> }>;
+    expect(development).toMatchObject({
+      split: "development",
+      majority: { TP: 24, FP: 0, FN: 13, TN: 17 },
+    });
+    expect(heldout).toMatchObject({
+      split: "heldout",
+      majority: { TP: 9, FP: 1, FN: 19, TN: 37 },
+    });
   });
 });
 

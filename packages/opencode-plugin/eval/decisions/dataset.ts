@@ -29,6 +29,10 @@ export const DEFAULT_DATASET_PATH = fileURLToPath(
 );
 export const DATASET_SPLITS = ["smoke", "development", "heldout"] as const;
 export type DatasetSplit = (typeof DATASET_SPLITS)[number];
+// The evaluation's reference keep threshold, frozen for held-out datasets.
+// It belongs to this protocol and stays independent of the runtime default
+// and its environment override, so stored results keep their meaning.
+export const DECISION_EVALUATION_THRESHOLD = 0.8;
 
 // IDs double as OpenAI question names, so they stay short and plain.
 const identifier = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/);

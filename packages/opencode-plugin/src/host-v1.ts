@@ -24,6 +24,7 @@ import {
 import { executeMagicCompact } from "./magic-compact";
 import { STATS_SUCCESS, executeMagicStats } from "./magic-stats";
 import { executeMagicTrim } from "./magic-trim";
+import { taskAwareRetentionPolicy } from "./policy/retention";
 import type { RetentionPolicy } from "./retention/retention";
 import { rejectNativeCompactionOfSummaryFork } from "./retention/summary";
 import { omissionReadDiagnostic, readOmittedContent } from "./storage/omission";
@@ -32,14 +33,6 @@ import { projectManifestCoveredMedia } from "./compact/media";
 import type { MessageWithParts } from "./compact/plan";
 
 const SUMMARIZER_PERMISSION = { "*": "deny" } as const;
-
-// Read per command so a missing key fails that command, not plugin startup.
-function taskAwareRetention(): RetentionPolicy {
-  return {
-    mode: "task-aware",
-    apiKey: process.env["TYPESAFE_API_KEY"] || undefined,
-  };
-}
 
 const server: Plugin = async input => {
   const identity = createListenerIdentity();
@@ -82,12 +75,14 @@ const server: Plugin = async input => {
 
       if (command.command === COMPACT_COMMAND) {
         const keepTurns = parseMagicCompactArguments(command.arguments);
+        // Read per command and reject an invalid threshold before session work.
+        const retention = taskAwareRetentionPolicy(process.env);
 
         const successor = await executeMagicCompact(
           await listener(),
           command.sessionID,
           keepTurns,
-          { retention: taskAwareRetention() },
+          { retention },
         );
         // Must throw error or OpenCode will send message to LLM
         throw new Error(
@@ -99,13 +94,14 @@ const server: Plugin = async input => {
         const { keepTurns, heuristic } = parseMagicTrimArguments(
           command.arguments,
         );
+        const retention: RetentionPolicy = heuristic
+          ? { mode: "heuristic" }
+          : taskAwareRetentionPolicy(process.env);
         const successor = await executeMagicTrim(
           await listener(),
           command.sessionID,
           keepTurns,
-          {
-            retention: heuristic ? { mode: "heuristic" } : taskAwareRetention(),
-          },
+          { retention },
         );
         throw new Error(
           successor ? trimSuccess(successor.session.id) : TRIM_NOOP,

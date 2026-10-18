@@ -5,7 +5,10 @@
 // are reassessed next time.
 import {
   classifyRetention,
+  resolveKeepThreshold,
   RETENTION_FAILURE_GUIDANCE,
+  RETENTION_KEEP_THRESHOLD,
+  RETENTION_KEEP_THRESHOLD_PERCENT_ENV,
   RetentionClassificationError,
   type RetentionCandidate,
   type RetentionFetch,
@@ -18,8 +21,42 @@ export type RetentionPolicy =
       mode: "task-aware";
       // Supplied by the plugin runtime from TYPESAFE_API_KEY.
       apiKey: string | undefined;
+      // Probability threshold from 0 to 1; defaults to RETENTION_KEEP_THRESHOLD.
+      keepThreshold?: number;
       fetch?: RetentionFetch;
     };
+
+const PERCENT_TEXT = /^\d+(?:\.\d+)?$/;
+
+// Percent text, such as "60" or "70.5", to a 0..1 threshold. The `e-2` suffix
+// moves the decimal point in the text, so "60.1" becomes the double nearest
+// 0.601 and not 60.1 / 100. Signs, "%", exponents, hex and other forms fail.
+export function parseKeepThresholdPercent(text: string): number {
+  const trimmed = text.trim();
+  const threshold = PERCENT_TEXT.test(trimmed) ? Number(`${trimmed}e-2`) : NaN;
+  if (!(threshold <= 1)) {
+    throw new RetentionClassificationError("invalid-threshold-percent");
+  }
+  return threshold;
+}
+
+// The task-aware policy for one command invocation, from the server
+// environment. The percent is validated before the key is read, and an
+// invalid or empty value fails instead of falling back to the default.
+export function taskAwareRetentionPolicy(
+  env: Readonly<Record<string, string | undefined>>,
+): Extract<RetentionPolicy, { mode: "task-aware" }> {
+  const percent = env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV];
+  const keepThreshold =
+    percent === undefined
+      ? RETENTION_KEEP_THRESHOLD
+      : parseKeepThresholdPercent(percent);
+  return {
+    mode: "task-aware",
+    apiKey: env["TYPESAFE_API_KEY"] || undefined,
+    keepThreshold,
+  };
+}
 
 export type RetentionPlan = {
   mode: RetentionPolicy["mode"];
@@ -95,6 +132,7 @@ export async function decideRetentionWith(
   policy: Extract<RetentionPolicy, { mode: "task-aware" }>,
   summarize: () => Promise<string>,
 ): Promise<RetentionPlan> {
+  const keepThreshold = resolveKeepThreshold(policy.keepThreshold);
   if (found.candidates.length === 0) {
     return { mode: "task-aware", evaluated: 0, keep: new Set() };
   }
@@ -107,6 +145,7 @@ export async function decideRetentionWith(
     found.candidates,
     {
       apiKey: policy.apiKey,
+      keepThreshold,
       ...(policy.fetch ? { fetch: policy.fetch } : {}),
     },
   );

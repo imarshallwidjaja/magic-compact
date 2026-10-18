@@ -7,10 +7,13 @@
 // is pinned rather than using the moving `jev-latest` alias.
 export const RETENTION_MODEL = "jev-1.13.0";
 export const RETENTION_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
-// The lowest of 0.80, 0.85 and 0.90 that met 80% precision on development
-// sessions with native session summaries. Held-out results are recorded in
-// docs/RetentionEvaluation.md.
-export const RETENTION_KEEP_THRESHOLD = 0.8;
+// The default keep threshold, selected by the operator after a development
+// study. It is not a held-out or native-summary calibration; the study and its
+// limits are in docs/RetentionEvaluation.md. The server environment overrides
+// it per command through RETENTION_KEEP_THRESHOLD_PERCENT_ENV.
+export const RETENTION_KEEP_THRESHOLD = 0.6;
+export const RETENTION_KEEP_THRESHOLD_PERCENT_ENV =
+  "MAGIC_COMPACT_KEEP_THRESHOLD_PERCENT";
 export const RETENTION_MAX_CONCURRENCY = 4;
 export const RETENTION_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -62,6 +65,9 @@ export type RetentionOptions = {
   batchSize?: number;
   timeoutMs?: number;
   fetch?: RetentionFetch;
+  // A finite probability from 0 to 1; a candidate is kept at or above it.
+  // Defaults to RETENTION_KEEP_THRESHOLD.
+  keepThreshold?: number;
 };
 
 export type RetentionDecision = {
@@ -108,6 +114,7 @@ type NoulQuestion = {
 export type RetentionFailureKind =
   | "configuration"
   | "missing-api-key"
+  | "invalid-threshold-percent"
   | "budget"
   | "timeout"
   | "network"
@@ -118,17 +125,40 @@ export const RETENTION_FAILURE_GUIDANCE =
   "No tool content was changed. Run /magic-trim --heuristic to trim without classification.";
 
 // Public messages are fixed text plus an optional HTTP status. They never
-// carry request state, response bodies, or credentials.
+// carry request state, response bodies, credentials, or the rejected value.
 export class RetentionClassificationError extends Error {
   constructor(
     readonly kind: RetentionFailureKind,
     readonly status?: number,
   ) {
     super(
-      `${kind === "missing-api-key" ? "Task-aware retention requires TYPESAFE_API_KEY in the OpenCode server environment." : `Task-aware retention classification failed (${kind}${status === undefined ? "" : ` ${status}`}).`} ${RETENTION_FAILURE_GUIDANCE}`,
+      `${retentionFailureText(kind, status)} ${RETENTION_FAILURE_GUIDANCE}`,
     );
     this.name = "RetentionClassificationError";
   }
+}
+
+function retentionFailureText(
+  kind: RetentionFailureKind,
+  status: number | undefined,
+): string {
+  if (kind === "missing-api-key") {
+    return "Task-aware retention requires TYPESAFE_API_KEY in the OpenCode server environment.";
+  }
+  if (kind === "invalid-threshold-percent") {
+    return `Task-aware retention requires ${RETENTION_KEEP_THRESHOLD_PERCENT_ENV} in the OpenCode server environment to be a plain decimal percent from 0 to 100, such as 60 or 70.5, or to be unset.`;
+  }
+  return `Task-aware retention classification failed (${kind}${status === undefined ? "" : ` ${status}`}).`;
+}
+
+// Resolves an explicit probability threshold before any request is built or
+// sent. An invalid value is never clamped or replaced by the default.
+export function resolveKeepThreshold(threshold: number | undefined): number {
+  if (threshold === undefined) return RETENTION_KEEP_THRESHOLD;
+  if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+    throw new RetentionClassificationError("configuration");
+  }
+  return threshold;
 }
 
 const QUESTION_CRITERIA = {
@@ -310,6 +340,7 @@ export async function classifyRetention(
   candidates: RetentionCandidate[],
   options: RetentionOptions,
 ): Promise<RetentionClassification> {
+  const keepThreshold = resolveKeepThreshold(options.keepThreshold);
   const timeoutMs = options.timeoutMs ?? RETENTION_REQUEST_TIMEOUT_MS;
   if (!options.apiKey || !(timeoutMs > 0)) {
     throw new RetentionClassificationError("configuration");
@@ -331,7 +362,7 @@ export async function classifyRetention(
     inputTokens += answer.inputTokens;
     for (const [key, id] of requests[index]!.candidates) {
       const useful = answer.nouls.get(key)!;
-      decisions.set(id, { useful, keep: useful >= RETENTION_KEEP_THRESHOLD });
+      decisions.set(id, { useful, keep: useful >= keepThreshold });
     }
   });
   return { decisions, requests: requests.length, inputTokens };

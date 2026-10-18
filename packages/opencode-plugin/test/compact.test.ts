@@ -80,7 +80,11 @@ import {
   readStats,
   writeStats,
 } from "../src/storage/stats";
-import { RetentionClassificationError } from "../src/retention/classifier";
+import { taskAwareRetentionPolicy } from "../src/policy/retention";
+import {
+  RETENTION_KEEP_THRESHOLD_PERCENT_ENV,
+  RetentionClassificationError,
+} from "../src/retention/classifier";
 import {
   hostClock,
   persistedForkHistory,
@@ -1385,6 +1389,23 @@ describe("bounded native compaction generation", () => {
         return Response.json({ agent: {} });
       },
     });
+    // The handlers read process.env before they connect. Swap in only fake
+    // fields so neither the real TYPESAFE_API_KEY nor an inherited
+    // MAGIC_COMPACT_KEEP_THRESHOLD_PERCENT reaches this test.
+    const inheritedEnv = process.env;
+    let keyReads = 0;
+    process.env = Object.defineProperty(
+      {} as NodeJS.ProcessEnv,
+      "TYPESAFE_API_KEY",
+      {
+        enumerable: true,
+        get: () => {
+          keyReads += 1;
+          return "fake-key";
+        },
+      },
+    );
+    const fakeEnv = process.env;
     try {
       const hooks = await server({
         serverUrl: new URL(`http://127.0.0.1:${decoy.port}/`),
@@ -1400,9 +1421,14 @@ describe("bounded native compaction generation", () => {
         ).rejects.toThrow(LISTENER_REQUIRED);
       }
       expect(requests).toEqual(["/config", "/config", "/config"]);
+      // Compact and trim built a task-aware policy from the fake environment.
+      expect(keyReads).toBe(2);
+      expect(process.env).toBe(fakeEnv);
     } finally {
+      process.env = inheritedEnv;
       await decoy.stop(true);
     }
+    expect(process.env).toBe(inheritedEnv);
   });
 
   test("registers a hidden summarizer that keeps the operator's model and denies operational tools", async () => {
@@ -6984,6 +7010,42 @@ describe("magic compact task-aware retention", () => {
       `Compacted 2 request turn(s) into successor session successor. ${preservedTurnsFeedback({ requested: 0, preserved: 0 })} Task-aware retention kept 1 of 2 evaluated tool call(s) whole.`,
     );
   });
+
+  test.each([
+    [undefined, 1],
+    ["80", 0],
+  ])(
+    "a 0.7 probability keeps the call by default and not at percent %p (kept=%p)",
+    async (percent, kept) => {
+      const harness = commandHarness(retainedTurns(), {
+        generationResponse: {
+          turns: [
+            result(1, "Useful turn summary."),
+            result(2, "Stale turn summary."),
+          ],
+        },
+      });
+      const retention = {
+        ...taskAwareRetentionPolicy({
+          TYPESAFE_API_KEY: "test-key",
+          ...(percent === undefined
+            ? {}
+            : { [RETENTION_KEEP_THRESHOLD_PERCENT_ENV]: percent }),
+        }),
+        fetch: scoredJevFetch(output =>
+          output.includes("useful") ? 0.7 : 0.1,
+        ),
+      };
+
+      await expect(
+        executeMagicCompact(harness.v2, "source", 0, { retention }),
+      ).resolves.toMatchObject({ session: { id: "successor" } });
+
+      expect(harness.toasts.at(-1)?.message).toContain(
+        `Task-aware retention kept ${kept} of 2 evaluated tool call(s) whole`,
+      );
+    },
+  );
 
   test("counts kept payloads in per-turn profitability and the savings gate", async () => {
     // Without retention the large read output makes this turn profitable.

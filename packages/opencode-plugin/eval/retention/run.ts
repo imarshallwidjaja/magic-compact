@@ -28,7 +28,6 @@ import { join } from "node:path";
 import {
   buildRetentionRequests,
   classifyRetention,
-  RETENTION_KEEP_THRESHOLD,
   RETENTION_MODEL,
   type RetentionCandidate,
   type RetentionContext,
@@ -36,6 +35,11 @@ import {
 } from "../../src/retention/classifier";
 import { countGptTokens } from "../../src/stats/tokenize";
 import { SCRATCH_DIR, type EvalSnapshot } from "./dataset";
+
+// The keep threshold of the recorded native-summary results. It belongs to
+// that protocol and stays independent of the runtime default and its
+// environment override, so the historical metrics keep their meaning.
+const NATIVE_EVALUATION_KEEP_THRESHOLD = 0.8;
 
 type Label = {
   partID: string;
@@ -445,6 +449,7 @@ async function scoreNative(
       order === "reversed" ? [...s.candidates].reverse() : s.candidates,
       {
         apiKey,
+        keepThreshold: NATIVE_EVALUATION_KEEP_THRESHOLD,
         fetch: async (url, init) => {
           const t0 = performance.now();
           const response = await fetch(url, init);
@@ -468,7 +473,7 @@ async function scoreNative(
     JSON.stringify(
       {
         model: RETENTION_MODEL,
-        threshold: RETENTION_KEEP_THRESHOLD,
+        threshold: NATIVE_EVALUATION_KEEP_THRESHOLD,
         split,
         order,
         scores,
@@ -489,7 +494,7 @@ function nativeMetrics(): void {
     const cases = snapshots.flatMap(s => s.cases);
     const runs = Object.keys(cases[0]!.scores);
     const keeps = (c: NativeCase) =>
-      Object.values(c.scores).map(p => p >= RETENTION_KEEP_THRESHOLD);
+      Object.values(c.scores).map(p => p >= NATIVE_EVALUATION_KEEP_THRESHOLD);
     const metrics = (
       label: "a" | "b" | "primary",
       keep: (c: NativeCase) => boolean,
@@ -540,7 +545,10 @@ function nativeMetrics(): void {
           perRun: Object.fromEntries(
             runs.map(r => [
               r,
-              metrics("primary", c => c.scores[r]! >= RETENTION_KEEP_THRESHOLD),
+              metrics(
+                "primary",
+                c => c.scores[r]! >= NATIVE_EVALUATION_KEEP_THRESHOLD,
+              ),
             ]),
           ),
           majority: metrics("primary", majority),

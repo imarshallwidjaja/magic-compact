@@ -17,6 +17,7 @@ import {
   canonicalJson,
   datasetCases,
   datasetSha256,
+  DECISION_EVALUATION_THRESHOLD,
   DecisionEvalError,
   isProductionTrimCandidate,
   loadDataset,
@@ -87,7 +88,7 @@ function options(
     dataset,
     adapter,
     model: adapter.id === "jev" ? RETENTION_MODEL : "gpt-6-luna",
-    threshold: RETENTION_KEEP_THRESHOLD,
+    threshold: DECISION_EVALUATION_THRESHOLD,
     repeat: 1,
     concurrency: RETENTION_MAX_CONCURRENCY,
     timeoutMs: 5_000,
@@ -245,9 +246,14 @@ describe("dataset", () => {
     ).toBe(false);
   });
 
+  test("the evaluation reference stays 0.80, independent of the runtime default", () => {
+    expect(DECISION_EVALUATION_THRESHOLD).toBe(0.8);
+    expect(DECISION_EVALUATION_THRESHOLD).not.toBe(RETENTION_KEEP_THRESHOLD);
+  });
+
   test("production constants the pack relies on are unchanged", () => {
     expect(RETENTION_MODEL).toBe("jev-1.13.0");
-    expect(RETENTION_KEEP_THRESHOLD).toBe(0.8);
+    expect(RETENTION_KEEP_THRESHOLD).toBe(0.6);
     expect(RETENTION_MAX_CONCURRENCY).toBe(4);
     expect(RETENTION_REQUEST_TIMEOUT_MS).toBe(30_000);
     expect(RETENTION_STATE_AND_QUESTION_BYTE_LIMIT).toBe(28_000);
@@ -1271,6 +1277,24 @@ describe("report and result integrity", () => {
     expect(mixed).toContain("threshold 0.5");
     const override = renderReport([loadRun(a.out, dataset)], dataset, 0.95);
     expect(override).toContain("threshold 0.95");
+    expect(same).toContain(
+      `production default keep threshold is ${RETENTION_KEEP_THRESHOLD}`,
+    );
+    expect(same).toContain(
+      `held-out results stay at ${DECISION_EVALUATION_THRESHOLD}`,
+    );
+    expect(same).toContain(
+      `Group 1: threshold ${DECISION_EVALUATION_THRESHOLD}`,
+    );
+  });
+
+  test("a development comparison can score at the runtime default without touching the held-out reference", async () => {
+    const run = await runFake(openai, perfect, {
+      threshold: RETENTION_KEEP_THRESHOLD,
+    });
+    const loaded = loadRun(run.out, dataset);
+    expect(loaded.manifest.threshold).toBe(0.6);
+    expect(renderReport([loaded], dataset)).toContain("Group 1: threshold 0.6");
   });
 
   test("requests that left no record are reported as unknown, never as not attempted", async () => {
@@ -1391,9 +1415,11 @@ describe("report and result integrity", () => {
         split: "heldout",
       }),
     );
-    expect(() =>
-      planRun({ ...options(openai), dataset: heldout, threshold: 0.7 }),
-    ).toThrow(/frozen threshold 0.8/);
+    for (const threshold of [0.7, RETENTION_KEEP_THRESHOLD]) {
+      expect(() =>
+        planRun({ ...options(openai), dataset: heldout, threshold }),
+      ).toThrow(/frozen threshold 0.8/);
+    }
     expect(() =>
       planRun({ ...options(openai), dataset: heldout, threshold: 0.8 }),
     ).not.toThrow();
@@ -1407,14 +1433,25 @@ describe("report and result integrity", () => {
     const run = loadRun(out, heldout);
     expect(renderReport([run], heldout)).toContain("(heldout)");
     expect(() => renderReport([run], heldout, 0.5)).toThrow(/frozen threshold/);
-    // A manifest edited to a different threshold is not a valid held-out result.
+    // A report stored before the runtime default changed recorded 0.80 as the
+    // production threshold. It still loads at the frozen reference.
     const manifestPath = join(out, "manifest.json");
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    expect(manifest.production.keepThreshold).toBe(RETENTION_KEEP_THRESHOLD);
     writeFileSync(
       manifestPath,
-      JSON.stringify({ ...manifest, threshold: 0.5 }),
+      JSON.stringify({
+        ...manifest,
+        production: { ...manifest.production, keepThreshold: 0.8 },
+      }),
     );
-    expect(() => loadRun(out, heldout)).toThrow(/frozen/);
+    expect(() => loadRun(out, heldout)).not.toThrow();
+    // A manifest edited to a different threshold, including the runtime
+    // default, is not a valid held-out result.
+    for (const threshold of [0.5, RETENTION_KEEP_THRESHOLD]) {
+      writeFileSync(manifestPath, JSON.stringify({ ...manifest, threshold }));
+      expect(() => loadRun(out, heldout)).toThrow(/frozen/);
+    }
     // Results never mix across splits: the smoke dataset rejects held-out runs.
     expect(() => loadRun(out, dataset)).toThrow(/different dataset/);
   });
@@ -1904,7 +1941,17 @@ describe("command line", () => {
     ).toBe(0);
     expect(dry.stdout.join("\n")).toContain(`${cases.length} requests`);
     expect(dry.stdout.join("\n")).toContain("Dry run");
+    expect(dry.stdout.join("\n")).toContain("Reference threshold 0.8");
     expect(dry.fetched()).toBe(0);
+
+    const development = harness();
+    expect(
+      await main(
+        ["run", "--provider", "jev", "--dry-run", "--threshold", "0.6"],
+        development.deps,
+      ),
+    ).toBe(0);
+    expect(development.stdout.join("\n")).toContain("Reference threshold 0.6");
 
     const out = freshDir();
     mkdirSync(out);

@@ -47,5 +47,6 @@ Magic Compact performs per-turn conversation compaction while preserving the con
 ## Task-Aware Retention
 
 - Tests never read `TYPESAFE_API_KEY` or reach the network: pass `retention` with a fake `fetch` (see `packages/opencode-plugin/test/retention-host.ts`), or `{ mode: "heuristic" }` for tests of the unchanged tool rules.
-- Do not change `RETENTION_KEEP_THRESHOLD` or the Jev question wording without the evaluation protocol in `docs/RetentionEvaluation.md`; never tune either against held-out results.
-- Judge calls independently: useful duplicates and recoverable content qualify, as does unchanged useful content in a partly edited read. Do not categorically exclude task procedures, skills or todos. Keep the frozen 0.80 threshold and request allocations until a new development-only calibration is frozen; bytes are not a documented tokenizer bound.
+- The operator-selected default is 0.60; the server may override it with `MAGIC_COMPACT_KEEP_THRESHOLD_PERCENT`. Further default or Jev-question changes require the evaluation protocol in `docs/RetentionEvaluation.md`; never tune against held-out results.
+- Keep archived evaluation thresholds independent of the runtime default and environment override.
+- Judge calls independently: useful duplicates and recoverable content qualify, as does unchanged useful content in a partly edited read. Do not categorically exclude task procedures, skills or todos. Keep request allocations until a new development-only calibration is frozen; bytes are not a documented tokenizer bound.

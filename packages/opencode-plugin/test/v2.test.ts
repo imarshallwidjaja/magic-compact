@@ -5,6 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GENERATION_PROTOCOL } from "../src/compact/constants";
 import { setup } from "../src/host-v2";
+import { taskAwareRetentionPolicy } from "../src/policy/retention";
+import {
+  RETENTION_KEEP_THRESHOLD_PERCENT_ENV,
+  RetentionClassificationError,
+} from "../src/retention/classifier";
 import plugin from "../src/index";
 import tuiPlugin from "../src/tui";
 import { readOmittedContent } from "../src/storage/omission";
@@ -1080,6 +1085,38 @@ describe("OpenCode 2 trim successors", () => {
     ).toBe(words("R", 400));
     expect([...state.sessions.keys()]).toHaveLength(2);
   });
+
+  test.each([
+    [undefined, 1],
+    ["80", 0],
+  ])(
+    "a 0.7 probability keeps the call by default and not at percent %p (kept=%p)",
+    async (percent, kept) => {
+      const state = fakeV2State();
+      sourceSession(state, "ses_src", toolHistory());
+      const owned = new OwnedSessions();
+      const host = fakeV2Host(state, owned, () => ({
+        text: "## Objective\n- Continue.",
+      }));
+      const { outcome } = await executeV2Trim(host, owned, "ses_src", 0, {
+        retention: {
+          ...taskAwareRetentionPolicy({
+            TYPESAFE_API_KEY: "test-key",
+            ...(percent === undefined
+              ? {}
+              : { [RETENTION_KEEP_THRESHOLD_PERCENT_ENV]: percent }),
+          }),
+          fetch: scoredJevFetch(output =>
+            output.startsWith("R-0") ? 0.7 : 0.1,
+          ),
+        },
+        controlTimeoutMs: 1_000,
+      });
+      expect(outcome).toContain(
+        `Task-aware retention kept ${kept} of 2 evaluated tool call(s) whole`,
+      );
+    },
+  );
 
   test("task-aware trim resolves the summarizer at the source session location", async () => {
     const state = fakeV2State();
@@ -2646,6 +2683,71 @@ describe("OpenCode 2 media projection", () => {
     };
     await hooks.get("context")!(plain as never);
     expect(contextReads).toHaveLength(4);
+  });
+});
+
+describe("OpenCode 2 retention keep threshold environment", () => {
+  type Execute = (input: {
+    sessionID: string;
+    prompt: { text: string };
+  }) => Promise<void>;
+  const commands = async () => {
+    const found = new Map<string, Execute>();
+    const editor = {
+      add: (command: { name: string; execute: Execute }) => {
+        found.set(command.name, command.execute);
+      },
+      update: () => undefined,
+    };
+    await setup({
+      // A non-string server URL fails the connection at once, without
+      // looking for a registered service.
+      options: { serverUrl: 0 },
+      agent: { transform: async (fn: (e: unknown) => void) => fn(editor) },
+      command: { transform: async (fn: (e: unknown) => void) => fn(editor) },
+      tool: { transform: async (fn: (e: unknown) => void) => fn(editor) },
+      session: { hook: async () => undefined, get: async () => ({}) },
+      event: { subscribe: async function* () {} },
+    } as never);
+    return (name: string, text: string) => {
+      const execute = found.get(name)!;
+      return execute({ sessionID: "ses_src", prompt: { text } }).then(
+        () => {
+          throw new Error("Expected a rejection.");
+        },
+        (error: unknown) => error,
+      );
+    };
+  };
+  const withPercent = async <T>(value: string, run: () => Promise<T>) => {
+    const previous = process.env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV];
+    process.env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV] = value;
+    try {
+      return await run();
+    } finally {
+      if (previous === undefined) {
+        delete process.env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV];
+      } else process.env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV] = previous;
+    }
+  };
+
+  test.each(["magic-compact", "magic-trim"])(
+    "%s rejects an invalid percent before it connects to the server",
+    async name => {
+      const run = await commands();
+      const error = await withPercent("60%", () => run(name, ""));
+      expect(error).toBeInstanceOf(RetentionClassificationError);
+      expect(String(error)).toContain(RETENTION_KEEP_THRESHOLD_PERCENT_ENV);
+    },
+  );
+
+  test("magic-trim --heuristic neither reads nor validates the percent", async () => {
+    const run = await commands();
+    const error = await withPercent("60%", () =>
+      run("magic-trim", "--heuristic"),
+    );
+    expect(error).not.toBeInstanceOf(RetentionClassificationError);
+    expect(String(error)).toContain(V2_ENDPOINT_REQUIRED);
   });
 });
 

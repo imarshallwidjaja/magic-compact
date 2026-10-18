@@ -18,7 +18,10 @@ import {
   READ_OMITTED_CONTENT_ID_DESCRIPTION,
 } from "./compact/constants";
 import { getCompactionCount } from "./compact/session";
-import type { RetentionPolicy } from "./policy/retention";
+import {
+  taskAwareRetentionPolicy,
+  type RetentionPolicy,
+} from "./policy/retention";
 import { recordAssistantCompletion } from "./stats/events";
 import { statsSummaryMessage } from "./stats/constants";
 import { omissionReadDiagnostic, readOmittedContent } from "./storage/omission";
@@ -46,14 +49,6 @@ type Context = Plugin.Context;
 
 const MEDIA_HISTORY_REQUIRED =
   "Magic Compact could not read this session's complete history over the OpenCode server's HTTP API, which it needs to project summarized images in a request that replays history from before the session's latest compaction. The request was not sent.";
-
-// Read per command so a missing key fails that command, not plugin startup.
-function taskAwareRetention(): RetentionPolicy {
-  return {
-    mode: "task-aware",
-    apiKey: process.env["TYPESAFE_API_KEY"] || undefined,
-  };
-}
 
 const RESPONSE_TOOL_REJECTED =
   "Magic Compact's response tool is only available in its own per-turn generation requests.";
@@ -108,13 +103,15 @@ export async function setup(
       description: COMMAND_DESCRIPTIONS[COMPACT_COMMAND],
       execute: async ({ sessionID, prompt }) => {
         const keepTurns = parseMagicCompactArguments(prompt.text);
+        // Read per command and reject an invalid threshold before session work.
+        const retention = taskAwareRetentionPolicy(process.env);
         const host = await connect(sessionID);
         const { successor, outcome } = await executeV2Compact(
           host,
           owned,
           sessionID,
           keepTurns,
-          { retention: taskAwareRetention(), controlTimeoutMs },
+          { retention, controlTimeoutMs },
         );
         throw new Error(
           successor
@@ -128,16 +125,16 @@ export async function setup(
       description: COMMAND_DESCRIPTIONS[TRIM_COMMAND],
       execute: async ({ sessionID, prompt }) => {
         const { keepTurns, heuristic } = parseMagicTrimArguments(prompt.text);
+        const retention: RetentionPolicy = heuristic
+          ? { mode: "heuristic" }
+          : taskAwareRetentionPolicy(process.env);
         const host = await connect(sessionID);
         const { successor, outcome } = await executeV2Trim(
           host,
           owned,
           sessionID,
           keepTurns,
-          {
-            retention: heuristic ? { mode: "heuristic" } : taskAwareRetention(),
-            controlTimeoutMs,
-          },
+          { retention, controlTimeoutMs },
         );
         throw new Error(
           successor
