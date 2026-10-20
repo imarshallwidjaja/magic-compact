@@ -54,7 +54,12 @@ import {
   validationCategoryText,
   validationFailure,
 } from "../policy/generation";
-
+import {
+  distinctReasons,
+  markPluginMessage,
+  PluginMessageError,
+  undeletedSessionIDs,
+} from "../policy/feedback";
 import { ForkCleanupError, ForkHistoryError, forkSession } from "./fork";
 import {
   assertForkMessageShape,
@@ -404,7 +409,7 @@ function finalizeGenerationBatch(
     exactInputTokens > batch.inputLimit
     || exactInputTokens > budget.usableInput
   ) {
-    throw new Error(
+    throw new PluginMessageError(
       "Magic Compact exact generation request cannot fit the configured model input. Run /magic-trim first and retry.",
     );
   }
@@ -412,7 +417,7 @@ function finalizeGenerationBatch(
     exactOutputTokens > batch.estimatedOutputTokens
     || exactOutputTokens > budget.outputTarget
   ) {
-    throw new Error(
+    throw new PluginMessageError(
       `A single compaction turn cannot fit the configured ${budget.outputTarget}-token output target. Configure a compaction model with more output capacity.`,
     );
   }
@@ -496,10 +501,9 @@ async function requestCompactionGenerationBatches(
   );
   if (orderedFailures.length === 1) throw orderedFailures[0];
   if (orderedFailures.length > 1) {
-    throw new AggregateError(
+    throw ownedAggregate(
       orderedFailures,
       "Multiple compaction generation batches failed.",
-      { cause: orderedFailures[0] },
     );
   }
 
@@ -1022,7 +1026,7 @@ export async function resolveCompactionSettings(
       }),
     );
   } catch {
-    throw new Error(
+    throw new PluginMessageError(
       `Magic Compact could not resolve the ${MAGIC_COMPACT_SUMMARIZER_AGENT} agent.`,
     );
   }
@@ -1030,7 +1034,7 @@ export async function resolveCompactionSettings(
     (agent: Agent) => agent.name === MAGIC_COMPACT_SUMMARIZER_AGENT,
   );
   if (!summarizer) {
-    throw new Error(
+    throw new PluginMessageError(
       `Magic Compact requires its ${MAGIC_COMPACT_SUMMARIZER_AGENT} agent, but it is missing or disabled.`,
     );
   }
@@ -1041,7 +1045,7 @@ export async function resolveCompactionSettings(
     || !summarizer.model.providerID.trim()
     || !summarizer.model.modelID.trim()
   ) {
-    throw new Error(SUMMARIZER_MODEL_REQUIRED);
+    throw new PluginMessageError(SUMMARIZER_MODEL_REQUIRED);
   }
   let catalog: ReturnType<typeof unwrap>;
   try {
@@ -1054,7 +1058,7 @@ export async function resolveCompactionSettings(
       }),
     );
   } catch {
-    throw new Error(
+    throw new PluginMessageError(
       requiresImages
         ? "Magic Compact could not verify an image-capable configured compaction model."
         : "Magic Compact could not resolve the configured compaction model descriptor.",
@@ -1077,7 +1081,7 @@ export async function resolveCompactionSettings(
     || !isRecord(limit)
     || typeof limit["context"] !== "number"
   ) {
-    throw new Error(
+    throw new PluginMessageError(
       requiresImages
         ? "Magic Compact requires an image-capable configured compaction model for retained fork history containing images."
         : "Magic Compact could not resolve the configured compaction model descriptor.",
@@ -1115,7 +1119,7 @@ export function assertConfiguredModelSupportsImages(
   settings: CompactionSettings,
 ): void {
   if (settings.descriptor.capabilities?.input?.image !== true) {
-    throw new Error(
+    throw new PluginMessageError(
       "Magic Compact requires an image-capable configured compaction model for retained fork history containing images.",
     );
   }
@@ -1208,7 +1212,7 @@ function assertGeneratedPartIDsAvailable(plan: CompactionPlan): void {
 
 type LifecycleFailureKind = "timeout" | "rejection";
 
-class GenerationLifecycleError extends Error {
+class GenerationLifecycleError extends PluginMessageError {
   readonly status: number | undefined;
 
   constructor(
@@ -1280,10 +1284,9 @@ function sanitizeGenerationFailure(
       sanitizeGenerationFailure(sourceSessionID, item),
     );
     if (errors.length > 0) {
-      return new AggregateError(
+      return ownedAggregate(
         errors,
         "Compaction generation batch and fork cleanup failed.",
-        { cause: errors[0] },
       );
     }
   }
@@ -1340,9 +1343,30 @@ function unwrapLifecycleResponse<T, E>(response: { data?: T; error?: E }): T {
 }
 
 function combineLifecycleErrors(primary: Error, secondary: Error): Error {
-  return new AggregateError(
+  return ownedAggregate(
     [primary, secondary],
     "Compaction generation and fork cleanup both failed.",
-    { cause: primary },
+  );
+}
+
+// An aggregate of this plugin's already sanitized generation failures. Its
+// message adds their distinct reasons, so a person sees why the batches
+// failed (for example, to run /magic-trim first) and not only that several
+// did, and then every partial fork that could not be deleted, which the
+// reason cap never drops. The failures stay in `errors`, unchanged and in
+// batch order.
+function ownedAggregate(errors: Error[], summary: string): AggregateError {
+  const forks = undeletedSessionIDs(errors);
+  const message = [
+    summary,
+    ...distinctReasons(errors),
+    ...(forks.length === 0
+      ? []
+      : [
+          `Delete partial fork${forks.length === 1 ? "" : "s"} ${forks.join(", ")} manually.`,
+        ]),
+  ].join(" ");
+  return markPluginMessage(
+    new AggregateError(errors, message, { cause: errors[0] }),
   );
 }

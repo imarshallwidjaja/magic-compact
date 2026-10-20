@@ -51,8 +51,22 @@ import {
   type MessageWithParts,
   type Turn,
 } from "../src/compact/plan";
-import { readSourceAtRest, SuccessorFailure } from "../src/compact/successor";
-import { hasUsefulSavings, successorFailure } from "../src/policy/successor";
+import {
+  readSourceAtRest,
+  SourceNotAtRestError,
+  SuccessorFailure,
+} from "../src/compact/successor";
+import {
+  hasUsefulSavings,
+  SourceChangedError,
+  successorFailure,
+  unfinishedHistoryRefusal,
+} from "../src/policy/successor";
+import {
+  commandFailureMessage,
+  TRIM_ARGUMENTS_ERROR,
+  TRIM_NOOP,
+} from "../src/commands";
 import { preservedTurnsFeedback, statsMessage } from "../src/stats/constants";
 import {
   countCanonicalContentTokens,
@@ -74,6 +88,11 @@ import {
   readOmittedContent,
 } from "../src/storage/omission";
 import { pluginStorageDirectory } from "../src/storage/store";
+import { failureToast } from "../src/util";
+import {
+  PluginMessageError,
+  undeletedSessionIDs,
+} from "../src/policy/feedback";
 import {
   type ConversationStats,
   deleteStats,
@@ -93,9 +112,11 @@ import {
   type JevCall,
 } from "./retention-host";
 import {
+  dependencyError,
   PRIVATE_SENTINEL,
   privateHostError,
   reachableStrings,
+  SPECIAL_TOKEN,
 } from "./v2-host";
 
 type TurnResult = {
@@ -112,6 +133,7 @@ const HEURISTIC_OPTIONS = { retention: { mode: "heuristic" } } as const;
 // N=1 over a single eligible turn preserves that turn and summarizes nothing.
 const NOOP_PRESERVING_ONE_TURN = `${COMPACT_NOOP} ${preservedTurnsFeedback({ requested: 1, preserved: 1 })}`;
 const originalDataHome = process.env.XDG_DATA_HOME;
+const PLUGIN_TEXT = "Magic Compact wrote this text for the person running it.";
 
 beforeAll(async () => {
   storageDirectory = await mkdtemp(join(tmpdir(), "magic-compact-test-"));
@@ -810,6 +832,7 @@ describe("chronological forks", () => {
         expect(String(failure)).toContain(
           "delete partial fork backup manually",
         );
+        expect(undeletedSessionIDs([failure])).toEqual(["backup"]);
         expect(nestedErrorMessages(failure).join(" ")).not.toContain("private");
         expect(host.deleted).toEqual(["backup"]);
       } finally {
@@ -1406,11 +1429,13 @@ describe("bounded native compaction generation", () => {
       },
     );
     const fakeEnv = process.env;
+    const { client, toasts } = hostToastClient();
     try {
       const hooks = await server({
         serverUrl: new URL(`http://127.0.0.1:${decoy.port}/`),
         directory: "/workspace",
-      } as PluginInput);
+        client,
+      } as unknown as PluginInput);
       await hooks.config?.({} as Config);
       for (const command of ["magic-compact", "magic-trim", "magic-stats"]) {
         await expect(
@@ -1421,6 +1446,22 @@ describe("bounded native compaction generation", () => {
         ).rejects.toThrow(LISTENER_REQUIRED);
       }
       expect(requests).toEqual(["/config", "/config", "/config"]);
+      // OpenCode 1 shows a thrown command error to no client, so compact and
+      // trim report through the plugin input's own client, once each.
+      expect(toasts).toEqual([
+        {
+          title: "Magic Compact Failed",
+          message: LISTENER_REQUIRED,
+          variant: "error",
+          duration: expect.any(Number),
+        },
+        {
+          title: "Magic Trim Failed",
+          message: LISTENER_REQUIRED,
+          variant: "error",
+          duration: expect.any(Number),
+        },
+      ]);
       // Compact and trim built a task-aware policy from the fake environment.
       expect(keyReads).toBe(2);
       expect(process.env).toBe(fakeEnv);
@@ -1429,6 +1470,111 @@ describe("bounded native compaction generation", () => {
       await decoy.stop(true);
     }
     expect(process.env).toBe(inheritedEnv);
+  });
+
+  test("reports invalid arguments through the host client before any connection", async () => {
+    const { client, toasts } = hostToastClient();
+    const hooks = await server({
+      serverUrl: new URL("http://127.0.0.1:9/"),
+      directory: "/workspace",
+      client,
+    } as unknown as PluginInput);
+    for (const [command, args, title, text] of [
+      [
+        "magic-compact",
+        "two",
+        "Magic Compact Failed",
+        "/magic-compact argument must be a non-negative integer.",
+      ],
+      ["magic-trim", "1 1", "Magic Trim Failed", TRIM_ARGUMENTS_ERROR],
+    ] as const) {
+      await expect(
+        hooks["command.execute.before"]!(
+          { command, arguments: args, sessionID: "session" },
+          { parts: [] },
+        ),
+      ).rejects.toThrow(text);
+      expect(toasts.at(-1)).toEqual({
+        title,
+        message: text,
+        variant: "error",
+        duration: expect.any(Number),
+      });
+    }
+    expect(toasts).toHaveLength(2);
+  });
+
+  test("leaves outcome and execution-failure toasts to the verified listener", async () => {
+    const { client, toasts: hostToasts } = hostToastClient();
+    const listenerToasts: Array<{ title: string; message: string }> = [];
+    let config: Config = {};
+    let failRead = false;
+    const listener = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async request => {
+        const path = new URL(request.url).pathname;
+        if (path === "/config") return Response.json({ agent: config.agent });
+        if (path === "/tui/show-toast") {
+          listenerToasts.push(await request.json());
+          return Response.json(true);
+        }
+        if (failRead) return new Response("down", { status: 500 });
+        if (path === "/session/session") {
+          return Response.json({
+            id: "session",
+            directory: "/workspace",
+            title: "source",
+            time: { created: 1, updated: 1 },
+          });
+        }
+        if (path === "/session/status") return Response.json({});
+        return Response.json([]);
+      },
+    });
+    try {
+      const hooks = await server({
+        serverUrl: new URL(`http://127.0.0.1:${listener.port}/`),
+        directory: "/workspace",
+        client,
+      } as unknown as PluginInput);
+      config = {} as Config;
+      await hooks.config?.(config);
+      const run = () =>
+        hooks["command.execute.before"]!(
+          {
+            command: "magic-trim",
+            arguments: "--heuristic",
+            sessionID: "session",
+          },
+          { parts: [] },
+        );
+
+      // The no-op result is thrown so OpenCode does not prompt the model; it
+      // is not reported as a failure.
+      await expect(run()).rejects.toThrow(TRIM_NOOP);
+      expect(listenerToasts.map(toast => toast.title)).toEqual([
+        "Magic Trim",
+        "Magic Trim",
+      ]);
+
+      failRead = true;
+      await expect(run()).rejects.toThrow(
+        "Magic Trim could not read the session state",
+      );
+      expect(listenerToasts.slice(2)).toMatchObject([
+        { title: "Magic Trim", message: "Trimming session..." },
+        {
+          title: "Magic Trim Failed",
+          message:
+            "Magic Trim could not read the session state it needs to check that the session is at rest. The session was left unchanged.",
+        },
+      ]);
+      // Execution feedback never repeats through the host client.
+      expect(hostToasts).toEqual([]);
+    } finally {
+      await listener.stop(true);
+    }
   });
 
   test("registers a hidden summarizer that keeps the operator's model and denies operational tools", async () => {
@@ -4109,7 +4255,7 @@ describe("compaction orchestration", () => {
       );
       expect(failed.toasts.map(toast => toast.message)).toEqual([
         "Compacting session...",
-        "GenerationLifecycleError: Compaction generation response validation failed: turn count mismatch (expected 1, received 0).",
+        "Compaction generation response validation failed: turn count mismatch (expected 1, received 0).",
       ]);
       expect(JSON.stringify(failed.messages)).not.toContain(
         "Compacting session...",
@@ -4754,6 +4900,10 @@ describe("compaction orchestration", () => {
       ]),
     );
     expect(nestedErrorMessages(failure).join(" ")).not.toContain("raw");
+    // The toast says why the batches failed, once for each distinct reason.
+    expect(harness.toasts.at(-1)?.message).toBe(
+      "Multiple compaction generation batches failed. Compaction generation model request failed. Compaction generation fork abort failed. Compaction generation fork deletion failed.",
+    );
     expect(messages).toEqual(before);
     expect(harness.forks).toEqual(["generation-fork", "generation-fork-2"]);
     expect(harness.deletedSessions).toEqual(
@@ -4764,6 +4914,173 @@ describe("compaction orchestration", () => {
     expect(boundaryParts(messages)).toEqual([]);
     expect(await readStats("source")).toBeNull();
     expect(await readStats("backup")).toBeNull();
+  });
+
+  test("names every partial fork that could not be deleted, however many reasons the batches have", async () => {
+    // Six turns, five concurrent batches: the sixth is never admitted. Four
+    // different fork failures exceed the three reasons an aggregate explains,
+    // and every orphaned fork is still named.
+    const messages = Array.from({ length: 6 }, (_, index) =>
+      compactableCommandMessages(
+        `orphan-batch-${index + 1}`,
+        `large output ${index + 1} `.repeat(1_000),
+      ),
+    ).flat();
+    const before = structuredClone(messages);
+    const harness = commandHarness(messages, {
+      generationResponse: {
+        turns: Array.from({ length: 6 }, (_, index) =>
+          result(index + 1, `Summary ${index + 1}.`),
+        ),
+      },
+      generationForkFaults: {
+        1: "replay-failed",
+        2: "read-failed",
+        3: "cut-not-empty",
+        4: "replay-mismatch",
+        5: "replay-failed",
+      },
+      generationForkDeleteFails: true,
+    });
+    const orphans = [
+      "generation-fork",
+      "generation-fork-2",
+      "generation-fork-3",
+      "generation-fork-4",
+      "generation-fork-5",
+    ];
+
+    const failure = await executeMagicCompact(
+      harness.v2,
+      "source",
+      0,
+      HEURISTIC_OPTIONS,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toHaveLength(5);
+    expect(
+      (failure as AggregateError).errors.every(
+        error => error instanceof ForkCleanupError,
+      ),
+    ).toBeTrue();
+    expect(undeletedSessionIDs([failure])).toEqual(orphans);
+    const shown = harness.toasts.at(-1)?.message ?? "";
+    expect(shown).toBe(
+      [
+        "Multiple compaction generation batches failed.",
+        "Magic Compact chronological fork initialization failed (history replay failed).",
+        "Magic Compact chronological fork initialization failed (history read failed).",
+        "Magic Compact chronological fork initialization failed (fork was not empty).",
+        `Delete partial forks ${orphans.join(", ")} manually.`,
+      ].join(" "),
+    );
+    expect(shown).not.toContain("replayed fork did not match the plan");
+    expect((failure as AggregateError).message).toBe(shown);
+    expect(shown.length).toBeLessThan(700);
+    expect(nestedErrorMessages(failure).join(" ")).not.toContain("raw");
+    // Every fork's deletion was attempted once and refused; the sixth batch
+    // was never admitted.
+    expect(harness.forks).toEqual(orphans);
+    expect([...harness.deletedSessions].sort()).toEqual([...orphans].sort());
+    expect(harness.sourceWrites).toEqual([]);
+    expect(harness.successors).toEqual([]);
+    expect(messages).toEqual(before);
+    expect(await readStats("source")).toBeNull();
+  });
+
+  test("keeps the one partial fork's ID when only some batches left one", async () => {
+    const messages = Array.from({ length: 2 }, (_, index) =>
+      compactableCommandMessages(
+        `orphan-one-${index + 1}`,
+        `large output ${index + 1} `.repeat(1_000),
+      ),
+    ).flat();
+    const harness = commandHarness(messages, {
+      generationResponse: {
+        turns: Array.from({ length: 2 }, (_, index) =>
+          result(index + 1, `Summary ${index + 1}.`),
+        ),
+      },
+      generationForkFaults: { 2: "replay-failed" },
+      generationErrorsByFirstOrdinal: { 1: new Error("raw provider payload") },
+      generationForkDeleteFails: true,
+    });
+
+    const failure = await executeMagicCompact(
+      harness.v2,
+      "source",
+      0,
+      HEURISTIC_OPTIONS,
+    ).catch((error: unknown) => error);
+
+    expect(undeletedSessionIDs([failure])).toEqual(["generation-fork-2"]);
+    expect(harness.toasts.at(-1)?.message).toEndWith(
+      "Delete partial fork generation-fork-2 manually.",
+    );
+  });
+
+  test("shows the actionable reason of an aggregated batch failure first and once", async () => {
+    const messages = Array.from({ length: 2 }, (_, index) =>
+      compactableCommandMessages(
+        `aggregate-overflow-${index + 1}`,
+        `large output ${index + 1} `.repeat(1_000),
+      ),
+    ).flat();
+    const overflow = new Error("outer raw error", {
+      cause: { name: "ContextOverflowError", data: { message: "raw inner" } },
+    });
+    const harness = commandHarness(messages, {
+      generationResponse: {
+        turns: Array.from({ length: 2 }, (_, index) =>
+          result(index + 1, `Summary ${index + 1}.`),
+        ),
+      },
+      generationErrorsByFirstOrdinal: { 1: overflow, 2: overflow },
+      holdGenerationPromptsUntil: 2,
+    });
+
+    await expect(
+      executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
+    ).rejects.toBeInstanceOf(AggregateError);
+
+    const shown = harness.toasts.at(-1)?.message ?? "";
+    expect(shown).toBe(
+      "Multiple compaction generation batches failed. The complete forked session exceeded the configured compaction model context. Run /magic-trim first, then retry /magic-compact.",
+    );
+    expect(shown).not.toContain("raw");
+  });
+
+  test("never shows a dependency's own error text for a failure inside the command", async () => {
+    // The tokenizer refuses a literal special token in the session's tool
+    // output with a plain Error (gpt-tokenizer 3.4.0), before any session work.
+    const messages = compactableCommandMessages(
+      "special-token",
+      `${SPECIAL_TOKEN} ${"large output ".repeat(1_000)}`,
+    );
+    const before = structuredClone(messages);
+    const harness = commandHarness(messages, {
+      generationResponse: { turns: [result(1, "Completed.")] },
+    });
+
+    const error = await executeMagicCompact(
+      harness.v2,
+      "source",
+      0,
+      HEURISTIC_OPTIONS,
+    ).catch((caught: unknown) => caught);
+
+    expect(String(error)).toContain("Disallowed special token");
+    expect(harness.toasts.at(-1)).toMatchObject({
+      title: "Magic Compact Failed",
+      variant: "error",
+      message:
+        "Magic Compact stopped on an unexpected error. The original session was left unchanged. Retry; if it fails again, check the OpenCode server log.",
+    });
+    expect(messages).toEqual(before);
+    expect(harness.forks).toEqual([]);
+    expect(harness.successors).toEqual([]);
+    expect(harness.sourceWrites).toEqual([]);
   });
 
   test("rejects an active marker leaked into a summary before backup or source writes", async () => {
@@ -4970,30 +5287,267 @@ describe("compaction orchestration", () => {
     },
   );
 
-  test.each([
-    ["an active assistant response", "assistant"],
-    ["a running tool call", "tool"],
-  ] as const)("refuses %s in the source history", async (_name, kind) => {
-    const messages = compactableCommandMessages(
-      "active",
-      "large output ".repeat(1_000),
-    );
-    if (kind === "assistant") {
-      messages[1]!.info.time = { created: messages[1]!.info.time.created };
-    } else {
-      const tool = messages[1]!.parts.find(part => part.type === "tool")!;
-      if (tool.type !== "tool") throw new Error("Expected a tool part.");
-      tool.state = { status: "running", input: {}, time: { start: 1 } };
-    }
-    const harness = commandHarness(messages, {
-      generationResponse: { turns: [result(1, "Completed.")] },
+  describe("unfinished stored history", () => {
+    const canary = "PRIVATE-CANARY-4c1e";
+    const open = (id: string, parts: Part[] = []) => {
+      const item = message(id, "assistant", parts);
+      delete (item.info.time as { completed?: number }).completed;
+      return item;
+    };
+    const running = (
+      id: string,
+      messageID: string,
+      tool = "task",
+      status = "running",
+    ) =>
+      toolPart(
+        id,
+        messageID,
+        { status, input: { prompt: canary }, time: { start: 1 } },
+        tool,
+      );
+    const readHistory = (
+      history: MessageWithParts[],
+      command: "Magic Compact" | "Magic Trim" = "Magic Compact",
+      options: Partial<CommandHarnessOptions> = {},
+    ) =>
+      readSourceAtRest(
+        commandHarness(history, {
+          generationResponse: { turns: [] },
+          ...options,
+        }).v2,
+        command,
+        "source",
+        1_000,
+      );
+    const refusal = async (
+      history: MessageWithParts[],
+      command: "Magic Compact" | "Magic Trim" = "Magic Compact",
+    ) => {
+      const error = await readHistory(history, command).then(
+        () => undefined,
+        (failure: unknown) => failure,
+      );
+      expect(error).toBeInstanceOf(SourceNotAtRestError);
+      expect((error as Error).name).toBe("SourceNotAtRestError");
+      return (error as Error).message;
+    };
+
+    test("names an unfinished assistant message without claiming it is running", async () => {
+      expect(
+        await refusal([
+          ...compactableCommandMessages("a", "x"),
+          open("msg_open"),
+        ]),
+      ).toBe(
+        "Magic Compact requires the session to be at rest, but its stored history has an unfinished record, which blocks even an idle session. If work may still be running, wait and retry. Otherwise continue without Magic Compact or in another session. The session was left unchanged.\nRecord: assistant message msg_open; no completion time or error.",
+      );
     });
 
-    await expect(
-      executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
-    ).rejects.toThrow("a model response or tool call is still active");
-    expect(harness.forks).toEqual([]);
-    expect(harness.successors).toEqual([]);
+    test("names the tool call and state of a finished assistant message with a running call", async () => {
+      const text = await refusal([
+        ...compactableCommandMessages("a", "x"),
+        message("msg_tool", "assistant", [
+          running("prt_a", "msg_tool"),
+          running("prt_b", "msg_tool", "task", "pending"),
+        ]),
+      ]);
+      expect(text).toEndWith(
+        "Record: assistant message msg_tool; running task call prt_a-call and 1 more call.",
+      );
+      expect(text).not.toContain("no completion time");
+    });
+
+    test("names an old blocker that later completed turns did not clear", async () => {
+      const text = await refusal([
+        open("msg_old", [running("prt_old", "msg_old")]),
+        ...compactableCommandMessages("later", "large output ".repeat(100)),
+        ...compactableCommandMessages("latest", "large output ".repeat(100)),
+      ]);
+      expect(text).toEndWith(
+        "Record: assistant message msg_old; no completion time or error; running task call prt_old-call.",
+      );
+      expect(text).not.toContain("later");
+      expect(text).not.toContain("more message");
+    });
+
+    test("names only the first blocker and counts the rest", async () => {
+      const text = await refusal([
+        open("msg_first"),
+        message("msg_second", "assistant", [running("prt_s", "msg_second")]),
+        open("msg_third"),
+      ]);
+      expect(text).toEndWith(
+        "Record: assistant message msg_first; no completion time or error; plus 2 more messages.",
+      );
+      expect(text).not.toContain("msg_second");
+      expect(text).not.toContain("msg_third");
+      expect(await refusal([open("msg_first"), open("msg_second")])).toEndWith(
+        "; plus 1 more message.",
+      );
+    });
+
+    test("renders bounded, sanitized references and no stored content", async () => {
+      const id = `msg_\n\u202e<b>${"x".repeat(200)}`;
+      const part = running("prt_h", id, `tool\n<i>${"y".repeat(80)}`);
+      if (part.type !== "tool") throw new Error("Expected a tool part.");
+      Object.assign(part, { callID: `call\u0000 "q" ${"z".repeat(200)}` });
+      const stale = open(id, [
+        textPart("prt_text", id, `${canary} text`),
+        part,
+      ]);
+      Object.assign(stale.info, {
+        summary: canary,
+        path: { cwd: canary },
+        agent: canary,
+      });
+      const text = await refusal([stale], "Magic Trim");
+      expect(text).not.toContain(canary);
+      // The one line break separates the sentence from the record line.
+      expect(text.replace("\n", " ")).not.toMatch(/[\p{C}<>"]/u);
+      const [, messageLabel, toolLabel, callLabel] =
+        /assistant message (\S+); no completion time or error; running (\S+) call (\S+)\.$/u.exec(
+          text,
+        ) ?? [];
+      expect(messageLabel).toMatch(/^msg_\?+b\?x+\.\.\.$/u);
+      expect(toolLabel).toMatch(/^tool\?+i\?y+\.\.\.$/u);
+      expect(callLabel).toMatch(/^call\?+q\?+z+\.\.\.$/u);
+      expect(messageLabel).toHaveLength(64);
+      expect(toolLabel).toHaveLength(24);
+      expect(callLabel).toHaveLength(64);
+      // Every label at its cap: the longest this refusal can be, and short
+      // enough that the toast shows all of it.
+      expect(text.length).toBeLessThan(600);
+      const failure = await readHistory([stale], "Magic Trim").catch(
+        (caught: unknown) => caught,
+      );
+      expect(failureToast("Magic Trim", failure).message).toBe(text);
+    });
+
+    test("keeps a kept candidate and what to do about it ahead of the record in the longest toast", () => {
+      // The longest refusal (a subagent session, every label at its cap and
+      // a count of more messages) for the command with the longest guidance,
+      // raised while a candidate had to be kept. The toast cuts the end of
+      // long text, so the candidate's ID, that this run did not mark it ready
+      // and the action must come before the record line.
+      const label = (character: string, length: number) =>
+        character.repeat(length);
+      const refusal = unfinishedHistoryRefusal(
+        "Magic Trim",
+        [
+          {
+            messageID: label("m", 80),
+            kind: "assistant",
+            unfinished: true,
+            tool: {
+              name: label("t", 40),
+              callID: label("c", 80),
+              state: label("s", 30),
+              count: 3,
+            },
+          },
+          ...Array.from({ length: 12 }, () => ({
+            messageID: "msg_more",
+            kind: "message" as const,
+            unfinished: true,
+          })),
+        ],
+        label("p", 80),
+      );
+      const candidateID = `ses_${label("k", 26)}`;
+      const failure = successorFailure("Magic Trim", refusal, {
+        stage: "recheck",
+        sourceID: "source",
+        candidateID,
+      });
+      const full = commandFailureMessage("Magic Trim", failure);
+      const toast = failureToast("Magic Trim", failure);
+
+      // The person still gets the whole text: the sentence, the candidate,
+      // the record and the details line, in that order.
+      const candidateEnd = "inspect it or delete it manually.";
+      expect(full).toStartWith(refusal.statement);
+      expect(full).toContain(refusal.record!);
+      expect(full.indexOf(candidateID)).toBeLessThan(full.indexOf("\nRecord:"));
+      expect(full.indexOf(candidateEnd)).toBeLessThan(
+        full.indexOf("\nRecord:"),
+      );
+      expect(full).toEndWith("\nDetails: stage recheck.");
+      // The long text is cut, but only inside the record line.
+      expect(full.length).toBeGreaterThan(700);
+      expect(toast.message).toHaveLength(700);
+      expect(toast.message).toEndWith("...");
+      expect(toast.message).toContain(
+        `Successor candidate ${candidateID} was kept because it could not be confirmed as unmodified; this run did not mark it ready, so ${candidateEnd}`,
+      );
+      expect(toast.message.indexOf(candidateEnd)).toBeLessThan(
+        toast.message.indexOf("\nRecord:"),
+      );
+      expect(toast.message).toContain("\nRecord: subagent session ");
+      expect(toast.message).not.toMatch(/not ready|was deleted|is ready/u);
+      expect(toast.duration).toBe(700 * 50);
+    });
+
+    test("tells the user what to do when work is running and when nothing is", async () => {
+      const compact = await refusal([open("msg_open")]);
+      const trim = await refusal([open("msg_open")], "Magic Trim");
+      for (const text of [compact, trim]) {
+        expect(text).toContain(
+          "If work may still be running, wait and retry. Otherwise continue without",
+        );
+        expect(text).toContain("or in another session.");
+        expect(text).not.toMatch(/restart|database|compacting|repair it/iu);
+        expect(text).not.toContain("is still active");
+        expect(text).not.toContain("is running");
+      }
+      expect(trim).toContain(" `--heuristic` does not skip this check.");
+      expect(compact).not.toContain("--heuristic");
+    });
+
+    test("reports running work as running instead of stale history", async () => {
+      await expect(
+        readHistory([open("msg_open")], "Magic Compact", {
+          statuses: { source: { type: "busy" } },
+        }),
+      ).rejects.toThrow("but it is running.");
+      await expect(
+        readHistory([open("msg_open")], "Magic Compact", {
+          questions: [{ sessionID: "source" }],
+        }),
+      ).rejects.toThrow("but a question is waiting for an answer.");
+    });
+
+    test("accepts an assistant message that ended with an error and no completion time", async () => {
+      const failed = open("msg_failed");
+      Object.assign(failed.info, {
+        error: { name: "ContextOverflowError", data: { message: "overflow" } },
+      });
+      await expect(readHistory([failed])).resolves.toMatchObject({
+        session: { id: "source" },
+      });
+    });
+
+    test("refuses a command with an unfinished stored message before any generation or write", async () => {
+      const messages = [
+        open("msg_old", [running("prt_old", "msg_old")]),
+        ...compactableCommandMessages("later", "large output ".repeat(1_000)),
+      ];
+      const before = structuredClone(messages);
+      const harness = commandHarness(messages, {
+        generationResponse: { turns: [result(1, "Completed.")] },
+      });
+
+      await expect(
+        executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
+      ).rejects.toThrow(
+        "Record: assistant message msg_old; no completion time or error; running task call prt_old-call.",
+      );
+      expect(messages).toEqual(before);
+      expect(harness.forks).toEqual([]);
+      expect(harness.successors).toEqual([]);
+      expect(harness.sourceWrites).toEqual([]);
+      expect(await readStats("source")).toBeNull();
+    });
   });
 
   test("refuses a second command for the same source while the first runs", async () => {
@@ -5112,6 +5666,20 @@ describe("compaction orchestration", () => {
     ["model", { model: { id: "other-model", providerID: "other" } }],
     ["share", { share: { url: "https://example.invalid/s" } }],
     ["archive time", { time: { created: 1, updated: 1, archived: 5 } }],
+    [
+      "lineage marked ready",
+      {
+        metadata: {
+          magicCompact: {
+            compactionCount: 1,
+            successorOf: "source",
+            operation: "compact",
+            createdAt: 1,
+            ready: true,
+          },
+        },
+      },
+    ],
   ] as const)(
     "keeps a candidate whose %s another writer changed without touching its history",
     async (_name, header) => {
@@ -5127,7 +5695,7 @@ describe("compaction orchestration", () => {
       await expect(
         executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
       ).rejects.toThrow(
-        "could not verify its successor session (candidate was changed by another writer). The session was left unchanged. Successor candidate successor was kept",
+        "could not verify its successor session (candidate was changed by another writer). The original session was left unchanged. Successor candidate successor was kept",
       );
       expect(harness.deletedSessions).not.toContain("successor");
       expect(harness.successorMessages().length).toBeGreaterThan(0);
@@ -5137,6 +5705,11 @@ describe("compaction orchestration", () => {
         ),
       ).toBeFalse();
       expect(harness.sourceWrites).toEqual([]);
+      // Another writer may have marked the candidate ready, so the message
+      // says only that this run did not.
+      const shown = harness.toasts.at(-1)?.message ?? "";
+      expect(shown).toContain("this run did not mark it ready");
+      expect(shown).not.toMatch(/\bnot ready\b|is not ready/u);
     },
   );
 
@@ -5236,6 +5809,14 @@ describe("compaction orchestration", () => {
       });
       expect((error as SuccessorFailure).details.code).toBeUndefined();
       expect(error).not.toHaveProperty("cause");
+      // The toast keeps the stage the error's message does not carry.
+      expect(harness.toasts.at(-1)).toMatchObject({
+        title: "Magic Compact Failed",
+        variant: "error",
+      });
+      expect(harness.toasts.at(-1)?.message).toStartWith(
+        `${(error as Error).message}\nDetails: stage ${stage}`,
+      );
       const leaked = [
         ...reachableStrings(error),
         ...reachableStrings(harness.toasts),
@@ -5243,6 +5824,45 @@ describe("compaction orchestration", () => {
       expect(leaked.filter(value => value.includes(PRIVATE_SENTINEL))).toEqual(
         [],
       );
+    },
+  );
+
+  test.each([
+    ["create", { create: 503 }, "create", "HTTP 503"],
+    ["ready", { update: 429 }, "ready", "HTTP 429"],
+  ] as const)(
+    "keeps the HTTP status of a refused successor %s call and nothing else of its response",
+    async (_name, successorHostRefusals, stage, status) => {
+      const messages = compactableCommandMessages(
+        "refused",
+        "large output ".repeat(1_000),
+      );
+      const harness = commandHarness(messages, {
+        generationResponse: { turns: [result(1, "Completed.")] },
+        successorHostRefusals,
+      });
+
+      const error = await executeMagicCompact(
+        harness.v2,
+        "source",
+        0,
+        HEURISTIC_OPTIONS,
+      ).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(SuccessorFailure);
+      expect((error as SuccessorFailure).details).toMatchObject({
+        stage,
+        status: Number(status.slice(5)),
+      });
+      expect(harness.toasts.at(-1)?.message).toEndWith(
+        `\nDetails: stage ${stage}, ${status}.`,
+      );
+      expect(
+        [
+          ...reachableStrings(error),
+          ...reachableStrings(harness.toasts),
+        ].filter(value => value.includes(PRIVATE_SENTINEL)),
+      ).toEqual([]);
     },
   );
 
@@ -5292,7 +5912,7 @@ describe("compaction orchestration", () => {
       sourceID: "source",
     });
     expect(failure.message).toBe(
-      "Magic Trim could not finish preparing its successor session. The session was left unchanged.",
+      "Magic Trim could not finish preparing its successor session. The original session was left unchanged.",
     );
     expect(failure.details).toEqual({
       stage: "import",
@@ -5312,6 +5932,120 @@ describe("compaction orchestration", () => {
         sourceID: "source",
       }).details.detail,
     ).toBe("history replay failed");
+  });
+
+  test("shows failures as the plugin's own text, with successor details, and never a host or dependency error's text", () => {
+    // A kept candidate is never described as removed or as ready; this run
+    // did not mark it ready, and another writer may have.
+    const kept = successorFailure(
+      "Magic Trim",
+      Object.assign(new Error("x"), { status: 503, code: "ENOSPC" }),
+      { stage: "cache", sourceID: "source", candidateID: "ses_kept" },
+    );
+    expect(commandFailureMessage("Magic Trim", kept)).toBe(
+      "Magic Trim could not finish preparing its successor session. The original session was left unchanged. Successor candidate ses_kept was kept because it could not be confirmed as unmodified; this run did not mark it ready, so inspect it or delete it manually.\nDetails: stage cache, HTTP 503, ENOSPC.",
+    );
+    // After the ready update was sent the candidate may be the successor.
+    const unconfirmed = successorFailure("Magic Compact", new Error("x"), {
+      stage: "ready",
+      sourceID: "source",
+      candidateID: "ses_maybe",
+      readyAttempted: true,
+    });
+    expect(commandFailureMessage("Magic Compact", unconfirmed)).toBe(
+      "Magic Compact could not confirm that successor session ses_maybe became ready. The original session was left unchanged; inspect ses_maybe before continuing in it.\nDetails: stage ready.",
+    );
+    // The plugin's own errors keep their message and lose their class name.
+    expect(
+      commandFailureMessage(
+        "Magic Compact",
+        new SourceChangedError("Magic Compact"),
+      ),
+    ).toBe(new SourceChangedError("Magic Compact").message);
+    expect(
+      commandFailureMessage(
+        "Magic Trim",
+        new RetentionClassificationError("missing-api-key"),
+      ),
+    ).toStartWith(
+      "Task-aware retention requires TYPESAFE_API_KEY in the OpenCode server environment.",
+    );
+    expect(
+      commandFailureMessage("Magic Trim", new PluginMessageError(PLUGIN_TEXT)),
+    ).toBe(PLUGIN_TEXT);
+
+    // Host, system, client and runtime errors show only a classified status
+    // and allowlisted code.
+    const foreign = [
+      privateHostError(),
+      Object.assign(new Error(`ENOENT: open '/home/${PRIVATE_SENTINEL}'`), {
+        code: "ENOENT",
+        errno: -2,
+        path: `/home/${PRIVATE_SENTINEL}`,
+      }),
+      Object.assign(new Error(`Transport: ${PRIVATE_SENTINEL}`), {
+        reason: "Transport",
+      }),
+      Object.assign(new Error(PRIVATE_SENTINEL), {
+        _tag: "SessionNotFoundError",
+        data: { message: PRIVATE_SENTINEL },
+      }),
+      new TypeError(`fetch failed ${PRIVATE_SENTINEL}`),
+      PRIVATE_SENTINEL,
+      { message: PRIVATE_SENTINEL },
+      new Error(""),
+      // Only a mark makes a message the plugin's own. A plain error is not,
+      // whatever it looks like, and neither is a lookalike of a plugin error.
+      new Error(`Plain ${PRIVATE_SENTINEL}`),
+      Object.assign(new Error(PRIVATE_SENTINEL), {
+        name: "SourceNotAtRestError",
+      }),
+      Object.assign(new RangeError("x"), {
+        cause: new PluginMessageError(PLUGIN_TEXT),
+      }),
+      dependencyError(),
+    ];
+    const shown = foreign.map(error =>
+      commandFailureMessage("Magic Compact", error),
+    );
+    for (const text of shown) {
+      expect(text).not.toContain(PRIVATE_SENTINEL);
+      expect(text).toStartWith("Magic Compact stopped on an unexpected error");
+      expect(text).toContain("The original session was left unchanged.");
+    }
+    expect(shown[0]).toBe(
+      "Magic Compact stopped on an unexpected error (HTTP 200). The original session was left unchanged. Retry; if it fails again, check the OpenCode server log.",
+    );
+    expect(shown[1]).toContain("(ENOENT)");
+    // The tokenizer dependency's own error text never reaches a person.
+    expect(shown.at(-1)).not.toContain("Disallowed special token");
+    expect(shown.at(-1)).not.toContain(SPECIAL_TOKEN);
+  });
+
+  test("keeps a failure toast up for as long as its text takes to read", () => {
+    const toast = (text: string) =>
+      failureToast("Magic Trim", new PluginMessageError(text));
+    // Short text keeps the 8-second floor; longer text gets 50 ms a character.
+    expect(toast("Short.").duration).toBe(8_000);
+    expect(toast("x".repeat(300))).toMatchObject({
+      message: "x".repeat(300),
+      duration: 15_000,
+    });
+    const listener = failureToast(
+      "Magic Compact",
+      new PluginMessageError(LISTENER_REQUIRED),
+    );
+    expect(listener).toEqual({
+      title: "Magic Compact Failed",
+      message: LISTENER_REQUIRED,
+      variant: "error",
+      duration: LISTENER_REQUIRED.length * 50,
+    });
+    // The shown text is bounded, and the time covers all of it.
+    const long = toast("y".repeat(5_000));
+    expect(long.message).toHaveLength(700);
+    expect(long.message).toEndWith("...");
+    expect(long.duration).toBe(700 * 50);
   });
 
   describe("background subagents", () => {
@@ -6514,12 +7248,26 @@ async function settleWithin<T>(promise: Promise<T>, timeoutMs: number) {
   ]);
 }
 
+type GenerationForkFault =
+  "read-failed" | "cut-not-empty" | "replay-failed" | "replay-mismatch";
+
+const generationForkOrdinal = (sessionID: string): number | undefined => {
+  if (sessionID === "generation-fork") return 1;
+  const match = /^generation-fork-(\d+)$/u.exec(sessionID);
+  return match ? Number(match[1]) : undefined;
+};
+
 type CommandHarnessOptions = {
   generationResponse: GenerationResponse;
   generationErrorForFirstOrdinal?: number;
   generationErrorsByFirstOrdinal?: Record<number, Error>;
   generationAbortErrorForFirstOrdinal?: number;
   generationDeleteErrorForFirstOrdinal?: number;
+  // How the numbered (1-based) generation fork fails while it is populated,
+  // before any prompt.
+  generationForkFaults?: Record<number, GenerationForkFault>;
+  // Every generation fork deletion is rejected, so a failed fork is orphaned.
+  generationForkDeleteFails?: boolean;
   holdGenerationPromptsUntil?: number;
   transformGenerationResponse?: (
     response: GenerationResponse,
@@ -6546,6 +7294,9 @@ type CommandHarnessOptions = {
   successorHostErrors?: Partial<
     Record<"create" | "replay" | "update" | "delete", unknown>
   >;
+  // The host answers the successor call with an error body and this HTTP
+  // status, as the SDK client does, instead of throwing.
+  successorHostRefusals?: Partial<Record<"create" | "update", number>>;
   generationGate?: Promise<void>;
   toastMode?: "hang" | "fail" | "delay-progress";
 };
@@ -6656,12 +7407,21 @@ function commandHarness(
           parentID: request.sessionID,
         })),
       }),
-      messages: async (request: { sessionID: string }) => ({
-        data:
-          request.sessionID === "source"
-            ? structuredClone(messages)
-            : history.read(request.sessionID),
-      }),
+      messages: async (request: { sessionID: string }) => {
+        const fault =
+          options.generationForkFaults?.[
+            generationForkOrdinal(request.sessionID) ?? 0
+          ];
+        if (fault === "read-failed") throw new Error("raw read payload");
+        return {
+          data:
+            request.sessionID === "source"
+              ? structuredClone(messages)
+              : fault === "cut-not-empty"
+                ? structuredClone(messages.slice(0, 1))
+                : history.read(request.sessionID),
+        };
+      },
       fork: async (request: { messageID?: string }) => {
         history.delete("source");
         messages.forEach((item, index) => history.write(item, index));
@@ -6679,6 +7439,12 @@ function commandHarness(
         createRequests.push(request);
         if (options.successorHostErrors?.create !== undefined)
           throw options.successorHostErrors.create;
+        if (options.successorHostRefusals?.create !== undefined) {
+          return {
+            error: { message: PRIVATE_SENTINEL },
+            response: { status: options.successorHostRefusals.create },
+          };
+        }
         const id =
           successorCount++ === 0 ? "successor" : `successor-${successorCount}`;
         successors.push(id);
@@ -6712,6 +7478,16 @@ function commandHarness(
           && options.successorHostErrors?.update !== undefined
         ) {
           throw options.successorHostErrors.update;
+        }
+        if (
+          successors.includes(sessionID)
+          && request.metadata !== undefined
+          && options.successorHostRefusals?.update !== undefined
+        ) {
+          return {
+            error: { message: PRIVATE_SENTINEL },
+            response: { status: options.successorHostRefusals.update },
+          };
         }
         const info = {
           ...(sessionInfo.get(sessionID) ?? {
@@ -6807,6 +7583,9 @@ function commandHarness(
         deletedSessions.push(request.sessionID);
         if (request.sessionID.startsWith("generation-fork")) {
           events.push("generation-delete");
+          if (options.generationForkDeleteFails) {
+            throw new Error("raw fork delete payload");
+          }
           if (
             options.generationDeleteErrorForFirstOrdinal !== undefined
             && generationFirstOrdinalByFork.get(request.sessionID)
@@ -6850,6 +7629,13 @@ function commandHarness(
         events: Parameters<typeof history.replay>[0];
       }) => {
         const target = request.events[0]!.aggregateID;
+        const forkFault =
+          options.generationForkFaults?.[generationForkOrdinal(target) ?? 0];
+        if (forkFault === "replay-failed")
+          throw new Error("raw replay payload");
+        if (forkFault === "replay-mismatch") {
+          return { data: { sessionID: target } };
+        }
         if (
           successors.includes(target)
           && options.failSuccessorReplay !== undefined
@@ -7230,4 +8016,18 @@ function withoutIdentity(messages: MessageWithParts[]): unknown[] {
     delete info["parentID"];
     return { info, parts: item.parts.map(withoutPartIdentity) };
   });
+}
+
+// The plugin input's own client, recording the toasts sent through it.
+function hostToastClient() {
+  const toasts: unknown[] = [];
+  const client = {
+    tui: {
+      showToast: async (options: { body: unknown }) => {
+        toasts.push(options.body);
+        return { data: true };
+      },
+    },
+  };
+  return { client, toasts };
 }

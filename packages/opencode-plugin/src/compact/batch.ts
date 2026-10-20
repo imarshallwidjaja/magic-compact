@@ -2,6 +2,7 @@ import type { FilePart, Part } from "@opencode-ai/sdk/v2";
 import { countGptTokens } from "../stats/tokenize";
 import { isRecord } from "../util";
 import type { MessageWithParts, Turn } from "./plan";
+import { PluginMessageError } from "../policy/feedback";
 
 export const NATIVE_BATCH_MAX_CONCURRENCY = 5;
 export const NATIVE_BATCH_NORMAL_INPUT_TARGET = 400_000;
@@ -49,7 +50,7 @@ export function computeNativeBatchBudget(limit: {
   output?: number;
 }): NativeBatchBudget {
   if (!Number.isFinite(limit.context) || limit.context <= 0) {
-    throw new Error(
+    throw new PluginMessageError(
       "Magic Compact requires a positive configured compaction model context limit.",
     );
   }
@@ -70,13 +71,13 @@ export function computeNativeBatchBudget(limit: {
     Math.min(configuredInput, context - outputTarget),
   );
   if (usableInput <= NATIVE_BATCH_FIXED_RESERVE_TOKENS) {
-    throw new Error(
+    throw new PluginMessageError(
       "Magic Compact configured compaction model has no usable input budget.",
     );
   }
   const hardSingleTurnInput = Math.floor(usableInput * 0.9);
   if (hardSingleTurnInput <= NATIVE_BATCH_FIXED_RESERVE_TOKENS) {
-    throw new Error(
+    throw new PluginMessageError(
       "Magic Compact configured compaction model input budget is too small to fit the fixed host reserve.",
     );
   }
@@ -157,7 +158,7 @@ export function planNativeGenerationBatches<T extends NativeTurnCost>(
     NATIVE_BATCH_FIXED_RESERVE_TOKENS + emptyRequestTokens
     > budget.usableInput
   ) {
-    throw new Error(
+    throw new PluginMessageError(
       "Magic Compact explicit request and global turn index cannot fit the configured model input budget. Run /magic-trim first or configure a compaction model with more input capacity.",
     );
   }
@@ -173,12 +174,12 @@ export function planNativeGenerationBatches<T extends NativeTurnCost>(
       Math.ceil(protocol.responseProtocolTokens([candidate]))
       + Math.ceil(candidate.outputTokens);
     if (estimatedInputTokens > budget.hardSingleTurnInput) {
-      throw new Error(
+      throw new PluginMessageError(
         "A single compaction turn cannot fit the configured model input. Run /magic-trim first and retry.",
       );
     }
     if (estimatedOutputTokens > budget.outputTarget) {
-      throw new Error(
+      throw new PluginMessageError(
         `A single compaction turn cannot fit the configured ${budget.outputTarget}-token output target. Configure a compaction model with more output capacity.`,
       );
     }

@@ -6,6 +6,7 @@ import type { SessionInfo } from "@opencode/client";
 import type { V2Host } from "../src/v2/host";
 import type { OwnedSessions } from "../src/v2/owned";
 import type { V2Message } from "../src/v2/session";
+import { countGptTokens } from "../src/stats/tokenize";
 
 export type FakeReply =
   | { text: string }
@@ -130,6 +131,19 @@ export function reachableStrings(value: unknown): string[] {
 // message, a spoofed plugin error name, an uppercase code, an out-of-range
 // status, a response body, custom data, and a nested cause.
 export const PRIVATE_SENTINEL = "PRIVATE_SENTINEL_7F3A";
+// What the tokenizer dependency (gpt-tokenizer 3.4.0) throws for a literal
+// special token: a plain `Error` with no code or other field, so only a mark
+// tells it from an error this plugin raised.
+export const SPECIAL_TOKEN = "<|endoftext|>";
+export function dependencyError(): unknown {
+  try {
+    countGptTokens(SPECIAL_TOKEN);
+  } catch (error) {
+    return error;
+  }
+  throw new Error("The tokenizer accepted the special token it refuses.");
+}
+
 export function privateHostError(): Error {
   const error = new Error(
     `host body ${PRIVATE_SENTINEL} at /home/${PRIVATE_SENTINEL}/x`,

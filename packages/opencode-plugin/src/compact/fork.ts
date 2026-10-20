@@ -2,6 +2,7 @@ import type { Message, Part, Session } from "@opencode-ai/sdk/v2";
 import { randomBytes, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { V2Client } from "../api";
+import { markPluginMessage, type LeavesSessions } from "../policy/feedback";
 import { ContentFreeError } from "../policy/successor";
 import { attemptWithinDeadline, CONTROL_OPERATION_TIMEOUT_MS } from "../util";
 import { snapshotSourceMessages, type MessageWithParts } from "./plan";
@@ -33,15 +34,21 @@ export class ForkHistoryError extends ContentFreeError {
   }
 }
 
-// Already sanitized; callers must retain the owned ID needed for cleanup.
-export class ForkCleanupError extends AggregateError {
+// Already sanitized; callers must retain the owned ID needed for cleanup. The
+// fork ID is `undeletedSessionIDs`, not a reason, so an aggregate of several
+// failed forks names every one however many reasons it explains.
+export class ForkCleanupError extends AggregateError implements LeavesSessions {
+  readonly undeletedSessionIDs: readonly string[];
+
   constructor(sourceID: string, forkID: string, reason: ForkFailureReason) {
     const failure = new ForkHistoryError(reason);
     super(
-      [failure, new Error(`Partial fork ${forkID} could not be deleted.`)],
+      [failure],
       `Magic Compact chronological fork initialization and cleanup failed (${failure.detail}). Source session ${sourceID} was left unchanged; delete partial fork ${forkID} manually.`,
     );
     this.name = "ForkCleanupError";
+    this.undeletedSessionIDs = [forkID];
+    markPluginMessage(this);
   }
 }
 

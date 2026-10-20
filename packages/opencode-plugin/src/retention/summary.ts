@@ -20,6 +20,11 @@ import {
   resolveCompactionSettings,
   type CompactionSettings,
 } from "../compact/compact";
+import {
+  hasPluginMessage,
+  markPluginMessage,
+  PluginMessageError,
+} from "../policy/feedback";
 import { isContextOverflow, safeStatus } from "../policy/generation";
 import {
   assertForkMessageShape,
@@ -115,9 +120,10 @@ export async function generateSessionSummary(
     if (requiresImages) assertConfiguredModelSupportsImages(settings);
     budget = computeNativeBatchBudget(settings.descriptor.limit);
   } catch (error) {
-    // These configuration messages are fixed text without session content.
-    throw new Error(
-      `${error instanceof Error ? error.message : "Magic Compact could not resolve its summarizer agent."} ${RETENTION_FAILURE_GUIDANCE}`,
+    // Only this plugin's own configuration messages, which are fixed text
+    // without session content, are repeated.
+    throw new PluginMessageError(
+      `${hasPluginMessage(error) ? error.message : "Magic Compact could not resolve its summarizer agent."} ${RETENTION_FAILURE_GUIDANCE}`,
       { cause: error },
     );
   }
@@ -141,10 +147,12 @@ export async function generateSessionSummary(
     fork = await forkSession(v2, session, messages, controlTimeoutMs);
   } catch (error) {
     if (error instanceof ForkCleanupError) {
-      throw new AggregateError(
-        [error, new SessionSummaryError("history")],
-        `${error.message} ${RETENTION_FAILURE_GUIDANCE}`,
-        { cause: error },
+      throw markPluginMessage(
+        new AggregateError(
+          [error, new SessionSummaryError("history")],
+          `${error.message} ${RETENTION_FAILURE_GUIDANCE}`,
+          { cause: error },
+        ),
       );
     }
     throw new SessionSummaryError(
@@ -256,10 +264,12 @@ export async function generateSessionSummary(
   const failures = [...(failure ? [failure] : []), ...cleanupFailures];
   if (failures.length === 1) throw failures[0];
   if (failures.length > 1) {
-    throw new AggregateError(
-      failures,
-      `Task-aware retention session summary and fork cleanup failed (${failures.map(item => item.stage).join(", ")}). ${RETENTION_FAILURE_GUIDANCE}`,
-      { cause: failures[0] },
+    throw markPluginMessage(
+      new AggregateError(
+        failures,
+        `Task-aware retention session summary and fork cleanup failed (${failures.map(item => item.stage).join(", ")}). ${RETENTION_FAILURE_GUIDANCE}`,
+        { cause: failures[0] },
+      ),
     );
   }
   return summary!;

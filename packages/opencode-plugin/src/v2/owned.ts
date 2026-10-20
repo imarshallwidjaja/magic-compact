@@ -32,6 +32,7 @@ import {
   type V2Message,
   type V2Source,
 } from "./session";
+import { hasPluginMessage, PluginMessageError } from "../policy/feedback";
 
 // `generation` sessions run one per-turn summary request and may call the
 // response tool; `retention` sessions run the whole-session summary and may
@@ -140,7 +141,7 @@ export async function resolveV2Summarizer(
   const model =
     outcome.kind === "success" ? outcome.value.data.model : undefined;
   if (!model) {
-    throw new Error(
+    throw new PluginMessageError(
       `Magic Compact needs a model on the \`${MAGIC_COMPACT_SUMMARIZER_AGENT}\` agent. Set \`agents.${MAGIC_COMPACT_SUMMARIZER_AGENT}.model\` (for example \`provider/model#variant\`) in opencode.json.`,
     );
   }
@@ -167,7 +168,7 @@ export async function resolveV2SummarizerModel(
         )
       : undefined;
   if (!info) {
-    throw new Error(
+    throw new PluginMessageError(
       "Magic Compact could not resolve the configured compaction model descriptor.",
     );
   }
@@ -203,13 +204,14 @@ export async function generateV2SessionSummary(
       requiresImages
       && !summarizer.info.capabilities.input.includes("image")
     ) {
-      throw new Error(V2_IMAGE_MODEL_REQUIRED);
+      throw new PluginMessageError(V2_IMAGE_MODEL_REQUIRED);
     }
     budget = computeNativeBatchBudget(summarizer.info.limit);
   } catch (error) {
-    // These configuration messages are fixed text without session content.
-    throw new Error(
-      `${error instanceof Error ? error.message : "Magic Compact could not resolve its summarizer model."} ${RETENTION_FAILURE_GUIDANCE}`,
+    // Only this plugin's own configuration messages, which are fixed text
+    // without session content, are repeated.
+    throw new PluginMessageError(
+      `${hasPluginMessage(error) ? error.message : "Magic Compact could not resolve its summarizer model."} ${RETENTION_FAILURE_GUIDANCE}`,
       { cause: error },
     );
   }
@@ -305,7 +307,7 @@ export async function generateV2SessionSummary(
   }
   if (failures.length === 1) throw new SessionSummaryError(failures[0]!);
   if (failures.length > 1) {
-    throw new Error(
+    throw new PluginMessageError(
       `Task-aware retention session summary and cleanup failed (${failures.join(", ")}). ${RETENTION_FAILURE_GUIDANCE}`,
     );
   }

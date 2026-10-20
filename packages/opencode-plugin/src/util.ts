@@ -1,4 +1,6 @@
 import { unwrap, type V2Client } from "./api";
+import { commandFailureMessage } from "./commands";
+import type { SuccessorCommand } from "./policy/successor";
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -17,6 +19,29 @@ export type MagicToast = {
   variant: "info" | "error";
   duration?: number;
 };
+
+// A failure toast stays up for 50 ms per character of the text it shows, at
+// least 8 seconds. The text is cut at 700 characters, which bounds the time
+// at 35 seconds; the plugin's own messages, even with every reference at its
+// cap, stay under that.
+const FAILURE_TOAST_MAX_CHARACTERS = 700;
+
+export function failureToast(
+  command: SuccessorCommand,
+  error: unknown,
+): MagicToast {
+  const full = commandFailureMessage(command, error);
+  const message =
+    full.length > FAILURE_TOAST_MAX_CHARACTERS
+      ? `${full.slice(0, FAILURE_TOAST_MAX_CHARACTERS - 3)}...`
+      : full;
+  return {
+    title: `${command} Failed`,
+    message,
+    variant: "error",
+    duration: Math.max(8_000, message.length * 50),
+  };
+}
 
 const DEADLINE_REASON = Symbol("magic-compact control deadline");
 

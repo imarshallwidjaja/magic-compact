@@ -2,6 +2,7 @@
 // this module only asks TypeSafe Jev whether each candidate's content is
 // useful for the current task, and a candidate is kept whole only when the
 // probability clears the keep threshold. See docs/RetentionEvaluation.md.
+import { PluginMessageError } from "../policy/feedback";
 
 // The threshold was chosen against this exact model version, so the version
 // is pinned rather than using the moving `jev-latest` alias.
@@ -126,7 +127,7 @@ export const RETENTION_FAILURE_GUIDANCE =
 
 // Public messages are fixed text plus an optional HTTP status. They never
 // carry request state, response bodies, credentials, or the rejected value.
-export class RetentionClassificationError extends Error {
+export class RetentionClassificationError extends PluginMessageError {
   constructor(
     readonly kind: RetentionFailureKind,
     readonly status?: number,

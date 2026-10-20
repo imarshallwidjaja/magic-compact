@@ -52,6 +52,7 @@ import {
   readStats,
   writeStats,
 } from "../src/storage/stats";
+import { SourceNotAtRestError } from "../src/policy/successor";
 import { planToolTrim, type ToolRuleCategory } from "../src/policy/tool-rules";
 import { trimStatsMessage } from "../src/stats/constants";
 import {
@@ -1161,6 +1162,64 @@ describe("magic trim task-aware retention", () => {
         expect(harness.toasts.at(-1)?.message).toContain(
           "/magic-trim --heuristic",
         );
+      } finally {
+        await cleanupTrimSessions(sessionID, ...harness.created);
+      }
+    },
+  );
+
+  test.each([
+    ["heuristic", HEURISTIC_OPTIONS],
+    [
+      "task-aware",
+      {
+        retention: {
+          mode: "task-aware",
+          apiKey: "test-key",
+          fetch: async () => {
+            throw new Error("unexpected classifier request");
+          },
+        },
+      },
+    ],
+  ] as const)(
+    "refuses a stored unfinished tool call in %s mode before any retention or write",
+    async (_name, options) => {
+      const sessionID = `ses_trim_unfinished_${randomUUID().replaceAll("-", "")}`;
+      const stale = completedTool("tool_stale", "task", "never delivered");
+      stale.state = { status: "running", input: {}, time: { start: 1 } };
+      const messages = [
+        message("usr_1", "user", [userText("usr_1", "Add the parser.")]),
+        message("ast_old", "assistant", [stale]),
+        message("usr_2", "user", [userText("usr_2", "Continue.")]),
+        message("ast_1", "assistant", [
+          readTool("tool_read", "large output ".repeat(100)),
+        ]),
+      ];
+      const harness = trimCommandHarness(sessionID, messages);
+      const before = structuredClone(messages);
+      let failure: unknown;
+
+      try {
+        try {
+          await executeMagicTrim(harness.v2, sessionID, 0, options);
+        } catch (error) {
+          failure = error;
+        }
+
+        expect(failure).toBeInstanceOf(SourceNotAtRestError);
+        expect(String(failure)).toEndWith(
+          "Record: assistant message ast_old; running task call call_tool_stale.",
+        );
+        expect(messages).toEqual(before);
+        expect(harness.created).toEqual([]);
+        expect(harness.forks).toEqual([]);
+        expect(harness.modelCalls).toEqual([]);
+        expect(harness.sourceWrites).toEqual([]);
+        // The toast shows the refusal itself, without the error's class name.
+        expect(harness.toasts.at(-1)?.message).toBe((failure as Error).message);
+        expect(await readCache(sessionID)).toBeNull();
+        expect(await readStats(sessionID)).toBeNull();
       } finally {
         await cleanupTrimSessions(sessionID, ...harness.created);
       }

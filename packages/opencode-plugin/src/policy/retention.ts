@@ -13,6 +13,7 @@ import {
   type RetentionCandidate,
   type RetentionFetch,
 } from "../retention/classifier";
+import { PluginMessageError } from "./feedback";
 import { toolTrimChangesContent, type ToolCallView } from "./tool-rules";
 
 export type RetentionPolicy =
@@ -203,7 +204,7 @@ export type SessionSummaryStage =
 
 // Messages are fixed text plus an optional HTTP status; they never carry
 // session content, model output, or provider bodies.
-export class SessionSummaryError extends Error {
+export class SessionSummaryError extends PluginMessageError {
   constructor(
     readonly stage: SessionSummaryStage,
     readonly status?: number,

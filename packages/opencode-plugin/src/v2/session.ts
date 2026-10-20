@@ -11,8 +11,10 @@ import {
   SourceNotAtRestError,
   successorFailure,
   SuccessorVerificationError,
+  unfinishedHistoryRefusal,
   type SuccessorCommand,
   type SuccessorStage,
+  type UnfinishedHistoryRecord,
 } from "../policy/successor";
 import {
   commitPlannedOmission,
@@ -23,6 +25,7 @@ import {
 import { deleteStats, readStats, writeStats } from "../storage/stats";
 import { attemptWithinDeadline, isRecord } from "../util";
 import type { V2Host } from "./host";
+import { PluginMessageError } from "../policy/feedback";
 
 export type V2Message = SessionMessageInfo;
 
@@ -48,7 +51,7 @@ async function within<T>(
 ): Promise<T> {
   const outcome = await attemptWithinDeadline(request, controlTimeoutMs);
   if (outcome.kind !== "success") {
-    throw new Error(
+    throw new PluginMessageError(
       `${command} could not read the session state it needs to check that the session is at rest. The session was left unchanged.`,
     );
   }
@@ -127,7 +130,7 @@ export async function readV2SourceAtRest(
     host.session.get({ sessionID }, { signal }),
   );
   if (session.parentID) {
-    throw new Error(
+    throw new PluginMessageError(
       `${command} runs only on a root session; this is a subagent session. Run it from the parent session.`,
     );
   }
@@ -156,9 +159,18 @@ export async function readV2SourceAtRest(
   const jobs: BackgroundJob[] = [];
   for (const [id, history] of tree) {
     const child = id !== sessionID;
-    if (active[id] !== undefined || history.some(messageIsActive)) {
+    if (active[id] !== undefined) {
       throw notAtRest(
         child ? "one of its subagent sessions is running" : "it is running",
+      );
+    }
+    // Not active, so what remains is history the host never finished.
+    const unfinished = history.flatMap(unfinishedRecord);
+    if (unfinished.length > 0) {
+      throw unfinishedHistoryRefusal(
+        command,
+        unfinished,
+        child ? id : undefined,
       );
     }
     const started = deliveredBackgroundJobs(history);
@@ -232,29 +244,43 @@ async function readHistoryOrRefuse(
     // The host's own error is dropped: it may carry bodies or paths.
     throw error instanceof Error && error.message.startsWith(command)
       ? error
-      : new Error(
+      : new PluginMessageError(
           `${command} could not read a complete session history. The session was left unchanged.`,
         );
   }
 }
 
-function messageIsActive(message: V2Message): boolean {
+function unfinishedRecord(message: V2Message): UnfinishedHistoryRecord[] {
   switch (message.type) {
-    case "assistant":
-      return (
-        (message.time.completed === undefined && message.error === undefined)
-        || message.content.some(
-          item =>
-            item.type === "tool"
-            && item.state.status !== "completed"
-            && item.state.status !== "error",
-        )
+    case "assistant": {
+      const unfinished =
+        message.time.completed === undefined && message.error === undefined;
+      const tools = message.content.flatMap(item =>
+        item.type === "tool"
+        && item.state.status !== "completed"
+        && item.state.status !== "error"
+          ? [{ name: item.name, callID: item.id, state: item.state.status }]
+          : [],
       );
+      if (!unfinished && tools.length === 0) return [];
+      return [
+        {
+          messageID: message.id,
+          kind: "assistant",
+          unfinished,
+          ...(tools.length === 0
+            ? {}
+            : { tool: { ...tools[0]!, count: tools.length } }),
+        },
+      ];
+    }
     case "compaction":
     case "shell":
-      return message.status === "running";
+      return message.status === "running"
+        ? [{ messageID: message.id, kind: message.type, unfinished: true }]
+        : [];
     default:
-      return false;
+      return [];
   }
 }
 

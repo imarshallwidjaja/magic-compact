@@ -5,6 +5,7 @@ import {
 } from "@opencode-ai/sdk/v2/client";
 import { randomUUID } from "node:crypto";
 import { attemptWithinDeadline, CONTROL_OPERATION_TIMEOUT_MS } from "./util";
+import { PluginMessageError } from "./policy/feedback";
 
 export type V2Client = OpencodeClient;
 
@@ -23,7 +24,7 @@ export function unwrap<T, E>(response: { data?: T; error?: E }): T {
 export const LISTENER_IDENTITY_AGENT = "magic-compact-listener-identity";
 
 export const LISTENER_REQUIRED =
-  "Magic Compact needs this OpenCode instance's HTTP listener to create a successor session, and could not prove that the listener at the plugin's server URL belongs to this instance. Start OpenCode with a listener, for example `opencode --port 0`, or run `opencode serve` and connect with `opencode attach`. If the server uses basic auth, set OPENCODE_SERVER_PASSWORD (and OPENCODE_SERVER_USERNAME when it is not `opencode`) in the server environment.";
+  "Magic Compact and Magic Trim need this OpenCode instance's HTTP listener to create a successor session, and it could not be verified. Nothing was changed. Restart OpenCode with `opencode --port 0`, or run `opencode serve` and connect with `opencode attach`. With basic auth, set OPENCODE_SERVER_PASSWORD (and OPENCODE_SERVER_USERNAME if not `opencode`) in the server environment.";
 
 export type ListenerIdentity = {
   readonly description: string;
@@ -82,7 +83,7 @@ export async function connectListener(
     config?.agent?.[LISTENER_IDENTITY_AGENT]?.description
     !== identity.description
   ) {
-    throw new Error(LISTENER_REQUIRED);
+    throw new PluginMessageError(LISTENER_REQUIRED);
   }
   return client;
 }

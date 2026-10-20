@@ -25,8 +25,10 @@ import { countModelFacingContentTokens } from "./stats/tokenize";
 import {
   CONTROL_OPERATION_TIMEOUT_MS,
   createToastFeedback,
+  failureToast,
   IN_PROGRESS_TOAST_DURATION_MS,
 } from "./util";
+import { PluginMessageError } from "./policy/feedback";
 
 const COMMAND = "Magic Trim";
 
@@ -141,7 +143,7 @@ export async function executeMagicTrim(
       });
       const actual = countModelFacingContentTokens(successor.messages).tokens;
       if (actual !== after.tokens) {
-        throw new Error(
+        throw new PluginMessageError(
           `Trim final canonical active token count did not match its projection in successor session ${successor.session.id} (projected ${after.tokens}, actual ${actual}).`,
         );
       }
@@ -169,12 +171,7 @@ export async function executeMagicTrim(
     });
     return outcome.successor;
   } catch (error) {
-    await toastFeedback.showTerminal({
-      title: "Magic Trim Failed",
-      message: String(error),
-      variant: "error",
-      duration: 8000,
-    });
+    await toastFeedback.showTerminal(failureToast(COMMAND, error));
     throw error;
   }
 }

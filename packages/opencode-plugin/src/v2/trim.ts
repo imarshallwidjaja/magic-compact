@@ -34,6 +34,7 @@ import {
   type V2Message,
   type V2Successor,
 } from "./session";
+import { PluginMessageError } from "../policy/feedback";
 
 const COMMAND = "Magic Trim";
 
@@ -163,7 +164,7 @@ export async function executeV2Trim(
       actual.tokens !== after.tokens
       || actual.projectedMediaTokens !== after.projectedMediaTokens
     ) {
-      throw new Error(
+      throw new PluginMessageError(
         `Trim final canonical active token count did not match its projection in successor session ${successor.session.id} (projected ${after.tokens}, actual ${actual.tokens}).`,
       );
     }

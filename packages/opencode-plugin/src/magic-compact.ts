@@ -43,6 +43,7 @@ import {
 import {
   CONTROL_OPERATION_TIMEOUT_MS,
   createToastFeedback,
+  failureToast,
   IN_PROGRESS_TOAST_DURATION_MS,
 } from "./util";
 import {
@@ -53,6 +54,7 @@ import {
   type RetentionPlan,
   type RetentionPolicy,
 } from "./retention/retention";
+import { PluginMessageError } from "./policy/feedback";
 
 export { COMPACT_NOOP, compactSuccess } from "./commands";
 export { COMPACT_INSUFFICIENT_SAVINGS };
@@ -141,7 +143,7 @@ export async function executeMagicCompact(
       );
       if (selection.turns.length === 0) {
         if (summaries.every(summary => summary === null)) return null;
-        throw new Error(COMPACT_INSUFFICIENT_SAVINGS);
+        throw new PluginMessageError(COMPACT_INSUFFICIENT_SAVINGS);
       }
 
       const compacted = applySuccessorEdits(
@@ -153,7 +155,7 @@ export async function executeMagicCompact(
         selection.turns.flatMap(turn => turn.assistants),
       ).tokens;
       if (!hasUsefulSavings(before.tokens - after.tokens, eligibleTokens)) {
-        throw new Error(COMPACT_INSUFFICIENT_SAVINGS);
+        throw new PluginMessageError(COMPACT_INSUFFICIENT_SAVINGS);
       }
       if (after.projectedMediaTokens < before.projectedMediaTokens) {
         throw new Error(
@@ -210,7 +212,7 @@ export async function executeMagicCompact(
         actual.tokens !== after.tokens
         || actual.projectedMediaTokens !== after.projectedMediaTokens
       ) {
-        throw new Error(
+        throw new PluginMessageError(
           `Compaction token projection mismatch in successor session ${created.session.id}.`,
         );
       }
@@ -228,12 +230,7 @@ export async function executeMagicCompact(
     }
     successor = outcome;
   } catch (error) {
-    await toastFeedback.showTerminal({
-      title: "Magic Compact Failed",
-      message: String(error),
-      variant: "error",
-      duration: 8000,
-    });
+    await toastFeedback.showTerminal(failureToast(COMMAND, error));
     throw error;
   }
 

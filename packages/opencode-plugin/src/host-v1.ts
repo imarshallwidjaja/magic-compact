@@ -31,12 +31,42 @@ import { omissionReadDiagnostic, readOmittedContent } from "./storage/omission";
 import { handleStatsEvent } from "./stats/events";
 import { projectManifestCoveredMedia } from "./compact/media";
 import type { MessageWithParts } from "./compact/plan";
+import type { SuccessorCommand } from "./policy/successor";
+import {
+  attemptWithinDeadline,
+  CONTROL_OPERATION_TIMEOUT_MS,
+  failureToast,
+} from "./util";
 
 const SUMMARIZER_PERMISSION = { "*": "deny" } as const;
 
 const server: Plugin = async input => {
   const identity = createListenerIdentity();
   const listener = () => connectListener(input, identity);
+  // OpenCode 1 logs a thrown command error and shows the client nothing, so
+  // a command that fails before it has a verified listener reports through
+  // the plugin input's own client. That client reaches this instance either
+  // in process or through its actual listener; it never follows the default
+  // `serverUrl` that another process may own. Delivery is best effort and
+  // the original error is rethrown.
+  const preflight = async <T>(
+    command: SuccessorCommand,
+    prepare: () => Promise<T>,
+  ): Promise<T> => {
+    try {
+      return await prepare();
+    } catch (error) {
+      await attemptWithinDeadline(
+        signal =>
+          input.client.tui.showToast({
+            body: failureToast(command, error),
+            signal,
+          }),
+        CONTROL_OPERATION_TIMEOUT_MS,
+      );
+      throw error;
+    }
+  };
   return {
     config: async config => {
       identity.register(config);
@@ -74,12 +104,20 @@ const server: Plugin = async input => {
       }
 
       if (command.command === COMPACT_COMMAND) {
-        const keepTurns = parseMagicCompactArguments(command.arguments);
-        // Read per command and reject an invalid threshold before session work.
-        const retention = taskAwareRetentionPolicy(process.env);
+        const { keepTurns, retention, v2 } = await preflight(
+          "Magic Compact",
+          async () => ({
+            keepTurns: parseMagicCompactArguments(command.arguments),
+            // Read per command and reject an invalid threshold before session
+            // work.
+            retention: taskAwareRetentionPolicy(process.env),
+            v2: await listener(),
+          }),
+        );
 
+        // Shows its own progress and terminal toasts.
         const successor = await executeMagicCompact(
-          await listener(),
+          v2,
           command.sessionID,
           keepTurns,
           { retention },
@@ -91,14 +129,20 @@ const server: Plugin = async input => {
       }
 
       if (command.command === TRIM_COMMAND) {
-        const { keepTurns, heuristic } = parseMagicTrimArguments(
-          command.arguments,
+        const { keepTurns, retention, v2 } = await preflight(
+          "Magic Trim",
+          async () => {
+            const { keepTurns, heuristic } = parseMagicTrimArguments(
+              command.arguments,
+            );
+            const retention: RetentionPolicy = heuristic
+              ? { mode: "heuristic" }
+              : taskAwareRetentionPolicy(process.env);
+            return { keepTurns, retention, v2: await listener() };
+          },
         );
-        const retention: RetentionPolicy = heuristic
-          ? { mode: "heuristic" }
-          : taskAwareRetentionPolicy(process.env);
         const successor = await executeMagicTrim(
-          await listener(),
+          v2,
           command.sessionID,
           keepTurns,
           { retention },

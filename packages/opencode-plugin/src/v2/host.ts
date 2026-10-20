@@ -2,11 +2,12 @@ import { OpenCode, type OpenCodeClient } from "@opencode/client";
 import { Service, type Endpoint } from "@opencode/client/service";
 import { isDeepStrictEqual } from "node:util";
 import { attemptWithinDeadline } from "../util";
+import { PluginMessageError } from "../policy/feedback";
 
 export type V2Host = OpenCodeClient;
 
 export const V2_ENDPOINT_REQUIRED =
-  "Magic Compact needs this OpenCode server's HTTP API to create a successor session, and could not prove that a reachable endpoint belongs to this server. Run OpenCode through its registered background service (the default for the OpenCode 2 TUI and `opencode run`, or `opencode serve --service`), or set the plugin's `serverUrl` option to this server's own listener and export OPENCODE_SERVER_PASSWORD (and OPENCODE_SERVER_USERNAME when it is not `opencode`) in its environment.";
+  "Magic Compact and Magic Trim need this OpenCode server's HTTP API to create a successor session, and could not prove that a reachable endpoint belongs to this server. Nothing was changed. Run OpenCode through its registered background service (the default for the OpenCode 2 TUI and `opencode run`, or `opencode serve --service`), or set the plugin's `serverUrl` option to this server's own listener and export OPENCODE_SERVER_PASSWORD (and OPENCODE_SERVER_USERNAME when it is not `opencode`) in its environment.";
 
 export type V2HostOptions = {
   // The plugin's `serverUrl` option, when the operator configured one.
@@ -45,7 +46,7 @@ export async function connectV2Host(
       typeof options.serverUrl !== "string"
       || !URL.canParse(options.serverUrl)
     )
-      throw new Error(V2_ENDPOINT_REQUIRED);
+      throw new PluginMessageError(V2_ENDPOINT_REQUIRED);
     const password = env["OPENCODE_SERVER_PASSWORD"];
     endpoint = {
       url: options.serverUrl.replace(/\/$/u, ""),
@@ -66,7 +67,7 @@ export async function connectV2Host(
     );
     endpoint = discovered.kind === "success" ? discovered.value : undefined;
   }
-  if (!endpoint) throw new Error(V2_ENDPOINT_REQUIRED);
+  if (!endpoint) throw new PluginMessageError(V2_ENDPOINT_REQUIRED);
   const host = OpenCode.make({
     baseUrl: endpoint.url,
     headers: Service.headers(endpoint),
@@ -96,6 +97,6 @@ export async function connectV2Host(
     );
   }, options.controlTimeoutMs);
   if (qualified.kind !== "success" || !qualified.value)
-    throw new Error(V2_ENDPOINT_REQUIRED);
+    throw new PluginMessageError(V2_ENDPOINT_REQUIRED);
   return host;
 }

@@ -660,7 +660,18 @@ describe("retention keep threshold in the OpenCode 1 server environment", () => 
   test.each(["magic-compact", "magic-trim"])(
     "%s rejects an invalid percent before it contacts the server",
     async name => {
-      const hooks = await server({} as PluginInput);
+      const toasts: Array<{ title: string; message: string }> = [];
+      const client = {
+        tui: {
+          showToast: async (options: {
+            body: { title: string; message: string };
+          }) => {
+            toasts.push(options.body);
+            return { data: true };
+          },
+        },
+      };
+      const hooks = await server({ client } as unknown as PluginInput);
       const error = await withPercent("60%", () =>
         promiseError(
           hooks["command.execute.before"]!(command(name), { parts: [] }),
@@ -668,6 +679,17 @@ describe("retention keep threshold in the OpenCode 1 server environment", () => 
       );
       expect(error).toBeInstanceOf(RetentionClassificationError);
       expect(String(error)).toContain(RETENTION_KEEP_THRESHOLD_PERCENT_ENV);
+      // The operator sees the same fixed message in the TUI.
+      expect(toasts).toMatchObject([
+        {
+          title:
+            name === "magic-compact"
+              ? "Magic Compact Failed"
+              : "Magic Trim Failed",
+          message: (error as Error).message,
+          variant: "error",
+        },
+      ]);
     },
   );
 

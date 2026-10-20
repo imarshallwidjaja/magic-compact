@@ -19,7 +19,7 @@ import {
   isDisposableV2HostRecord,
   planV2Compaction,
 } from "../src/v2/compact";
-import { generateV2Summaries } from "../src/v2/generation";
+import { generateV2Summaries, V2GenerationError } from "../src/v2/generation";
 import { trimV2Tool, v2ToolCallView, v2ToolCalls } from "../src/v2/history";
 import { connectV2Host, V2_ENDPOINT_REQUIRED } from "../src/v2/host";
 import {
@@ -35,7 +35,10 @@ import {
   GENERATION_RESPONSE_SCHEMA,
   generationTurnMarker,
 } from "../src/policy/generation";
-import { SuccessorFailure } from "../src/policy/successor";
+import {
+  SourceNotAtRestError,
+  SuccessorFailure,
+} from "../src/policy/successor";
 import { countGptTokens } from "../src/stats/tokenize";
 import {
   readV2SourceAtRest,
@@ -46,6 +49,7 @@ import { executeV2Trim } from "../src/v2/trim";
 import { scoredJevFetch } from "./retention-host";
 import {
   assistantMessage,
+  dependencyError,
   echoGeneration,
   fakeV2Host,
   fakeV2State,
@@ -596,7 +600,7 @@ describe("OpenCode 2 source at rest", () => {
           .get("ses_src")!
           .push(assistantMessage("msg_open", [], { time: { created: 9 } }));
       },
-      /it is running/,
+      /Record: assistant message msg_open; no completion time or error\./,
     ],
   ];
   for (const [name, arrange, expected] of refusals) {
@@ -640,6 +644,149 @@ describe("OpenCode 2 source at rest", () => {
       expect(source.messages).toHaveLength(10);
     },
   );
+
+  describe("unfinished stored history", () => {
+    const canary = "PRIVATE-CANARY-9b2d";
+    const unfinishedTool = (id: string, name: string, status: string) => ({
+      type: "tool",
+      id,
+      name,
+      state: { status, input: { prompt: canary } },
+      time: { created: 1 },
+    });
+    const refusal = async (
+      arrange: (state: FakeV2State) => void,
+      command: "Magic Compact" | "Magic Trim" = "Magic Trim",
+    ) => {
+      const state = fakeV2State();
+      sourceSession(state, "ses_src", toolHistory());
+      arrange(state);
+      const error = await readV2SourceAtRest(
+        fakeV2Host(state, new OwnedSessions()),
+        command,
+        "ses_src",
+        1_000,
+      ).then(
+        () => undefined,
+        (failure: unknown) => failure,
+      );
+      expect(error).toBeInstanceOf(SourceNotAtRestError);
+      expect((error as Error).name).toBe("SourceNotAtRestError");
+      return (error as Error).message;
+    };
+
+    test("names a terminal assistant message that still holds an unfinished tool call", async () => {
+      const text = await refusal(state => {
+        state.messages
+          .get("ses_src")!
+          .push(
+            assistantMessage("msg_stale", [
+              unfinishedTool("call_s", "subagent", "running"),
+              unfinishedTool("call_t", "subagent", "streaming"),
+            ]),
+          );
+      });
+      expect(text).toEndWith(
+        "Record: assistant message msg_stale; running subagent call call_s and 1 more call.",
+      );
+      expect(text).not.toContain(canary);
+    });
+
+    test("names an old blocker that later completed work did not clear", async () => {
+      const text = await refusal(state => {
+        const history = state.messages.get("ses_src")!;
+        history.splice(
+          0,
+          0,
+          assistantMessage("msg_old", [], { time: { created: 1 } }),
+        );
+      }, "Magic Compact");
+      expect(text).toEndWith(
+        "Record: assistant message msg_old; no completion time or error.",
+      );
+      expect(text).not.toContain("msg_a2");
+    });
+
+    test.each([
+      ["compaction", "Record: compaction record msg_c; still marked running."],
+      ["shell", "Record: shell record msg_c; still marked running."],
+    ] as const)("names a running %s record", async (type, expected) => {
+      const text = await refusal(state => {
+        state.messages.get("ses_src")!.push({
+          id: "msg_c",
+          type,
+          status: "running",
+          time: { created: 9 },
+        } as unknown as V2Message);
+      });
+      expect(text).toEndWith(expected);
+    });
+
+    test("names the subagent session whose history holds the record", async () => {
+      const text = await refusal(state => {
+        sourceSession(
+          state,
+          "ses_child",
+          [assistantMessage("msg_kid", [], { time: { created: 9 } })],
+          { parentID: "ses_src" } as never,
+        );
+      });
+      expect(text).toEndWith(
+        "Record: subagent session ses_child; assistant message msg_kid; no completion time or error.",
+      );
+    });
+
+    test("reports an active session as running, not as stale history", async () => {
+      const text = await refusal(state => {
+        state.messages
+          .get("ses_src")!
+          .push(assistantMessage("msg_open", [], { time: { created: 9 } }));
+        state.active["ses_src"] = { type: "running" };
+      });
+      expect(text).toContain("but it is running.");
+      expect(text).not.toContain("unfinished record");
+    });
+
+    test("accepts an assistant message that ended with an error and no completion time", async () => {
+      const state = fakeV2State();
+      sourceSession(state, "ses_src", [
+        ...toolHistory(),
+        assistantMessage("msg_failed", [], {
+          time: { created: 9 },
+          error: { type: "unknown", message: "failed" },
+        }),
+      ]);
+      await expect(
+        readV2SourceAtRest(
+          fakeV2Host(state, new OwnedSessions()),
+          "Magic Trim",
+          "ses_src",
+          1_000,
+        ),
+      ).resolves.toMatchObject({ session: { id: "ses_src" } });
+    });
+
+    test("renders bounded, sanitized references", async () => {
+      const text = await refusal(state => {
+        state.messages
+          .get("ses_src")!
+          .push(
+            assistantMessage(`msg_\n<b>${"x".repeat(200)}`, [
+              unfinishedTool(
+                `call\u0000 "q"${"z".repeat(200)}`,
+                "t\n<i>",
+                "run ning",
+              ),
+            ]),
+          );
+      });
+      // The one line break separates the sentence from the record line.
+      expect(text.replace("\n", " ")).not.toMatch(/[\p{C}<>"]/u);
+      expect(text).toMatch(
+        /message msg_\?+b\?x+\.\.\.; run\?ning t\?+i\? call call\?+q\?z+\.\.\.\.$/u,
+      );
+    });
+  });
 
   test("refuses a subagent session", async () => {
     const state = fakeV2State();
@@ -853,7 +1000,7 @@ describe("OpenCode 2 trim successors", () => {
       },
     ).catch((caught: Error) => caught);
     expect(String(error)).toContain(
-      "could not finish preparing its successor session. The session was left unchanged.",
+      "could not finish preparing its successor session. The original session was left unchanged.",
     );
     expect(String(error)).not.toContain("was kept");
     expect([...state.sessions.keys()]).toEqual(["ses_src"]);
@@ -974,7 +1121,7 @@ describe("OpenCode 2 trim successors", () => {
     };
     const error = await trim(state);
     expect(String(error)).toContain(
-      "could not finish preparing its successor session. The session was left unchanged.",
+      "could not finish preparing its successor session. The original session was left unchanged.",
     );
     expect(String(error)).not.toContain("was kept");
     expect([...state.sessions.keys()]).toEqual(["ses_src"]);
@@ -1280,6 +1427,104 @@ describe("OpenCode 2 generation responses", () => {
       expect([...state.sessions.keys()]).toEqual(["ses_src"]);
     });
   }
+
+  test("names each distinct reason of several failed turns once", async () => {
+    const second = [
+      userMessage("msg_t2", "Do it again"),
+      assistantMessage("msg_t2a", [{ type: "text", text: words("B", 200) }]),
+      idleMessage("msg_t2i"),
+    ];
+    const history = [...target, ...second];
+    const state = fakeV2State();
+    const source = sourceSession(state, "ses_src", history);
+    const owned = new OwnedSessions();
+    const outcome = await generateV2Summaries(
+      fakeV2Host(state, owned, () => ({
+        error: { type: "provider.invalid-request", message: "bad" },
+      })),
+      owned,
+      { session: source, messages: history, instructions: [] },
+      {
+        ref: state.summarizerModel!,
+        info: {
+          limit: state.modelLimit,
+          capabilities: { tools: true, input: ["text"], output: ["text"] },
+        },
+      },
+      [{ span: target }, { span: second }],
+      "index",
+      { controlTimeoutMs: 1_000 },
+    ).catch((error: Error) => error);
+    expect((outcome as Error).message).toBe(
+      "Compaction generation failed for 2 turns: Compaction generation model request failed.",
+    );
+  });
+
+  test("names every temporary session that could not be deleted when five started batches fail", async () => {
+    // Six turns, five concurrent batches. Every request fails and every
+    // removal is refused, so five sessions stay behind and the sixth turn is
+    // never admitted. The aggregate explains the failure once and still names
+    // all five sessions.
+    const extra = Array.from({ length: 5 }, (_, index) => [
+      userMessage(`msg_x${index}`, `Turn ${index + 2}`),
+      assistantMessage(`msg_x${index}a`, [
+        { type: "text", text: words(`X${index}`, 200) },
+      ]),
+      idleMessage(`msg_x${index}i`),
+    ]).flat();
+    const history = [...target, ...extra];
+    const state = fakeV2State();
+    const source = sourceSession(state, "ses_src", history);
+    const before = structuredClone(state.messages.get("ses_src"));
+    state.beforeWrite = method => {
+      if (method === "remove") throw new Error("connection reset");
+    };
+    const owned = new OwnedSessions();
+    const outcome = await generateV2Summaries(
+      fakeV2Host(state, owned, () => ({
+        error: { type: "provider.invalid-request", message: "bad" },
+      })),
+      owned,
+      { session: source, messages: history, instructions: [] },
+      {
+        ref: state.summarizerModel!,
+        info: {
+          limit: state.modelLimit,
+          capabilities: { tools: true, input: ["text"], output: ["text"] },
+        },
+      },
+      [
+        { span: target },
+        ...Array.from({ length: 5 }, (_, index) => ({
+          span: extra.slice(index * 3, index * 3 + 3),
+        })),
+      ],
+      "index",
+      { controlTimeoutMs: 1_000 },
+    ).catch((error: Error) => error);
+
+    const ids = state.calls
+      .filter(entry => entry.startsWith("import:"))
+      .map(entry => entry.slice("import:".length));
+    expect(ids).toHaveLength(5);
+    expect(new Set(ids).size).toBe(5);
+    expect(outcome).toBeInstanceOf(V2GenerationError);
+    expect((outcome as V2GenerationError).undeletedSessionIDs).toEqual(ids);
+    expect((outcome as Error).message).toBe(
+      `Compaction generation failed for 5 turns: Compaction generation model request failed. Temporary sessions ${ids.join(", ")} could not be deleted.`,
+    );
+    for (const id of ids) {
+      // Each stays registered and refuses new provider requests.
+      expect(state.sessions.has(id)).toBeTrue();
+      expect(owned.has(id)).toBeTrue();
+      expect(() => owned.admitRequest(id)).toThrow(owned.stop);
+      expect(() => owned.rejectCompaction(id)).toThrow(owned.compactionBlocked);
+    }
+    // The source is unchanged and the sixth turn started nothing.
+    expect(state.messages.get("ses_src")).toEqual(before);
+    expect([...state.sessions.keys()]).toEqual(["ses_src", ...ids]);
+    expect(state.requests).toHaveLength(5);
+  });
 
   // Each owned session's lifecycle requests are awaited until they settle;
   // the 10 ms control deadline below bounds only reads.
@@ -2709,9 +2954,12 @@ describe("OpenCode 2 retention keep threshold environment", () => {
       session: { hook: async () => undefined, get: async () => ({}) },
       event: { subscribe: async function* () {} },
     } as never);
-    return (name: string, text: string) => {
+    return (name: string, prompt: string | { text: string }) => {
       const execute = found.get(name)!;
-      return execute({ sessionID: "ses_src", prompt: { text } }).then(
+      return execute({
+        sessionID: "ses_src",
+        prompt: typeof prompt === "string" ? { text: prompt } : prompt,
+      }).then(
         () => {
           throw new Error("Expected a rejection.");
         },
@@ -2738,6 +2986,30 @@ describe("OpenCode 2 retention keep threshold environment", () => {
       const error = await withPercent("60%", () => run(name, ""));
       expect(error).toBeInstanceOf(RetentionClassificationError);
       expect(String(error)).toContain(RETENTION_KEEP_THRESHOLD_PERCENT_ENV);
+    },
+  );
+
+  test.each([
+    ["magic-compact", "Magic Compact", "host", " (HTTP 200)"],
+    ["magic-trim", "Magic Trim", "host", " (HTTP 200)"],
+    ["magic-compact", "Magic Compact", "dependency", ""],
+    ["magic-trim", "Magic Trim", "dependency", ""],
+  ] as const)(
+    "%s returns a %s %s failure it did not author without that failure's text",
+    async (name, command, kind, classified) => {
+      const run = await commands();
+      const foreign = kind === "host" ? privateHostError() : dependencyError();
+      const error = await run(name, {
+        get text(): string {
+          throw foreign;
+        },
+      });
+      expect((error as Error).message).toBe(
+        `${command} stopped on an unexpected error${classified}. The original session was left unchanged. Retry; if it fails again, check the OpenCode server log.`,
+      );
+      expect((error as Error).name).toBe("Error");
+      // The original stays attached for the server's own error logging.
+      expect((error as Error).cause).toBe(foreign);
     },
   );
 

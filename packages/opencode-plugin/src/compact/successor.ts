@@ -35,9 +35,12 @@ import {
   SourceNotAtRestError,
   successorFailure,
   SuccessorVerificationError,
+  unfinishedHistoryRefusal,
   type SuccessorCommand,
   type SuccessorStage,
+  type UnfinishedHistoryRecord,
 } from "../policy/successor";
+import { PluginMessageError } from "../policy/feedback";
 
 export {
   SourceChangedError,
@@ -91,7 +94,7 @@ export async function readSourceAtRest(
       controlTimeoutMs,
     );
     if (outcome.kind !== "success") {
-      throw new Error(
+      throw new PluginMessageError(
         `${command} could not read the session state it needs to check that the session is at rest. The session was left unchanged.`,
       );
     }
@@ -101,7 +104,7 @@ export async function readSourceAtRest(
     v2.session.get({ sessionID }, { signal }),
   );
   if (session.parentID) {
-    throw new Error(
+    throw new PluginMessageError(
       `${command} runs only on a root session; this is a subagent session. Run it from the parent session.`,
     );
   }
@@ -119,9 +122,6 @@ export async function readSourceAtRest(
   const messages = await read<MessageWithParts[]>(signal =>
     v2.session.messages({ sessionID, ...route }, { signal }),
   );
-  if (messages.some(messageIsActive)) {
-    throw notAtRest("a model response or tool call is still active");
-  }
 
   const statuses = await read<Record<string, SessionStatus>>(signal =>
     v2.session.status(route, { signal }),
@@ -163,6 +163,12 @@ export async function readSourceAtRest(
   );
   if (questions.some(request => tree.has(request.sessionID))) {
     throw notAtRest("a question is waiting for an answer");
+  }
+  // After the live checks, so work that is actually running is reported as
+  // running; what remains is history the host never finished.
+  const unfinished = messages.flatMap(unfinishedRecord);
+  if (unfinished.length > 0) {
+    throw unfinishedHistoryRefusal(command, unfinished);
   }
   const undelivered = undeliveredBackgroundTask(messages);
   if (undelivered !== undefined) {
@@ -228,21 +234,35 @@ function undeliveredBackgroundTask(
   return [...pending].find(([, count]) => count > 0)?.[0];
 }
 
-function messageIsActive(message: MessageWithParts): boolean {
+// The stored message's unfinished assistant response or tool calls, if any.
+// The test is the host's own: an assistant message with neither a completion
+// time nor an error, or a tool part that is neither completed nor an error.
+function unfinishedRecord(
+  message: MessageWithParts,
+): UnfinishedHistoryRecord[] {
   const info = message.info;
-  if (
+  const unfinished =
     info.role === "assistant"
     && info.time.completed === undefined
-    && info.error === undefined
-  ) {
-    return true;
-  }
-  return message.parts.some(
-    part =>
-      part.type === "tool"
-      && part.state.status !== "completed"
-      && part.state.status !== "error",
+    && info.error === undefined;
+  const tools = message.parts.flatMap(part =>
+    part.type === "tool"
+    && part.state.status !== "completed"
+    && part.state.status !== "error"
+      ? [{ name: part.tool, callID: part.callID, state: part.state.status }]
+      : [],
   );
+  if (!unfinished && tools.length === 0) return [];
+  return [
+    {
+      messageID: info.id,
+      kind: info.role === "assistant" ? "assistant" : "message",
+      unfinished,
+      ...(tools.length === 0
+        ? {}
+        : { tool: { ...tools[0]!, count: tools.length } }),
+    },
+  ];
 }
 
 // The fields a successor copies from its source. A change to any of them, or
@@ -491,7 +511,8 @@ export async function createSuccessor(
       metadata: sessionMetadata(false),
     });
     created = response.data;
-    if (response.error || !created) throw new Error("create failed");
+    if (response.error || !created)
+      throw hostRefusal("create failed", response);
   } catch (error) {
     throw successorFailure(command, error, { stage: "create", sourceID });
   }
@@ -574,7 +595,9 @@ export async function createSuccessor(
       title: source.session.title,
       metadata: sessionMetadata(true),
     });
-    if (ready.error || !ready.data) throw new Error("ready update failed");
+    if (ready.error || !ready.data) {
+      throw hostRefusal("ready update failed", ready);
+    }
     if (
       !headerMatches(
         ready.data,
@@ -606,6 +629,19 @@ export async function createSuccessor(
       readyAttempted,
     });
   }
+}
+
+// A failed host call's error: fixed text, and the HTTP status the response
+// carried so that the failure's details can name it. The response body and
+// error are never attached; `classifyFailure` accepts only a status from 100
+// to 599.
+function hostRefusal(
+  message: string,
+  response: { response?: { status?: number } },
+): Error {
+  return Object.assign(new Error(message), {
+    status: response.response?.status,
+  });
 }
 
 async function readCandidate(

@@ -7,6 +7,7 @@ import {
   groupTurns,
   trimmedTurnRange,
 } from "../policy/turns";
+import { hasPluginMessage, PluginMessageError } from "../policy/feedback";
 
 export type MessageWithParts = {
   info: Message;
@@ -32,9 +33,9 @@ export type CompactionPlan = {
 
 export type SourceSnapshot = Array<{ info: unknown; parts: unknown[] }>;
 
-export class NativeCheckpointChangedError extends Error {
+export class NativeCheckpointChangedError extends PluginMessageError {
   constructor(cause?: unknown) {
-    const detail = cause instanceof Error ? ` ${cause.message}` : "";
+    const detail = hasPluginMessage(cause) ? ` ${cause.message}` : "";
     super(`OpenCode source changed during Magic Compact.${detail}`, { cause });
     this.name = "NativeCheckpointChangedError";
   }
@@ -281,7 +282,7 @@ export function nativeModelVisibleMessages(
     ? result.findIndex(message => message.info.id === tailStartID)
     : -1;
   if (part && (tailIndex < 0 || tailIndex >= markerIndex)) {
-    throw new Error(
+    throw new PluginMessageError(
       "Native compaction tail does not resolve before its marker.",
     );
   }
@@ -305,12 +306,12 @@ function inspectNativeCheckpoints(messages: MessageWithParts[]): {
     const parts = message.parts.filter(part => part.type === "compaction");
     if (parts.length === 0) return [];
     if (message.info.role !== "user") {
-      throw new Error(
+      throw new PluginMessageError(
         `Native compaction part on ${message.info.id} must belong to a user message.`,
       );
     }
     if (parts.length > 1) {
-      throw new Error(
+      throw new PluginMessageError(
         `Native compaction marker ${message.info.id} has multiple compaction parts.`,
       );
     }
@@ -339,7 +340,7 @@ function inspectNativeCheckpoints(messages: MessageWithParts[]): {
       || markerIndex === undefined
       || markerIndex >= summary.index
     ) {
-      throw new Error(
+      throw new PluginMessageError(
         `Found orphan native compaction summary ${summary.message.info.id}.`,
       );
     }
@@ -363,7 +364,7 @@ function inspectNativeCheckpoints(messages: MessageWithParts[]): {
     if (tailStartID) {
       const tailIndex = messageIndex.get(tailStartID);
       if (tailIndex === undefined || tailIndex >= marker.index) {
-        throw new Error(
+        throw new PluginMessageError(
           `Native compaction tail_start_id ${tailStartID} does not resolve before its marker.`,
         );
       }
@@ -385,7 +386,7 @@ function inspectNativeCheckpoints(messages: MessageWithParts[]): {
         && summary.index < candidate.summary.index,
     );
     if (containsForeignMarker || containsForeignSummary) {
-      throw new Error(
+      throw new PluginMessageError(
         `Native compaction checkpoint ${candidate.marker.message.info.id} overlaps another checkpoint interval.`,
       );
     }
@@ -417,11 +418,11 @@ function inspectNativeCheckpoints(messages: MessageWithParts[]): {
         ).length > 1
           ? ", including multiple completed summaries"
           : "";
-      throw new Error(
+      throw new PluginMessageError(
         `Native compaction marker ${marker.message.info.id} has ambiguous summary children${detail}.`,
       );
     }
-    throw new Error(
+    throw new PluginMessageError(
       `Native compaction marker ${marker.message.info.id} is incomplete or errored.`,
     );
   }

@@ -1,6 +1,7 @@
 import type { Plugin } from "@opencode/plugin";
 import {
   COMMAND_DESCRIPTIONS,
+  commandFailureMessage,
   COMPACT_COMMAND,
   compactSuccess,
   parseMagicCompactArguments,
@@ -42,6 +43,7 @@ import {
   type V2RequestMessage,
 } from "./v2/media";
 import { OwnedSessions } from "./v2/owned";
+import type { SuccessorCommand } from "./policy/successor";
 import { readV2History, v2StorageKey, type V2Message } from "./v2/session";
 import { executeV2Trim } from "./v2/trim";
 
@@ -52,6 +54,24 @@ const MEDIA_HISTORY_REQUIRED =
 
 const RESPONSE_TOOL_REJECTED =
   "Magic Compact's response tool is only available in its own per-turn generation requests.";
+
+// Runs a compact or trim command and returns its success or no-op message.
+// A failure is rethrown as the error OpenCode 2 returns to the client: the
+// plugin's own error unchanged when its message is already the feedback,
+// otherwise an error carrying the feedback, with the original as its cause.
+async function commandResult(
+  command: SuccessorCommand,
+  run: () => Promise<string>,
+): Promise<string> {
+  try {
+    return await run();
+  } catch (error) {
+    const message = commandFailureMessage(command, error);
+    throw error instanceof Error && error.message === message
+      ? error
+      : new Error(message, { cause: error });
+  }
+}
 
 // OpenCode 2 entry point. Commands throw their result message, as on
 // OpenCode 1, so a client that runs the command receives it. `owned` is the
@@ -102,45 +122,48 @@ export async function setup(
       name: COMPACT_COMMAND,
       description: COMMAND_DESCRIPTIONS[COMPACT_COMMAND],
       execute: async ({ sessionID, prompt }) => {
-        const keepTurns = parseMagicCompactArguments(prompt.text);
-        // Read per command and reject an invalid threshold before session work.
-        const retention = taskAwareRetentionPolicy(process.env);
-        const host = await connect(sessionID);
-        const { successor, outcome } = await executeV2Compact(
-          host,
-          owned,
-          sessionID,
-          keepTurns,
-          { retention, controlTimeoutMs },
-        );
-        throw new Error(
-          successor
+        const result = await commandResult("Magic Compact", async () => {
+          const keepTurns = parseMagicCompactArguments(prompt.text);
+          // Read per command and reject an invalid threshold before session
+          // work.
+          const retention = taskAwareRetentionPolicy(process.env);
+          const host = await connect(sessionID);
+          const { successor, outcome } = await executeV2Compact(
+            host,
+            owned,
+            sessionID,
+            keepTurns,
+            { retention, controlTimeoutMs },
+          );
+          return successor
             ? `${compactSuccess(successor.session.id)}\n${outcome}`
-            : outcome,
-        );
+            : outcome;
+        });
+        throw new Error(result);
       },
     });
     editor.add({
       name: TRIM_COMMAND,
       description: COMMAND_DESCRIPTIONS[TRIM_COMMAND],
       execute: async ({ sessionID, prompt }) => {
-        const { keepTurns, heuristic } = parseMagicTrimArguments(prompt.text);
-        const retention: RetentionPolicy = heuristic
-          ? { mode: "heuristic" }
-          : taskAwareRetentionPolicy(process.env);
-        const host = await connect(sessionID);
-        const { successor, outcome } = await executeV2Trim(
-          host,
-          owned,
-          sessionID,
-          keepTurns,
-          { retention, controlTimeoutMs },
-        );
-        throw new Error(
-          successor
+        const result = await commandResult("Magic Trim", async () => {
+          const { keepTurns, heuristic } = parseMagicTrimArguments(prompt.text);
+          const retention: RetentionPolicy = heuristic
+            ? { mode: "heuristic" }
+            : taskAwareRetentionPolicy(process.env);
+          const host = await connect(sessionID);
+          const { successor, outcome } = await executeV2Trim(
+            host,
+            owned,
+            sessionID,
+            keepTurns,
+            { retention, controlTimeoutMs },
+          );
+          return successor
             ? `${trimSuccess(successor.session.id)}\n${outcome}`
-            : `${TRIM_NOOP} ${outcome}`,
-        );
+            : `${TRIM_NOOP} ${outcome}`;
+        });
+        throw new Error(result);
       },
     });
   });

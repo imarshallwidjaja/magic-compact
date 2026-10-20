@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { GENERATION_PROTOCOL } from "../compact/constants";
 import { countGptTokens } from "../stats/tokenize";
 import { isRecord } from "../util";
+import { PluginMessageError } from "./feedback";
 
 // Host-neutral per-turn generation protocol: the response schema, prompt and
 // markers, the nonce, strict response validation, summary framing, and the
@@ -346,7 +347,7 @@ export function isPlainRecord(
   return prototype === Object.prototype || prototype === null;
 }
 
-export class GenerationMarkerNonceCollisionError extends Error {
+export class GenerationMarkerNonceCollisionError extends PluginMessageError {
   constructor() {
     super("Compaction generation marker nonce collision.");
     this.name = "GenerationMarkerNonceCollisionError";

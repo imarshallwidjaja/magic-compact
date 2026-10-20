@@ -60,6 +60,7 @@ import {
   type V2Message,
   type V2Successor,
 } from "./session";
+import { PluginMessageError } from "../policy/feedback";
 
 const COMMAND = "Magic Compact";
 
@@ -354,7 +355,7 @@ export async function executeV2Compact(
       for (const [id, message] of turnEdits) edits.set(id, message);
     }
     if (selected.length === 0) {
-      throw new Error(COMPACT_INSUFFICIENT_SAVINGS);
+      throw new PluginMessageError(COMPACT_INSUFFICIENT_SAVINGS);
     }
 
     const boundary = {
@@ -385,7 +386,7 @@ export async function executeV2Compact(
       selected.flatMap(turn => turn.assistants),
     ).tokens;
     if (!hasUsefulSavings(baseline.tokens - after.tokens, eligible)) {
-      throw new Error(COMPACT_INSUFFICIENT_SAVINGS);
+      throw new PluginMessageError(COMPACT_INSUFFICIENT_SAVINGS);
     }
     if (after.projectedMediaTokens < before.projectedMediaTokens) {
       throw new Error("Magic Compact media projection unexpectedly decreased.");
@@ -428,7 +429,7 @@ export async function executeV2Compact(
       actual.tokens !== after.tokens
       || actual.projectedMediaTokens !== after.projectedMediaTokens
     ) {
-      throw new Error(
+      throw new PluginMessageError(
         `Compaction token projection mismatch in successor session ${successor.session.id}.`,
       );
     }

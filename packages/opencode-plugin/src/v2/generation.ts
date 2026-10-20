@@ -24,6 +24,12 @@ import {
   validationFailure,
   type GenerationTarget,
 } from "../policy/generation";
+import {
+  MAX_REASONS,
+  PluginMessageError,
+  undeletedSessionIDs,
+  type LeavesSessions,
+} from "../policy/feedback";
 import { countGptTokens } from "../stats/tokenize";
 import { attemptWithinDeadline } from "../util";
 import type { V2Host } from "./host";
@@ -84,8 +90,17 @@ type Batch = {
   prompt: string;
 };
 
-export class V2GenerationError extends Error {
-  constructor(message: string) {
+export class V2GenerationError
+  extends PluginMessageError
+  implements LeavesSessions
+{
+  // `reason` says what failed without naming a temporary session left behind,
+  // so an aggregate can explain failures once and still name every session.
+  constructor(
+    message: string,
+    readonly reason: string = message,
+    readonly undeletedSessionIDs: readonly string[] = [],
+  ) {
     super(message);
     this.name = "V2GenerationError";
   }
@@ -325,7 +340,7 @@ export async function generateV2Summaries(
     options.nonceFactory ?? createGenerationNonce,
   );
   const results: V2GeneratedSummary[] = [];
-  const failures: Array<{ index: number; error: Error }> = [];
+  const failures: Array<{ index: number; error: V2GenerationError }> = [];
   let nextIndex = 0;
   const worker = async () => {
     while (failures.length === 0 && nextIndex < batches.length) {
@@ -360,11 +375,22 @@ export async function generateV2Summaries(
   );
   if (failures.length > 0) {
     failures.sort((a, b) => a.index - b.index);
-    throw failures.length === 1
-      ? failures[0]!.error
-      : new V2GenerationError(
-          `Compaction generation failed for ${failures.length} turns: ${failures.map(failure => failure.error.message).join(" ")}`,
-        );
+    if (failures.length === 1) throw failures[0]!.error;
+    const errors = failures.map(failure => failure.error);
+    const reasons = [...new Set(errors.map(error => error.reason))].slice(
+      0,
+      MAX_REASONS,
+    );
+    const sessions = undeletedSessionIDs(errors);
+    throw new V2GenerationError(
+      `Compaction generation failed for ${failures.length} turns: ${reasons.join(" ")}${
+        sessions.length === 0
+          ? ""
+          : ` Temporary session${sessions.length === 1 ? "" : "s"} ${sessions.join(", ")} could not be deleted.`
+      }`,
+      undefined,
+      sessions,
+    );
   }
   return results;
 }
@@ -405,7 +431,7 @@ async function runBatch(
 
   owned.register(sessionID, "generation");
   let result: V2GeneratedSummary | undefined;
-  let failure: Error | undefined;
+  let failure: V2GenerationError | undefined;
   try {
     // Directly awaited, like the removal: a timed-out import could still
     // create the session after cleanup.
@@ -459,6 +485,8 @@ async function runBatch(
       failure
         ? `${failure.message} Its temporary session ${sessionID} could not be deleted.`
         : `Compaction generation session deletion failed; temporary session ${sessionID} could not be deleted.`,
+      failure?.reason ?? "Compaction generation session deletion failed.",
+      [sessionID],
     );
   }
   if (failure) throw failure;
