@@ -52,9 +52,8 @@ import {
   RETENTION_KEEP_THRESHOLD,
   RETENTION_MAX_CONCURRENCY,
   RETENTION_MODEL,
+  RETENTION_REQUEST_BODY_BYTE_LIMIT,
   RETENTION_REQUEST_TIMEOUT_MS,
-  RETENTION_STATE_AND_QUESTION_BYTE_LIMIT,
-  RETENTION_TOTAL_BYTE_LIMIT,
   type RetentionFetch,
 } from "../src/retention/classifier";
 
@@ -256,8 +255,7 @@ describe("dataset", () => {
     expect(RETENTION_KEEP_THRESHOLD).toBe(0.6);
     expect(RETENTION_MAX_CONCURRENCY).toBe(4);
     expect(RETENTION_REQUEST_TIMEOUT_MS).toBe(30_000);
-    expect(RETENTION_STATE_AND_QUESTION_BYTE_LIMIT).toBe(28_000);
-    expect(RETENTION_TOTAL_BYTE_LIMIT).toBe(56_000);
+    expect(RETENTION_REQUEST_BODY_BYTE_LIMIT).toBe(32 * 1024 * 1024);
   });
 
   test("parsing is strict and identity ignores formatting", () => {

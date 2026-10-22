@@ -109,6 +109,7 @@ import {
   persistedForkHistory,
   scoredJevFetch,
   summaryReply,
+  tokenLimitResponse,
   type JevCall,
 } from "./retention-host";
 import {
@@ -7864,33 +7865,43 @@ describe("magic compact task-aware retention", () => {
     expect(await readStats("source")).toBeNull();
   });
 
-  test("a classification failure stops before turn generation, backup, or writes", async () => {
-    const messages = retainedTurns();
-    const before = structuredClone(messages);
-    const harness = commandHarness(messages, {
-      generationResponse: { turns: [result(1, "unused"), result(2, "unused")] },
-    });
+  test.each([
+    ["an HTTP 429", "http", () => new Response("private", { status: 429 })],
+    ["a token-limit refusal", "token-limit", tokenLimitResponse],
+  ] as const)(
+    "a classification failure (%s) stops before turn generation, backup, or writes",
+    async (_name, kind, respond) => {
+      const messages = retainedTurns();
+      const before = structuredClone(messages);
+      const harness = commandHarness(messages, {
+        generationResponse: {
+          turns: [result(1, "unused"), result(2, "unused")],
+        },
+      });
 
-    const error = await executeMagicCompact(harness.v2, "source", 0, {
-      retention: {
-        mode: "task-aware",
-        apiKey: "test-key",
-        fetch: async () => new Response("private", { status: 429 }),
-      },
-    }).then(
-      () => undefined,
-      (caught: unknown) => caught,
-    );
+      const error = await executeMagicCompact(harness.v2, "source", 0, {
+        retention: {
+          mode: "task-aware",
+          apiKey: "test-key",
+          fetch: async () => respond(),
+        },
+      }).then(
+        () => undefined,
+        (caught: unknown) => caught,
+      );
 
-    expect(error).toBeInstanceOf(RetentionClassificationError);
-    expect(String(error)).toContain("/magic-trim --heuristic");
-    expect(messages).toEqual(before);
-    expect(harness.modelPrompts).toEqual([]);
-    expect(harness.forks).toEqual(["generation-fork"]);
-    expect(harness.activeGenerationForks).toEqual([]);
-    expect(harness.sourceWrites).toEqual([]);
-    expect(await readStats("source")).toBeNull();
-  });
+      expect(error).toBeInstanceOf(RetentionClassificationError);
+      expect((error as RetentionClassificationError).kind).toBe(kind);
+      expect(String(error)).toContain("/magic-trim --heuristic");
+      expect(String(error)).not.toContain("private");
+      expect(messages).toEqual(before);
+      expect(harness.modelPrompts).toEqual([]);
+      expect(harness.forks).toEqual(["generation-fork"]);
+      expect(harness.activeGenerationForks).toEqual([]);
+      expect(harness.sourceWrites).toEqual([]);
+      expect(await readStats("source")).toBeNull();
+    },
+  );
 });
 
 function compactableCommandMessages(

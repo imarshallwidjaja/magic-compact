@@ -264,6 +264,24 @@ export function summaryReply(
   return { data: { info, parts } };
 }
 
+// Jev's refusal of a request over the model's token limits, as recorded from
+// jev-1.13.0: HTTP 400, a chunked 47-byte JSON body and a request ID header.
+// The request ID here is synthetic.
+export const TOKEN_LIMIT_BODY =
+  '{"detail":{"error_type":"max_tokens_exceeded"}}';
+export const TOKEN_LIMIT_REQUEST_ID = "req_00000000000000000000000000000001";
+
+export function tokenLimitResponse(): Response {
+  return new Response(TOKEN_LIMIT_BODY, {
+    status: 400,
+    statusText: "Bad Request",
+    headers: {
+      "content-type": "application/json",
+      "x-typesafe-request-id": TOKEN_LIMIT_REQUEST_ID,
+    },
+  });
+}
+
 export type JevCall = {
   task: { latestUserRequest: string; sessionSummary: string };
   candidate: { tool: string; calledWhile: string; output: string };

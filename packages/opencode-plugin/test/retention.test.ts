@@ -33,6 +33,9 @@ import {
   providerCatalog,
   SESSION_SUMMARY_TEXT,
   summaryReply,
+  TOKEN_LIMIT_BODY,
+  TOKEN_LIMIT_REQUEST_ID,
+  tokenLimitResponse,
 } from "./retention-host";
 import {
   buildRetentionRequests,
@@ -42,7 +45,7 @@ import {
   RETENTION_KEEP_THRESHOLD_PERCENT_ENV,
   RETENTION_MAX_CONCURRENCY,
   RETENTION_MODEL,
-  RETENTION_STATE_AND_QUESTION_BYTE_LIMIT,
+  RETENTION_REQUEST_BODY_BYTE_LIMIT,
   RetentionClassificationError,
   type RetentionCandidate,
   type RetentionFetch,
@@ -108,11 +111,16 @@ async function failure(promise: Promise<unknown>) {
 }
 
 describe("frozen retention cohort parity", () => {
-  function fixture(duplicateBodies = false) {
+  // `frozenSummary` is the summary the frozen hashes were built with.
+  function fixture(
+    duplicateBodies = false,
+    sessionSummary = context.sessionSummary,
+    frozenSummary = sessionSummary,
+  ) {
     const snapshots = ["first", "second"].map(snapshotID => ({
       snapshotID,
       split: "development",
-      context,
+      context: { ...context, sessionSummary },
       candidates: [
         candidate(`${snapshotID}#01`, "parser contents"),
         candidate(
@@ -125,16 +133,17 @@ describe("frozen retention cohort parity", () => {
       snapshots: snapshots.map(snapshot => ({
         snapshotID: snapshot.snapshotID,
         split: snapshot.split,
-        cases: buildRetentionRequests(context, snapshot.candidates).map(
-          request => ({
-            caseID: request.candidates[0]![1],
-            bodySha256: createHash("sha256")
-              .update(JSON.stringify(request.body))
-              .digest("hex"),
-            labels: { a: true, b: true, primary: true },
-            scores: {},
-          }),
-        ),
+        cases: buildRetentionRequests(
+          { ...context, sessionSummary: frozenSummary },
+          snapshot.candidates,
+        ).map(request => ({
+          caseID: request.candidates[0]![1],
+          bodySha256: createHash("sha256")
+            .update(JSON.stringify(request.body))
+            .digest("hex"),
+          labels: { a: true, b: true, primary: true },
+          scores: {},
+        })),
       })),
     };
     return { input: { snapshots }, frozen };
@@ -147,6 +156,18 @@ describe("frozen retention cohort parity", () => {
     await expect(checkNative(input, frozen)).rejects.toThrow(
       "Request body differs from frozen evidence",
     );
+  });
+
+  test("rejects bodies frozen with the 8,000-byte summary excerpt once the summary is sent whole", async () => {
+    // The recorded native-summary cohort was built when the builder clipped
+    // the summary to this excerpt, so a longer summary no longer matches it.
+    const summary = `START${"s".repeat(10_000)}END`;
+    const clipped = fixture(false, summary, excerpt(summary, 8_000));
+    await expect(checkNative(clipped.input, clipped.frozen)).rejects.toThrow(
+      "Request body differs from frozen evidence",
+    );
+    const whole = fixture(false, summary);
+    await checkNative(whole.input, whole.frozen);
   });
 
   test("accepts whole-candidate and snapshot reordering", async () => {
@@ -209,18 +230,18 @@ describe("retention request format", () => {
     ]);
   });
 
-  test("keeps head and tail of oversized content within the byte budget", () => {
+  test("keeps head and tail of oversized candidate content and the latest request", () => {
     const output = `HEAD${"x".repeat(200_000)}TAIL`;
+    const latest = "é".repeat(50_000);
+    const prompt = "p".repeat(50_000);
+    const turnRequest = "t".repeat(50_000);
     const [request] = buildRetentionRequests(
-      {
-        latestUserRequest: "é".repeat(50_000),
-        sessionSummary: "s".repeat(50_000),
-      },
+      { latestUserRequest: latest, sessionSummary: "s".repeat(50_000) },
       [
         {
           ...candidate("a", output),
-          input: { prompt: "p".repeat(50_000), description: "short" },
-          turnRequest: "t".repeat(50_000),
+          input: { prompt, description: "short" },
+          turnRequest,
           requestsBeforeLatest: 12,
         },
       ],
@@ -231,10 +252,14 @@ describe("retention request format", () => {
     expect(shown.output.endsWith("TAIL")).toBe(true);
     expect(shown.output).toContain("characters omitted");
     expect(shown.input["description"]).toBe("short");
-    const bytes =
-      Buffer.byteLength(JSON.stringify(request!.body.state))
-      + Buffer.byteLength(JSON.stringify(request!.body.questions));
-    expect(bytes).toBeLessThanOrEqual(RETENTION_STATE_AND_QUESTION_BYTE_LIMIT);
+    // The fixed allocations are unchanged by sending the summary whole.
+    expect(shown.output).toBe(excerpt(output, 9_000));
+    expect(shown.turnRequest).toBe(excerpt(turnRequest, 600));
+    expect(shown.input["prompt"]).toBe(excerpt(prompt, 3_000 - 7));
+    expect(request!.body.state.task.latestUserRequest).toBe(
+      excerpt(latest, 5_000),
+    );
+    expect(request!.body.state.task.sessionSummary).toBe("s".repeat(50_000));
   });
 
   test("never splits a surrogate pair when excerpting", () => {
@@ -248,22 +273,56 @@ describe("retention request format", () => {
     );
   });
 
-  test("sends one bounded session summary beside the latest request", () => {
-    const [request] = buildRetentionRequests(
-      { ...context, sessionSummary: `START${"s".repeat(20_000)}END` },
-      [candidate("a")],
+  test("sends the session summary whole, middle included, beside the latest request", () => {
+    // Past the old 8,000-byte excerpt, with escapes and non-ASCII text in the
+    // part that excerpt dropped.
+    const middle =
+      '## Current\n- Active: "quoted" C:\\path\\file\ttab é 中文 😀 \u2028 \u0000 end';
+    const summary = `START${"s".repeat(6_000)}${middle}${"t".repeat(6_000)}END`;
+    expect(Buffer.byteLength(JSON.stringify(summary))).toBeGreaterThan(8_000);
+    const requests = buildRetentionRequests(
+      { ...context, sessionSummary: summary },
+      [candidate("a"), candidate("b"), candidate("c", "x".repeat(20_000))],
     );
-    const task = request!.body.state.task;
 
-    expect(Object.keys(task)).toEqual(["latestUserRequest", "sessionSummary"]);
-    expect(task.sessionSummary.startsWith("START")).toBe(true);
-    expect(task.sessionSummary.endsWith("END")).toBe(true);
-    expect(Buffer.byteLength(JSON.stringify(task.sessionSummary))).toBe(8_000);
-    expect(request!.body.questions["candidate_0"]!.instructions).toContain(
-      "`task.sessionSummary`",
-    );
+    expect(requests).toHaveLength(3);
+    for (const request of requests) {
+      const task = request.body.state.task;
+      expect(Object.keys(task)).toEqual([
+        "latestUserRequest",
+        "sessionSummary",
+      ]);
+      expect(task.sessionSummary).toBe(summary);
+      expect(JSON.stringify(request.body)).toContain(JSON.stringify(summary));
+      expect(request.body.questions["candidate_0"]!.instructions).toContain(
+        "`task.sessionSummary`",
+      );
+    }
     const [short] = buildRetentionRequests(context, [candidate("a")]);
     expect(short!.body.state.task.sessionSummary).toBe(context.sessionSummary);
+  });
+
+  test("sends a 50,000-character summary whole, past the removed byte guards", async () => {
+    const summary = `HEAD${"m".repeat(50_000)}TAIL`;
+    const bodies: string[] = [];
+    await classifyRetention(
+      { ...context, sessionSummary: summary },
+      [candidate("a"), candidate("b")],
+      {
+        apiKey: "key",
+        fetch: async (url, init) => {
+          bodies.push(String(init.body));
+          return jevFetch(() => 0.5)(url, init);
+        },
+      },
+    );
+
+    expect(bodies).toHaveLength(2);
+    for (const body of bodies) {
+      // Above the removed 28,000-byte state-plus-question guard.
+      expect(Buffer.byteLength(body)).toBeGreaterThan(50_000);
+      expect(JSON.parse(body).state.task.sessionSummary).toBe(summary);
+    }
   });
 
   test("sends typical content whole", () => {
@@ -419,6 +478,433 @@ describe("retention classification", () => {
     );
     expect(error.kind).toBe("configuration");
     expect(calls).toBe(0);
+  });
+});
+
+describe("retention request body limit", () => {
+  const LIMIT = RETENTION_REQUEST_BODY_BYTE_LIMIT;
+  const bodyBytes = (sessionSummary: string, item: RetentionCandidate) =>
+    Buffer.byteLength(
+      JSON.stringify(
+        buildRetentionRequests({ ...context, sessionSummary }, [item])[0]!.body,
+      ),
+    );
+  // An ASCII summary that makes `item`'s request body exactly `target` bytes.
+  const summaryFor = (item: RetentionCandidate, target: number) =>
+    "s".repeat(target - bodyBytes("", item));
+
+  test("sends a body of exactly 32 MiB, counting model, state and questions", async () => {
+    const item = candidate("a");
+    const sessionSummary = summaryFor(item, LIMIT);
+    const sent: number[] = [];
+    const result = await classifyRetention(
+      { ...context, sessionSummary },
+      [item],
+      {
+        apiKey: "key",
+        fetch: async (url, init) => {
+          sent.push(Buffer.byteLength(String(init.body)));
+          return jevFetch(() => 0.7)(url, init);
+        },
+      },
+    );
+
+    expect(sent).toEqual([LIMIT]);
+    expect(result.decisions.get("a")).toEqual({ useful: 0.7, keep: true });
+  });
+
+  test("refuses a body one byte over before any request, even for the last candidate", async () => {
+    const late = candidate("late", "o".repeat(100));
+    const sessionSummary = summaryFor(late, LIMIT + 1);
+    const early = [candidate("a"), candidate("b")];
+    for (const item of early) {
+      expect(bodyBytes(sessionSummary, item)).toBeLessThanOrEqual(LIMIT);
+    }
+    let calls = 0;
+    const error = await failure(
+      classifyRetention({ ...context, sessionSummary }, [...early, late], {
+        apiKey: "key",
+        fetch: jevFetch(() => 0.5, { onCall: () => (calls += 1) }),
+      }),
+    );
+
+    expect(calls).toBe(0);
+    expect(error.kind).toBe("budget");
+    expect(error.message).toBe(
+      "A task-aware retention request is larger than TypeSafe's 32 MiB request body limit and was not sent. The original session is unchanged and no retention decisions were applied. Run /magic-trim --heuristic to trim without task-aware keep protection.",
+    );
+    expect(error.message).not.toContain("sss");
+  });
+
+  test("batched requests flush at the body limit and keep the task and candidate mapping", async () => {
+    const items = ["c0", "c1", "c2"].map(id =>
+      candidate(id, `${id} ${"o".repeat(5_000)}`),
+    );
+    const near = summaryFor(items[0]!, LIMIT - 1_000);
+    const flushed = buildRetentionRequests(
+      { ...context, sessionSummary: near },
+      items,
+      3,
+    );
+    expect(flushed.map(request => request.candidates)).toEqual([
+      [["candidate_0", "c0"]],
+      [["candidate_0", "c1"]],
+      [["candidate_0", "c2"]],
+    ]);
+
+    const grouped = buildRetentionRequests(context, items, 3);
+    expect(grouped).toHaveLength(1);
+    expect(grouped[0]!.candidates).toEqual([
+      ["candidate_0", "c0"],
+      ["candidate_1", "c1"],
+      ["candidate_2", "c2"],
+    ]);
+    for (const request of flushed) {
+      expect(request.body.state.task).toEqual({
+        ...context,
+        sessionSummary: near,
+      });
+    }
+    expect(grouped[0]!.body.state.task).toEqual(context);
+    const result = await classifyRetention(context, items, {
+      apiKey: "key",
+      batchSize: 3,
+      fetch: jevFetch(body =>
+        Object.fromEntries(
+          body.state.candidates.map((shown, index) => [
+            `candidate_${index}`,
+            { type: "noul", noul: Number(shown.output[1]) / 10 },
+          ]),
+        ),
+      ),
+    });
+    expect([...result.decisions]).toEqual([
+      ["c0", { useful: 0, keep: false }],
+      ["c1", { useful: 0.1, keep: false }],
+      ["c2", { useful: 0.2, keep: false }],
+    ]);
+  });
+});
+
+describe("retention service refusals", () => {
+  const CANARY = "canary-request-echo-sk-secret";
+  // A body stream that records whether it was read or cancelled.
+  function trackedBody(
+    chunks: Array<string | Uint8Array>,
+    options: { hang?: boolean; fail?: boolean; cancelHangs?: boolean } = {},
+  ) {
+    const seen = { pulls: 0, cancelled: false };
+    const encoder = new TextEncoder();
+    let index = 0;
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          seen.pulls += 1;
+          if (index < chunks.length) {
+            const chunk = chunks[index++]!;
+            controller.enqueue(
+              typeof chunk === "string" ? encoder.encode(chunk) : chunk,
+            );
+            return;
+          }
+          if (options.fail) controller.error(new Error(CANARY));
+          else if (options.hang) return new Promise<void>(() => {});
+          else controller.close();
+        },
+        cancel() {
+          seen.cancelled = true;
+          if (options.cancelHangs) return new Promise<void>(() => {});
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    return { stream, seen };
+  }
+
+  async function refusal(
+    respond: () => Response,
+    options: { timeoutMs?: number } = {},
+  ) {
+    let calls = 0;
+    const error = await failure(
+      classifyRetention(context, [candidate("a", CANARY)], {
+        apiKey: "sk-secret",
+        ...options,
+        fetch: async () => {
+          calls += 1;
+          return respond();
+        },
+      }),
+    );
+    expect(calls).toBe(1);
+    expect(error.cause).toBeUndefined();
+    for (const text of [error.message, JSON.stringify(error.diagnostics)]) {
+      expect(text).not.toContain("canary");
+      expect(text).not.toContain("sk-secret");
+    }
+    return error;
+  }
+
+  test("reports Jev's recorded token-limit refusal once, with the manual fallback", async () => {
+    let bodyBytes = 0;
+    let calls = 0;
+    const error = await failure(
+      classifyRetention(context, [candidate("a")], {
+        apiKey: "key",
+        fetch: async (_url, init) => {
+          calls += 1;
+          bodyBytes = Buffer.byteLength(String(init.body));
+          return tokenLimitResponse();
+        },
+      }),
+    );
+
+    expect(calls).toBe(1);
+    expect(error.kind).toBe("token-limit");
+    expect(error.status).toBe(400);
+    expect(error.message).toBe(
+      "TypeSafe Jev refused a task-aware retention request because it exceeds the model's token limit. The original session is unchanged and no retention decisions were applied. Run /magic-trim --heuristic to trim without task-aware keep protection.",
+    );
+    expect(error.diagnostics).toEqual({
+      request: {
+        ordinal: 0,
+        bodyBytes,
+        status: 400,
+        requestId: TOKEN_LIMIT_REQUEST_ID,
+      },
+      counts: { planned: 1, started: 1, succeeded: 0, failed: 1, unstarted: 0 },
+    });
+  });
+
+  test("recognizes the token-limit refusal across chunks and with extra keys it never shows", async () => {
+    const body = JSON.stringify({
+      detail: { error_type: "max_tokens_exceeded", message: `é ${CANARY}` },
+      trace: CANARY,
+    });
+    const split = Buffer.from(body).indexOf(Buffer.from("é")) + 1;
+    const bytes = Buffer.from(body);
+    const error = await refusal(
+      () =>
+        new Response(
+          trackedBody([bytes.subarray(0, split), bytes.subarray(split)]).stream,
+          {
+            status: 400,
+            headers: { "x-typesafe-request-id": `req ${CANARY}` },
+          },
+        ),
+    );
+    expect(error.kind).toBe("token-limit");
+    // An invalid request ID header is dropped, not shown.
+    expect(error.diagnostics?.request).toEqual({
+      ordinal: 0,
+      bodyBytes: expect.any(Number),
+      status: 400,
+    });
+  });
+
+  const otherBadRequests: Array<[string, string | Uint8Array]> = [
+    [
+      "another error type",
+      JSON.stringify({ detail: { error_type: "invalid_utf8", input: CANARY } }),
+    ],
+    [
+      "a detail array",
+      JSON.stringify({ detail: [{ error_type: "max_tokens_exceeded" }] }),
+    ],
+    [
+      "a root array",
+      JSON.stringify([{ detail: { error_type: "max_tokens_exceeded" } }]),
+    ],
+    ["a detail string", JSON.stringify({ detail: "max_tokens_exceeded" })],
+    [
+      "a root error type",
+      JSON.stringify({ error_type: "max_tokens_exceeded" }),
+    ],
+    ["matching text that is not JSON", `max_tokens_exceeded ${CANARY}`],
+    ["an empty body", ""],
+    [
+      "a body over 4,096 bytes",
+      JSON.stringify({
+        detail: { error_type: "max_tokens_exceeded" },
+        pad: "x".repeat(5_000),
+      }),
+    ],
+    [
+      "invalid UTF-8",
+      new Uint8Array([
+        ...Buffer.from('{"detail":{"error_type":"max_tokens_exceeded","x":"'),
+        0xff,
+        ...Buffer.from('"}}'),
+      ]),
+    ],
+  ];
+  for (const [name, body] of otherBadRequests) {
+    test(`keeps HTTP 400 with ${name} a plain failure`, async () => {
+      const error = await refusal(
+        () => new Response(trackedBody([body]).stream, { status: 400 }),
+      );
+      expect(error.kind).toBe("http");
+      expect(error.status).toBe(400);
+      expect(error.message).toBe(
+        "Task-aware retention classification failed (http 400). No tool content was changed. Run /magic-trim --heuristic to trim without classification.",
+      );
+    });
+  }
+
+  test.each([401, 413, 422, 429, 500, 529])(
+    "cancels an HTTP %p body without reading it",
+    async status => {
+      // A 422 body details the offending field, which can echo the request.
+      const { stream, seen } = trackedBody([
+        JSON.stringify({ detail: [{ input: CANARY }] }),
+      ]);
+      const error = await refusal(() => new Response(stream, { status }));
+      expect(error.kind).toBe("http");
+      expect(error.status).toBe(status);
+      expect(seen).toEqual({ pulls: 0, cancelled: true });
+    },
+  );
+
+  test.each([
+    ["never finishes", { hang: true }],
+    [
+      "never finishes and never settles its cancellation",
+      {
+        hang: true,
+        cancelHangs: true,
+      },
+    ],
+    ["fails while it is read", { fail: true }],
+  ] as const)(
+    "keeps HTTP 400 a plain failure within the deadline when its body %s",
+    async (_name, options) => {
+      const { stream, seen } = trackedBody(['{"detail":'], options);
+      const started = performance.now();
+      const error = await refusal(() => new Response(stream, { status: 400 }), {
+        timeoutMs: 50,
+      });
+      expect(performance.now() - started).toBeLessThan(2_000);
+      expect(error.kind).toBe("http");
+      expect(error.status).toBe(400);
+      if (!("fail" in options)) expect(seen.cancelled).toBe(true);
+    },
+  );
+});
+
+describe("retention invocation outcome", () => {
+  test("stops admission at failed headers while the body is still arriving and discards drained successes", async () => {
+    let calls = 0;
+    let callsAtBody = -1;
+    const fetchImpl: RetentionFetch = async (url, init) => {
+      const call = calls++;
+      if (call === 0) {
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream<Uint8Array>(
+          {
+            async pull(controller) {
+              await Bun.sleep(60);
+              callsAtBody = calls;
+              controller.enqueue(encoder.encode(TOKEN_LIMIT_BODY));
+              controller.close();
+            },
+          },
+          { highWaterMark: 0 },
+        );
+        return new Response(stream, { status: 400 });
+      }
+      await Bun.sleep(5);
+      return jevFetch(() => 0.9)(url, init);
+    };
+    const candidates = Array.from({ length: 20 }, (_, i) => candidate(`c${i}`));
+
+    const error = await failure(
+      classifyRetention(context, candidates, {
+        apiKey: "key",
+        fetch: fetchImpl,
+      }),
+    );
+
+    expect(error.kind).toBe("token-limit");
+    expect(calls).toBe(RETENTION_MAX_CONCURRENCY);
+    expect(callsAtBody).toBe(RETENTION_MAX_CONCURRENCY);
+    expect(error.diagnostics?.request?.ordinal).toBe(0);
+    expect(error.diagnostics?.counts).toEqual({
+      planned: 20,
+      started: RETENTION_MAX_CONCURRENCY,
+      succeeded: RETENTION_MAX_CONCURRENCY - 1,
+      failed: 1,
+      unstarted: 20 - RETENTION_MAX_CONCURRENCY,
+    });
+  });
+
+  test("keeps the first failure when later requests fail during and after its body read", async () => {
+    let calls = 0;
+    const fetchImpl: RetentionFetch = async () => {
+      const call = calls++;
+      if (call === 0) {
+        const stream = new ReadableStream<Uint8Array>(
+          {
+            async pull(controller) {
+              await Bun.sleep(30);
+              controller.enqueue(new TextEncoder().encode(TOKEN_LIMIT_BODY));
+              controller.close();
+            },
+          },
+          { highWaterMark: 0 },
+        );
+        return new Response(stream, { status: 400 });
+      }
+      // One failure lands while the body is read, one after it is read.
+      if (call === 1) await Bun.sleep(60);
+      throw new TypeError("connect failed");
+    };
+
+    const error = await failure(
+      classifyRetention(
+        context,
+        Array.from({ length: 8 }, (_, i) => candidate(`c${i}`)),
+        { apiKey: "key", fetch: fetchImpl },
+      ),
+    );
+
+    expect(error.kind).toBe("token-limit");
+    expect(error.diagnostics?.request?.ordinal).toBe(0);
+    expect(error.diagnostics?.counts).toMatchObject({
+      started: RETENTION_MAX_CONCURRENCY,
+      succeeded: 0,
+      failed: RETENTION_MAX_CONCURRENCY,
+    });
+  });
+
+  test("counts only usable reported usage and leaves missing usage unknown", async () => {
+    const usages: unknown[] = [
+      { input_tokens: 10, output_tokens: 1 },
+      undefined,
+      { input_tokens: -1 },
+      { input_tokens: 1.5 },
+      { input_tokens: "10" },
+      { output_tokens: 3 },
+      { input_tokens: 0 },
+    ];
+    let call = 0;
+    const result = await classifyRetention(
+      context,
+      usages.map((_, i) => candidate(`c${i}`)),
+      {
+        apiKey: "key",
+        fetch: async () => {
+          const usage = usages[call++];
+          return Response.json({
+            model: RETENTION_MODEL,
+            answers: { candidate_0: { type: "noul", noul: 0.5 } },
+            ...(usage === undefined ? {} : { usage }),
+          });
+        },
+      },
+    );
+    expect(result.requests).toBe(7);
+    expect(result.inputTokens).toBe(10);
+    expect(result.reportedUsageRequests).toBe(2);
   });
 });
 

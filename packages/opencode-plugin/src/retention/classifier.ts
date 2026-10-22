@@ -18,20 +18,23 @@ export const RETENTION_KEEP_THRESHOLD_PERCENT_ENV =
 export const RETENTION_MAX_CONCURRENCY = 4;
 export const RETENTION_REQUEST_TIMEOUT_MS = 30_000;
 
-// Jev accepts 32K tokens for state plus the longest question and 64K for
-// state plus all questions. Its tokenizer is not public, so budgets are in
-// UTF-8 bytes of the serialized JSON. Bytes are not a documented token bound;
-// measured usage is well under one token per byte, which is the headroom
-// these limits rely on.
-export const RETENTION_STATE_AND_QUESTION_BYTE_LIMIT = 28_000;
-export const RETENTION_TOTAL_BYTE_LIMIT = 56_000;
+// TypeSafe refuses a request body above 32 MiB, counting every byte of the
+// JSON (model, state and questions). This is the only size check made here:
+// Jev's token limits (32K tokens for state plus one question, 64K for state
+// plus all questions) are enforced by the service, because its tokenizer is
+// not public and bytes are not a token bound. A request over them is refused
+// with HTTP 400 `max_tokens_exceeded`, reported as the `token-limit` failure.
+export const RETENTION_REQUEST_BODY_BYTE_LIMIT = 32 * 1024 * 1024;
+// Only a 400 body this small is read, to recognize `max_tokens_exceeded`.
+const ERROR_BODY_BYTE_LIMIT = 4_096;
+const REQUEST_ID_HEADER = "x-typesafe-request-id";
+const REQUEST_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
-// Fixed per-field allocation. Content within its allocation is sent whole;
-// larger content keeps its head and tail. Short input fields, such as paths,
-// commands and patterns, always stay whole. The largest possible request is
-// about 27 KB, so every allocation fits at once.
+// Fixed per-field allocation for candidate content and the latest request.
+// Content within its allocation is sent whole; larger content keeps its head
+// and tail. Short input fields, such as paths, commands and patterns, always
+// stay whole. The session summary has no allocation: it is sent whole.
 const LATEST_REQUEST_BYTES = 5_000;
-const SESSION_SUMMARY_BYTES = 8_000;
 const TURN_REQUEST_BYTES = 600;
 const INPUT_BYTES = 3_000;
 const INPUT_FIELD_WHOLE_BYTES = 200;
@@ -89,7 +92,33 @@ export type RetentionRequest = {
 export type RetentionClassification = {
   decisions: Map<string, RetentionDecision>;
   requests: number;
+  // Sum of the input tokens Jev reported, over `reportedUsageRequests` of
+  // the `requests`. A response without a usable count adds nothing here, so
+  // the sum covers every request only when the two counts are equal.
   inputTokens: number;
+  reportedUsageRequests: number;
+};
+
+export type RetentionRequestCounts = {
+  planned: number;
+  started: number;
+  succeeded: number;
+  failed: number;
+  unstarted: number;
+};
+
+// Content-free facts about a failed invocation, for callers and tests. They
+// never include request or response text, headers other than the validated
+// request ID, the key, or an underlying error.
+export type RetentionFailureDiagnostics = {
+  // The request whose failure is reported, by zero-based planned position.
+  request?: {
+    ordinal: number;
+    bodyBytes: number;
+    status?: number;
+    requestId?: string;
+  };
+  counts?: RetentionRequestCounts;
 };
 
 type RetentionState = {
@@ -116,7 +145,10 @@ export type RetentionFailureKind =
   | "configuration"
   | "missing-api-key"
   | "invalid-threshold-percent"
+  // A request body above RETENTION_REQUEST_BODY_BYTE_LIMIT, refused locally.
   | "budget"
+  // Jev refused a request as longer than the model's token limits.
+  | "token-limit"
   | "timeout"
   | "network"
   | "http"
@@ -125,21 +157,38 @@ export type RetentionFailureKind =
 export const RETENTION_FAILURE_GUIDANCE =
   "No tool content was changed. Run /magic-trim --heuristic to trim without classification.";
 
+// The manual fallback for a request too large to classify. Nothing retries
+// with a shorter request or falls back on its own.
+const SIZE_FAILURE_GUIDANCE =
+  "The original session is unchanged and no retention decisions were applied. Run /magic-trim --heuristic to trim without task-aware keep protection.";
+
 // Public messages are fixed text plus an optional HTTP status. They never
 // carry request state, response bodies, credentials, or the rejected value.
 export class RetentionClassificationError extends PluginMessageError {
   constructor(
     readonly kind: RetentionFailureKind,
     readonly status?: number,
+    readonly diagnostics?: RetentionFailureDiagnostics,
   ) {
-    super(
-      `${retentionFailureText(kind, status)} ${RETENTION_FAILURE_GUIDANCE}`,
-    );
+    super(retentionFailureText(kind, status));
     this.name = "RetentionClassificationError";
   }
 }
 
 function retentionFailureText(
+  kind: RetentionFailureKind,
+  status: number | undefined,
+): string {
+  if (kind === "token-limit") {
+    return `TypeSafe Jev refused a task-aware retention request because it exceeds the model's token limit. ${SIZE_FAILURE_GUIDANCE}`;
+  }
+  if (kind === "budget") {
+    return `A task-aware retention request is larger than TypeSafe's 32 MiB request body limit and was not sent. ${SIZE_FAILURE_GUIDANCE}`;
+  }
+  return `${retentionFailureDetail(kind, status)} ${RETENTION_FAILURE_GUIDANCE}`;
+}
+
+function retentionFailureDetail(
   kind: RetentionFailureKind,
   status: number | undefined,
 ): string {
@@ -188,9 +237,10 @@ export function buildRetentionRequests(
   if (ids.size !== candidates.length) {
     throw new RetentionClassificationError("configuration");
   }
+  // Every request carries the same task; the summary is sent byte for byte.
   const task = {
     latestUserRequest: excerpt(context.latestUserRequest, LATEST_REQUEST_BYTES),
-    sessionSummary: excerpt(context.sessionSummary, SESSION_SUMMARY_BYTES),
+    sessionSummary: context.sessionSummary,
   };
   const requests: RetentionRequest[] = [];
   let pending: RetentionCandidate[] = [];
@@ -202,12 +252,12 @@ export function buildRetentionRequests(
     if (
       pending.length === batchSize
       || (pending.length > 0
-        && !fits(buildRequest(task, [...pending, candidate])))
+        && !withinBodyLimit(buildRequest(task, [...pending, candidate])))
     ) {
       flush();
     }
     pending.push(candidate);
-    if (!fits(buildRequest(task, pending))) {
+    if (!withinBodyLimit(buildRequest(task, pending))) {
       throw new RetentionClassificationError("budget");
     }
   }
@@ -245,15 +295,9 @@ function buildRequest(
   };
 }
 
-function fits(request: RetentionRequest): boolean {
-  const state = jsonBytes(request.body.state);
-  const questions = Object.values(request.body.questions).map(jsonBytes);
-  const longest = Math.max(0, ...questions);
-  const total = questions.reduce((sum, bytes) => sum + bytes, state);
-  return (
-    state + longest <= RETENTION_STATE_AND_QUESTION_BYTE_LIMIT
-    && total <= RETENTION_TOTAL_BYTE_LIMIT
-  );
+// The serialized text is measured and dropped; the send serializes again.
+function withinBodyLimit(request: RetentionRequest): boolean {
+  return jsonBytes(request.body) <= RETENTION_REQUEST_BODY_BYTE_LIMIT;
 }
 
 function calledWhile(requestsBeforeLatest: number): string {
@@ -351,89 +395,251 @@ export async function classifyRetention(
     candidates,
     options.batchSize ?? 1,
   );
-  const answers = await runBounded(
+  const run = await runBounded(
     requests,
     RETENTION_MAX_CONCURRENCY,
-    request =>
-      sendRequest(request, options.apiKey, timeoutMs, options.fetch ?? fetch),
+    (request, ordinal, halt) =>
+      sendRequest(
+        request,
+        ordinal,
+        options.apiKey,
+        timeoutMs,
+        options.fetch ?? fetch,
+        halt,
+      ),
   );
+  if ("failure" in run) {
+    const { failure, counts } = run;
+    if (!(failure instanceof RetentionClassificationError)) throw failure;
+    throw new RetentionClassificationError(failure.kind, failure.status, {
+      ...failure.diagnostics,
+      counts,
+    });
+  }
   const decisions = new Map<string, RetentionDecision>();
   let inputTokens = 0;
-  answers.forEach((answer, index) => {
-    inputTokens += answer.inputTokens;
+  let reportedUsageRequests = 0;
+  run.results.forEach((answer, index) => {
+    if (answer.inputTokens !== undefined) {
+      inputTokens += answer.inputTokens;
+      reportedUsageRequests += 1;
+    }
     for (const [key, id] of requests[index]!.candidates) {
       const useful = answer.nouls.get(key)!;
       decisions.set(id, { useful, keep: useful >= keepThreshold });
     }
   });
-  return { decisions, requests: requests.length, inputTokens };
+  return {
+    decisions,
+    requests: requests.length,
+    inputTokens,
+    reportedUsageRequests,
+  };
 }
 
-// Runs every request with at most `limit` in flight. The first failure stops
-// new admissions; in-flight requests drain before the first error is thrown,
-// so no partial result is ever returned.
+// Runs every request with at most `limit` in flight. A request calls `halt`
+// as soon as it knows it failed, before reading an error body; a thrown
+// error marks its request failed if nothing halted first. The first request
+// marked stops new admissions. In-flight requests drain, and then that
+// request's error is returned in place of every result, so no partial result
+// is ever returned and a later failure never replaces the first.
 async function runBounded<T, R>(
   items: T[],
   limit: number,
-  run: (item: T) => Promise<R>,
-): Promise<R[]> {
+  run: (item: T, ordinal: number, halt: () => void) => Promise<R>,
+): Promise<
+  { results: R[] } | { failure: unknown; counts: RetentionRequestCounts }
+> {
   const results: R[] = new Array(items.length);
+  const errors = new Map<number, unknown>();
   let next = 0;
-  let failure: { error: unknown } | undefined;
+  let first: number | undefined;
+  let succeeded = 0;
   const worker = async () => {
-    while (!failure && next < items.length) {
+    while (first === undefined && next < items.length) {
       const index = next;
       next += 1;
       try {
-        results[index] = await run(items[index]!);
+        results[index] = await run(items[index]!, index, () => {
+          first ??= index;
+        });
+        succeeded += 1;
       } catch (error) {
-        failure ??= { error };
+        errors.set(index, error);
+        first ??= index;
       }
     }
   };
   await Promise.all(
     Array.from({ length: Math.min(limit, items.length) }, worker),
   );
-  if (failure) throw failure.error;
-  return results;
+  if (first === undefined) return { results };
+  if (!errors.has(first)) {
+    throw new Error("A retention request halted admission without failing.");
+  }
+  return {
+    failure: errors.get(first),
+    counts: {
+      planned: items.length,
+      started: next,
+      succeeded,
+      failed: errors.size,
+      unstarted: items.length - next,
+    },
+  };
 }
+
+type RetentionAnswers = {
+  nouls: Map<string, number>;
+  inputTokens: number | undefined;
+};
 
 async function sendRequest(
   request: RetentionRequest,
+  ordinal: number,
   apiKey: string,
   timeoutMs: number,
   fetchImpl: RetentionFetch,
-): Promise<{ nouls: Map<string, number>; inputTokens: number }> {
-  let response: Response;
+  halt: () => void,
+): Promise<RetentionAnswers> {
+  // Serialized once; the bytes measured are the bytes sent.
+  const body = JSON.stringify(request.body);
+  const bodyBytes = Buffer.byteLength(body, "utf8");
+  const facts: NonNullable<RetentionFailureDiagnostics["request"]> = {
+    ordinal,
+    bodyBytes,
+  };
+  const fail = (kind: RetentionFailureKind, status?: number) =>
+    new RetentionClassificationError(kind, status, { request: facts });
+  if (bodyBytes > RETENTION_REQUEST_BODY_BYTE_LIMIT) throw fail("budget");
+  const signal = AbortSignal.timeout(timeoutMs);
   let payload: unknown;
   try {
-    response = await fetchImpl(RETENTION_ENDPOINT, {
+    const response = await fetchImpl(RETENTION_ENDPOINT, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(request.body),
-      signal: AbortSignal.timeout(timeoutMs),
+      body,
+      signal,
     });
+    const status = httpStatus(response.status);
+    if (status !== undefined) facts.status = status;
+    const requestId = response.headers.get(REQUEST_ID_HEADER);
+    if (requestId !== null && REQUEST_ID.test(requestId)) {
+      facts.requestId = requestId;
+    }
     if (!response.ok) {
-      throw new RetentionClassificationError(
-        "http",
-        httpStatus(response.status),
+      halt();
+      if (response.status !== 400) {
+        discardBody(response);
+        throw fail("http", status);
+      }
+      const text = await readErrorBody(response, signal);
+      throw fail(
+        text !== undefined && isTokenLimitBody(text) ? "token-limit" : "http",
+        status,
       );
     }
     payload = await response.json();
   } catch (error) {
     if (error instanceof RetentionClassificationError) throw error;
     if (error instanceof DOMException && error.name === "TimeoutError") {
-      throw new RetentionClassificationError("timeout");
+      throw fail("timeout");
     }
-    if (error instanceof SyntaxError) {
-      throw new RetentionClassificationError("invalid-response");
-    }
-    throw new RetentionClassificationError("network");
+    if (error instanceof SyntaxError) throw fail("invalid-response");
+    throw fail("network");
   }
-  return parseAnswers(payload, request);
+  try {
+    return parseAnswers(payload, request);
+  } catch (error) {
+    if (error instanceof RetentionClassificationError) {
+      throw fail(error.kind, error.status);
+    }
+    throw error;
+  }
+}
+
+// Cancels an unread body without waiting for the cancellation.
+function discardBody(response: Response): void {
+  try {
+    response.body?.cancel().catch(() => {});
+  } catch {
+    // An already locked or released body has nothing more to discard.
+  }
+}
+
+// Reads a 400 body of at most ERROR_BODY_BYTE_LIMIT bytes of UTF-8 before
+// the request deadline. Any other outcome, including a body that is larger,
+// malformed, failing or still open at the deadline, reads as undefined; an
+// unfinished body is cancelled without waiting for the cancellation.
+async function readErrorBody(
+  response: Response,
+  signal: AbortSignal,
+): Promise<string | undefined> {
+  const reader = (() => {
+    try {
+      return response.body?.getReader();
+    } catch {
+      return undefined;
+    }
+  })();
+  if (!reader) return undefined;
+  let onAbort = () => {};
+  const deadline = new Promise<undefined>(resolve => {
+    onAbort = () => resolve(undefined);
+  });
+  if (signal.aborted) onAbort();
+  else signal.addEventListener("abort", onAbort, { once: true });
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  let complete = false;
+  try {
+    for (;;) {
+      const next = await Promise.race([reader.read(), deadline]);
+      if (next === undefined) return undefined;
+      if (next.done) break;
+      if (!(next.value instanceof Uint8Array)) return undefined;
+      bytes += next.value.byteLength;
+      if (bytes > ERROR_BODY_BYTE_LIMIT) return undefined;
+      chunks.push(next.value);
+    }
+    complete = true;
+  } catch {
+    return undefined;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    if (!complete) {
+      try {
+        reader.cancel().catch(() => {});
+      } catch {
+        // A released reader has nothing more to cancel.
+      }
+    }
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(
+      Buffer.concat(chunks),
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+// Exactly `{"detail": {"error_type": "max_tokens_exceeded", ...}}`. Other
+// keys are ignored and never shown; arrays and matching text elsewhere do
+// not count.
+function isTokenLimitBody(text: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return false;
+  }
+  if (!isObject(parsed)) return false;
+  const detail = parsed["detail"];
+  return isObject(detail) && detail["error_type"] === "max_tokens_exceeded";
 }
 
 function httpStatus(status: number): number | undefined {
@@ -445,7 +651,7 @@ function httpStatus(status: number): number | undefined {
 function parseAnswers(
   payload: unknown,
   request: RetentionRequest,
-): { nouls: Map<string, number>; inputTokens: number } {
+): RetentionAnswers {
   const invalid = () => new RetentionClassificationError("invalid-response");
   if (!isObject(payload) || payload["model"] !== RETENTION_MODEL) {
     throw invalid();
@@ -470,13 +676,13 @@ function parseAnswers(
     }
     nouls.set(key, noul);
   }
+  // Usage is informational: a missing or unusable count stays unknown.
   const usage = payload["usage"];
+  const reported = isObject(usage) ? usage["input_tokens"] : undefined;
   const inputTokens =
-    isObject(usage)
-    && typeof usage["input_tokens"] === "number"
-    && Number.isFinite(usage["input_tokens"])
-      ? usage["input_tokens"]
-      : 0;
+    Number.isSafeInteger(reported) && (reported as number) >= 0
+      ? (reported as number)
+      : undefined;
   return { nouls, inputTokens };
 }
 

@@ -36,6 +36,7 @@ import {
   scoredJevFetch,
   SESSION_SUMMARY_TEXT,
   summaryReply,
+  tokenLimitResponse,
   type JevCall,
 } from "./retention-host";
 import {
@@ -1116,11 +1117,20 @@ describe("magic trim task-aware retention", () => {
   });
 
   test.each([
-    ["a missing API key", undefined, 200],
-    ["a failed classification", "test-key", 500],
+    [
+      "a missing API key",
+      undefined,
+      () => new Response("private", { status: 200 }),
+    ],
+    [
+      "a failed classification",
+      "test-key",
+      () => new Response("private", { status: 500 }),
+    ],
+    ["a token-limit refusal", "test-key", tokenLimitResponse],
   ] as const)(
     "%s leaves the source, cache, and stats untouched without a successor",
-    async (_name, apiKey, status) => {
+    async (name, apiKey, respond) => {
       const sessionID = `ses_trim_retention_fail_${randomUUID().replaceAll("-", "")}`;
       const messages = [
         message("usr_1", "user", [userText("usr_1", "Add the parser.")]),
@@ -1138,7 +1148,7 @@ describe("magic trim task-aware retention", () => {
             retention: {
               mode: "task-aware",
               apiKey,
-              fetch: async () => new Response("private", { status }),
+              fetch: async () => respond(),
             },
           });
         } catch (error) {
@@ -1147,6 +1157,14 @@ describe("magic trim task-aware retention", () => {
 
         expect(failure).toBeInstanceOf(RetentionClassificationError);
         expect(String(failure)).toContain("/magic-trim --heuristic");
+        if (name === "a token-limit refusal") {
+          expect((failure as RetentionClassificationError).kind).toBe(
+            "token-limit",
+          );
+          expect(String(failure)).toContain(
+            "no retention decisions were applied",
+          );
+        }
         expect(String(failure)).not.toContain("private");
         expect(messages).toEqual(before);
         expect(harness.created).toEqual([]);

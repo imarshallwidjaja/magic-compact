@@ -46,7 +46,7 @@ import {
   type V2Message,
 } from "../src/v2/session";
 import { executeV2Trim } from "../src/v2/trim";
-import { scoredJevFetch } from "./retention-host";
+import { scoredJevFetch, tokenLimitResponse } from "./retention-host";
 import {
   assistantMessage,
   dependencyError,
@@ -1314,6 +1314,40 @@ describe("OpenCode 2 trim successors", () => {
       }),
     ).rejects.toThrow(/summary failed \(validation\)/);
     expect(state.requests).toHaveLength(1);
+    expect([...state.sessions.keys()]).toEqual(["ses_src"]);
+  });
+
+  test("a Jev token-limit refusal fails task-aware trim with the manual fallback and no successor", async () => {
+    const state = fakeV2State();
+    sourceSession(state, "ses_src", toolHistory());
+    const before = structuredClone(state.messages.get("ses_src"));
+    const owned = new OwnedSessions();
+    const host = fakeV2Host(state, owned, () => ({
+      text: "## Objective\n- Continue.",
+    }));
+    let jevCalls = 0;
+    const error = await executeV2Trim(host, owned, "ses_src", 0, {
+      retention: {
+        mode: "task-aware",
+        apiKey: "test-key",
+        fetch: async () => {
+          jevCalls += 1;
+          return tokenLimitResponse();
+        },
+      },
+      controlTimeoutMs: 1_000,
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(RetentionClassificationError);
+    expect((error as RetentionClassificationError).kind).toBe("token-limit");
+    expect(String(error)).toContain(
+      "no retention decisions were applied. Run /magic-trim --heuristic",
+    );
+    // Both candidates were admitted together; nothing was retried.
+    expect(jevCalls).toBe(2);
+    expect(state.messages.get("ses_src")).toEqual(before);
     expect([...state.sessions.keys()]).toEqual(["ses_src"]);
   });
 });
