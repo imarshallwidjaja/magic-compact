@@ -38,6 +38,7 @@ import {
   type Transport,
 } from "../eval/decisions/providers";
 import { computeMetrics, renderReport } from "../eval/decisions/report";
+import { openAIDecisionsBody } from "../src/retention/backends";
 import { main, type CliDeps } from "../eval/decisions/run";
 import {
   executeRun,
@@ -335,6 +336,32 @@ describe("request mapping", () => {
       expect(
         PROVIDERS.jev.translate(buildCaseRequest(item), RETENTION_MODEL),
       ).toBe(sent);
+    }
+  });
+
+  test("OpenAI sends the production body, named by the case ID instead of the opaque question key", async () => {
+    const openai = PROVIDERS["openai-decisions"];
+    for (const item of cases) {
+      let sent = "";
+      await classifyRetention(item.context, [item.candidate], {
+        backend: "openai-decisions",
+        apiKey: KEY,
+        fetch: async (_url, init) => {
+          sent = String(init.body);
+          return reply(openai, "candidate_0", 0.5);
+        },
+      });
+      const request = buildCaseRequest(item);
+      expect(sent).toBe(
+        openAIDecisionsBody(request, "gpt-6-luna", "candidate_0"),
+      );
+      expect(sent).not.toContain(item.caseID);
+      const production = JSON.parse(sent);
+      const evaluated = JSON.parse(openai.translate(request, "gpt-6-luna"));
+      expect({
+        ...production,
+        questions: [{ ...production.questions[0], name: item.caseID }],
+      }).toEqual(evaluated);
     }
   });
 
@@ -671,6 +698,47 @@ describe("response interpretation", () => {
         status: "failed",
         category: "invalid-response",
       });
+    }
+  });
+
+  // The harness records a fixed category for a response; the response's own
+  // `ok` and `reason` are provider data and never choose it.
+  test("a response's own ok and reason never choose the recorded category", async () => {
+    const CANARY = "PRIVATE_PROVIDER_CANARY";
+    const roots = [
+      { ok: true },
+      { ok: false, reason: CANARY },
+      { ok: false, reason: "refusal" },
+    ];
+    const valid = {
+      jev: (root: object) => ({
+        ...jevPayload({ type: "noul", noul: 0.4 }),
+        ...root,
+      }),
+      openai: (root: object) => ({
+        ...openaiPayload([{ type: "predicate", name, probability: 0.4 }]),
+        ...root,
+      }),
+    };
+    const bare = {
+      jev: (root: object) => ({ model: RETENTION_MODEL, ...root }),
+      openai: (root: object) => ({ model: "gpt-6-luna", ...root }),
+    };
+    for (const [adapter, id] of [
+      [jev, "jev"],
+      [openai, "openai"],
+    ] as const) {
+      for (const root of roots) {
+        expect(
+          await sendOne(adapter, respondWith(valid[id](root))),
+        ).toMatchObject({ status: "scored", probability: 0.4 });
+        const failed = await sendOne(adapter, respondWith(bare[id](root)));
+        expect(failed).toMatchObject({
+          status: "failed",
+          category: "invalid-response",
+        });
+        expect(JSON.stringify(failed)).not.toContain(CANARY);
+      }
     }
   });
 

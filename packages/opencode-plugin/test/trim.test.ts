@@ -13,11 +13,13 @@ import { projectToolTrim } from "../src/compact/prune";
 import server from "../src/host-v1";
 import {
   COMPACT_ARGUMENTS_ERROR,
+  COMPACT_BACKEND_ERROR,
   COMPACT_THRESHOLD_ERROR,
   parseMagicCompactArguments,
 } from "../src/magic-compact";
 import {
   TRIM_ARGUMENTS_ERROR,
+  TRIM_BACKEND_ERROR,
   TRIM_THRESHOLD_ERROR,
   TRIM_NOOP,
   executeMagicTrim,
@@ -36,6 +38,7 @@ import {
 } from "../src/retention/classifier";
 import {
   scoredJevFetch,
+  scoredOpenAIFetch,
   SESSION_SUMMARY_TEXT,
   tokenLimitResponse,
   type JevCall,
@@ -832,16 +835,18 @@ describe("magic trim task-aware retention", () => {
       parseMagicCompactArguments,
       COMPACT_ARGUMENTS_ERROR,
       COMPACT_THRESHOLD_ERROR,
+      COMPACT_BACKEND_ERROR,
     ],
     [
       "magic-trim",
       parseMagicTrimArguments,
       TRIM_ARGUMENTS_ERROR,
       TRIM_THRESHOLD_ERROR,
+      TRIM_BACKEND_ERROR,
     ],
   ] as const)(
     "%s arguments",
-    (command, parse, ARGUMENTS_ERROR, THRESHOLD_ERROR) => {
+    (command, parse, ARGUMENTS_ERROR, THRESHOLD_ERROR, BACKEND_ERROR) => {
       test.each([
         ["", { keepTurns: 0, heuristic: false, truncate: false }],
         [" 3 ", { keepTurns: 3, heuristic: false, truncate: false }],
@@ -883,6 +888,29 @@ describe("magic trim task-aware retention", () => {
             truncate: false,
           },
         ],
+        [
+          "--backend jev",
+          { keepTurns: 0, heuristic: false, backend: "jev", truncate: false },
+        ],
+        [
+          "1 --backend openai-decisions --threshold 70 --truncate",
+          {
+            keepTurns: 1,
+            heuristic: false,
+            backend: "openai-decisions",
+            keepThreshold: 0.7,
+            truncate: true,
+          },
+        ],
+        [
+          "--truncate --backend openai-decisions 2",
+          {
+            keepTurns: 2,
+            heuristic: false,
+            backend: "openai-decisions",
+            truncate: true,
+          },
+        ],
       ] as const)("parses %p", (raw, expected) => {
         expect(parse(raw)).toEqual(expected);
       });
@@ -918,9 +946,27 @@ describe("magic trim task-aware retention", () => {
         ["--threshold 0x3c", "threshold"],
         ["--threshold 100.00000000000000001", "threshold"],
         [`--threshold 0.${"0".repeat(400)}1`, "threshold"],
+        ["--backend jev --backend jev", "arguments"],
+        ["--backend jev --backend openai-decisions", "arguments"],
+        ["--backend=openai-decisions", "arguments"],
+        ["--backends jev", "arguments"],
+        ["--heuristic --backend jev", "arguments"],
+        ["--backend openai-decisions --heuristic", "arguments"],
+        ["--backend", "backend"],
+        ["--backend --truncate", "backend"],
+        ["--backend 70", "backend"],
+        ["--backend Jev", "backend"],
+        ["--backend OPENAI-DECISIONS", "backend"],
+        ["--backend openai", "backend"],
+        ["--backend typesafe", "backend"],
+        ["--backend jev|openai-decisions", "backend"],
       ] as const)("rejects %p", (raw, kind) => {
         expect(() => parse(raw)).toThrow(
-          kind === "arguments" ? ARGUMENTS_ERROR : THRESHOLD_ERROR,
+          kind === "arguments"
+            ? ARGUMENTS_ERROR
+            : kind === "threshold"
+              ? THRESHOLD_ERROR
+              : BACKEND_ERROR,
         );
       });
 
@@ -930,6 +976,7 @@ describe("magic trim task-aware retention", () => {
       test.each([
         ["--heuristic --truncate", ARGUMENTS_ERROR],
         ["--threshold 101", THRESHOLD_ERROR],
+        ["--backend openai", BACKEND_ERROR],
       ])("rejects %p before any work", async (raw, message) => {
         const inherited = process.env;
         const reads: string[] = [];
@@ -964,6 +1011,10 @@ describe("magic trim task-aware retention", () => {
           expect(message).toContain("--threshold");
           expect(message).not.toMatch(/MAGIC_COMPACT|%|Infinity|0x/);
         }
+        expect(ARGUMENTS_ERROR).toContain("--backend jev|openai-decisions");
+        expect(BACKEND_ERROR).toBe(
+          `/${command} --backend needs jev or openai-decisions after a space, such as --backend openai-decisions.`,
+        );
       });
     },
   );
@@ -1023,14 +1074,14 @@ describe("magic trim task-aware retention", () => {
       expect(harness.deletedSessions).toEqual([harness.summaryForkID]);
       expect(JSON.stringify(messages)).not.toContain(harness.summaryForkID);
       expect(harness.toasts.at(-1)?.message).toBe(
-        `Trimmed 2 tool call(s) into successor session ${harness.successorID}. Task-aware retention at keep threshold 60% kept 1 of 2 evaluated tool call(s) whole (read 1).`,
+        `Trimmed 2 tool call(s) into successor session ${harness.successorID}. Task-aware retention with jev (jev-1.13.0) at keep threshold 60% kept 1 of 2 evaluated tool call(s) whole (read 1).`,
       );
       const notice = harness.successorMessages().at(-1)!.parts[0] as TextPart;
       expect(notice.ignored).toBeTrue();
       expect(notice.text.split("\n")).toHaveLength(4);
       expect(notice.text).toContain("Changes | Tool calls trimmed: 2");
       expect(notice.text).toContain(
-        "Retention | Task-aware retention at keep threshold 60% kept 1 of 2 evaluated tool call(s) whole (read 1).",
+        "Retention | Task-aware retention with jev (jev-1.13.0) at keep threshold 60% kept 1 of 2 evaluated tool call(s) whole (read 1).",
       );
     } finally {
       await cleanupSessions(sessionID, ...harness.created);
@@ -1067,7 +1118,7 @@ describe("magic trim task-aware retention", () => {
         expect(
           await executeMagicTrim(harness.v2, sessionID, 0, { retention }),
         ).toEqual(keep ? null : expect.anything());
-        const feedback = `Task-aware retention at keep threshold ${percent ?? 60}% kept ${keep ? 1 : 0} of 1 evaluated tool call(s) whole${keep ? " (read 1)" : ""}.`;
+        const feedback = `Task-aware retention with jev (jev-1.13.0) at keep threshold ${percent ?? 60}% kept ${keep ? 1 : 0} of 1 evaluated tool call(s) whole${keep ? " (read 1)" : ""}.`;
         expect(harness.toasts.at(-1)?.message).toBe(
           `${keep ? TRIM_NOOP : `Trimmed 1 tool call(s) into successor session ${harness.successorID}.`} ${feedback}`,
         );
@@ -1105,21 +1156,60 @@ describe("magic trim task-aware retention", () => {
     const harness = v1CommandHarness(sessionID, messages);
 
     try {
+      // The selected backend's key is not needed when nothing is evaluated.
       await expect(
         executeMagicTrim(harness.v2, sessionID, 0, {
-          retention: { mode: "task-aware", apiKey: undefined },
+          retention: commandRetentionPolicy(
+            "trim",
+            parseMagicTrimArguments("--backend openai-decisions"),
+            {},
+          ),
         }),
       ).resolves.not.toBeNull();
 
       expect(harness.modelCalls).toEqual([]);
       expect(harness.forks).toEqual([]);
       expect(harness.toasts.at(-1)?.message).toBe(
-        `Trimmed 1 tool call(s) into successor session ${harness.successorID}. Task-aware retention at keep threshold 60%: no tool calls needed evaluation.`,
+        `Trimmed 1 tool call(s) into successor session ${harness.successorID}. Task-aware retention with openai-decisions (gpt-6-luna) at keep threshold 60%: no tool calls needed evaluation.`,
       );
       expect(
         (harness.successorMessages().at(-1)!.parts[0] as TextPart).text,
       ).toContain(
-        "Retention | Task-aware retention at keep threshold 60%: no tool calls needed evaluation.",
+        "Retention | Task-aware retention with openai-decisions (gpt-6-luna) at keep threshold 60%: no tool calls needed evaluation.",
+      );
+    } finally {
+      await cleanupSessions(sessionID, ...harness.created);
+    }
+  });
+
+  test("--backend openai-decisions judges every candidate there and names it", async () => {
+    const sessionID = `ses_trim_openai_${randomUUID().replaceAll("-", "")}`;
+    const harness = v1CommandHarness(sessionID, [
+      message("usr_1", "user", [userText("usr_1", "Fix tests.")]),
+      message("ast_1", "assistant", [
+        readTool("tool_read", "large output ".repeat(100)),
+      ]),
+    ]);
+    const calls: JevCall[] = [];
+    try {
+      await expect(
+        executeMagicTrim(harness.v2, sessionID, 0, {
+          retention: {
+            ...commandRetentionPolicy(
+              "trim",
+              parseMagicTrimArguments(
+                "--backend openai-decisions --threshold 70",
+              ),
+              { OPENAI_API_KEY: "test-openai-key" },
+            ),
+            fetch: scoredOpenAIFetch(() => 0.65, calls),
+          },
+        }),
+      ).resolves.not.toBeNull();
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.task.sessionSummary).toBe(SESSION_SUMMARY_TEXT);
+      expect(harness.toasts.at(-1)?.message).toBe(
+        `Trimmed 1 tool call(s) into successor session ${harness.successorID}. Task-aware retention with openai-decisions (gpt-6-luna) at keep threshold 70% kept 0 of 1 evaluated tool call(s) whole.`,
       );
     } finally {
       await cleanupSessions(sessionID, ...harness.created);
@@ -1337,7 +1427,7 @@ describe("magic trim task-aware retention", () => {
         excerpt(summaryText, RETENTION_SUMMARY_EXCERPT_BYTES),
       ]);
       const feedback =
-        "Task-aware retention at keep threshold 70% kept 1 of 2 evaluated tool call(s) whole (read 1). 1 decision(s) used a shortened session summary after a Jev token-limit refusal (--truncate) and could have missed useful context.";
+        "Task-aware retention with jev (jev-1.13.0) at keep threshold 70% kept 1 of 2 evaluated tool call(s) whole (read 1). 1 decision(s) used a shortened session summary after a token-limit refusal (--truncate) and could have missed useful context.";
       expect(harness.toasts.at(-1)?.message).toBe(
         `Trimmed 1 tool call(s) into successor session ${harness.successorID}. ${feedback}`,
       );

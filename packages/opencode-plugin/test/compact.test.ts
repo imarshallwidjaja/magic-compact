@@ -120,6 +120,7 @@ import {
   RetentionClassificationError,
   type RetentionFetch,
 } from "../src/retention/classifier";
+import { RETENTION_BACKEND_ENV } from "../src/retention/backends";
 import {
   hostClock,
   persistedForkHistory,
@@ -1508,6 +1509,14 @@ describe("bounded native compaction generation", () => {
           reads.push("key");
           return "fake-key";
         },
+        get OPENAI_API_KEY() {
+          reads.push("openai-key");
+          return "fake-openai-key";
+        },
+        get [RETENTION_BACKEND_ENV]() {
+          reads.push("backend");
+          return "openai";
+        },
         get [RETENTION_KEEP_THRESHOLD_PERCENT_ENV]() {
           reads.push("percent");
           return "60%";
@@ -1530,20 +1539,33 @@ describe("bounded native compaction generation", () => {
             (error: unknown) => error,
           );
 
-        // The invalid server percent fails the plain command before a
-        // listener is sought.
+        // The invalid server backend fails the plain command before a
+        // listener is sought, and names the accepted values, not its own.
         const plain = await run("");
         expect(plain).toBeInstanceOf(RetentionClassificationError);
-        expect(String(plain)).toContain(RETENTION_KEEP_THRESHOLD_PERCENT_ENV);
+        expect(String(plain)).toContain(RETENTION_BACKEND_ENV);
+        expect(String(plain)).toContain("jev or openai-decisions");
         expect(String(plain)).toContain(`Run /${command} --heuristic`);
+        expect(reads).toEqual(["backend"]);
+
+        // An explicit backend never reads or validates the server's; the
+        // invalid server percent then fails.
+        reads.length = 0;
+        const percent = await run("--backend jev");
+        expect(String(percent)).toContain(RETENTION_KEEP_THRESHOLD_PERCENT_ENV);
         expect(reads).toEqual(["percent"]);
 
-        // An explicit threshold, including 0, never reads or validates it,
-        // and --heuristic reads neither variable.
-        for (const args of ["--threshold 70", "1 --truncate --threshold 0"]) {
+        // An explicit threshold, including 0, never reads or validates it.
+        // Only the selected backend's key is read, and --heuristic reads no
+        // variable.
+        for (const [args, key] of [
+          ["--backend jev --threshold 70", "key"],
+          ["1 --truncate --threshold 0 --backend jev", "key"],
+          ["--threshold 70 --backend openai-decisions", "openai-key"],
+        ]) {
           reads.length = 0;
           expect(String(await run(args))).toContain(LISTENER_REQUIRED);
-          expect(reads).toEqual(["key"]);
+          expect(reads).toEqual([key]);
         }
         reads.length = 0;
         expect(String(await run("2 --heuristic"))).toContain(LISTENER_REQUIRED);
@@ -6082,7 +6104,7 @@ describe("compaction orchestration", () => {
         new RetentionClassificationError("missing-api-key"),
       ),
     ).toStartWith(
-      "Task-aware retention requires TYPESAFE_API_KEY in the OpenCode server environment.",
+      "Task-aware retention with the jev backend requires TYPESAFE_API_KEY in the OpenCode server environment.",
     );
     expect(
       commandFailureMessage("Magic Trim", new PluginMessageError(PLUGIN_TEXT)),
@@ -8002,7 +8024,7 @@ describe("magic compact task-aware retention", () => {
       "Historical read result omitted",
     );
     const line =
-      "Task-aware retention at keep threshold 60% kept 1 of 2 evaluated tool call(s) whole (read 1).";
+      "Task-aware retention with jev (jev-1.13.0) at keep threshold 60% kept 1 of 2 evaluated tool call(s) whole (read 1).";
     expect(harness.toasts.at(-1)?.message).toBe(
       `Compacted 2 request turn(s) into successor session successor. ${preservedTurnsFeedback({ requested: 0, preserved: 0 })} ${line}`,
     );
@@ -8050,7 +8072,7 @@ describe("magic compact task-aware retention", () => {
       ).resolves.toMatchObject({ session: { id: "successor" } });
 
       expect(harness.toasts.at(-1)?.message).toContain(
-        `Task-aware retention at keep threshold ${percent ?? 60}% kept ${kept} of 2 evaluated tool call(s) whole`,
+        `Task-aware retention with jev (jev-1.13.0) at keep threshold ${percent ?? 60}% kept ${kept} of 2 evaluated tool call(s) whole`,
       );
     },
   );
@@ -8271,7 +8293,7 @@ describe("magic compact task-aware retention", () => {
     );
     expect(harness.modelPrompts).toHaveLength(2);
     const feedback =
-      "Task-aware retention at keep threshold 70% kept 1 of 2 evaluated tool call(s) whole (read 1). 1 decision(s) used a shortened session summary after a Jev token-limit refusal (--truncate) and could have missed useful context.";
+      "Task-aware retention with jev (jev-1.13.0) at keep threshold 70% kept 1 of 2 evaluated tool call(s) whole (read 1). 1 decision(s) used a shortened session summary after a token-limit refusal (--truncate) and could have missed useful context.";
     expect(harness.toasts.at(-1)?.message).toBe(
       `Compacted 2 request turn(s) into successor session successor. ${preservedTurnsFeedback({ requested: 0, preserved: 0 })} ${feedback}`,
     );
@@ -8330,7 +8352,13 @@ describe("magic compact task-aware retention", () => {
   });
 
   test.each([
-    ["--threshold 70", "70%", "Task-aware retention"],
+    ["--threshold 70", "70%", "Task-aware retention with jev (jev-1.13.0)"],
+    // No selected key is needed when nothing is evaluated.
+    [
+      "--backend openai-decisions --threshold 70",
+      "70%",
+      "Task-aware retention with openai-decisions (gpt-6-luna)",
+    ],
     ["--heuristic", undefined, HEURISTIC_FEEDBACK],
   ] as const)(
     "a no-op under %p reports its retention mode without a request or successor",

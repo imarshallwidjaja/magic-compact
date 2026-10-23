@@ -1,8 +1,13 @@
-// Fake OpenCode host pieces for the task-aware retention summary fork and a
-// fake Jev endpoint, shared by the retention, trim, and compact suites.
+// Fake OpenCode host pieces for the task-aware retention summary fork and
+// fake Jev and OpenAI Decisions endpoints, shared by the retention, trim, and
+// compact suites.
 import type { Message, Part } from "@opencode-ai/sdk/v2";
 import { Database } from "bun:sqlite";
 import type { MessageWithParts } from "../src/compact/plan";
+import {
+  OPENAI_DECISIONS_ENDPOINT,
+  OPENAI_DECISIONS_MODEL,
+} from "../src/retention/backends";
 import {
   RETENTION_MODEL,
   type RetentionFetch,
@@ -280,6 +285,66 @@ export function tokenLimitResponse(): Response {
       "x-typesafe-request-id": TOKEN_LIMIT_REQUEST_ID,
     },
   });
+}
+
+// OpenAI Decisions' refusal of a request over gpt-6-luna's input token limit,
+// as recorded on 2026-10-23: HTTP 400, this 119-byte JSON body and an
+// `x-request-id` header. The request ID here is synthetic.
+export const OPENAI_TOKEN_LIMIT_BODY =
+  '{"error":{"message":"Decision input exceeds the token limit.","type":"invalid_request_error","param":null,"code":null}}';
+export const OPENAI_TOKEN_LIMIT_REQUEST_ID =
+  "req_00000000000000000000000000000002";
+
+export function openAITokenLimitResponse(): Response {
+  return new Response(OPENAI_TOKEN_LIMIT_BODY, {
+    status: 400,
+    headers: {
+      "content-type": "application/json",
+      "x-request-id": OPENAI_TOKEN_LIMIT_REQUEST_ID,
+    },
+  });
+}
+
+// An OpenAI Decisions answer to the one predicate of `init`'s body.
+export function openAIAnswer(
+  init: RequestInit,
+  answer: Record<string, unknown>,
+  model = OPENAI_DECISIONS_MODEL,
+): Response {
+  const body = JSON.parse(String(init.body)) as {
+    questions: Array<{ name: string }>;
+  };
+  return Response.json({
+    model,
+    answers: [{ name: body.questions[0]!.name, ...answer }],
+    usage: {
+      input_tokens: 10,
+      input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+      output_tokens: 0,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: 10,
+    },
+  });
+}
+
+// Scores each OpenAI Decisions request by its candidate's excerpted output,
+// recording the decoded `input` state like `scoredJevFetch`.
+export function scoredOpenAIFetch(
+  score: (output: string) => number,
+  calls: JevCall[] = [],
+): RetentionFetch {
+  return async (url, init) => {
+    if (url !== OPENAI_DECISIONS_ENDPOINT) throw new Error("unexpected URL");
+    const state = JSON.parse(JSON.parse(String(init.body)).input) as {
+      task: JevCall["task"];
+      candidates: Array<JevCall["candidate"]>;
+    };
+    calls.push({ task: state.task, candidate: state.candidates[0]! });
+    return openAIAnswer(init, {
+      type: "predicate",
+      probability: score(state.candidates[0]!.output),
+    });
+  };
 }
 
 export type JevCall = {

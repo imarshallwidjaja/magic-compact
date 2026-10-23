@@ -1,11 +1,24 @@
 // Decision providers. Each adapter turns the production singleton request into
-// its own wire body and strictly reads the answer back. Adding a provider is
-// one more adapter in PROVIDERS; there is no registry or plugin loading.
+// its own wire body and strictly reads the answer back, with the production
+// serializers and answer readers of `src/retention/backends.ts`. The
+// evaluation differs from production only where it must: Jev may run at any
+// version, and the OpenAI predicate is named by the case ID. Adding a provider
+// is one more adapter in PROVIDERS; there is no registry or plugin loading.
 //
 // Failures are reduced to a fixed category and optional HTTP status. Request
 // text, response bodies, error messages and keys never reach a result.
 import {
+  OPENAI_DECISIONS_ENDPOINT,
+  OPENAI_DECISIONS_MODEL,
+  openAIDecisionsBody,
+  parseJevAnswers,
+  parseOpenAIDecisionAnswers,
+  renderPredicateInstructions,
+  RETENTION_BACKENDS,
   RETENTION_ENDPOINT,
+  type BackendAnswers,
+} from "../../src/retention/backends";
+import {
   RETENTION_REQUEST_TIMEOUT_MS,
   type RetentionFetch,
   type RetentionRequest,
@@ -20,11 +33,12 @@ import {
 export const PROVIDER_IDS = ["jev", "openai-decisions"] as const;
 export type ProviderID = (typeof PROVIDER_IDS)[number];
 
+export { OPENAI_DECISIONS_ENDPOINT, renderPredicateInstructions };
+
 export const DEFAULT_TIMEOUT_MS = RETENTION_REQUEST_TIMEOUT_MS;
-export const OPENAI_DECISIONS_ENDPOINT = "https://api.openai.com/v1/decisions";
 // OpenAI documents gpt-6-luna as the only Decisions model. Selecting another
 // is refused up front rather than sent to be rejected one case at a time.
-export const OPENAI_DECISIONS_MODELS = ["gpt-6-luna"] as const;
+export const OPENAI_DECISIONS_MODELS = [OPENAI_DECISIONS_MODEL] as const;
 export const OPENAI_TRANSLATION_VERSION = "openai-predicate-1";
 
 export type Usage = { inputTokens?: number; outputTokens?: number };
@@ -100,14 +114,8 @@ class ResponseError extends Error {
   }
 }
 
-const invalid = () => new ResponseError("invalid-response");
-
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function validProbability(value: unknown): value is number {
-  return typeof value === "number" && value >= 0 && value <= 1;
 }
 
 // A count outside the safe integer range cannot be stored or summed exactly,
@@ -142,21 +150,26 @@ function readUsage(payload: Record<string, unknown>): Usage | undefined {
   };
 }
 
-function readModel(payload: unknown): Record<string, unknown> & {
-  model: string;
-} {
-  if (!isObject(payload) || typeof payload["model"] !== "string") {
-    throw invalid();
+// The production reader's verdict as an evaluation outcome. The response
+// model equals the requested model whenever the reader accepted it.
+function interpreted(
+  answers: BackendAnswers,
+  payload: unknown,
+  name: string,
+): Interpreted {
+  if (!answers.ok && answers.reason !== "refusal") {
+    throw new ResponseError(answers.reason);
   }
-  return payload as Record<string, unknown> & { model: string };
-}
-
-type Question = RetentionRequest["body"]["questions"][string];
-
-// One predicate has no separate criteria field, so the production question and
-// both of its criteria go into the instructions in a fixed order.
-export function renderPredicateInstructions(question: Question): string {
-  return `${question.instructions}\n\nYes, probability near 1: ${question.criteria.true}\nNo, probability near 0: ${question.criteria.false}`;
+  const body = payload as Record<string, unknown> & { model: string };
+  const usage = readUsage(body);
+  const extra = { returnedModel: body.model, ...(usage ? { usage } : {}) };
+  return answers.ok
+    ? {
+        kind: "scored",
+        probability: answers.probabilities.get(name)!,
+        ...extra,
+      }
+    : { kind: "refused", ...extra };
 }
 
 const JEV_VERSION = /^jev-\d+\.\d+\.\d+$/;
@@ -164,7 +177,7 @@ const JEV_VERSION = /^jev-\d+\.\d+\.\d+$/;
 const jev: ProviderAdapter = {
   id: "jev",
   endpoint: RETENTION_ENDPOINT,
-  keyEnv: "TYPESAFE_API_KEY",
+  keyEnv: RETENTION_BACKENDS.jev.keyEnv,
   translation: () => null,
   checkModel(model) {
     if (!JEV_VERSION.test(model)) {
@@ -177,41 +190,15 @@ const jev: ProviderAdapter = {
   // production body whenever the model is the production model.
   translate: (request, model) => JSON.stringify({ ...request.body, model }),
   interpret(payload, request, model) {
-    const body = readModel(payload);
-    if (!returnedModelMatches(model, body.model)) {
-      throw new ResponseError("model-mismatch");
-    }
-    const answers = body["answers"];
     const key = request.candidates[0]![0];
-    if (
-      !isObject(answers)
-      || Object.keys(answers).length !== 1
-      || !Object.hasOwn(answers, key)
-    ) {
-      throw invalid();
-    }
-    const answer = answers[key];
-    if (
-      !isObject(answer)
-      || answer["type"] !== "noul"
-      || !validProbability(answer["noul"])
-    ) {
-      throw invalid();
-    }
-    const usage = readUsage(body);
-    return {
-      kind: "scored",
-      probability: answer["noul"],
-      returnedModel: body.model,
-      ...(usage ? { usage } : {}),
-    };
+    return interpreted(parseJevAnswers(payload, [key], model), payload, key);
   },
 };
 
 const openaiDecisions: ProviderAdapter = {
   id: "openai-decisions",
   endpoint: OPENAI_DECISIONS_ENDPOINT,
-  keyEnv: "OPENAI_API_KEY",
+  keyEnv: RETENTION_BACKENDS["openai-decisions"].keyEnv,
   translation: () => ({
     version: OPENAI_TRANSLATION_VERSION,
     sha256: sha256(
@@ -228,44 +215,16 @@ const openaiDecisions: ProviderAdapter = {
       );
     }
   },
-  translate(request, model) {
-    const question = request.body.questions[request.candidates[0]![0]]!;
-    return JSON.stringify({
-      model,
-      input: JSON.stringify(request.body.state),
-      questions: [
-        {
-          type: "predicate",
-          name: request.candidates[0]![1],
-          instructions: renderPredicateInstructions(question),
-        },
-      ],
-    });
-  },
+  // The production body, with the predicate named by the case ID.
+  translate: (request, model) =>
+    openAIDecisionsBody(request, model, request.candidates[0]![1]),
   interpret(payload, request, model) {
-    const body = readModel(payload);
-    if (!returnedModelMatches(model, body.model)) {
-      throw new ResponseError("model-mismatch");
-    }
-    const answers = body["answers"];
-    if (!Array.isArray(answers) || answers.length !== 1) throw invalid();
-    const answer: unknown = answers[0];
-    if (!isObject(answer) || answer["name"] !== request.candidates[0]![1]) {
-      throw invalid();
-    }
-    const usage = readUsage(body);
-    const extra = {
-      returnedModel: body.model,
-      ...(usage ? { usage } : {}),
-    };
-    if (answer["type"] === "refusal") return { kind: "refused", ...extra };
-    if (
-      answer["type"] !== "predicate"
-      || !validProbability(answer["probability"])
-    ) {
-      throw invalid();
-    }
-    return { kind: "scored", probability: answer["probability"], ...extra };
+    const name = request.candidates[0]![1];
+    return interpreted(
+      parseOpenAIDecisionAnswers(payload, name, model),
+      payload,
+      name,
+    );
   },
 };
 

@@ -1,33 +1,41 @@
 // Task-aware tool retention classifier. Trimming rules pick the candidates;
-// this module only asks TypeSafe Jev whether each candidate's content is
-// useful for the current task, and a candidate is kept whole only when the
-// probability clears the keep threshold. See docs/RetentionEvaluation.md.
+// this module only asks the selected decision backend (TypeSafe Jev by
+// default, or OpenAI Decisions) whether each candidate's content is useful for
+// the current task, and a candidate is kept whole only when the probability
+// clears the keep threshold. Evidence, question, scheduling and thresholds are
+// shared; `backends.ts` owns each backend's wire format, limits and exact
+// error recognition. See docs/RetentionEvaluation.md.
 import { PluginMessageError } from "../policy/feedback";
+import {
+  DEFAULT_RETENTION_BACKEND,
+  RETENTION_BACKEND_ENV,
+  RETENTION_BACKENDS,
+  RETENTION_MODEL,
+  RETENTION_REQUEST_BODY_BYTE_LIMIT,
+  type RetentionBackend,
+  type RetentionBackendID,
+} from "./backends";
 
-// The threshold was chosen against this exact model version, so the version
-// is pinned rather than using the moving `jev-latest` alias.
-export const RETENTION_MODEL = "jev-1.13.0";
-export const RETENTION_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
+export {
+  RETENTION_ENDPOINT,
+  RETENTION_MODEL,
+  RETENTION_REQUEST_BODY_BYTE_LIMIT,
+} from "./backends";
+
 // The default keep threshold, selected by the operator after a development
-// study. It is not a held-out or native-summary calibration; the study and its
-// limits are in docs/RetentionEvaluation.md. The server environment overrides
-// it per command through RETENTION_KEEP_THRESHOLD_PERCENT_ENV.
+// study of Jev. It is not a held-out or native-summary calibration, and it is
+// not calibrated for OpenAI Decisions; the study and its limits are in
+// docs/RetentionEvaluation.md. The server environment overrides it per
+// command through RETENTION_KEEP_THRESHOLD_PERCENT_ENV, for either backend.
 export const RETENTION_KEEP_THRESHOLD = 0.6;
 export const RETENTION_KEEP_THRESHOLD_PERCENT_ENV =
   "MAGIC_COMPACT_KEEP_THRESHOLD_PERCENT";
 export const RETENTION_MAX_CONCURRENCY = 4;
 export const RETENTION_REQUEST_TIMEOUT_MS = 30_000;
 
-// TypeSafe refuses a request body above 32 MiB, counting every byte of the
-// JSON (model, state and questions). This is the only size check made here:
-// Jev's token limits (32K tokens for state plus one question, 64K for state
-// plus all questions) are enforced by the service, because its tokenizer is
-// not public and bytes are not a token bound. A request over them is refused
-// with HTTP 400 `max_tokens_exceeded`, reported as the `token-limit` failure.
-export const RETENTION_REQUEST_BODY_BYTE_LIMIT = 32 * 1024 * 1024;
-// Only a 400 body this small is read, to recognize `max_tokens_exceeded`.
+// Only a 400 body this small is read, to recognize a backend's token-limit
+// refusal.
 const ERROR_BODY_BYTE_LIMIT = 4_096;
-const REQUEST_ID_HEADER = "x-typesafe-request-id";
 const REQUEST_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 // Fixed per-field allocation for candidate content and the latest request.
@@ -67,17 +75,23 @@ export type RetentionFetch = (
 ) => Promise<Response>;
 
 export type RetentionOptions = {
+  // Defaults to DEFAULT_RETENTION_BACKEND. Every request and retry of one
+  // invocation goes to this backend; nothing fails over to the other.
+  backend?: RetentionBackendID;
+  // The selected backend's own key.
   apiKey: string;
-  // Evaluation-only: compares batched formats against the shipped one.
+  // Evaluation-only, and Jev-only: compares batched formats against the
+  // shipped one.
   batchSize?: number;
   timeoutMs?: number;
   fetch?: RetentionFetch;
   // A finite probability from 0 to 1; a candidate is kept at or above it.
   // Defaults to RETENTION_KEEP_THRESHOLD.
   keepThreshold?: number;
-  // `--truncate` on /magic-compact or /magic-trim: a request Jev refuses as
-  // over its token limit is sent once more, identical except that the session
-  // summary is cut to its head and tail within RETENTION_SUMMARY_EXCERPT_BYTES.
+  // `--truncate` on /magic-compact or /magic-trim: a request the backend
+  // refuses as over its token limit is sent once more, identical except that
+  // the session summary is cut to its head and tail within
+  // RETENTION_SUMMARY_EXCERPT_BYTES.
   // Only singleton requests (batchSize 1) support it.
   truncateSummary?: boolean;
 };
@@ -89,10 +103,13 @@ export type RetentionDecision = {
 
 // The command a person ran, as /magic-compact or /magic-trim, with the
 // arguments that shape what a failure suggests running again: the turn count
-// always, the keep threshold only when `--threshold` gave it explicitly.
+// always, the keep threshold only when `--threshold` gave it explicitly, and
+// the backend when `--backend` or the server environment chose it, so a
+// suggested retry never silently selects the other provider.
 export type RetentionInvocation = {
   command: "compact" | "trim";
   keepTurns: number;
+  backend?: RetentionBackendID;
   keepThreshold?: number;
   truncate: boolean;
 };
@@ -115,9 +132,10 @@ export type RetentionClassification = {
   attempts: number;
   // Requests answered by their --truncate retry, with the summary excerpt.
   truncated: number;
-  // Sum of the input tokens Jev reported, over `reportedUsageRequests` of
-  // the `attempts`. A response without a usable count, including every
-  // refused attempt, adds nothing here and stays unknown, not zero.
+  // Sum of the input tokens the backend reported, over
+  // `reportedUsageRequests` of the `attempts`. A response without a usable
+  // count, including every refused attempt, adds nothing here and stays
+  // unknown, not zero.
   inputTokens: number;
   reportedUsageRequests: number;
 };
@@ -145,6 +163,9 @@ export type SummaryTruncation = "unavailable" | "available";
 // never include request or response text, headers other than the validated
 // request ID, the key, or an underlying error.
 export type RetentionFailureDiagnostics = {
+  // The backend the failed invocation used, with its pinned model.
+  backend?: RetentionBackendID;
+  model?: string;
   // The attempt whose failure is reported, by zero-based planned position
   // of its request and the summary it carried.
   request?: {
@@ -182,14 +203,20 @@ export type RetentionFailureKind =
   | "configuration"
   | "missing-api-key"
   | "invalid-threshold-percent"
-  // A request body above RETENTION_REQUEST_BODY_BYTE_LIMIT, refused locally.
+  | "invalid-backend"
+  // A Jev request body above RETENTION_REQUEST_BODY_BYTE_LIMIT, refused
+  // locally.
   | "budget"
-  // Jev refused a request as longer than the model's token limits.
+  // The backend refused a request as longer than the model's token limits.
   | "token-limit"
   | "timeout"
   | "network"
   | "http"
-  | "invalid-response";
+  | "invalid-response"
+  // The answer named a model other than the pinned one.
+  | "model-mismatch"
+  // The backend declined to answer the question (OpenAI Decisions `refusal`).
+  | "refusal";
 
 // The closing advice of a failure before or around classification. Without an
 // invocation it names /magic-trim without the caller's N or an explicit
@@ -269,49 +296,78 @@ function retentionFailureText(
 ): string {
   const compact = invocation?.command === "compact";
   const command = invocationCommand(invocation);
+  const backend =
+    diagnostics?.backend === undefined
+      ? undefined
+      : RETENTION_BACKENDS[diagnostics.backend];
   const heuristic = compact
     ? `Run ${command} --heuristic to compact without task-aware keep protection (turn summaries are still generated).`
     : `Run ${command} --heuristic to trim without task-aware keep protection.`;
   if (kind === "token-limit") {
-    const refused =
-      "TypeSafe Jev refused a task-aware retention request because it exceeds the model's token limit.";
+    const name = (backend ?? RETENTION_BACKENDS[DEFAULT_RETENTION_BACKEND])
+      .name;
+    const refused = `${name} refused a task-aware retention request because it exceeds the model's token limit.`;
     if (diagnostics?.request?.summary === "excerpt") {
-      return `TypeSafe Jev refused a task-aware retention request again after --truncate retried it with a shorter session summary, so the retry limit was exceeded. ${UNCHANGED} ${heuristic}`;
+      return `${name} refused a task-aware retention request again after --truncate retried it with a shorter session summary, so the retry limit was exceeded. ${UNCHANGED} ${heuristic}`;
     }
     if (diagnostics?.truncation === "unavailable") {
       return `${refused} The session summary already fits the 8,000-byte excerpt that --truncate would use, so --truncate cannot shorten the request. ${UNCHANGED} ${heuristic}`;
     }
-    const threshold =
+    // The retry repeats the person's turn count, backend and threshold, so
+    // it asks the same backend at the same threshold.
+    const retry = `${command}${invocation?.backend === undefined ? "" : ` --backend ${invocation.backend}`}${
       invocation?.keepThreshold === undefined
         ? ""
-        : ` --threshold ${formatKeepThresholdPercent(invocation.keepThreshold)}`;
-    const full = `${refused} ${UNCHANGED} Run ${command}${threshold} --truncate to retry each refused call once with a shorter session summary, which can omit useful context, or ${command} --heuristic to ${compact ? "compact" : "trim"} without task-aware keep protection${compact ? " (turn summaries are still generated)" : ""}. --threshold does not reduce the Jev request size.`;
+        : ` --threshold ${formatKeepThresholdPercent(invocation.keepThreshold)}`
+    } --truncate`;
+    const full = `${refused} ${UNCHANGED} Run ${retry} to retry each refused call once with a shorter session summary, which can omit useful context, or ${command} --heuristic to ${compact ? "compact" : "trim"} without task-aware keep protection${compact ? " (turn summaries are still generated)" : ""}. --threshold does not reduce the request size.`;
     // A threshold of hundreds of digits would push the --heuristic command
     // out of the toast, so the same guidance is then worded more briefly.
     return full.length < MESSAGE_CHARACTER_LIMIT
       ? full
-      : `TypeSafe Jev refused a retention request as over its token limit. ${UNCHANGED} Run ${command}${threshold} --truncate (a shorter summary can omit context) or ${command} --heuristic${compact ? " (turns are still summarized)" : ""}. --threshold does not shrink the request.`;
+      : `${name} refused a retention request as over its token limit; nothing was changed. Run ${retry} (a shorter summary can omit context) or ${command} --heuristic${compact ? " (turns are still summarized)" : ""}. --threshold does not shrink it.`;
   }
   if (kind === "budget") {
     return `A task-aware retention request is larger than TypeSafe's 32 MiB request body limit and was not sent; --truncate does not apply to this limit. ${UNCHANGED} ${heuristic}`;
   }
-  return `${retentionFailureDetail(kind, status)} ${retentionFailureGuidance(invocation)}`;
+  return `${retentionFailureDetail(kind, status, backend)} ${retentionFailureGuidance(invocation)}`;
 }
 
 function retentionFailureDetail(
   kind: RetentionFailureKind,
   status: number | undefined,
+  backend: RetentionBackend | undefined,
 ): string {
   if (kind === "missing-api-key") {
-    return "Task-aware retention requires TYPESAFE_API_KEY in the OpenCode server environment.";
+    const selected = backend ?? RETENTION_BACKENDS[DEFAULT_RETENTION_BACKEND];
+    return `Task-aware retention with the ${selected.id} backend requires ${selected.keyEnv} in the OpenCode server environment.`;
   }
   if (kind === "invalid-threshold-percent") {
     return `Task-aware retention requires ${RETENTION_KEEP_THRESHOLD_PERCENT_ENV} in the OpenCode server environment to be a plain decimal percent from 0 to 100, such as 60 or 70.5, or to be unset.`;
   }
-  if (kind === "http" && (status === 401 || status === 403)) {
-    return `TypeSafe refused the TYPESAFE_API_KEY credentials (http ${status}). Check the key in the OpenCode server environment.`;
+  if (kind === "invalid-backend") {
+    return `Task-aware retention requires ${RETENTION_BACKEND_ENV} in the OpenCode server environment to be jev or openai-decisions, or to be unset; --backend jev or --backend openai-decisions on the command overrides it.`;
   }
-  return `Task-aware retention classification failed (${kind}${status === undefined ? "" : ` ${status}`}).`;
+  if (backend !== undefined) {
+    if (kind === "http" && (status === 401 || status === 403)) {
+      return `${backend.provider} refused the ${backend.keyEnv} credentials (http ${status}). Check the key in the OpenCode server environment.`;
+    }
+    if (
+      kind === "http"
+      && status !== undefined
+      && status >= 300
+      && status < 400
+    ) {
+      return `${backend.name} answered with a redirect (http ${status}), which is never followed, so the request went nowhere else.`;
+    }
+    if (kind === "model-mismatch") {
+      return `${backend.name} answered with a model other than the pinned ${backend.model}, so its decisions were not used.`;
+    }
+    if (kind === "refusal") {
+      return `${backend.name} declined to judge a tool call, so its decisions were not used.`;
+    }
+  }
+  return `Task-aware retention classification${backend === undefined ? "" : ` with ${backend.id}`} failed (${kind}${status === undefined ? "" : ` ${status}`}).`;
 }
 
 // Resolves an explicit probability threshold before any request is built or
@@ -338,10 +394,15 @@ function question(index: number): NoulQuestion {
   };
 }
 
+// Canonical requests. `bodyByteLimit` caps the canonical body, which is the
+// Jev wire body; it defaults to TypeSafe's limit and is null for a
+// backend that documents none, so that backend's request is never refused
+// here for a limit that is not its own.
 export function buildRetentionRequests(
   context: RetentionContext,
   candidates: RetentionCandidate[],
   batchSize = 1,
+  bodyByteLimit: number | null = RETENTION_REQUEST_BODY_BYTE_LIMIT,
 ): RetentionRequest[] {
   if (!Number.isInteger(batchSize) || batchSize < 1) {
     throw new RetentionClassificationError("configuration");
@@ -366,12 +427,15 @@ export function buildRetentionRequests(
     if (
       pending.length === batchSize
       || (pending.length > 0
-        && !withinBodyLimit(buildRequest(task, [...pending, candidate])))
+        && !withinBodyLimit(
+          buildRequest(task, [...pending, candidate]),
+          bodyByteLimit,
+        ))
     ) {
       flush();
     }
     pending.push(candidate);
-    if (!withinBodyLimit(buildRequest(task, pending))) {
+    if (!withinBodyLimit(buildRequest(task, pending), bodyByteLimit)) {
       throw new RetentionClassificationError("budget");
     }
   }
@@ -410,8 +474,11 @@ function buildRequest(
 }
 
 // The serialized text is measured and dropped; the send serializes again.
-function withinBodyLimit(request: RetentionRequest): boolean {
-  return jsonBytes(request.body) <= RETENTION_REQUEST_BODY_BYTE_LIMIT;
+function withinBodyLimit(
+  request: RetentionRequest,
+  limit: number | null,
+): boolean {
+  return limit === null || jsonBytes(request.body) <= limit;
 }
 
 function calledWhile(requestsBeforeLatest: number): string {
@@ -502,14 +569,22 @@ export async function classifyRetention(
   const keepThreshold = resolveKeepThreshold(options.keepThreshold);
   const timeoutMs = options.timeoutMs ?? RETENTION_REQUEST_TIMEOUT_MS;
   const batchSize = options.batchSize ?? 1;
+  const backend =
+    RETENTION_BACKENDS[options.backend ?? DEFAULT_RETENTION_BACKEND];
   if (
     !options.apiKey
     || !(timeoutMs > 0)
-    || (options.truncateSummary === true && batchSize !== 1)
+    || (batchSize !== 1
+      && (options.truncateSummary === true || backend.id !== "jev"))
   ) {
     throw new RetentionClassificationError("configuration");
   }
-  const requests = buildRetentionRequests(context, candidates, batchSize);
+  const requests = buildRetentionRequests(
+    context,
+    candidates,
+    batchSize,
+    backend.bodyByteLimit,
+  );
   // A summary that already fits the excerpt has no shorter retry. That fact
   // shapes the failure guidance with or without --truncate; the excerpt
   // itself is built once, and only when the retry is asked for and possible.
@@ -532,6 +607,7 @@ export async function classifyRetention(
           ? requests[ordinal]!
           : withSummary(requests[ordinal]!, summaryExcerpt!),
         { ordinal, summary },
+        backend,
         options.apiKey,
         timeoutMs,
         fetchImpl,
@@ -559,7 +635,7 @@ export async function classifyRetention(
     const keys = requests[index]!.candidates;
     if (summary === "excerpt") truncated += keys.length;
     for (const [key, id] of keys) {
-      const useful = answers.nouls.get(key)!;
+      const useful = answers.probabilities.get(key)!;
       decisions.set(id, { useful, keep: useful >= keepThreshold });
     }
   });
@@ -727,43 +803,54 @@ function runAttempts(
 }
 
 type RetentionAnswers = {
-  nouls: Map<string, number>;
+  // Keyed by question key.
+  probabilities: Map<string, number>;
   inputTokens: number | undefined;
 };
 
 async function sendRequest(
   request: RetentionRequest,
   attempt: { ordinal: number; summary: SummaryVariant },
+  backend: RetentionBackend,
   apiKey: string,
   timeoutMs: number,
   fetchImpl: RetentionFetch,
   rejected: (status: number) => void,
 ): Promise<RetentionAnswers> {
   // Serialized once; the bytes measured are the bytes sent.
-  const body = JSON.stringify(request.body);
+  const body = backend.serialize(request);
   const bodyBytes = Buffer.byteLength(body, "utf8");
   const facts: NonNullable<RetentionFailureDiagnostics["request"]> = {
     ...attempt,
     bodyBytes,
   };
   const fail = (kind: RetentionFailureKind, status?: number) =>
-    new RetentionClassificationError(kind, status, { request: facts });
-  if (bodyBytes > RETENTION_REQUEST_BODY_BYTE_LIMIT) throw fail("budget");
+    new RetentionClassificationError(kind, status, {
+      backend: backend.id,
+      model: backend.model,
+      request: facts,
+    });
+  if (backend.bodyByteLimit !== null && bodyBytes > backend.bodyByteLimit) {
+    throw fail("budget");
+  }
   const signal = AbortSignal.timeout(timeoutMs);
   let payload: unknown;
   try {
-    const response = await fetchImpl(RETENTION_ENDPOINT, {
+    const response = await fetchImpl(backend.endpoint, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body,
+      // A redirect keeps the method, key and body, so following one would
+      // send them to an address nobody chose. A 3xx is an HTTP failure.
+      redirect: "manual",
       signal,
     });
     const status = httpStatus(response.status);
     if (status !== undefined) facts.status = status;
-    const requestId = response.headers.get(REQUEST_ID_HEADER);
+    const requestId = response.headers.get(backend.requestIdHeader);
     if (requestId !== null && REQUEST_ID.test(requestId)) {
       facts.requestId = requestId;
     }
@@ -775,7 +862,9 @@ async function sendRequest(
       }
       const text = await readErrorBody(response, signal);
       throw fail(
-        text !== undefined && isTokenLimitBody(text) ? "token-limit" : "http",
+        text !== undefined && backend.isTokenLimitBody(text)
+          ? "token-limit"
+          : "http",
         status,
       );
     }
@@ -788,14 +877,18 @@ async function sendRequest(
     if (error instanceof SyntaxError) throw fail("invalid-response");
     throw fail("network");
   }
-  try {
-    return parseAnswers(payload, request);
-  } catch (error) {
-    if (error instanceof RetentionClassificationError) {
-      throw fail(error.kind, error.status);
-    }
-    throw error;
-  }
+  const answers = backend.parse(payload, request);
+  if (!answers.ok) throw fail(answers.reason);
+  // Usage is informational: a missing or unusable count stays unknown.
+  const usage = isObject(payload) ? payload["usage"] : undefined;
+  const reported = isObject(usage) ? usage["input_tokens"] : undefined;
+  return {
+    probabilities: answers.probabilities,
+    inputTokens:
+      Number.isSafeInteger(reported) && (reported as number) >= 0
+        ? (reported as number)
+        : undefined,
+  };
 }
 
 // Cancels an unread body without waiting for the cancellation.
@@ -864,63 +957,10 @@ async function readErrorBody(
   }
 }
 
-// Exactly `{"detail": {"error_type": "max_tokens_exceeded", ...}}`. Other
-// keys are ignored and never shown; arrays and matching text elsewhere do
-// not count.
-function isTokenLimitBody(text: string): boolean {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return false;
-  }
-  if (!isObject(parsed)) return false;
-  const detail = parsed["detail"];
-  return isObject(detail) && detail["error_type"] === "max_tokens_exceeded";
-}
-
 function httpStatus(status: number): number | undefined {
   return Number.isInteger(status) && status >= 100 && status <= 599
     ? status
     : undefined;
-}
-
-function parseAnswers(
-  payload: unknown,
-  request: RetentionRequest,
-): RetentionAnswers {
-  const invalid = () => new RetentionClassificationError("invalid-response");
-  if (!isObject(payload) || payload["model"] !== RETENTION_MODEL) {
-    throw invalid();
-  }
-  const answers = payload["answers"];
-  if (!isObject(answers)) throw invalid();
-  const expected = request.candidates.map(([key]) => key);
-  const received = Object.keys(answers);
-  if (
-    received.length !== expected.length
-    || !expected.every(key => Object.hasOwn(answers, key))
-  ) {
-    throw invalid();
-  }
-  const nouls = new Map<string, number>();
-  for (const key of expected) {
-    const answer = answers[key];
-    if (!isObject(answer) || answer["type"] !== "noul") throw invalid();
-    const noul = answer["noul"];
-    if (typeof noul !== "number" || !(noul >= 0 && noul <= 1)) {
-      throw invalid();
-    }
-    nouls.set(key, noul);
-  }
-  // Usage is informational: a missing or unusable count stays unknown.
-  const usage = payload["usage"];
-  const reported = isObject(usage) ? usage["input_tokens"] : undefined;
-  const inputTokens =
-    Number.isSafeInteger(reported) && (reported as number) >= 0
-      ? (reported as number)
-      : undefined;
-  return { nouls, inputTokens };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

@@ -63,7 +63,12 @@ import {
   type V2Message,
 } from "../src/v2/session";
 import { executeV2Trim } from "../src/v2/trim";
-import { scoredJevFetch, tokenLimitResponse } from "./retention-host";
+import {
+  scoredJevFetch,
+  scoredOpenAIFetch,
+  tokenLimitResponse,
+  type JevCall,
+} from "./retention-host";
 import {
   assistantMessage,
   dependencyError,
@@ -1264,7 +1269,7 @@ describe("OpenCode 2 trim successors", () => {
     );
     expect(state.requests).toHaveLength(1);
     expect(outcome).toContain(
-      "Task-aware retention at keep threshold 60% kept 1 of 2 evaluated tool call(s) whole (read 1).",
+      "Task-aware retention with jev (jev-1.13.0) at keep threshold 60% kept 1 of 2 evaluated tool call(s) whole (read 1).",
     );
     const read = v2ToolCalls(state.messages.get(successor!.session.id)![4]!)[0]!
       .tool;
@@ -1272,6 +1277,34 @@ describe("OpenCode 2 trim successors", () => {
       (read.state as { content: Array<{ text?: string }> }).content[0]!.text,
     ).toBe(words("R", 400));
     expect([...state.sessions.keys()]).toHaveLength(2);
+  });
+
+  test("--backend openai-decisions judges every candidate there and names it", async () => {
+    const state = fakeV2State();
+    sourceSession(state, "ses_src", toolHistory());
+    const owned = new OwnedSessions();
+    const host = fakeV2Host(state, owned, () => ({
+      text: "## Objective\n- Continue.",
+    }));
+    const calls: JevCall[] = [];
+    const { outcome } = await executeV2Trim(host, owned, "ses_src", 0, {
+      retention: {
+        ...commandRetentionPolicy(
+          "trim",
+          parseMagicTrimArguments("--backend openai-decisions"),
+          { OPENAI_API_KEY: "test-openai-key" },
+        ),
+        fetch: scoredOpenAIFetch(
+          output => (output.startsWith("R-0") ? 0.9 : 0.1),
+          calls,
+        ),
+      },
+      controlTimeoutMs: 1_000,
+    });
+    expect(calls).toHaveLength(2);
+    expect(outcome).toContain(
+      "Task-aware retention with openai-decisions (gpt-6-luna) at keep threshold 60% kept 1 of 2 evaluated tool call(s) whole (read 1).",
+    );
   });
 
   test.each([
@@ -1301,7 +1334,7 @@ describe("OpenCode 2 trim successors", () => {
         controlTimeoutMs: 1_000,
       });
       expect(outcome).toContain(
-        `Task-aware retention at keep threshold ${percent ?? 60}% kept ${kept} of 2 evaluated tool call(s) whole`,
+        `Task-aware retention with jev (jev-1.13.0) at keep threshold ${percent ?? 60}% kept ${kept} of 2 evaluated tool call(s) whole`,
       );
     },
   );
@@ -1343,7 +1376,7 @@ describe("OpenCode 2 trim successors", () => {
     expect(successor).not.toBeNull();
     expect(summaries).toHaveLength(3);
     expect(outcome).toContain(
-      "Retention | Task-aware retention at keep threshold 70% kept 1 of 2 evaluated tool call(s) whole (read 1). 1 decision(s) used a shortened session summary after a Jev token-limit refusal (--truncate) and could have missed useful context.",
+      "Retention | Task-aware retention with jev (jev-1.13.0) at keep threshold 70% kept 1 of 2 evaluated tool call(s) whole (read 1). 1 decision(s) used a shortened session summary after a token-limit refusal (--truncate) and could have missed useful context.",
     );
     expect(
       (successor!.session.metadata as { magicCompact: { outcome: string } })
@@ -2088,7 +2121,7 @@ describe("OpenCode 2 compaction", () => {
       );
       const { successor, outcome } = await result;
       const line =
-        "Task-aware retention at keep threshold 70% kept 1 of 2 evaluated tool call(s) whole (read 1).";
+        "Task-aware retention with jev (jev-1.13.0) at keep threshold 70% kept 1 of 2 evaluated tool call(s) whole (read 1).";
       expect(outcome.split("\n").at(-1)).toBe(`Retention | ${line}`);
       expect(outcome.match(/Retention \|/gu)).toHaveLength(1);
       expect(
@@ -2161,7 +2194,7 @@ describe("OpenCode 2 compaction", () => {
         "characters omitted",
       );
       expect(outcome.split("\n").at(-1)).toBe(
-        "Retention | Task-aware retention at keep threshold 70% kept 1 of 2 evaluated tool call(s) whole (read 1). 1 decision(s) used a shortened session summary after a Jev token-limit refusal (--truncate) and could have missed useful context.",
+        "Retention | Task-aware retention with jev (jev-1.13.0) at keep threshold 70% kept 1 of 2 evaluated tool call(s) whole (read 1). 1 decision(s) used a shortened session summary after a token-limit refusal (--truncate) and could have missed useful context.",
       );
     });
 
@@ -2201,7 +2234,11 @@ describe("OpenCode 2 compaction", () => {
     test.each([
       [
         "--threshold 70",
-        "Task-aware retention at keep threshold 70%: no tool calls needed evaluation.",
+        "Task-aware retention with jev (jev-1.13.0) at keep threshold 70%: no tool calls needed evaluation.",
+      ],
+      [
+        "--backend openai-decisions",
+        "Task-aware retention with openai-decisions (gpt-6-luna) at keep threshold 60%: no tool calls needed evaluation.",
       ],
       ["--heuristic", "Heuristic mode: tool calls not evaluated."],
     ])(
@@ -3289,15 +3326,19 @@ describe("OpenCode 2 retention keep threshold environment", () => {
       );
     };
   };
+  // The handlers read process.env. Swap in a complete fake map so neither an
+  // inherited backend, threshold nor real key reaches the test.
   const withPercent = async <T>(value: string, run: () => Promise<T>) => {
-    const previous = process.env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV];
-    process.env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV] = value;
+    const inherited = process.env;
+    process.env = {
+      TYPESAFE_API_KEY: "fake-jev-key",
+      OPENAI_API_KEY: "fake-openai-key",
+      [RETENTION_KEEP_THRESHOLD_PERCENT_ENV]: value,
+    } as NodeJS.ProcessEnv;
     try {
       return await run();
     } finally {
-      if (previous === undefined) {
-        delete process.env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV];
-      } else process.env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV] = previous;
+      process.env = inherited;
     }
   };
 

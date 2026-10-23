@@ -1,8 +1,15 @@
 // Task-aware retention for /magic-compact and /magic-trim, shared by both
 // hosts. The existing tool rules still decide which calls would change; this
-// step only vetoes changes to calls Jev judges likely to help the current
-// task. Decisions are made per invocation and never persisted, so kept calls
-// are reassessed next time.
+// step only vetoes changes to calls the selected decision backend judges
+// likely to help the current task. Decisions are made per invocation and
+// never persisted, so kept calls are reassessed next time.
+import {
+  DEFAULT_RETENTION_BACKEND,
+  isRetentionBackendID,
+  RETENTION_BACKEND_ENV,
+  RETENTION_BACKENDS,
+  type RetentionBackendID,
+} from "../retention/backends";
 import {
   classifyRetention,
   formatKeepThresholdPercent,
@@ -23,7 +30,10 @@ export type RetentionPolicy =
   | { mode: "heuristic" }
   | {
       mode: "task-aware";
-      // Supplied by the plugin runtime from TYPESAFE_API_KEY.
+      // Defaults to DEFAULT_RETENTION_BACKEND.
+      backend?: RetentionBackendID;
+      // Supplied by the plugin runtime from the selected backend's key
+      // variable, and from no other.
       apiKey: string | undefined;
       // Probability threshold from 0 to 1; defaults to RETENTION_KEEP_THRESHOLD.
       keepThreshold?: number;
@@ -34,13 +44,14 @@ export type RetentionPolicy =
     };
 
 // The retention arguments /magic-compact and /magic-trim share, after
-// parsing. `keepThreshold` is the explicit `--threshold` probability, absent
-// when it was not given.
+// parsing. `backend` and `keepThreshold` are the explicit `--backend` and
+// `--threshold` values, absent when they were not given.
 export type RetentionArguments =
   | { keepTurns: number; heuristic: true }
   | {
       keepTurns: number;
       heuristic: false;
+      backend?: RetentionBackendID;
       keepThreshold?: number;
       truncate: boolean;
     };
@@ -75,22 +86,46 @@ export function parseKeepThresholdPercent(text: string): number {
   return threshold;
 }
 
-// The task-aware policy for one command invocation. The threshold is the
-// explicit `--threshold` when given, and the environment's percent or the
-// default is then never read; otherwise an invalid or empty percent fails
-// instead of falling back to the default. The threshold is resolved before
-// the key is read.
+// The server environment's backend name, with surrounding whitespace
+// ignored. Only the exact lowercase names are accepted.
+export function parseRetentionBackend(text: string): RetentionBackendID {
+  const name = text.trim();
+  if (!isRetentionBackendID(name)) {
+    throw new RetentionClassificationError("invalid-backend");
+  }
+  return name;
+}
+
+// The task-aware policy for one command invocation. The backend is the
+// explicit `--backend` when given, else the environment's backend, else
+// jev; the threshold is the explicit `--threshold`, else the environment's
+// percent, else the default. An explicit value means its environment
+// variable is never read, and an invalid or empty environment value fails
+// instead of falling back. Backend and threshold are resolved before the
+// key, and only the selected backend's key is read: a key for the other
+// backend never selects it.
 export function taskAwareRetentionPolicy(
   env: Readonly<Record<string, string | undefined>>,
   invocation?: RetentionInvocation,
 ): Extract<RetentionPolicy, { mode: "task-aware" }> {
+  const chosen =
+    invocation?.backend
+    ?? withInvocation(invocation, () => environmentBackend(env));
+  const backend = chosen ?? DEFAULT_RETENTION_BACKEND;
+  // A retry suggestion names a backend the person or the server chose.
+  const named =
+    invocation && chosen !== undefined
+      ? { ...invocation, backend: chosen }
+      : invocation;
   const keepThreshold =
-    invocation?.keepThreshold ?? environmentKeepThreshold(env, invocation);
+    invocation?.keepThreshold
+    ?? withInvocation(named, () => environmentKeepThreshold(env));
   return {
     mode: "task-aware",
-    apiKey: env["TYPESAFE_API_KEY"] || undefined,
+    backend,
+    apiKey: env[RETENTION_BACKENDS[backend].keyEnv] || undefined,
     keepThreshold,
-    ...(invocation ? { invocation } : {}),
+    ...(named ? { invocation: named } : {}),
   };
 }
 
@@ -103,25 +138,40 @@ export function commandRetentionPolicy(
   env: Readonly<Record<string, string | undefined>>,
 ): RetentionPolicy {
   if (args.heuristic) return { mode: "heuristic" };
-  const { keepTurns, keepThreshold, truncate } = args;
+  const { keepTurns, backend, keepThreshold, truncate } = args;
   return taskAwareRetentionPolicy(env, {
     command,
     keepTurns,
+    ...(backend === undefined ? {} : { backend }),
     ...(keepThreshold === undefined ? {} : { keepThreshold }),
     truncate,
   });
 }
 
+function environmentBackend(
+  env: Readonly<Record<string, string | undefined>>,
+): RetentionBackendID | undefined {
+  const name = env[RETENTION_BACKEND_ENV];
+  return name === undefined ? undefined : parseRetentionBackend(name);
+}
+
 function environmentKeepThreshold(
   env: Readonly<Record<string, string | undefined>>,
-  invocation: RetentionInvocation | undefined,
 ): number {
   const percent = env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV];
-  if (percent === undefined) return RETENTION_KEEP_THRESHOLD;
+  return percent === undefined
+    ? RETENTION_KEEP_THRESHOLD
+    : parseKeepThresholdPercent(percent);
+}
+
+// Runs `read`; its failure suggests the person's own command.
+function withInvocation<T>(
+  invocation: RetentionInvocation | undefined,
+  read: () => T,
+): T {
   try {
-    return parseKeepThresholdPercent(percent);
+    return read();
   } catch (error) {
-    // The failure suggests the person's own command.
     if (invocation && error instanceof RetentionClassificationError) {
       throw new RetentionClassificationError(
         error.kind,
@@ -144,6 +194,7 @@ export function retentionWithoutCandidates(
     ? HEURISTIC_RETENTION
     : {
         mode: "task-aware",
+        ...selectedBackend(policy),
         evaluated: 0,
         keep: new Set(),
         keepThreshold: resolveKeepThreshold(policy.keepThreshold),
@@ -151,10 +202,20 @@ export function retentionWithoutCandidates(
       };
 }
 
+function selectedBackend(
+  policy: Extract<RetentionPolicy, { mode: "task-aware" }>,
+): { backend: RetentionBackendID; model: string } {
+  const backend = policy.backend ?? DEFAULT_RETENTION_BACKEND;
+  return { backend, model: RETENTION_BACKENDS[backend].model };
+}
+
 export type RetentionPlan =
   | { mode: "heuristic"; evaluated: 0; keep: ReadonlySet<string> }
   | {
       mode: "task-aware";
+      // The backend that judged the candidates, with its pinned model.
+      backend: RetentionBackendID;
+      model: string;
       evaluated: number;
       // Host tool-call references kept whole for this invocation.
       keep: ReadonlySet<string>;
@@ -234,15 +295,20 @@ export async function decideRetentionWith(
   if (found.candidates.length === 0) return retentionWithoutCandidates(policy);
   const keepThreshold = resolveKeepThreshold(policy.keepThreshold);
   const { invocation } = policy;
+  const selected = selectedBackend(policy);
   try {
     if (!policy.apiKey) {
-      throw new RetentionClassificationError("missing-api-key");
+      throw new RetentionClassificationError("missing-api-key", undefined, {
+        backend: selected.backend,
+        model: selected.model,
+      });
     }
     const sessionSummary = await summarize();
     const { decisions, truncated } = await classifyRetention(
       { latestUserRequest: found.latestUserRequest, sessionSummary },
       found.candidates,
       {
+        backend: selected.backend,
         apiKey: policy.apiKey,
         keepThreshold,
         ...(invocation?.truncate ? { truncateSummary: true } : {}),
@@ -257,6 +323,7 @@ export async function decideRetentionWith(
     }
     return {
       mode: "task-aware",
+      ...selected,
       evaluated: found.candidates.length,
       keep,
       keepThreshold,
@@ -300,7 +367,7 @@ export function formatRetentionFeedback(
   if (plan.mode === "heuristic") {
     return "Heuristic mode: tool calls not evaluated.";
   }
-  const retention = `Task-aware retention at keep threshold ${formatKeepThresholdPercent(plan.keepThreshold)}%`;
+  const retention = `Task-aware retention with ${plan.backend} (${plan.model}) at keep threshold ${formatKeepThresholdPercent(plan.keepThreshold)}%`;
   if (plan.evaluated === 0) {
     return `${retention}: no tool calls needed evaluation.`;
   }
@@ -326,7 +393,7 @@ export function formatRetentionFeedback(
   const truncated =
     plan.truncated === 0
       ? ""
-      : ` ${plan.truncated} decision(s) used a shortened session summary after a Jev token-limit refusal (--truncate) and could have missed useful context.`;
+      : ` ${plan.truncated} decision(s) used a shortened session summary after a token-limit refusal (--truncate) and could have missed useful context.`;
   return `${retention} kept ${plan.keep.size} of ${plan.evaluated} evaluated tool call(s) whole${breakdown.length > 0 ? ` (${breakdown.join(", ")})` : ""}.${truncated}`;
 }
 

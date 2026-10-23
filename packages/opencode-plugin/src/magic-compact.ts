@@ -58,6 +58,7 @@ import { PluginMessageError } from "./policy/feedback";
 
 export {
   COMPACT_ARGUMENTS_ERROR,
+  COMPACT_BACKEND_ERROR,
   COMPACT_NOOP,
   COMPACT_THRESHOLD_ERROR,
   compactSuccess,

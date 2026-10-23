@@ -35,6 +35,7 @@ const COMMAND = "Magic Trim";
 export {
   parseMagicTrimArguments,
   TRIM_ARGUMENTS_ERROR,
+  TRIM_BACKEND_ERROR,
   TRIM_NOOP,
   TRIM_THRESHOLD_ERROR,
   trimSuccess,

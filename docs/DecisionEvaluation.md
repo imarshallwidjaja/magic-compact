@@ -2,7 +2,7 @@
 
 This evaluation measures how well a decision model answers the keep/trim question that task-aware retention asks. Each case fixes the context (the latest user request and a session summary) and one completed tool call. The model returns a probability that the assistant would use the call's content again, and the harness compares that probability with a hand-written label. It scores the decision only. It does not run `/magic-trim`, generate a summary, or judge the summary model, so a good result here says nothing about end-to-end trim quality.
 
-The harness reuses the production request builder in `src/retention/classifier.ts`, so every provider answers the same state, the same question text and the same criteria that the shipped classifier sends. This evaluation changes no production code, keep threshold or question. The existing 144-case native-summary cohort and its commands are described in [RetentionEvaluation.md](RetentionEvaluation.md); this evaluation has its own dataset, scripts and results and never mixes with that cohort or rewrites its labels.
+The harness reuses the production request builder in `src/retention/classifier.ts` and the production wire serializers and answer readers in `src/retention/backends.ts`, so every provider answers the same state, the same question text and the same criteria that the shipped classifier sends to either backend. This evaluation changes no production code, keep threshold or question. The existing 144-case native-summary cohort and its commands are described in [RetentionEvaluation.md](RetentionEvaluation.md); this evaluation has its own dataset, scripts and results and never mixes with that cohort or rewrites its labels.
 
 ## Commands
 
@@ -19,7 +19,7 @@ bun run eval:decisions run --provider jev --model jev-1.14.0 --dry-run
 export TYPESAFE_API_KEY=<your TypeSafe key>
 bun run eval:decisions run --provider jev --model jev-1.14.0 --out /tmp/decisions/jev-1.14.0
 
-# Paid run: OpenAI Decisions API (public beta, gpt-6-luna only). Needs an OpenAI API key.
+# Paid run: OpenAI Decisions API (gpt-6-luna only). Needs an OpenAI API key.
 export OPENAI_API_KEY=<your OpenAI API key>
 bun run eval:decisions run --provider openai-decisions --model gpt-6-luna --out /tmp/decisions/gpt-6-luna
 
@@ -46,7 +46,7 @@ The harness never reads OpenCode's credential stores or provider pool. OpenCode'
 
 Jev aliases (`jev-latest`, `jev-preview`) are refused because they move between releases and would make runs unrepeatable. Production stays pinned to `jev-1.13.0`; the evaluation may select any version to measure it. For both providers the response `model` must equal the requested model exactly, for a probability and for a refusal; anything else is recorded as a `model-mismatch` failure. That means the requested Jev version, or `gpt-6-luna` for OpenAI. The harness accepts no dated snapshot label and no variant such as `gpt-6-luna-fast`, because no first-party contract says how to normalize one. If OpenAI starts returning a dated label for `gpt-6-luna`, runs fail with `model-mismatch` until a documented normalization is added here. An unsupported OpenAI model is rejected before any request, rather than sent and rejected case by case.
 
-Adding a provider means adding one adapter object to `PROVIDERS` in `providers.ts`: a model check, a request translation, and a strict response reader. There is no registry or plugin loading.
+Adding a provider means adding one adapter object to `PROVIDERS` in `providers.ts`: a model check, a request translation, and a strict response reader. There is no registry or plugin loading. A provider that production also uses takes its serializer and reader from `src/retention/backends.ts`, so the evaluation reads answers exactly as production does.
 
 ### Request translation
 
@@ -54,7 +54,7 @@ Every case becomes one singleton request through `buildRetentionRequests` (batch
 
 Jev receives the canonical body with only `model` replaced. For the production model the bytes equal what the shipped classifier sends, and a test asserts that.
 
-OpenAI Decisions has no criteria field and takes `input` rather than `state`. The adapter sends `input` as the canonical state JSON string and one `predicate` question named by the case ID. Its `instructions` hold the production instructions, then `Yes, probability near 1: <criteria.true>`, then `No, probability near 0: <criteria.false>`. This rendering is versioned (`openai-predicate-1`) and its hash is recorded in each run. The exact wire body is hashed separately (`providerRequestSha256`) in every outcome.
+OpenAI Decisions has no criteria field and takes `input` rather than `state`. The adapter sends `input` as the canonical state JSON string and one `predicate` question named by the case ID. Its `instructions` hold the production instructions, then `Yes, probability near 1: <criteria.true>`, then `No, probability near 0: <criteria.false>`. This rendering is versioned (`openai-predicate-1`) and its hash is recorded in each run. Production's `openai-decisions` backend sends the same body through the same serializer (`openAIDecisionsBody`), except that it names the predicate by the opaque question key `candidate_0` instead of a case ID; a test asserts that the name is the only difference, so the translation version and recorded hashes are unchanged. The exact wire body is hashed separately (`providerRequestSha256`) in every outcome.
 
 OpenAI's `answers` array must contain exactly one answer, naming the requested case, of type `predicate` or `refusal`. Extra, missing, duplicate, foreign or wrongly typed answers are invalid responses. A refusal is its own outcome. It is not a probability of 0 and not a trim.
 
@@ -146,12 +146,12 @@ One live run per model sent the 17 bundled cases (dataset `magic-compact-retenti
 
 Keep decisions use the `0.8` reference threshold. Both models put the same useful case below it: `release-todo-open-items`, at 0.65 for `jev-1.13.0` and 0.52 for `jev-1.14.0`. Its label was not changed after the run. Seventeen synthetic cases written alongside the classifier wording cannot show held-out accuracy, calibration or a difference between the two versions, and production stays on `jev-1.13.0`. These figures were scored at `0.8`, before production's default became `0.60`.
 
-No live OpenAI Decisions run has been made, because no OpenAI API key was available. The OpenAI adapter is covered by tests against fakes that enforce its strict response contract and by `--dry-run`; anyone with a key can run it with the command above.
+No live OpenAI Decisions run of the bundled pack is recorded here. On 2026-10-23, eight synthetic requests went through the OpenAI adapter to check the wire contract, the returned model, usage fields and the token-limit refusal; they are described in [RetentionEvaluation.md](RetentionEvaluation.md#openai-decisions-backend-2026-10-23) and are not a score. The adapter is otherwise covered by tests against fakes that enforce its strict response contract and by `--dry-run`; anyone with a key can run the pack with the command above.
 
 ## Limits
 
-- Live evidence covers the Jev smoke run above only. Wiring, parsing, failure handling and the command line are otherwise tested against fake fetch functions and a local HTTP server, which does not show how OpenAI Decisions behaves, including which model string it returns.
-- OpenAI Decisions is in public beta; its model list, response fields and behavior may change.
+- Scored live evidence covers the Jev smoke run above only. The OpenAI contract check returned exactly `gpt-6-luna` on one day; wiring, parsing, failure handling and the command line are otherwise tested against fake fetch functions and a local HTTP server.
+- OpenAI describes the Decisions API as generally available as of 2026-10-23; its model list, response fields and behavior may still change.
 - The probabilities of different models are not calibrated to one another.
 - The bundled pack is small and was written with knowledge of the classifier, so treat results as a sanity check.
 - Context is fixed. Summary quality, later-work visibility and the trim rules themselves are outside this evaluation.

@@ -40,7 +40,19 @@ import {
   TOKEN_LIMIT_BODY,
   TOKEN_LIMIT_REQUEST_ID,
   tokenLimitResponse,
+  openAIAnswer,
+  openAITokenLimitResponse,
+  OPENAI_TOKEN_LIMIT_BODY,
+  OPENAI_TOKEN_LIMIT_REQUEST_ID,
+  scoredOpenAIFetch,
 } from "./retention-host";
+import {
+  OPENAI_DECISIONS_ENDPOINT,
+  OPENAI_TOKEN_LIMIT_MESSAGE,
+  renderPredicateInstructions,
+  RETENTION_BACKEND_ENV,
+  RETENTION_BACKENDS,
+} from "../src/retention/backends";
 import {
   buildRetentionRequests,
   classifyRetention,
@@ -414,8 +426,20 @@ describe("retention classification", () => {
     expect(inFlight).toBe(0);
   });
 
+  test("rejects the whole invocation on another model as a model mismatch", async () => {
+    const error = await failure(
+      classifyRetention(context, [candidate("a"), candidate("b")], {
+        apiKey: "key",
+        fetch: jevFetch(() => 0.9, { model: "jev-1.14.0" }),
+      }),
+    );
+    expect(error.kind).toBe("model-mismatch");
+    expect(error.message).toBe(
+      "TypeSafe Jev answered with a model other than the pinned jev-1.13.0, so its decisions were not used. No tool content was changed. Run /magic-trim --heuristic to trim without classification.",
+    );
+  });
+
   const invalidResponses: Array<[string, RetentionFetch]> = [
-    ["another model", jevFetch(() => 0.9, { model: "jev-1.14.0" })],
     ["a missing answer", jevFetch(() => ({}))],
     [
       "an extra answer",
@@ -673,6 +697,8 @@ describe("retention service refusals", () => {
       "TypeSafe Jev refused a task-aware retention request because it exceeds the model's token limit. The session summary already fits the 8,000-byte excerpt that --truncate would use, so --truncate cannot shorten the request. The original session is unchanged and no retention decisions were applied. Run /magic-trim --heuristic to trim without task-aware keep protection.",
     );
     expect(error.diagnostics).toEqual({
+      backend: "jev",
+      model: RETENTION_MODEL,
       request: {
         ordinal: 0,
         summary: "whole",
@@ -764,7 +790,7 @@ describe("retention service refusals", () => {
       expect(error.kind).toBe("http");
       expect(error.status).toBe(400);
       expect(error.message).toBe(
-        "Task-aware retention classification failed (http 400). No tool content was changed. Run /magic-trim --heuristic to trim without classification.",
+        "Task-aware retention classification with jev failed (http 400). No tool content was changed. Run /magic-trim --heuristic to trim without classification.",
       );
     });
   }
@@ -1028,7 +1054,7 @@ describe("retention --truncate summary retry", () => {
     expect(calls).toBe(1);
     expect(error.diagnostics?.truncation).toBe("available");
     expect(error.message).toBe(
-      "TypeSafe Jev refused a task-aware retention request because it exceeds the model's token limit. The original session is unchanged and no retention decisions were applied. Run /magic-trim --truncate to retry each refused call once with a shorter session summary, which can omit useful context, or /magic-trim --heuristic to trim without task-aware keep protection. --threshold does not reduce the Jev request size.",
+      "TypeSafe Jev refused a task-aware retention request because it exceeds the model's token limit. The original session is unchanged and no retention decisions were applied. Run /magic-trim --truncate to retry each refused call once with a shorter session summary, which can omit useful context, or /magic-trim --heuristic to trim without task-aware keep protection. --threshold does not reduce the request size.",
     );
   });
 
@@ -1377,6 +1403,7 @@ describe("retention keep threshold", () => {
     );
     expect(taskAwareRetentionPolicy(percentEnv())).toEqual({
       mode: "task-aware",
+      backend: "jev",
       apiKey: "test-key",
       keepThreshold: 0.6,
     });
@@ -1598,6 +1625,7 @@ describe("retention keep threshold", () => {
           ),
         ).toEqual({
           mode: "task-aware",
+          backend: "jev",
           apiKey: "sk",
           keepThreshold,
           invocation: { command, keepTurns: 2, keepThreshold, truncate: true },
@@ -1700,7 +1728,7 @@ describe("retention keep threshold", () => {
         `or /magic-${command} 3 --heuristic to ${command} without task-aware keep protection`,
       );
       expect(plain.message).toContain(
-        "--threshold does not reduce the Jev request size.",
+        "--threshold does not reduce the request size.",
       );
       const defaults = await refuse(
         { keepTurns: 0, truncate: false },
@@ -1876,6 +1904,8 @@ describe("retention keep threshold", () => {
     } as const;
     expect(retentionWithoutCandidates(quiet)).toEqual({
       mode: "task-aware",
+      backend: "jev",
+      model: RETENTION_MODEL,
       evaluated: 0,
       keep: new Set(),
       keepThreshold: 0,
@@ -1945,15 +1975,19 @@ describe("retention keep threshold in the OpenCode 1 server environment", () => 
     arguments: args,
     sessionID: "session",
   });
+  // The handlers read process.env. Swap in a complete fake map so neither an
+  // inherited backend, threshold nor real key reaches the test.
   const withPercent = async <T>(value: string, run: () => Promise<T>) => {
-    const previous = process.env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV];
-    process.env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV] = value;
+    const inherited = process.env;
+    process.env = {
+      TYPESAFE_API_KEY: "fake-jev-key",
+      OPENAI_API_KEY: "fake-openai-key",
+      [RETENTION_KEEP_THRESHOLD_PERCENT_ENV]: value,
+    } as NodeJS.ProcessEnv;
     try {
       return await run();
     } finally {
-      if (previous === undefined) {
-        delete process.env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV];
-      } else process.env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV] = previous;
+      process.env = inherited;
     }
   };
 
@@ -2011,6 +2045,880 @@ describe("retention keep threshold in the OpenCode 1 server environment", () => 
   });
 });
 
+describe("OpenAI Decisions retention backend", () => {
+  const CANARY = "canary-openai-echo";
+  const KEY = "sk-openai-test";
+  const openai = (
+    fetchImpl: RetentionFetch,
+    extra: Partial<Parameters<typeof classifyRetention>[2]> = {},
+  ) => ({
+    backend: "openai-decisions" as const,
+    apiKey: KEY,
+    fetch: fetchImpl,
+    ...extra,
+  });
+  const predicate =
+    (probability: unknown): RetentionFetch =>
+    async (_url, init) =>
+      openAIAnswer(init, { type: "predicate", probability });
+
+  test("sends the canonical request as one opaque predicate to the pinned model", async () => {
+    const sent: Array<{ url: string; init: RequestInit }> = [];
+    const item = candidate("prt_host_part_id", "parser output");
+    const result = await classifyRetention(
+      context,
+      [item],
+      openai(async (url, init) => {
+        sent.push({ url, init });
+        return predicate(0.7)(url, init);
+      }),
+    );
+    expect(result.decisions.get("prt_host_part_id")).toEqual({
+      useful: 0.7,
+      keep: true,
+    });
+    expect(sent).toHaveLength(1);
+    const [{ url, init }] = sent as [{ url: string; init: RequestInit }];
+    expect(url).toBe(OPENAI_DECISIONS_ENDPOINT);
+    expect(init.redirect).toBe("manual");
+    expect(new Headers(init.headers).get("authorization")).toBe(
+      `Bearer ${KEY}`,
+    );
+    const canonical = buildRetentionRequests(context, [item])[0]!;
+    const body = String(init.body);
+    expect(body).toBe(
+      JSON.stringify({
+        model: "gpt-6-luna",
+        input: JSON.stringify(canonical.body.state),
+        questions: [
+          {
+            type: "predicate",
+            name: "candidate_0",
+            instructions: renderPredicateInstructions(
+              canonical.body.questions["candidate_0"]!,
+            ),
+          },
+        ],
+      }),
+    );
+    // The host part ID and the key never reach the wire.
+    expect(body).not.toContain("prt_host_part_id");
+    expect(body).not.toContain(KEY);
+  });
+
+  test("keeps at the shared threshold and leaves the probability unchanged", async () => {
+    const scores: Record<string, number> = { keep: 0.6, trim: 0.599 };
+    const result = await classifyRetention(
+      context,
+      [candidate("a", "keep"), candidate("b", "trim")],
+      openai(scoredOpenAIFetch(output => scores[output]!)),
+    );
+    expect([...result.decisions]).toEqual([
+      ["a", { useful: 0.6, keep: true }],
+      ["b", { useful: 0.599, keep: false }],
+    ]);
+    expect(result).toMatchObject({
+      requests: 2,
+      attempts: 2,
+      inputTokens: 20,
+      reportedUsageRequests: 2,
+    });
+  });
+
+  test("sends a summary past TypeSafe's 32 MiB body limit, which is not OpenAI's", async () => {
+    const sessionSummary = "s".repeat(RETENTION_REQUEST_BODY_BYTE_LIMIT + 1);
+    const sizes: number[] = [];
+    const result = await classifyRetention(
+      { ...context, sessionSummary },
+      [candidate("a")],
+      openai(async (url, init) => {
+        sizes.push(Buffer.byteLength(String(init.body)));
+        return predicate(0.2)(url, init);
+      }),
+    );
+    expect(sizes[0]).toBeGreaterThan(RETENTION_REQUEST_BODY_BYTE_LIMIT);
+    expect(result.decisions.get("a")).toEqual({ useful: 0.2, keep: false });
+  });
+
+  test("rejects batched requests before any request", async () => {
+    let calls = 0;
+    const error = await failure(
+      classifyRetention(
+        context,
+        [candidate("a"), candidate("b")],
+        openai(
+          async (url, init) => {
+            calls += 1;
+            return predicate(0.5)(url, init);
+          },
+          { batchSize: 2 },
+        ),
+      ),
+    );
+    expect(error.kind).toBe("configuration");
+    expect(calls).toBe(0);
+  });
+
+  const answers: Array<[string, RetentionFetch, string]> = [
+    [
+      "another model",
+      async (_url, init) =>
+        openAIAnswer(
+          init,
+          { type: "predicate", probability: 0.9 },
+          "gpt-6-luna-2026-10-01",
+        ),
+      "model-mismatch",
+    ],
+    [
+      "a missing model",
+      async () => Response.json({ answers: [] }),
+      "invalid-response",
+    ],
+    [
+      "an extra answer",
+      async () =>
+        Response.json({
+          model: "gpt-6-luna",
+          answers: [
+            { type: "predicate", name: "candidate_0", probability: 0.9 },
+            { type: "predicate", name: "candidate_1", probability: 0.9 },
+          ],
+        }),
+      "invalid-response",
+    ],
+    [
+      "no answer",
+      async () => Response.json({ model: "gpt-6-luna", answers: [] }),
+      "invalid-response",
+    ],
+    [
+      "an answer object instead of an array",
+      async () =>
+        Response.json({
+          model: "gpt-6-luna",
+          answers: {
+            candidate_0: { type: "predicate", probability: 0.9 },
+          },
+        }),
+      "invalid-response",
+    ],
+    [
+      "the caller's ID as the name",
+      async () =>
+        Response.json({
+          model: "gpt-6-luna",
+          answers: [{ type: "predicate", name: "a", probability: 0.9 }],
+        }),
+      "invalid-response",
+    ],
+    [
+      "a choice answer",
+      async (_url, init) =>
+        openAIAnswer(init, { type: "choice", choice: "yes", confidence: 1 }),
+      "invalid-response",
+    ],
+    ["a probability above one", predicate(1.5), "invalid-response"],
+    ["a negative probability", predicate(-0.1), "invalid-response"],
+    ["a string probability", predicate("0.9"), "invalid-response"],
+    ["a missing probability", predicate(undefined), "invalid-response"],
+    [
+      "a non-JSON body",
+      async () => new Response("not json"),
+      "invalid-response",
+    ],
+  ];
+  test.each(answers)(
+    "rejects the whole invocation on %s",
+    async (_name, fetchImpl, kind) => {
+      const error = await failure(
+        classifyRetention(
+          context,
+          [candidate("a"), candidate("b")],
+          openai(fetchImpl),
+        ),
+      );
+      expect(error.kind).toBe(kind);
+      expect(error.diagnostics).toMatchObject({
+        backend: "openai-decisions",
+        model: "gpt-6-luna",
+      });
+      if (kind === "model-mismatch") {
+        expect(error.message).toBe(
+          "OpenAI Decisions answered with a model other than the pinned gpt-6-luna, so its decisions were not used. No tool content was changed. Run /magic-trim --heuristic to trim without classification.",
+        );
+      }
+    },
+  );
+
+  test("a provider refusal is terminal: no probability, no retry, no decisions", async () => {
+    const longSummary = "s".repeat(20_000);
+    let calls = 0;
+    const error = await failure(
+      classifyRetention(
+        { ...context, sessionSummary: longSummary },
+        [candidate("a"), candidate("b")],
+        openai(
+          async (_url, init) => {
+            calls += 1;
+            return openAIAnswer(init, { type: "refusal" });
+          },
+          { truncateSummary: true },
+        ),
+      ),
+    );
+    expect(error.kind).toBe("refusal");
+    expect(calls).toBe(2);
+    expect(error.diagnostics?.counts).toMatchObject({
+      attempts: 2,
+      succeeded: 0,
+    });
+    expect(error.message).toBe(
+      "OpenAI Decisions declined to judge a tool call, so its decisions were not used. No tool content was changed. Run /magic-trim --heuristic to trim without classification.",
+    );
+  });
+
+  test("recognizes the recorded token-limit refusal and its request ID", async () => {
+    const error = await failure(
+      classifyRetention(
+        context,
+        [candidate("a")],
+        openai(async () => openAITokenLimitResponse()),
+      ),
+    );
+    expect(Buffer.byteLength(OPENAI_TOKEN_LIMIT_BODY)).toBe(119);
+    expect(error.kind).toBe("token-limit");
+    expect(error.diagnostics).toEqual({
+      backend: "openai-decisions",
+      model: "gpt-6-luna",
+      request: {
+        ordinal: 0,
+        summary: "whole",
+        bodyBytes: expect.any(Number),
+        status: 400,
+        requestId: OPENAI_TOKEN_LIMIT_REQUEST_ID,
+      },
+      truncation: "unavailable",
+      counts: {
+        planned: 1,
+        started: 1,
+        succeeded: 0,
+        failed: 1,
+        cancelled: 0,
+        unstarted: 0,
+        attempts: 1,
+      },
+    });
+    expect(error.message).toBe(
+      "OpenAI Decisions refused a task-aware retention request because it exceeds the model's token limit. The session summary already fits the 8,000-byte excerpt that --truncate would use, so --truncate cannot shorten the request. The original session is unchanged and no retention decisions were applied. Run /magic-trim --heuristic to trim without task-aware keep protection.",
+    );
+  });
+
+  const recorded = JSON.parse(OPENAI_TOKEN_LIMIT_BODY) as {
+    error: Record<string, unknown>;
+  };
+  const variant = (change: (error: Record<string, unknown>) => void) => {
+    const copy = structuredClone(recorded);
+    change(copy.error);
+    return JSON.stringify(copy);
+  };
+  test("ignores extra keys it never shows", async () => {
+    const error = await failure(
+      classifyRetention(
+        context,
+        [candidate("a", CANARY)],
+        openai(
+          async () =>
+            new Response(
+              JSON.stringify({
+                ...recorded,
+                error: { ...recorded.error, detail: CANARY },
+                trace: CANARY,
+              }),
+              { status: 400 },
+            ),
+        ),
+      ),
+    );
+    expect(error.kind).toBe("token-limit");
+    expect(error.message).not.toContain("canary");
+    expect(JSON.stringify(error.diagnostics)).not.toContain("canary");
+  });
+
+  test.each([
+    ["a different message", variant(e => (e.message = "Too many tokens."))],
+    [
+      "the message inside other text",
+      variant(e => (e.message = `x ${OPENAI_TOKEN_LIMIT_MESSAGE}`)),
+    ],
+    [
+      "a differently cased message",
+      variant(e => (e.message = OPENAI_TOKEN_LIMIT_MESSAGE.toLowerCase())),
+    ],
+    ["another type", variant(e => (e.type = "server_error"))],
+    ["a code", variant(e => (e.code = "context_length_exceeded"))],
+    ["a param", variant(e => (e.param = "input"))],
+    ["no param", variant(e => delete e.param)],
+    ["no code", variant(e => delete e.code)],
+    ["an error string", JSON.stringify({ error: OPENAI_TOKEN_LIMIT_MESSAGE })],
+    ["a root array", `[${OPENAI_TOKEN_LIMIT_BODY}]`],
+    ["Jev's refusal", TOKEN_LIMIT_BODY],
+    [
+      "a body over 4,096 bytes",
+      JSON.stringify({ ...recorded, pad: "x".repeat(5_000) }),
+    ],
+    ["text that is not JSON", OPENAI_TOKEN_LIMIT_MESSAGE],
+  ])("keeps HTTP 400 with %s a plain failure", async (_name, body) => {
+    let calls = 0;
+    const error = await failure(
+      classifyRetention(
+        { ...context, sessionSummary: "s".repeat(20_000) },
+        [candidate("a")],
+        openai(
+          async () => {
+            calls += 1;
+            return new Response(body, { status: 400 });
+          },
+          { truncateSummary: true },
+        ),
+      ),
+    );
+    expect(error.kind).toBe("http");
+    expect(error.status).toBe(400);
+    expect(calls).toBe(1);
+    expect(error.message).toBe(
+      "Task-aware retention classification with openai-decisions failed (http 400). No tool content was changed. Run /magic-trim --heuristic to trim without classification.",
+    );
+  });
+
+  test.each([401, 403, 413, 422, 429, 500])(
+    "never matches or reads the recorded body under HTTP %p",
+    async status => {
+      let pulls = 0;
+      let cancelled = false;
+      const error = await failure(
+        classifyRetention(
+          { ...context, sessionSummary: "s".repeat(20_000) },
+          [candidate("a", CANARY)],
+          openai(
+            async () =>
+              new Response(
+                new ReadableStream<Uint8Array>(
+                  {
+                    pull(controller) {
+                      pulls += 1;
+                      controller.enqueue(
+                        new TextEncoder().encode(OPENAI_TOKEN_LIMIT_BODY),
+                      );
+                      controller.close();
+                    },
+                    cancel() {
+                      cancelled = true;
+                    },
+                  },
+                  { highWaterMark: 0 },
+                ),
+                { status },
+              ),
+            { truncateSummary: true },
+          ),
+        ),
+      );
+      expect(error.kind).toBe("http");
+      expect(error.status).toBe(status);
+      expect({ pulls, cancelled }).toEqual({ pulls: 0, cancelled: true });
+      expect(error.message).not.toContain("canary");
+      if (status === 401 || status === 403) {
+        expect(error.message).toStartWith(
+          `OpenAI refused the OPENAI_API_KEY credentials (http ${status}).`,
+        );
+      }
+    },
+  );
+
+  test("Jev never treats OpenAI's refusal as its own", async () => {
+    const error = await failure(
+      classifyRetention(context, [candidate("a")], {
+        apiKey: "key",
+        fetch: async () => openAITokenLimitResponse(),
+      }),
+    );
+    expect(error.kind).toBe("http");
+  });
+
+  test("--truncate retries a confirmed refusal once, changing only the summary inside input", async () => {
+    const longSummary = `## Objective\n${"- A dense detail line.\n".repeat(1_500)}`;
+    const shortSummary = excerpt(longSummary, RETENTION_SUMMARY_EXCERPT_BYTES);
+    const bodies: string[] = [];
+    const result = await classifyRetention(
+      { ...context, sessionSummary: longSummary },
+      [candidate("a")],
+      openai(
+        async (url, init) => {
+          bodies.push(String(init.body));
+          return bodies.length === 1
+            ? openAITokenLimitResponse()
+            : predicate(0.8)(url, init);
+        },
+        { truncateSummary: true },
+      ),
+    );
+    expect(bodies).toHaveLength(2);
+    const [whole, retry] = bodies.map(body => JSON.parse(body));
+    expect(JSON.parse(whole.input).task.sessionSummary).toBe(longSummary);
+    expect(JSON.parse(retry.input).task.sessionSummary).toBe(shortSummary);
+    const restored = JSON.parse(retry.input);
+    restored.task.sessionSummary = longSummary;
+    expect(JSON.stringify(restored)).toBe(whole.input);
+    expect({ ...retry, input: whole.input }).toEqual(whole);
+    expect(result).toMatchObject({ requests: 1, attempts: 2, truncated: 1 });
+    expect(result.decisions.get("a")).toEqual({ useful: 0.8, keep: true });
+  });
+
+  test("a fatal failure stops admission, drains the pool and returns no decisions", async () => {
+    let calls = 0;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const error = await failure(
+      classifyRetention(
+        context,
+        Array.from({ length: 12 }, (_, i) => candidate(`c${i}`)),
+        openai(async (url, init) => {
+          const call = calls++;
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await Bun.sleep(call === 1 ? 5 : 20);
+          inFlight -= 1;
+          return call === 1
+            ? new Response("", { status: 401 })
+            : predicate(0.9)(url, init);
+        }),
+      ),
+    );
+    expect(error.kind).toBe("http");
+    expect(error.status).toBe(401);
+    expect(maxInFlight).toBe(RETENTION_MAX_CONCURRENCY);
+    expect(calls).toBe(RETENTION_MAX_CONCURRENCY);
+    expect(error.diagnostics?.counts).toEqual({
+      planned: 12,
+      started: RETENTION_MAX_CONCURRENCY,
+      succeeded: RETENTION_MAX_CONCURRENCY - 1,
+      failed: 1,
+      cancelled: 0,
+      unstarted: 12 - RETENTION_MAX_CONCURRENCY,
+      attempts: RETENTION_MAX_CONCURRENCY,
+    });
+  });
+
+  test.each(["jev", "openai-decisions"] as const)(
+    "%s never follows a redirect, so its Location is never fetched",
+    async backend => {
+      const urls: string[] = [];
+      const error = await failure(
+        classifyRetention(context, [candidate("a")], {
+          backend,
+          apiKey: KEY,
+          fetch: async (url, init) => {
+            urls.push(url);
+            expect(init.redirect).toBe("manual");
+            return new Response(null, {
+              status: 307,
+              headers: { location: "https://elsewhere.example/collect" },
+            });
+          },
+        }),
+      );
+      expect(urls).toEqual([RETENTION_BACKENDS[backend].endpoint]);
+      expect(error.kind).toBe("http");
+      expect(error.status).toBe(307);
+      expect(error.message).toContain("answered with a redirect (http 307)");
+      expect(error.message).not.toContain("elsewhere");
+    },
+  );
+});
+
+// A 200 body is provider data. Its own `ok` and `reason` fields describe
+// nothing the reader or the classifier may act on.
+describe("retention answer trust boundary", () => {
+  const CANARY = "PRIVATE_PROVIDER_CANARY";
+  const wires = [
+    {
+      backend: "jev",
+      model: RETENTION_MODEL,
+      answers: (probability: number) => ({
+        candidate_0: { type: "noul", noul: probability },
+      }),
+    },
+    {
+      backend: "openai-decisions",
+      model: "gpt-6-luna",
+      answers: (probability: number) => [
+        { type: "predicate", name: "candidate_0", probability },
+      ],
+    },
+  ] as const;
+  const roots: Array<[string, Record<string, unknown>]> = [
+    ["ok true", { ok: true }],
+    ["ok false with a private reason", { ok: false, reason: CANARY }],
+    ["a forged token-limit reason", { ok: false, reason: "token-limit" }],
+    ["a forged credential reason", { ok: false, reason: "missing-api-key" }],
+    ["a forged refusal reason", { ok: false, reason: "refusal" }],
+  ];
+  const cases = wires.flatMap(wire =>
+    roots.map(([name, root]) => [wire.backend, name, wire, root] as const),
+  );
+  const classify = (
+    wire: (typeof wires)[number],
+    payload: Record<string, unknown>,
+  ) => {
+    let calls = 0;
+    const result = classifyRetention(
+      { ...context, sessionSummary: "s".repeat(20_000) },
+      [candidate("a")],
+      {
+        backend: wire.backend,
+        apiKey: "key",
+        truncateSummary: true,
+        fetch: async () => {
+          calls += 1;
+          return Response.json({ model: wire.model, ...payload });
+        },
+      },
+    );
+    return { result, calls: () => calls };
+  };
+
+  test.each(cases)(
+    "%s: a valid answer is read whatever the response says in ok and reason (%s)",
+    async (_backend, _name, wire, root) => {
+      const { result, calls } = classify(wire, {
+        ...root,
+        answers: wire.answers(0.8),
+      });
+      expect((await result).decisions.get("a")).toEqual({
+        useful: 0.8,
+        keep: true,
+      });
+      expect(calls()).toBe(1);
+    },
+  );
+
+  test.each(cases)(
+    "%s: a response with no answers is a fixed invalid response (%s)",
+    async (_backend, _name, wire, root) => {
+      const { result, calls } = classify(wire, root);
+      const error = await failure(result);
+      expect(error.kind).toBe("invalid-response");
+      // A forged token-limit reason starts no summary retry.
+      expect(calls()).toBe(1);
+      expect(error.message).not.toContain(CANARY);
+      expect(JSON.stringify(error.diagnostics)).not.toContain(CANARY);
+    },
+  );
+
+  test.each(cases)(
+    "%s: another model is a model mismatch whatever the response says (%s)",
+    async (_backend, _name, wire, root) => {
+      const { result } = classify(wire, {
+        ...root,
+        model: "another-model",
+        answers: wire.answers(0.8),
+      });
+      expect((await failure(result)).kind).toBe("model-mismatch");
+    },
+  );
+});
+
+describe("retention backend selection", () => {
+  const thrown = (run: () => unknown) => {
+    try {
+      run();
+    } catch (error) {
+      return error as RetentionClassificationError;
+    }
+    throw new Error("Expected a throw.");
+  };
+  // An environment that records every variable read.
+  const recorded = (values: Record<string, string>) => {
+    const reads: string[] = [];
+    const env = new Proxy(values, {
+      get: (target, key) => {
+        reads.push(String(key));
+        return target[String(key)];
+      },
+    });
+    return { env, reads };
+  };
+  const both = { TYPESAFE_API_KEY: "jev-key", OPENAI_API_KEY: "openai-key" };
+
+  test.each([
+    [{}, "jev", "jev-key", ["TYPESAFE_API_KEY"]],
+    [
+      { [RETENTION_BACKEND_ENV]: "openai-decisions" },
+      "openai-decisions",
+      "openai-key",
+      ["OPENAI_API_KEY"],
+    ],
+    [
+      { [RETENTION_BACKEND_ENV]: " jev\n" },
+      "jev",
+      "jev-key",
+      ["TYPESAFE_API_KEY"],
+    ],
+  ] as const)(
+    "the environment %p selects %p and only its key is read",
+    (extra, backend, apiKey, keys) => {
+      const { env, reads } = recorded({ ...both, ...extra });
+      const policy = taskAwareRetentionPolicy(env);
+      expect(policy).toMatchObject({ backend, apiKey });
+      expect(reads).toEqual([
+        RETENTION_BACKEND_ENV,
+        RETENTION_KEEP_THRESHOLD_PERCENT_ENV,
+        ...keys,
+      ]);
+    },
+  );
+
+  test("an OpenAI key alone never selects OpenAI", () => {
+    const { env, reads } = recorded({ OPENAI_API_KEY: "openai-key" });
+    expect(taskAwareRetentionPolicy(env)).toMatchObject({
+      backend: "jev",
+      apiKey: undefined,
+    });
+    expect(reads).not.toContain("OPENAI_API_KEY");
+  });
+
+  test("--backend wins without reading or validating the environment's backend", () => {
+    for (const backend of ["jev", "openai-decisions"] as const) {
+      const { env, reads } = recorded({
+        ...both,
+        [RETENTION_BACKEND_ENV]: "not-a-backend",
+      });
+      const policy = commandRetentionPolicy(
+        "trim",
+        { keepTurns: 1, heuristic: false, backend, truncate: false },
+        env,
+      );
+      expect(policy).toMatchObject({
+        backend,
+        apiKey: backend === "jev" ? "jev-key" : "openai-key",
+        invocation: { backend },
+      });
+      expect(reads).not.toContain(RETENTION_BACKEND_ENV);
+      expect(reads).toContain(RETENTION_BACKENDS[backend].keyEnv);
+      expect(reads).not.toContain(
+        RETENTION_BACKENDS[backend === "jev" ? "openai-decisions" : "jev"]
+          .keyEnv,
+      );
+    }
+    const { env, reads } = recorded({
+      ...both,
+      [RETENTION_BACKEND_ENV]: "not-a-backend",
+    });
+    expect(
+      commandRetentionPolicy("compact", { keepTurns: 1, heuristic: true }, env),
+    ).toEqual({ mode: "heuristic" });
+    expect(reads).toEqual([]);
+  });
+
+  test.each([
+    "",
+    "  ",
+    "openai",
+    "OpenAI-Decisions",
+    "JEV",
+    "jev,openai-decisions",
+    "jev openai-decisions",
+    "typesafe",
+  ])("rejects the environment backend %p without a fallback or echo", name => {
+    const { env, reads } = recorded({
+      ...both,
+      [RETENTION_BACKEND_ENV]: name,
+    });
+    const error = thrown(() =>
+      commandRetentionPolicy(
+        "compact",
+        { keepTurns: 2, heuristic: false, truncate: false },
+        env,
+      ),
+    );
+    expect(error.kind).toBe("invalid-backend");
+    expect(error.message).toBe(
+      "Task-aware retention requires MAGIC_COMPACT_RETENTION_BACKEND in the OpenCode server environment to be jev or openai-decisions, or to be unset; --backend jev or --backend openai-decisions on the command overrides it. No tool content was changed. Run /magic-compact 2 --heuristic to compact without classification (turn summaries are still generated).",
+    );
+    expect(reads).toEqual([RETENTION_BACKEND_ENV]);
+  });
+
+  test("a missing selected key fails before the session summary or any request", async () => {
+    let summaries = 0;
+    let requests = 0;
+    const error = await failure(
+      decideRetentionWith(
+        { latestUserRequest: "Ship it.", candidates: [candidate("a")] },
+        {
+          ...commandRetentionPolicy(
+            "trim",
+            {
+              keepTurns: 1,
+              heuristic: false,
+              backend: "openai-decisions",
+              truncate: false,
+            },
+            { TYPESAFE_API_KEY: "jev-key" },
+          ),
+          fetch: async () => {
+            requests += 1;
+            return new Response();
+          },
+        },
+        async () => {
+          summaries += 1;
+          return "summary";
+        },
+      ),
+    );
+    expect(error.kind).toBe("missing-api-key");
+    expect(error.message).toBe(
+      "Task-aware retention with the openai-decisions backend requires OPENAI_API_KEY in the OpenCode server environment. No tool content was changed. Run /magic-trim 1 --heuristic to trim without classification.",
+    );
+    expect({ summaries, requests }).toEqual({ summaries: 0, requests: 0 });
+  });
+
+  test("the backend selected for a command answers every candidate and names itself", async () => {
+    const urls: string[] = [];
+    const plan = await decideRetentionWith(
+      {
+        latestUserRequest: "Ship it.",
+        candidates: [candidate("a", "keep"), candidate("b", "trim")],
+      },
+      {
+        ...commandRetentionPolicy(
+          "trim",
+          { keepTurns: 0, heuristic: false, truncate: false },
+          { ...both, [RETENTION_BACKEND_ENV]: "openai-decisions" },
+        ),
+        fetch: async (url, init) => {
+          urls.push(url);
+          return scoredOpenAIFetch(output => (output === "keep" ? 0.9 : 0.1))(
+            url,
+            init,
+          );
+        },
+      },
+      async () => "summary",
+    );
+    expect(urls).toEqual([
+      OPENAI_DECISIONS_ENDPOINT,
+      OPENAI_DECISIONS_ENDPOINT,
+    ]);
+    expect(plan).toEqual({
+      mode: "task-aware",
+      backend: "openai-decisions",
+      model: "gpt-6-luna",
+      evaluated: 2,
+      keep: new Set(["a"]),
+      keepThreshold: 0.6,
+      truncated: 0,
+    });
+    expect(retentionFeedback(plan)).toBe(
+      "Task-aware retention with openai-decisions (gpt-6-luna) at keep threshold 60% kept 1 of 2 evaluated tool call(s) whole.",
+    );
+  });
+
+  test.each([
+    ["--backend", { backend: "openai-decisions" as const }, {}],
+    ["the environment", {}, { [RETENTION_BACKEND_ENV]: "openai-decisions" }],
+  ])(
+    "a token-limit retry names the backend chosen by %s",
+    async (_source, args, extra) => {
+      const error = await failure(
+        decideRetentionWith(
+          { latestUserRequest: "Ship it.", candidates: [candidate("a")] },
+          {
+            ...commandRetentionPolicy(
+              "trim",
+              {
+                keepTurns: 1,
+                heuristic: false,
+                keepThreshold: 0.7,
+                truncate: false,
+                ...args,
+              },
+              { ...both, ...extra },
+            ),
+            fetch: async () => openAITokenLimitResponse(),
+          },
+          async () => "s".repeat(20_000),
+        ),
+      );
+      expect(error.message).toBe(
+        "OpenAI Decisions refused a task-aware retention request because it exceeds the model's token limit. The original session is unchanged and no retention decisions were applied. Run /magic-trim 1 --backend openai-decisions --threshold 70 --truncate to retry each refused call once with a shorter session summary, which can omit useful context, or /magic-trim 1 --heuristic to trim without task-aware keep protection. --threshold does not reduce the request size.",
+      );
+    },
+  );
+
+  test("every failure with the longest arguments and backend fits the toast", async () => {
+    const messages: string[] = [];
+    for (const command of ["compact", "trim"] as const) {
+      const invocation = {
+        command,
+        keepTurns: Number.MAX_SAFE_INTEGER,
+        backend: "openai-decisions" as const,
+        keepThreshold: Number.MIN_VALUE,
+        truncate: false,
+      };
+      const kinds = [
+        "configuration",
+        "missing-api-key",
+        "invalid-threshold-percent",
+        "invalid-backend",
+        "budget",
+        "timeout",
+        "network",
+        "http",
+        "invalid-response",
+        "model-mismatch",
+        "refusal",
+      ] as const;
+      for (const backend of ["jev", "openai-decisions"] as const) {
+        for (const kind of kinds) {
+          for (const status of [undefined, 307, 401, 500]) {
+            messages.push(
+              new RetentionClassificationError(
+                kind,
+                status,
+                { backend, model: RETENTION_BACKENDS[backend].model },
+                invocation,
+              ).message,
+            );
+          }
+        }
+        for (const truncation of ["available", "unavailable"] as const) {
+          for (const summary of ["whole", "excerpt"] as const) {
+            messages.push(
+              new RetentionClassificationError(
+                "token-limit",
+                400,
+                {
+                  backend,
+                  request: { ordinal: 0, summary, bodyBytes: 1 },
+                  truncation,
+                },
+                invocation,
+              ).message,
+            );
+          }
+        }
+      }
+    }
+    const retry = `--backend openai-decisions --threshold ${formatKeepThresholdPercent(Number.MIN_VALUE)} --truncate`;
+    expect(messages.some(message => message.includes(retry))).toBe(true);
+    for (const message of messages) {
+      expect(message.length).toBeLessThan(700);
+    }
+  });
+});
+
 describe("native-summary evaluation metrics", () => {
   test("keep the recorded 0.80 threshold, not the runtime default", () => {
     const run = Bun.spawnSync([
@@ -2062,6 +2970,8 @@ describe("retention feedback", () => {
     ];
     const plan = {
       mode: "task-aware" as const,
+      backend: "jev" as const,
+      model: RETENTION_MODEL,
       evaluated: 12,
       keep: new Set(parts.map(part => part.id)),
       keepThreshold: 0.6,
@@ -2069,7 +2979,7 @@ describe("retention feedback", () => {
     };
     const feedback = retentionFeedback(plan, messages);
     expect(feedback).toBe(
-      "Task-aware retention at keep threshold 60% kept 8 of 12 evaluated tool call(s) whole (read 3, task 2, bash 1, +2 other calls).",
+      "Task-aware retention with jev (jev-1.13.0) at keep threshold 60% kept 8 of 12 evaluated tool call(s) whole (read 3, task 2, bash 1, +2 other calls).",
     );
     expect(
       retentionFeedback(plan, [
@@ -2091,6 +3001,8 @@ describe("retention feedback", () => {
     const feedback = retentionFeedback(
       {
         mode: "task-aware",
+        backend: "jev",
+        model: RETENTION_MODEL,
         evaluated: 3,
         keep: new Set(parts.map(part => part.id)),
         keepThreshold: 0.6,
@@ -2114,6 +3026,8 @@ describe("retention feedback", () => {
     const astralFeedback = retentionFeedback(
       {
         mode: "task-aware",
+        backend: "jev",
+        model: RETENTION_MODEL,
         evaluated: 1,
         keep: new Set([astralPart.id]),
         keepThreshold: 0.6,
@@ -2132,19 +3046,21 @@ describe("retention feedback", () => {
     const messages = [assistantMessage("assistant", [kept])];
     const plan = (keepThreshold: number, evaluated: number, truncated = 0) => ({
       mode: "task-aware" as const,
+      backend: "jev" as const,
+      model: RETENTION_MODEL,
       evaluated,
       keep: new Set(evaluated > 0 ? [kept.id] : []),
       keepThreshold,
       truncated,
     });
     expect(retentionFeedback(plan(0.601, 0))).toBe(
-      "Task-aware retention at keep threshold 60.1%: no tool calls needed evaluation.",
+      "Task-aware retention with jev (jev-1.13.0) at keep threshold 60.1%: no tool calls needed evaluation.",
     );
     expect(retentionFeedback(plan(0, 2), messages)).toBe(
-      "Task-aware retention at keep threshold 0% kept 1 of 2 evaluated tool call(s) whole (read 1).",
+      "Task-aware retention with jev (jev-1.13.0) at keep threshold 0% kept 1 of 2 evaluated tool call(s) whole (read 1).",
     );
     expect(retentionFeedback(plan(0.705, 2, 1), messages)).toBe(
-      "Task-aware retention at keep threshold 70.5% kept 1 of 2 evaluated tool call(s) whole (read 1). 1 decision(s) used a shortened session summary after a Jev token-limit refusal (--truncate) and could have missed useful context.",
+      "Task-aware retention with jev (jev-1.13.0) at keep threshold 70.5% kept 1 of 2 evaluated tool call(s) whole (read 1). 1 decision(s) used a shortened session summary after a token-limit refusal (--truncate) and could have missed useful context.",
     );
     expect(retentionFeedback(HEURISTIC_RETENTION)).toBe(
       "Heuristic mode: tool calls not evaluated.",
@@ -2300,6 +3216,8 @@ describe("retention candidates", () => {
     );
     expect(plan).toEqual({
       mode: "task-aware",
+      backend: "jev",
+      model: RETENTION_MODEL,
       evaluated: 0,
       keep: new Set(),
       keepThreshold: 0.6,
