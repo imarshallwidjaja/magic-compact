@@ -1509,7 +1509,7 @@ describe("bounded native compaction generation", () => {
           reads.push("key");
           return "fake-key";
         },
-        get OPENAI_API_KEY() {
+        get MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY() {
           reads.push("openai-key");
           return "fake-openai-key";
         },

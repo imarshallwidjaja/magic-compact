@@ -1897,7 +1897,7 @@ describe("command line", () => {
       "run",
       "report",
       "TYPESAFE_API_KEY",
-      "OPENAI_API_KEY",
+      "MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY",
       "gpt-6-luna",
       "--threshold",
       "Exit status",
@@ -1977,7 +1977,7 @@ describe("command line", () => {
     const envs: Array<Record<string, string>> = [
       {},
       { TYPESAFE_API_KEY: KEY },
-      { OPENAI_API_KEY: "" },
+      { MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY: "" },
     ];
     for (const env of envs) {
       const out = freshDir();
@@ -1988,16 +1988,57 @@ describe("command line", () => {
           h.deps,
         ),
       ).toBe(2);
-      expect(h.stderr.join("\n")).toContain("OPENAI_API_KEY is not set");
+      expect(h.stderr.join("\n")).toContain(
+        "MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY is not set",
+      );
       expect(h.fetched()).toBe(0);
       expect(existsSync(out)).toBe(false);
     }
-    const h = harness({ OPENAI_API_KEY: KEY }, id => keepProbability(id));
+    const h = harness({ MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY: KEY }, id =>
+      keepProbability(id),
+    );
     expect(
       await main(["run", "--provider", "jev", "--out", freshDir()], h.deps),
     ).toBe(2);
     expect(h.stderr.join("\n")).toContain("TYPESAFE_API_KEY is not set");
     expect(h.fetched()).toBe(0);
+  });
+
+  test("the generic OPENAI_API_KEY is never read or used as a fallback", async () => {
+    const guarded = (values: Record<string, string>) =>
+      new Proxy(values, {
+        get: (target, key) => {
+          if (key === "OPENAI_API_KEY") {
+            throw new Error("OPENAI_API_KEY must never be read");
+          }
+          return target[String(key)];
+        },
+      });
+
+    const missing = harness({ OPENAI_API_KEY: KEY }, id => keepProbability(id));
+    expect(
+      await main(
+        ["run", "--provider", "openai-decisions", "--out", freshDir()],
+        missing.deps,
+      ),
+    ).toBe(2);
+    expect(missing.stderr.join("\n")).toContain(
+      "MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY is not set",
+    );
+    expect(missing.fetched()).toBe(0);
+
+    const out = freshDir();
+    const supplied = harness(
+      guarded({ MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY: KEY }),
+      id => keepProbability(id),
+    );
+    expect(
+      await main(
+        ["run", "--provider", "openai-decisions", "--out", out],
+        supplied.deps,
+      ),
+    ).toBe(0);
+    expect(supplied.fetched()).toBe(cases.length);
   });
 
   test("dry run, output collisions and oversized plans make no request and need no key", async () => {
@@ -2060,7 +2101,9 @@ describe("command line", () => {
 
   test("run writes records, prints the report, and report recomputes it offline", async () => {
     const out = freshDir();
-    const h = harness({ OPENAI_API_KEY: KEY }, id => keepProbability(id));
+    const h = harness({ MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY: KEY }, id =>
+      keepProbability(id),
+    );
     expect(
       await main(
         [
@@ -2094,7 +2137,9 @@ describe("command line", () => {
 
   test("a rejected key ends the run with exit status 1 and a report of what was not attempted", async () => {
     const out = freshDir();
-    const h = harness({ OPENAI_API_KEY: KEY }, () => ({ status: 401 }));
+    const h = harness({ MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY: KEY }, () => ({
+      status: 401,
+    }));
     expect(
       await main(
         [

@@ -1981,7 +1981,7 @@ describe("retention keep threshold in the OpenCode 1 server environment", () => 
     const inherited = process.env;
     process.env = {
       TYPESAFE_API_KEY: "fake-jev-key",
-      OPENAI_API_KEY: "fake-openai-key",
+      MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY: "fake-openai-key",
       [RETENTION_KEEP_THRESHOLD_PERCENT_ENV]: value,
     } as NodeJS.ProcessEnv;
     try {
@@ -2430,7 +2430,7 @@ describe("OpenAI Decisions retention backend", () => {
       expect(error.message).not.toContain("canary");
       if (status === 401 || status === 403) {
         expect(error.message).toStartWith(
-          `OpenAI refused the OPENAI_API_KEY credentials (http ${status}).`,
+          `OpenAI refused the MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY credentials (http ${status}).`,
         );
       }
     },
@@ -2639,17 +2639,26 @@ describe("retention backend selection", () => {
     throw new Error("Expected a throw.");
   };
   // An environment that records every variable read.
-  const recorded = (values: Record<string, string>) => {
+  const recorded = (
+    values: Record<string, string>,
+    forbidden: readonly string[] = [],
+  ) => {
     const reads: string[] = [];
     const env = new Proxy(values, {
       get: (target, key) => {
         reads.push(String(key));
+        if (forbidden.includes(String(key))) {
+          throw new Error(`${String(key)} must never be read`);
+        }
         return target[String(key)];
       },
     });
     return { env, reads };
   };
-  const both = { TYPESAFE_API_KEY: "jev-key", OPENAI_API_KEY: "openai-key" };
+  const both = {
+    TYPESAFE_API_KEY: "jev-key",
+    MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY: "openai-key",
+  };
 
   test.each([
     [{}, "jev", "jev-key", ["TYPESAFE_API_KEY"]],
@@ -2657,7 +2666,7 @@ describe("retention backend selection", () => {
       { [RETENTION_BACKEND_ENV]: "openai-decisions" },
       "openai-decisions",
       "openai-key",
-      ["OPENAI_API_KEY"],
+      ["MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY"],
     ],
     [
       { [RETENTION_BACKEND_ENV]: " jev\n" },
@@ -2680,12 +2689,72 @@ describe("retention backend selection", () => {
   );
 
   test("an OpenAI key alone never selects OpenAI", () => {
-    const { env, reads } = recorded({ OPENAI_API_KEY: "openai-key" });
+    const { env, reads } = recorded({
+      MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY: "openai-key",
+    });
     expect(taskAwareRetentionPolicy(env)).toMatchObject({
       backend: "jev",
       apiKey: undefined,
     });
-    expect(reads).not.toContain("OPENAI_API_KEY");
+    expect(reads).not.toContain("MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY");
+  });
+
+  // The generic OpenAI variable belongs to other tools, so the Decisions
+  // backend neither reads nor falls back to it.
+  describe("the generic OPENAI_API_KEY is never read", () => {
+    const decisions = {
+      keepTurns: 1,
+      heuristic: false,
+      backend: "openai-decisions",
+      truncate: false,
+    } as const;
+
+    test("an absent selected key stays absent even when the generic variable holds a value", () => {
+      const { env, reads } = recorded({ OPENAI_API_KEY: "generic-key" }, [
+        "OPENAI_API_KEY",
+      ]);
+      expect(commandRetentionPolicy("trim", decisions, env)).toMatchObject({
+        backend: "openai-decisions",
+        apiKey: undefined,
+      });
+      expect(reads).toContain("MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY");
+      expect(reads).not.toContain("OPENAI_API_KEY");
+    });
+
+    test("the failure names the namespaced variable and sends no request", async () => {
+      let requests = 0;
+      const error = await failure(
+        decideRetentionWith(
+          { latestUserRequest: "Ship it.", candidates: [candidate("a")] },
+          {
+            ...commandRetentionPolicy("trim", decisions, {
+              OPENAI_API_KEY: "generic-key",
+            }),
+            fetch: async () => {
+              requests += 1;
+              return new Response();
+            },
+          },
+          async () => "summary",
+        ),
+      );
+      expect(error.kind).toBe("missing-api-key");
+      expect(error.message).toContain("MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY");
+      expect(error.message).not.toContain("OPENAI_API_KEY");
+      expect(requests).toBe(0);
+    });
+
+    test("the namespaced key alone supplies the credential", () => {
+      const { env, reads } = recorded(
+        { MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY: "decisions-key" },
+        ["OPENAI_API_KEY"],
+      );
+      expect(commandRetentionPolicy("trim", decisions, env)).toMatchObject({
+        backend: "openai-decisions",
+        apiKey: "decisions-key",
+      });
+      expect(reads).not.toContain("OPENAI_API_KEY");
+    });
   });
 
   test("--backend wins without reading or validating the environment's backend", () => {
@@ -2779,7 +2848,7 @@ describe("retention backend selection", () => {
     );
     expect(error.kind).toBe("missing-api-key");
     expect(error.message).toBe(
-      "Task-aware retention with the openai-decisions backend requires OPENAI_API_KEY in the OpenCode server environment. No tool content was changed. Run /magic-trim 1 --heuristic to trim without classification.",
+      "Task-aware retention with the openai-decisions backend requires MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY in the OpenCode server environment. No tool content was changed. Run /magic-trim 1 --heuristic to trim without classification.",
     );
     expect({ summaries, requests }).toEqual({ summaries: 0, requests: 0 });
   });

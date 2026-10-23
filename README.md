@@ -145,16 +145,16 @@ What differs on OpenCode 2:
 
 Task-aware retention asks a decision backend whether each tool call is likely to help the current task. There are two backends, each pinned to one model:
 
-| Backend            | Service and model                  | Key variable       |
-| ------------------ | ---------------------------------- | ------------------ |
-| `jev` (default)    | TypeSafe Jev `jev-1.13.0`          | `TYPESAFE_API_KEY` |
-| `openai-decisions` | OpenAI Decisions API, `gpt-6-luna` | `OPENAI_API_KEY`   |
+| Backend            | Service and model                  | Key variable                             |
+| ------------------ | ---------------------------------- | ---------------------------------------- |
+| `jev` (default)    | TypeSafe Jev `jev-1.13.0`          | `TYPESAFE_API_KEY`                       |
+| `openai-decisions` | OpenAI Decisions API, `gpt-6-luna` | `MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY` |
 
 Set the selected backend's key in the environment of the OpenCode server process, which is the process that loads plugins:
 
 ```bash
-export TYPESAFE_API_KEY=...   # jev, the default
-export OPENAI_API_KEY=...     # openai-decisions
+export TYPESAFE_API_KEY=...                         # jev, the default
+export MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY=...   # openai-decisions
 ```
 
 The backend is chosen per command: `--backend jev` or `--backend openai-decisions` on `/magic-compact` or `/magic-trim` wins, then `MAGIC_COMPACT_RETENTION_BACKEND` in the server environment, then `jev`. Existing setups therefore keep using Jev unchanged. To make OpenAI Decisions the default for both commands:
@@ -163,7 +163,7 @@ The backend is chosen per command: `--backend jev` or `--backend openai-decision
 export MAGIC_COMPACT_RETENTION_BACKEND=openai-decisions
 ```
 
-The variable takes exactly `jev` or `openai-decisions`, with surrounding spaces ignored. Any other value, including an empty one, fails the command before any summary or provider request, and the message lists the accepted names; `--backend` on the command overrides it without reading it. Setting only `OPENAI_API_KEY` does not switch the backend. The plugin reads only the selected backend's key, never loads a `.env` file, and never falls back from one backend to the other or to `--heuristic`. `OPENAI_API_KEY` must be a plain OpenAI API key; OpenCode's ChatGPT sign-in is not used.
+The variable takes exactly `jev` or `openai-decisions`, with surrounding spaces ignored. Any other value, including an empty one, fails the command before any summary or provider request, and the message lists the accepted names; `--backend` on the command overrides it without reading it. Setting only `MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY` does not switch the backend. The plugin reads only the selected backend's key, never loads a `.env` file, and never falls back from one backend to the other or to `--heuristic`. `MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY` must be a plain OpenAI API key; OpenCode's ChatGPT sign-in is not used. A generic `OPENAI_API_KEY` is never read, so setting it neither supplies the key nor selects the backend.
 
 Restart the OpenCode server process after setting a variable; restarting an attached TUI does not reload the environment. Without the selected key, `/magic-compact` and `/magic-trim` fail without changing anything whenever they find a tool call to evaluate, before the retention summary is generated, and suggest your own command with `--heuristic`: `/magic-trim --heuristic` trims by the rules below without any model or backend call, and `/magic-compact --heuristic` skips only retention and still summarizes your turns. A command with nothing to evaluate needs no key.
 
@@ -367,7 +367,7 @@ bun run eval:compact report runs/haiku-low
 
 Task-aware retention asks a decision model whether the assistant would use a tool call's content again. The decision evaluation scores a model on that question with fixed cases: each gives the latest request, a session summary and one completed tool call, and compares the model's probability with a hand-written label. It measures the keep/trim decision only. It does not run `/magic-trim` end to end, judge summaries, or change the production model or its keep threshold.
 
-It runs against any versioned TypeSafe Jev model (`jev-1.13.0` by default; aliases such as `jev-latest` are refused so runs stay repeatable) or the OpenAI Decisions API. Each provider needs its own API key in the environment: `TYPESAFE_API_KEY` or `OPENAI_API_KEY`. OpenCode sign-ins are not used.
+It runs against any versioned TypeSafe Jev model (`jev-1.13.0` by default; aliases such as `jev-latest` are refused so runs stay repeatable) or the OpenAI Decisions API. Each provider needs its own API key in the environment: `TYPESAFE_API_KEY` or `MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY`. OpenCode sign-ins are not used.
 
 ```bash
 bun run eval:decisions check

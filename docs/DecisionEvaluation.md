@@ -20,7 +20,7 @@ export TYPESAFE_API_KEY=<your TypeSafe key>
 bun run eval:decisions run --provider jev --model jev-1.14.0 --out /tmp/decisions/jev-1.14.0
 
 # Paid run: OpenAI Decisions API (gpt-6-luna only). Needs an OpenAI API key.
-export OPENAI_API_KEY=<your OpenAI API key>
+export MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY=<your OpenAI API key>
 bun run eval:decisions run --provider openai-decisions --model gpt-6-luna --out /tmp/decisions/gpt-6-luna
 
 # Compare saved runs of the same dataset. Offline.
@@ -33,7 +33,7 @@ Any output directory outside the repository works; `--out` must name a path that
 
 ## Keys and sign-in
 
-The harness reads one environment variable for the selected provider and nothing else: `TYPESAFE_API_KEY` for `jev`, `OPENAI_API_KEY` for `openai-decisions`. A missing key fails the run before the first request and before the output directory is created. Keys travel only in the `Authorization` header and are never written to a result.
+The harness reads one environment variable for the selected provider and nothing else: `TYPESAFE_API_KEY` for `jev`, `MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY` for `openai-decisions`. A missing key fails the run before the first request and before the output directory is created. Keys travel only in the `Authorization` header and are never written to a result.
 
 The harness never reads OpenCode's credential stores or provider pool. OpenCode's ChatGPT sign-in is OAuth; OpenAI documents the Decisions API with API keys, and this harness does not try that sign-in against the endpoint. `--endpoint` redirects requests to another URL (https, or http on localhost for a local fake server) and sends the key there, so only point it at a server you control. Requests never follow redirects. A 3xx answer is recorded as an `http` failure with its status, because a redirect keeps the method and body and would send the case text to an origin you did not choose.
 

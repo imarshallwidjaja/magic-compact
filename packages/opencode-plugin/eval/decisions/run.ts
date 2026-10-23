@@ -81,8 +81,8 @@ run options
   --dry-run           Validate the selection and print the plan. No key, no network, no files.
 
 Environment (read only for the selected provider)
-  TYPESAFE_API_KEY    jev
-  OPENAI_API_KEY      openai-decisions
+  TYPESAFE_API_KEY                        jev
+  MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY  openai-decisions
   ChatGPT or OpenCode sign-ins are not used; these APIs need their own keys.
 
 Exit status (run and report): 0 every request produced a probability or a

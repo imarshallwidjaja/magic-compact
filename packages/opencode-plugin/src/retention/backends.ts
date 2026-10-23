@@ -92,7 +92,7 @@ export const RETENTION_BACKENDS: Readonly<
     name: "OpenAI Decisions",
     provider: "OpenAI",
     endpoint: OPENAI_DECISIONS_ENDPOINT,
-    keyEnv: "OPENAI_API_KEY",
+    keyEnv: "MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY",
     model: OPENAI_DECISIONS_MODEL,
     requestIdHeader: "x-request-id",
     // OpenAI documents no request body cap; the service enforces its limits.

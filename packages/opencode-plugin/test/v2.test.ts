@@ -1292,7 +1292,7 @@ describe("OpenCode 2 trim successors", () => {
         ...commandRetentionPolicy(
           "trim",
           parseMagicTrimArguments("--backend openai-decisions"),
-          { OPENAI_API_KEY: "test-openai-key" },
+          { MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY: "test-openai-key" },
         ),
         fetch: scoredOpenAIFetch(
           output => (output.startsWith("R-0") ? 0.9 : 0.1),
@@ -3332,7 +3332,7 @@ describe("OpenCode 2 retention keep threshold environment", () => {
     const inherited = process.env;
     process.env = {
       TYPESAFE_API_KEY: "fake-jev-key",
-      OPENAI_API_KEY: "fake-openai-key",
+      MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY: "fake-openai-key",
       [RETENTION_KEEP_THRESHOLD_PERCENT_ENV]: value,
     } as NodeJS.ProcessEnv;
     try {

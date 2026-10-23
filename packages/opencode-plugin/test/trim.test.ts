@@ -1200,7 +1200,7 @@ describe("magic trim task-aware retention", () => {
               parseMagicTrimArguments(
                 "--backend openai-decisions --threshold 70",
               ),
-              { OPENAI_API_KEY: "test-openai-key" },
+              { MAGIC_COMPACT_OPENAI_DECISIONS_API_KEY: "test-openai-key" },
             ),
             fetch: scoredOpenAIFetch(() => 0.65, calls),
           },
