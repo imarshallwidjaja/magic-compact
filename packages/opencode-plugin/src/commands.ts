@@ -1,6 +1,7 @@
 // The command surface both hosts register: names, arguments, and the result
 // messages their handlers throw or report.
 import { hasPluginMessage, PluginMessageError } from "./policy/feedback";
+import { percentThreshold } from "./policy/retention";
 import {
   classifyFailure,
   SuccessorFailure,
@@ -14,14 +15,16 @@ export const STATS_COMMAND = "magic-stats" as const;
 export const COMMAND_DESCRIPTIONS = {
   [COMPACT_COMMAND]: "Lossless context compression",
   [TRIM_COMMAND]:
-    "Trim historical tool inputs and outputs (add --heuristic to skip task-aware retention)",
+    "Trim historical tool inputs and outputs ([N] [--threshold P] [--truncate], or [N] --heuristic to skip task-aware retention)",
   [STATS_COMMAND]: "Show Magic Compact token and cost savings stats",
 } as const;
 
 export const COMPACT_NOOP = "No assistant turns are old enough to compact.";
 export const TRIM_NOOP = "No eligible tool calls need trimming.";
 export const TRIM_ARGUMENTS_ERROR =
-  "/magic-trim accepts an optional non-negative integer and an optional --heuristic flag.";
+  "/magic-trim accepts an optional non-negative integer N plus either --heuristic or any of --threshold P and --truncate, each at most once and in any order.";
+export const TRIM_THRESHOLD_ERROR =
+  "/magic-trim --threshold needs a plain decimal percent from 0 to 100 after a space, such as --threshold 70 or --threshold 60.5.";
 export const STATS_ARGUMENTS_ERROR = "/magic-stats does not accept arguments.";
 
 export function compactSuccess(successorID: string): string {
@@ -68,20 +71,57 @@ export function parseMagicCompactArguments(raw: string): number {
   return trimmed ? Number(trimmed) : 0;
 }
 
-export function parseMagicTrimArguments(raw: string): {
-  keepTurns: number;
-  heuristic: boolean;
-} {
+export type MagicTrimArguments =
+  | { keepTurns: number; heuristic: true }
+  | {
+      keepTurns: number;
+      heuristic: false;
+      // The --threshold probability, absent when it was not given.
+      keepThreshold?: number;
+      truncate: boolean;
+    };
+
+// Validates every token before any work, so nothing reads the environment
+// or contacts the host for a malformed command. Errors never echo a token.
+export function parseMagicTrimArguments(raw: string): MagicTrimArguments {
   let keepTurns: number | undefined;
   let heuristic = false;
-  for (const token of raw.trim().split(/\s+/u).filter(Boolean)) {
+  let truncate = false;
+  let keepThreshold: number | undefined;
+  const tokens = raw.trim().split(/\s+/u).filter(Boolean);
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
     if (token === "--heuristic" && !heuristic) {
       heuristic = true;
-    } else if (/^\d+$/u.test(token) && keepTurns === undefined) {
+    } else if (token === "--truncate" && !truncate) {
+      truncate = true;
+    } else if (token === "--threshold" && keepThreshold === undefined) {
+      index += 1;
+      const value = tokens[index];
+      keepThreshold = value === undefined ? undefined : percentThreshold(value);
+      if (keepThreshold === undefined) {
+        throw new PluginMessageError(TRIM_THRESHOLD_ERROR);
+      }
+    } else if (
+      /^\d+$/u.test(token)
+      && keepTurns === undefined
+      && Number.isSafeInteger(Number(token))
+    ) {
       keepTurns = Number(token);
     } else {
       throw new PluginMessageError(TRIM_ARGUMENTS_ERROR);
     }
   }
-  return { keepTurns: keepTurns ?? 0, heuristic };
+  if (heuristic) {
+    if (truncate || keepThreshold !== undefined) {
+      throw new PluginMessageError(TRIM_ARGUMENTS_ERROR);
+    }
+    return { keepTurns: keepTurns ?? 0, heuristic: true };
+  }
+  return {
+    keepTurns: keepTurns ?? 0,
+    heuristic: false,
+    ...(keepThreshold === undefined ? {} : { keepThreshold }),
+    truncate,
+  };
 }

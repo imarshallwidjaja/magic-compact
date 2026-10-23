@@ -36,6 +36,7 @@ export {
   parseMagicTrimArguments,
   TRIM_ARGUMENTS_ERROR,
   TRIM_NOOP,
+  TRIM_THRESHOLD_ERROR,
   trimSuccess,
 } from "./commands";
 

@@ -31,7 +31,7 @@ Magic Compact performs per-turn conversation compaction while preserving the con
 ### Runtime Surfaces
 
 - `/magic-compact [N]` slash command.
-- `/magic-trim [N] [--heuristic]` slash command.
+- `/magic-trim [N] [--threshold P] [--truncate]` or `/magic-trim [N] --heuristic` slash command.
 - `/magic-stats` slash command.
 - `read_omitted_content` tool.
 
@@ -49,4 +49,4 @@ Magic Compact performs per-turn conversation compaction while preserving the con
 - Tests never read `TYPESAFE_API_KEY` or reach the network: pass `retention` with a fake `fetch` (see `packages/opencode-plugin/test/retention-host.ts`), or `{ mode: "heuristic" }` for tests of the unchanged tool rules.
 - The operator-selected default is 0.60; the server may override it with `MAGIC_COMPACT_KEEP_THRESHOLD_PERCENT`. Further default or Jev-question changes require the evaluation protocol in `docs/RetentionEvaluation.md`; never tune against held-out results.
 - Keep archived evaluation thresholds independent of the runtime default and environment override.
-- Judge calls independently: useful duplicates and recoverable content qualify, as does unchanged useful content in a partly edited read. Do not categorically exclude task procedures, skills or todos. Send the session summary whole and keep the other request allocations fixed until a new development-only calibration is frozen. Enforce TypeSafe's 32 MiB request-body limit locally; let Jev enforce token limits. A confirmed token-limit refusal must fail unchanged with explicit /magic-trim --heuristic guidance; do not add byte-to-token proxies, clipped-summary retries or automatic fallbacks.
+- Judge calls independently: useful duplicates and recoverable content qualify, as does unchanged useful content in a partly edited read. Do not categorically exclude task procedures, skills or todos. Send the session summary whole by default and keep the other request allocations fixed until a new development-only calibration is frozen. Enforce TypeSafe's 32 MiB request-body limit locally; let Jev enforce token limits. Only /magic-trim --truncate may retry a confirmed token-limit refusal, once per rejected candidate with the summary head/tail excerpt capped at 8,000 UTF-8 JSON bytes. No other request fields change. Unrecovered token-limit refusals fail the whole command unchanged with explicit /magic-trim --heuristic guidance; do not add byte-to-token proxies or automatic heuristic fallbacks.

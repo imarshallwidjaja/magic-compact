@@ -4,8 +4,17 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GENERATION_PROTOCOL } from "../src/compact/constants";
+import {
+  commandFailureMessage,
+  parseMagicTrimArguments,
+  TRIM_ARGUMENTS_ERROR,
+  TRIM_THRESHOLD_ERROR,
+} from "../src/commands";
 import { setup } from "../src/host-v2";
-import { taskAwareRetentionPolicy } from "../src/policy/retention";
+import {
+  taskAwareRetentionPolicy,
+  trimRetentionPolicy,
+} from "../src/policy/retention";
 import {
   RETENTION_KEEP_THRESHOLD_PERCENT_ENV,
   RetentionClassificationError,
@@ -1223,7 +1232,7 @@ describe("OpenCode 2 trim successors", () => {
     );
     expect(state.requests).toHaveLength(1);
     expect(outcome).toContain(
-      "Task-aware retention kept 1 of 2 evaluated tool call(s) whole (read 1).",
+      "Task-aware retention at keep threshold 60% kept 1 of 2 evaluated tool call(s) whole (read 1).",
     );
     const read = v2ToolCalls(state.messages.get(successor!.session.id)![4]!)[0]!
       .tool;
@@ -1260,10 +1269,54 @@ describe("OpenCode 2 trim successors", () => {
         controlTimeoutMs: 1_000,
       });
       expect(outcome).toContain(
-        `Task-aware retention kept ${kept} of 2 evaluated tool call(s) whole`,
+        `Task-aware retention at keep threshold ${percent ?? 60}% kept ${kept} of 2 evaluated tool call(s) whole`,
       );
     },
   );
+
+  test("--threshold and --truncate reach the outcome with the actual truncated decisions", async () => {
+    const state = fakeV2State();
+    sourceSession(state, "ses_src", toolHistory());
+    const owned = new OwnedSessions();
+    const summary = `## Objective\n${"- A dense detail line.\n".repeat(1_500)}## Next Move`;
+    const host = fakeV2Host(state, owned, () => ({ text: summary }));
+    const summaries: string[] = [];
+    const answer = scoredJevFetch(output =>
+      output.startsWith("R-0") ? 0.75 : 0.1,
+    );
+    const { successor, outcome } = await executeV2Trim(
+      host,
+      owned,
+      "ses_src",
+      0,
+      {
+        retention: {
+          ...trimRetentionPolicy(
+            parseMagicTrimArguments("--truncate --threshold 70"),
+            { TYPESAFE_API_KEY: "test-key" },
+          ),
+          fetch: async (url, init) => {
+            const body = JSON.parse(String(init.body));
+            summaries.push(body.state.task.sessionSummary);
+            return body.state.task.sessionSummary === summary
+              && body.state.candidates[0].output.startsWith("R-0")
+              ? tokenLimitResponse()
+              : answer(url, init);
+          },
+        },
+        controlTimeoutMs: 1_000,
+      },
+    );
+    expect(successor).not.toBeNull();
+    expect(summaries).toHaveLength(3);
+    expect(outcome).toContain(
+      "Retention | Task-aware retention at keep threshold 70% kept 1 of 2 evaluated tool call(s) whole (read 1). 1 decision(s) used a shortened session summary after a Jev token-limit refusal (--truncate) and could have missed useful context.",
+    );
+    expect(
+      (successor!.session.metadata as { magicCompact: { outcome: string } })
+        .magicCompact.outcome,
+    ).toBe(outcome);
+  });
 
   test("task-aware trim resolves the summarizer at the source session location", async () => {
     const state = fakeV2State();
@@ -1323,13 +1376,14 @@ describe("OpenCode 2 trim successors", () => {
     const before = structuredClone(state.messages.get("ses_src"));
     const owned = new OwnedSessions();
     const host = fakeV2Host(state, owned, () => ({
-      text: "## Objective\n- Continue.",
+      text: `## Objective\n${"- A dense detail line.\n".repeat(1_500)}`,
     }));
     let jevCalls = 0;
     const error = await executeV2Trim(host, owned, "ses_src", 0, {
       retention: {
-        mode: "task-aware",
-        apiKey: "test-key",
+        ...trimRetentionPolicy(parseMagicTrimArguments("--threshold 60.1"), {
+          TYPESAFE_API_KEY: "test-key",
+        }),
         fetch: async () => {
           jevCalls += 1;
           return tokenLimitResponse();
@@ -1342,9 +1396,14 @@ describe("OpenCode 2 trim successors", () => {
     );
     expect(error).toBeInstanceOf(RetentionClassificationError);
     expect((error as RetentionClassificationError).kind).toBe("token-limit");
-    expect(String(error)).toContain(
-      "no retention decisions were applied. Run /magic-trim --heuristic",
+    // OpenCode 2 returns this text as the command error.
+    const message = commandFailureMessage("Magic Trim", error);
+    expect(message).toBe((error as Error).message);
+    expect(message.length).toBeLessThan(700);
+    expect(message).toContain(
+      "no retention decisions were applied. Run /magic-trim --threshold 60.1 --truncate to retry",
     );
+    expect(message).toContain("or /magic-trim --heuristic to trim");
     // Both candidates were admitted together; nothing was retried.
     expect(jevCalls).toBe(2);
     expect(state.messages.get("ses_src")).toEqual(before);
@@ -3047,14 +3106,28 @@ describe("OpenCode 2 retention keep threshold environment", () => {
     },
   );
 
-  test("magic-trim --heuristic neither reads nor validates the percent", async () => {
-    const run = await commands();
-    const error = await withPercent("60%", () =>
-      run("magic-trim", "--heuristic"),
-    );
-    expect(error).not.toBeInstanceOf(RetentionClassificationError);
-    expect(String(error)).toContain(V2_ENDPOINT_REQUIRED);
-  });
+  test.each(["--heuristic", "--threshold 70", "1 --truncate --threshold 0"])(
+    "magic-trim %s neither reads nor validates the percent",
+    async args => {
+      const run = await commands();
+      const error = await withPercent("60%", () => run("magic-trim", args));
+      expect(error).not.toBeInstanceOf(RetentionClassificationError);
+      expect(String(error)).toContain(V2_ENDPOINT_REQUIRED);
+    },
+  );
+
+  test.each([
+    ["--threshold 70%", TRIM_THRESHOLD_ERROR],
+    ["--threshold=70", TRIM_ARGUMENTS_ERROR],
+    ["--heuristic --truncate", TRIM_ARGUMENTS_ERROR],
+  ])(
+    "magic-trim %s fails with the argument error before the environment or the server",
+    async (args, message) => {
+      const run = await commands();
+      const error = await withPercent("60%", () => run("magic-trim", args));
+      expect((error as Error).message).toBe(message);
+    },
+  );
 });
 
 describe("OpenCode 2 response tool boundary", () => {

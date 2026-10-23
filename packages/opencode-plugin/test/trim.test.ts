@@ -19,14 +19,20 @@ import { projectToolTrim } from "../src/compact/prune";
 import server from "../src/host-v1";
 import {
   TRIM_ARGUMENTS_ERROR,
+  TRIM_THRESHOLD_ERROR,
   TRIM_NOOP,
   executeMagicTrim,
   parseMagicTrimArguments,
 } from "../src/magic-trim";
 import type { PluginInput } from "@opencode-ai/plugin";
-import { taskAwareRetentionPolicy } from "../src/policy/retention";
 import {
+  taskAwareRetentionPolicy,
+  trimRetentionPolicy,
+} from "../src/policy/retention";
+import {
+  excerpt,
   RETENTION_KEEP_THRESHOLD_PERCENT_ENV,
+  RETENTION_SUMMARY_EXCERPT_BYTES,
   RetentionClassificationError,
 } from "../src/retention/classifier";
 import {
@@ -817,46 +823,93 @@ describe("magic trim task-aware retention", () => {
       await cleanupTrimSessions(sessionID, ...harness.created);
     }
   });
-  test("parses an optional turn count and --heuristic flag in either order", () => {
-    expect(parseMagicTrimArguments("")).toEqual({
-      keepTurns: 0,
-      heuristic: false,
-    });
-    expect(parseMagicTrimArguments(" 3 ")).toEqual({
-      keepTurns: 3,
-      heuristic: false,
-    });
-    expect(parseMagicTrimArguments("--heuristic")).toEqual({
-      keepTurns: 0,
-      heuristic: true,
-    });
-    expect(parseMagicTrimArguments("--heuristic 2")).toEqual({
-      keepTurns: 2,
-      heuristic: true,
-    });
-    expect(parseMagicTrimArguments("2  --heuristic")).toEqual({
-      keepTurns: 2,
-      heuristic: true,
-    });
+  test.each([
+    ["", { keepTurns: 0, heuristic: false, truncate: false }],
+    [" 3 ", { keepTurns: 3, heuristic: false, truncate: false }],
+    ["--heuristic", { keepTurns: 0, heuristic: true }],
+    ["--heuristic 2", { keepTurns: 2, heuristic: true }],
+    ["2  --heuristic", { keepTurns: 2, heuristic: true }],
+    ["--truncate", { keepTurns: 0, heuristic: false, truncate: true }],
+    [
+      "1 --threshold 70 --truncate",
+      { keepTurns: 1, heuristic: false, keepThreshold: 0.7, truncate: true },
+    ],
+    [
+      "--truncate --threshold 60.1 1",
+      { keepTurns: 1, heuristic: false, keepThreshold: 0.601, truncate: true },
+    ],
+    [
+      "--threshold 0",
+      { keepTurns: 0, heuristic: false, keepThreshold: 0, truncate: false },
+    ],
+    [
+      "--threshold 100 4",
+      { keepTurns: 4, heuristic: false, keepThreshold: 1, truncate: false },
+    ],
+    [
+      `${Number.MAX_SAFE_INTEGER}`,
+      { keepTurns: Number.MAX_SAFE_INTEGER, heuristic: false, truncate: false },
+    ],
+  ] as const)("parses %p", (raw, expected) => {
+    expect(parseMagicTrimArguments(raw)).toEqual(expected);
   });
 
   test.each([
-    "--heuristic --heuristic",
-    "1 2",
-    "-1",
-    "1.5",
-    "--Heuristic",
-    "--heuristic=true",
-    "heuristic",
-  ])("rejects malformed arguments %p before any work", async raw => {
-    expect(() => parseMagicTrimArguments(raw)).toThrow(TRIM_ARGUMENTS_ERROR);
+    ["--heuristic --heuristic", TRIM_ARGUMENTS_ERROR],
+    ["--truncate --truncate", TRIM_ARGUMENTS_ERROR],
+    ["--threshold 70 --threshold 70", TRIM_ARGUMENTS_ERROR],
+    ["1 2", TRIM_ARGUMENTS_ERROR],
+    ["-1", TRIM_ARGUMENTS_ERROR],
+    ["1.5", TRIM_ARGUMENTS_ERROR],
+    [`${Number.MAX_SAFE_INTEGER + 1}`, TRIM_ARGUMENTS_ERROR],
+    ["--Heuristic", TRIM_ARGUMENTS_ERROR],
+    ["--heuristic=true", TRIM_ARGUMENTS_ERROR],
+    ["heuristic", TRIM_ARGUMENTS_ERROR],
+    ["--threshold=70", TRIM_ARGUMENTS_ERROR],
+    ["--thresholds 70", TRIM_ARGUMENTS_ERROR],
+    ["--heuristic --truncate", TRIM_ARGUMENTS_ERROR],
+    ["--threshold 70 --heuristic", TRIM_ARGUMENTS_ERROR],
+    ["--threshold", TRIM_THRESHOLD_ERROR],
+    ["--threshold --truncate", TRIM_THRESHOLD_ERROR],
+    ["--threshold 101", TRIM_THRESHOLD_ERROR],
+    ["--threshold 100.5", TRIM_THRESHOLD_ERROR],
+    ["--threshold -1", TRIM_THRESHOLD_ERROR],
+    ["--threshold +60", TRIM_THRESHOLD_ERROR],
+    ["--threshold 70%", TRIM_THRESHOLD_ERROR],
+    ["--threshold 6e1", TRIM_THRESHOLD_ERROR],
+    ["--threshold .5", TRIM_THRESHOLD_ERROR],
+    ["--threshold 5.", TRIM_THRESHOLD_ERROR],
+    ["--threshold NaN", TRIM_THRESHOLD_ERROR],
+    ["--threshold Infinity", TRIM_THRESHOLD_ERROR],
+    ["--threshold 0x3c", TRIM_THRESHOLD_ERROR],
+    ["--threshold 100.00000000000000001", TRIM_THRESHOLD_ERROR],
+    [`--threshold 0.${"0".repeat(400)}1`, TRIM_THRESHOLD_ERROR],
+  ])("rejects %p", (raw, message) => {
+    expect(() => parseMagicTrimArguments(raw)).toThrow(message);
+  });
+
+  // One grammar and one threshold error reach the host before any work; the
+  // parser table above owns every other form.
+  test.each([
+    ["--heuristic --truncate", TRIM_ARGUMENTS_ERROR],
+    ["--threshold 101", TRIM_THRESHOLD_ERROR],
+  ])("rejects %p before any work", async (raw, message) => {
     const hooks = await server({} as PluginInput);
-    await expect(
-      hooks["command.execute.before"]!(
-        { command: "magic-trim", arguments: raw, sessionID: "session" },
-        { parts: [] },
-      ),
-    ).rejects.toThrow(TRIM_ARGUMENTS_ERROR);
+    const failure = await hooks["command.execute.before"]!(
+      { command: "magic-trim", arguments: raw, sessionID: "session" },
+      { parts: [] },
+    ).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect((failure as Error).message).toBe(message);
+  });
+
+  test("the argument errors name the flags and echo no value", () => {
+    for (const message of [TRIM_ARGUMENTS_ERROR, TRIM_THRESHOLD_ERROR]) {
+      expect(message).toContain("--threshold");
+      expect(message).not.toMatch(/MAGIC_COMPACT|%|Infinity|0x/);
+    }
   });
 
   test("keeps judged-useful calls whole and trims the rest by the existing rules", async () => {
@@ -914,14 +967,14 @@ describe("magic trim task-aware retention", () => {
       expect(harness.deletedSessions).toEqual([harness.summaryForkID]);
       expect(JSON.stringify(messages)).not.toContain(harness.summaryForkID);
       expect(harness.toasts.at(-1)?.message).toBe(
-        `Trimmed 2 tool call(s) into successor session ${harness.successorID}. Task-aware retention kept 1 of 2 evaluated tool call(s) whole (read 1).`,
+        `Trimmed 2 tool call(s) into successor session ${harness.successorID}. Task-aware retention at keep threshold 60% kept 1 of 2 evaluated tool call(s) whole (read 1).`,
       );
       const notice = harness.successorMessages().at(-1)!.parts[0] as TextPart;
       expect(notice.ignored).toBeTrue();
       expect(notice.text.split("\n")).toHaveLength(4);
       expect(notice.text).toContain("Changes | Tool calls trimmed: 2");
       expect(notice.text).toContain(
-        "Retention | Task-aware retention kept 1 of 2 evaluated tool call(s) whole (read 1).",
+        "Retention | Task-aware retention at keep threshold 60% kept 1 of 2 evaluated tool call(s) whole (read 1).",
       );
     } finally {
       await cleanupTrimSessions(sessionID, ...harness.created);
@@ -958,7 +1011,7 @@ describe("magic trim task-aware retention", () => {
         expect(
           await executeMagicTrim(harness.v2, sessionID, 0, { retention }),
         ).toEqual(keep ? null : expect.anything());
-        const feedback = `Task-aware retention kept ${keep ? 1 : 0} of 1 evaluated tool call(s) whole${keep ? " (read 1)" : ""}.`;
+        const feedback = `Task-aware retention at keep threshold ${percent ?? 60}% kept ${keep ? 1 : 0} of 1 evaluated tool call(s) whole${keep ? " (read 1)" : ""}.`;
         expect(harness.toasts.at(-1)?.message).toBe(
           `${keep ? TRIM_NOOP : `Trimmed 1 tool call(s) into successor session ${harness.successorID}.`} ${feedback}`,
         );
@@ -1005,12 +1058,12 @@ describe("magic trim task-aware retention", () => {
       expect(harness.modelCalls).toEqual([]);
       expect(harness.forks).toEqual([]);
       expect(harness.toasts.at(-1)?.message).toBe(
-        `Trimmed 1 tool call(s) into successor session ${harness.successorID}. Task-aware retention: no tool calls needed evaluation.`,
+        `Trimmed 1 tool call(s) into successor session ${harness.successorID}. Task-aware retention at keep threshold 60%: no tool calls needed evaluation.`,
       );
       expect(
         (harness.successorMessages().at(-1)!.parts[0] as TextPart).text,
       ).toContain(
-        "Retention | Task-aware retention: no tool calls needed evaluation.",
+        "Retention | Task-aware retention at keep threshold 60%: no tool calls needed evaluation.",
       );
     } finally {
       await cleanupTrimSessions(sessionID, ...harness.created);
@@ -1186,6 +1239,113 @@ describe("magic trim task-aware retention", () => {
     },
   );
 
+  test("--truncate retries a token-limit refusal with the summary excerpt and reports it", async () => {
+    const sessionID = `ses_trim_truncate_${randomUUID().replaceAll("-", "")}`;
+    const summaryText = `## Objective\n${"- A dense detail line.\n".repeat(1_500)}## Next Move`;
+    const useful = readTool("tool_useful", "useful parser finding ".repeat(80));
+    const messages = [
+      message("usr_1", "user", [userText("usr_1", "Add the parser.")]),
+      message("ast_1", "assistant", [
+        useful,
+        readTool("tool_stale", "stale directory listing ".repeat(80)),
+      ]),
+    ];
+    const usefulBefore = structuredClone(useful);
+    const harness = trimCommandHarness(sessionID, messages, { summaryText });
+    const summaries: string[] = [];
+    const answer = scoredJevFetch(output =>
+      output.includes("useful") ? 0.75 : 0.1,
+    );
+    try {
+      const successor = await executeMagicTrim(harness.v2, sessionID, 0, {
+        retention: {
+          ...trimRetentionPolicy(
+            parseMagicTrimArguments("--threshold 70 --truncate"),
+            { TYPESAFE_API_KEY: "test-key" },
+          ),
+          fetch: async (url, init) => {
+            const body = JSON.parse(String(init.body));
+            summaries.push(body.state.task.sessionSummary);
+            // Only the useful call's whole-summary request is refused.
+            return body.state.task.sessionSummary === summaryText
+              && body.state.candidates[0].output.includes("useful")
+              ? tokenLimitResponse()
+              : answer(url, init);
+          },
+        },
+      });
+      expect(successor).not.toBeNull();
+      expect(summaries.filter(text => text === summaryText)).toHaveLength(2);
+      expect(summaries.filter(text => text !== summaryText)).toEqual([
+        excerpt(summaryText, RETENTION_SUMMARY_EXCERPT_BYTES),
+      ]);
+      const feedback =
+        "Task-aware retention at keep threshold 70% kept 1 of 2 evaluated tool call(s) whole (read 1). 1 decision(s) used a shortened session summary after a Jev token-limit refusal (--truncate) and could have missed useful context.";
+      expect(harness.toasts.at(-1)?.message).toBe(
+        `Trimmed 1 tool call(s) into successor session ${harness.successorID}. ${feedback}`,
+      );
+      const notice = harness.successorMessages().at(-1)!.parts[0] as TextPart;
+      expect(notice.text).toContain(`Retention | ${feedback}`);
+      expect(harness.successorPart("tool_useful").state).toEqual(
+        usefulBefore.state,
+      );
+    } finally {
+      await cleanupTrimSessions(sessionID, ...harness.created);
+    }
+  });
+
+  test("a token-limit refusal without --truncate toasts the person's own retry once", async () => {
+    const sessionID = `ses_trim_truncate_hint_${randomUUID().replaceAll("-", "")}`;
+    const messages = [
+      message("usr_1", "user", [userText("usr_1", "Add the parser.")]),
+      message("ast_1", "assistant", [
+        readTool("tool_read", "large output ".repeat(100)),
+      ]),
+      message("usr_2", "user", [userText("usr_2", "Continue.")]),
+      message("ast_2", "assistant", []),
+    ];
+    const harness = trimCommandHarness(sessionID, messages, {
+      summaryText: "s".repeat(20_000),
+    });
+    const before = structuredClone(messages);
+    let calls = 0;
+    try {
+      const failure = await executeMagicTrim(harness.v2, sessionID, 1, {
+        retention: {
+          ...trimRetentionPolicy(parseMagicTrimArguments("--threshold 70 1"), {
+            TYPESAFE_API_KEY: "test-key",
+          }),
+          fetch: async () => {
+            calls += 1;
+            return tokenLimitResponse();
+          },
+        },
+      }).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(failure).toBeInstanceOf(RetentionClassificationError);
+      expect(calls).toBe(1);
+      const errors = harness.toasts.filter(
+        toast => (toast as { variant?: string }).variant === "error",
+      );
+      expect(errors).toHaveLength(1);
+      const text = errors[0]!.message!;
+      expect(text).toBe((failure as Error).message);
+      expect(text.length).toBeLessThan(700);
+      expect(text).toContain(
+        "Run /magic-trim 1 --threshold 70 --truncate to retry each refused call once",
+      );
+      expect(text).toContain("or /magic-trim 1 --heuristic to trim");
+      expect(text).not.toContain("sss");
+      expect(messages).toEqual(before);
+      expect(harness.created).toEqual([]);
+      expect(await readStats(sessionID)).toBeNull();
+    } finally {
+      await cleanupTrimSessions(sessionID, ...harness.created);
+    }
+  });
+
   test.each([
     ["heuristic", HEURISTIC_OPTIONS],
     [
@@ -1322,6 +1482,8 @@ type TrimCommandHarnessOptions = {
   duringSuccessorCreate?: () => void;
   // Replaces source message reads after this many successful reads.
   failSourceReadAfter?: number;
+  // The retention summary the fake summarizer replies with.
+  summaryText?: string;
 };
 
 // Fake OpenCode host for trim command tests. `messages` is the live source;
@@ -1446,7 +1608,12 @@ function trimCommandHarness(
         modelCalls.push("summary");
         options.duringSummary?.();
         const fork = history.read(summaryForkID);
-        const reply = summaryReply(fork, request, summaryForkID);
+        const reply = summaryReply(
+          fork,
+          request,
+          summaryForkID,
+          options.summaryText,
+        );
         fork
           .slice(-2)
           .forEach((item, index) => history.write(item, 100 + index));

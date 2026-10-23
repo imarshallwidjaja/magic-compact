@@ -14,11 +14,14 @@ import { trimWouldChangeContent } from "../src/compact/prune";
 import server from "../src/host-v1";
 import {
   decideRetentionWith,
+  percentThreshold,
   taskAwareRetentionPolicy,
+  trimRetentionPolicy,
 } from "../src/policy/retention";
 import {
   decideRetention,
   findRetentionCandidates,
+  HEURISTIC_RETENTION,
   retentionFeedback,
 } from "../src/retention/retention";
 import {
@@ -41,11 +44,13 @@ import {
   buildRetentionRequests,
   classifyRetention,
   excerpt,
+  formatKeepThresholdPercent,
   RETENTION_KEEP_THRESHOLD,
   RETENTION_KEEP_THRESHOLD_PERCENT_ENV,
   RETENTION_MAX_CONCURRENCY,
   RETENTION_MODEL,
   RETENTION_REQUEST_BODY_BYTE_LIMIT,
+  RETENTION_SUMMARY_EXCERPT_BYTES,
   RetentionClassificationError,
   type RetentionCandidate,
   type RetentionFetch,
@@ -531,7 +536,7 @@ describe("retention request body limit", () => {
     expect(calls).toBe(0);
     expect(error.kind).toBe("budget");
     expect(error.message).toBe(
-      "A task-aware retention request is larger than TypeSafe's 32 MiB request body limit and was not sent. The original session is unchanged and no retention decisions were applied. Run /magic-trim --heuristic to trim without task-aware keep protection.",
+      "A task-aware retention request is larger than TypeSafe's 32 MiB request body limit and was not sent; --truncate does not apply to this limit. The original session is unchanged and no retention decisions were applied. Run /magic-trim --heuristic to trim without task-aware keep protection.",
     );
     expect(error.message).not.toContain("sss");
   });
@@ -663,16 +668,26 @@ describe("retention service refusals", () => {
     expect(error.kind).toBe("token-limit");
     expect(error.status).toBe(400);
     expect(error.message).toBe(
-      "TypeSafe Jev refused a task-aware retention request because it exceeds the model's token limit. The original session is unchanged and no retention decisions were applied. Run /magic-trim --heuristic to trim without task-aware keep protection.",
+      "TypeSafe Jev refused a task-aware retention request because it exceeds the model's token limit. The session summary already fits the 8,000-byte excerpt that --truncate would use, so --truncate cannot shorten the request. The original session is unchanged and no retention decisions were applied. Run /magic-trim --heuristic to trim without task-aware keep protection.",
     );
     expect(error.diagnostics).toEqual({
       request: {
         ordinal: 0,
+        summary: "whole",
         bodyBytes,
         status: 400,
         requestId: TOKEN_LIMIT_REQUEST_ID,
       },
-      counts: { planned: 1, started: 1, succeeded: 0, failed: 1, unstarted: 0 },
+      truncation: "unavailable",
+      counts: {
+        planned: 1,
+        started: 1,
+        succeeded: 0,
+        failed: 1,
+        cancelled: 0,
+        unstarted: 0,
+        attempts: 1,
+      },
     });
   });
 
@@ -697,6 +712,7 @@ describe("retention service refusals", () => {
     // An invalid request ID header is dropped, not shown.
     expect(error.diagnostics?.request).toEqual({
       ordinal: 0,
+      summary: "whole",
       bodyBytes: expect.any(Number),
       status: 400,
     });
@@ -833,7 +849,9 @@ describe("retention invocation outcome", () => {
       started: RETENTION_MAX_CONCURRENCY,
       succeeded: RETENTION_MAX_CONCURRENCY - 1,
       failed: 1,
+      cancelled: 0,
       unstarted: 20 - RETENTION_MAX_CONCURRENCY,
+      attempts: RETENTION_MAX_CONCURRENCY,
     });
   });
 
@@ -908,6 +926,428 @@ describe("retention invocation outcome", () => {
   });
 });
 
+describe("retention --truncate summary retry", () => {
+  const longSummary = `## Objective\n${"- A dense detail line.\n".repeat(1_500)}## Next Move\n- Finish.`;
+  const long = { ...context, sessionSummary: longSummary };
+  const shortSummary = excerpt(longSummary, RETENTION_SUMMARY_EXCERPT_BYTES);
+  type Sent = { candidate: string; summary: "whole" | "excerpt"; body: string };
+  const sentAs = (init: RequestInit): Sent => {
+    const body = String(init.body);
+    const parsed = JSON.parse(body);
+    const summary = parsed.state.task.sessionSummary;
+    if (summary !== longSummary && summary !== shortSummary) {
+      throw new Error("unexpected summary");
+    }
+    return {
+      candidate: parsed.state.candidates[0].output,
+      summary: summary === longSummary ? "whole" : "excerpt",
+      body,
+    };
+  };
+  const answered = (sent: Sent) =>
+    Response.json({
+      model: RETENTION_MODEL,
+      answers: { candidate_0: { type: "noul", noul: 0.7 } },
+      usage: { input_tokens: sent.summary === "whole" ? 100 : 10 },
+    });
+  // A 400 whose token-limit body arrives after `ms`.
+  const slowTokenLimit = (ms: number, onBody: () => void = () => {}) =>
+    new Response(
+      new ReadableStream<Uint8Array>(
+        {
+          async pull(controller) {
+            await Bun.sleep(ms);
+            onBody();
+            controller.enqueue(new TextEncoder().encode(TOKEN_LIMIT_BODY));
+            controller.close();
+          },
+        },
+        { highWaterMark: 0 },
+      ),
+      { status: 400 },
+    );
+  const items = (count: number) =>
+    Array.from({ length: count }, (_, i) => candidate(`c${i}`, `c${i}`));
+
+  test("retries a token-limit refusal once with only the summary excerpt changed", async () => {
+    const sent: Sent[] = [];
+    const result = await classifyRetention(long, [candidate("a")], {
+      apiKey: "key",
+      truncateSummary: true,
+      fetch: async (_url, init) => {
+        const request = sentAs(init);
+        sent.push(request);
+        return request.summary === "whole"
+          ? tokenLimitResponse()
+          : answered(request);
+      },
+    });
+
+    expect(sent.map(request => request.summary)).toEqual(["whole", "excerpt"]);
+    const [whole, retry] = sent.map(request => JSON.parse(request.body));
+    expect(Buffer.byteLength(JSON.stringify(shortSummary))).toBeLessThanOrEqual(
+      RETENTION_SUMMARY_EXCERPT_BYTES,
+    );
+    expect(retry.state.task.sessionSummary).toBe(shortSummary);
+    expect({
+      ...retry,
+      state: {
+        ...retry.state,
+        task: { ...retry.state.task, sessionSummary: longSummary },
+      },
+    }).toEqual(whole);
+    expect(sent[1]!.body).toBe(
+      sent[0]!.body.replace(
+        JSON.stringify(longSummary),
+        JSON.stringify(shortSummary),
+      ),
+    );
+    expect(result).toMatchObject({
+      requests: 1,
+      attempts: 2,
+      truncated: 1,
+      inputTokens: 10,
+      reportedUsageRequests: 1,
+    });
+    expect(result.decisions.get("a")).toEqual({ useful: 0.7, keep: true });
+  });
+
+  test("without the flag a token-limit refusal is never retried and offers --truncate for a long summary", async () => {
+    let calls = 0;
+    const error = await failure(
+      classifyRetention(long, [candidate("a")], {
+        apiKey: "key",
+        fetch: async () => {
+          calls += 1;
+          return tokenLimitResponse();
+        },
+      }),
+    );
+    expect(calls).toBe(1);
+    expect(error.diagnostics?.truncation).toBe("available");
+    expect(error.message).toBe(
+      "TypeSafe Jev refused a task-aware retention request because it exceeds the model's token limit. The original session is unchanged and no retention decisions were applied. Run /magic-trim --truncate to retry each refused call once with a shorter session summary, which can omit useful context, or /magic-trim --heuristic to trim without task-aware keep protection. --threshold does not reduce the Jev request size.",
+    );
+  });
+
+  test("a summary that already fits the excerpt has no retry", async () => {
+    let calls = 0;
+    const error = await failure(
+      classifyRetention(context, [candidate("a")], {
+        apiKey: "key",
+        truncateSummary: true,
+        fetch: async () => {
+          calls += 1;
+          return tokenLimitResponse();
+        },
+      }),
+    );
+    expect(calls).toBe(1);
+    expect(error.kind).toBe("token-limit");
+    expect(error.diagnostics?.truncation).toBe("unavailable");
+    expect(error.diagnostics?.counts?.attempts).toBe(1);
+    expect(error.message).toBe(
+      "TypeSafe Jev refused a task-aware retention request because it exceeds the model's token limit. The session summary already fits the 8,000-byte excerpt that --truncate would use, so --truncate cannot shorten the request. The original session is unchanged and no retention decisions were applied. Run /magic-trim --heuristic to trim without task-aware keep protection.",
+    );
+  });
+
+  test.each([
+    ["a second token-limit refusal", () => tokenLimitResponse(), "token-limit"],
+    ["a failed retry", () => new Response("private", { status: 500 }), "http"],
+  ] as const)(
+    "%s is terminal and discards every decision",
+    async (_name, retryResponse, kind) => {
+      const sent: Sent[] = [];
+      const error = await failure(
+        classifyRetention(long, items(3), {
+          apiKey: "key",
+          truncateSummary: true,
+          fetch: async (_url, init) => {
+            const request = sentAs(init);
+            sent.push(request);
+            if (request.candidate !== "c0") return answered(request);
+            return request.summary === "whole"
+              ? tokenLimitResponse()
+              : retryResponse();
+          },
+        }),
+      );
+      expect(sent.filter(request => request.candidate === "c0")).toHaveLength(
+        2,
+      );
+      expect(error.kind).toBe(kind);
+      expect(error.diagnostics?.request).toMatchObject({
+        ordinal: 0,
+        summary: "excerpt",
+      });
+      expect(error.diagnostics?.counts).toEqual({
+        planned: 3,
+        started: 3,
+        succeeded: 2,
+        failed: 1,
+        cancelled: 0,
+        unstarted: 0,
+        attempts: 4,
+      });
+      expect(error.message).not.toContain("private");
+      if (kind === "token-limit") {
+        expect(error.message).toBe(
+          "TypeSafe Jev refused a task-aware retention request again after --truncate retried it with a shorter session summary, so the retry limit was exceeded. The original session is unchanged and no retention decisions were applied. Run /magic-trim --heuristic to trim without task-aware keep protection.",
+        );
+      }
+    },
+  );
+
+  const terminal: Array<[string, () => Response | Promise<Response>, string]> =
+    [
+      [
+        "another 400",
+        () =>
+          new Response(
+            JSON.stringify({ detail: { error_type: "invalid_utf8" } }),
+            { status: 400 },
+          ),
+        "http",
+      ],
+      [
+        "a 400 body over 4,096 bytes",
+        () =>
+          new Response(
+            JSON.stringify({
+              detail: { error_type: "max_tokens_exceeded" },
+              pad: "x".repeat(5_000),
+            }),
+            { status: 400 },
+          ),
+        "http",
+      ],
+      ["HTTP 401", () => new Response("", { status: 401 }), "http"],
+      ["HTTP 422", () => new Response("", { status: 422 }), "http"],
+      ["HTTP 429", () => new Response("", { status: 429 }), "http"],
+      [
+        "an invalid response",
+        () => new Response("not json"),
+        "invalid-response",
+      ],
+      [
+        "a network failure",
+        () => Promise.reject(new TypeError("connect failed")),
+        "network",
+      ],
+    ];
+  test.each(terminal)("never retries %s", async (_name, respond, kind) => {
+    let calls = 0;
+    const error = await failure(
+      classifyRetention(long, [candidate("a")], {
+        apiKey: "key",
+        truncateSummary: true,
+        fetch: async () => {
+          calls += 1;
+          return respond();
+        },
+      }),
+    );
+    expect(calls).toBe(1);
+    expect(error.kind).toBe(kind);
+  });
+
+  test("never retries a timeout or a hanging 400 body", async () => {
+    for (const respond of [
+      (signal: AbortSignal) =>
+        new Promise<Response>((_, reject) =>
+          signal.addEventListener("abort", () => reject(signal.reason)),
+        ),
+      async () =>
+        new Response(
+          new ReadableStream({ pull: () => new Promise<void>(() => {}) }),
+          { status: 400 },
+        ),
+    ]) {
+      let calls = 0;
+      const error = await failure(
+        classifyRetention(long, [candidate("a")], {
+          apiKey: "key",
+          truncateSummary: true,
+          timeoutMs: 30,
+          fetch: async (_url, init) => {
+            calls += 1;
+            return respond(init.signal!);
+          },
+        }),
+      );
+      expect(calls).toBe(1);
+      expect(["timeout", "http"]).toContain(error.kind);
+    }
+  });
+
+  test("cannot bypass the local 32 MiB body check", async () => {
+    let calls = 0;
+    const sessionSummary = "s".repeat(RETENTION_REQUEST_BODY_BYTE_LIMIT);
+    const error = await failure(
+      classifyRetention({ ...context, sessionSummary }, [candidate("a")], {
+        apiKey: "key",
+        truncateSummary: true,
+        fetch: jevFetch(() => 0.9, { onCall: () => (calls += 1) }),
+      }),
+    );
+    expect(calls).toBe(0);
+    expect(error.kind).toBe("budget");
+    expect(error.message).toContain("--truncate does not apply");
+  });
+
+  test("rejects batched evaluation requests before any request", async () => {
+    let calls = 0;
+    const error = await failure(
+      classifyRetention(long, items(2), {
+        apiKey: "key",
+        truncateSummary: true,
+        batchSize: 2,
+        fetch: jevFetch(() => 0.9, { onCall: () => (calls += 1) }),
+      }),
+    );
+    expect(error.kind).toBe("configuration");
+    expect(calls).toBe(0);
+  });
+
+  test("pauses admission until every pending refusal is classified", async () => {
+    let calls = 0;
+    let callsAtSecondBody = -1;
+    const sent: Sent[] = [];
+    const result = await classifyRetention(long, items(6), {
+      apiKey: "key",
+      truncateSummary: true,
+      fetch: async (_url, init) => {
+        calls += 1;
+        const request = sentAs(init);
+        sent.push(request);
+        if (request.summary === "whole" && request.candidate === "c0") {
+          return slowTokenLimit(30);
+        }
+        if (request.summary === "whole" && request.candidate === "c1") {
+          return slowTokenLimit(90, () => (callsAtSecondBody = calls));
+        }
+        await Bun.sleep(5);
+        return answered(request);
+      },
+    });
+    // c0's classification alone does not reopen admission while c1's body
+    // is still being read.
+    expect(callsAtSecondBody).toBe(RETENTION_MAX_CONCURRENCY);
+    expect(
+      sent.slice(0, RETENTION_MAX_CONCURRENCY).map(s => s.candidate),
+    ).toEqual(["c0", "c1", "c2", "c3"]);
+    expect(result).toMatchObject({ requests: 6, attempts: 8, truncated: 2 });
+    expect([...result.decisions.keys()].sort()).toEqual([
+      "c0",
+      "c1",
+      "c2",
+      "c3",
+      "c4",
+      "c5",
+    ]);
+  });
+
+  test("a terminal failure before a refusal is classified cancels its retry", async () => {
+    let calls = 0;
+    const error = await failure(
+      classifyRetention(long, items(8), {
+        apiKey: "key",
+        truncateSummary: true,
+        fetch: async (_url, init) => {
+          calls += 1;
+          const request = sentAs(init);
+          if (request.candidate === "c0") return slowTokenLimit(60);
+          if (request.candidate === "c1") {
+            return new Response("", { status: 429 });
+          }
+          await Bun.sleep(5);
+          return answered(request);
+        },
+      }),
+    );
+    expect(calls).toBe(RETENTION_MAX_CONCURRENCY);
+    expect(error.kind).toBe("http");
+    expect(error.status).toBe(429);
+    expect(error.diagnostics?.request).toMatchObject({
+      ordinal: 1,
+      summary: "whole",
+    });
+    expect(error.diagnostics?.counts).toEqual({
+      planned: 8,
+      started: 4,
+      succeeded: 2,
+      failed: 1,
+      cancelled: 1,
+      unstarted: 4,
+      attempts: 4,
+    });
+  });
+
+  test("a retry in flight drains after a later terminal failure and is discarded", async () => {
+    let retryDone = false;
+    const error = await failure(
+      classifyRetention(long, items(6), {
+        apiKey: "key",
+        truncateSummary: true,
+        fetch: async (_url, init) => {
+          const request = sentAs(init);
+          if (request.candidate === "c0") {
+            if (request.summary === "whole") return tokenLimitResponse();
+            await Bun.sleep(60);
+            retryDone = true;
+            return answered(request);
+          }
+          if (request.candidate === "c1") {
+            await Bun.sleep(20);
+            return new Response("", { status: 500 });
+          }
+          await Bun.sleep(5);
+          return answered(request);
+        },
+      }),
+    );
+    expect(retryDone).toBeTrue();
+    expect(error.kind).toBe("http");
+    expect(error.status).toBe(500);
+    expect(error.diagnostics?.counts).toEqual({
+      planned: 6,
+      started: 6,
+      succeeded: 5,
+      failed: 1,
+      cancelled: 0,
+      unstarted: 0,
+      attempts: 7,
+    });
+  });
+
+  test("retries share the concurrency limit and usage counts only answers", async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const result = await classifyRetention(long, items(10), {
+      apiKey: "key",
+      truncateSummary: true,
+      fetch: async (_url, init) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        const request = sentAs(init);
+        await Bun.sleep(5);
+        inFlight -= 1;
+        return request.summary === "whole"
+          ? tokenLimitResponse()
+          : answered(request);
+      },
+    });
+    expect(maxInFlight).toBeLessThanOrEqual(RETENTION_MAX_CONCURRENCY);
+    expect(result).toMatchObject({
+      requests: 10,
+      attempts: 20,
+      truncated: 10,
+      inputTokens: 100,
+      reportedUsageRequests: 10,
+    });
+  });
+});
+
 describe("retention keep threshold", () => {
   const percentEnv = (percent?: string) => ({
     TYPESAFE_API_KEY: "test-key",
@@ -954,6 +1394,11 @@ describe("retention keep threshold", () => {
     ["100.0", 1],
     ["060", 0.6],
     [" 70\n", 0.7],
+    ["99.99999999999999", 0.9999999999999999],
+    ["0.000000000000000000001", 1e-23],
+    [`0.${"0".repeat(321)}5`, Number.MIN_VALUE],
+    [`0.${"0".repeat(400)}`, 0],
+    [`100.${"0".repeat(400)}`, 1],
   ])("reads %p percent as probability %p", (percent, expected) => {
     expect(taskAwareRetentionPolicy(percentEnv(percent)).keepThreshold).toBe(
       expected,
@@ -980,6 +1425,9 @@ describe("retention keep threshold", () => {
     "6,5",
     "\u0666\u0660",
     "9".repeat(400),
+    "100.00000000000000001",
+    `100.${"0".repeat(400)}1`,
+    `0.${"0".repeat(400)}1`,
   ])("rejects percent %p without falling back to the default", percent => {
     const error = thrown(() => taskAwareRetentionPolicy(percentEnv(percent)));
     expect(error).toBeInstanceOf(RetentionClassificationError);
@@ -990,6 +1438,43 @@ describe("retention keep threshold", () => {
     expect(message).toContain(RETENTION_KEEP_THRESHOLD_PERCENT_ENV);
     expect(message).toContain("0 to 100");
     expect(message).toContain("/magic-trim --heuristic");
+  });
+
+  test.each([
+    [0, "0"],
+    [1, "100"],
+    [0.6, "60"],
+    [0.601, "60.1"],
+    [0.705, "70.5"],
+    [0.05, "5"],
+    [0.9999999999999999, "99.99999999999999"],
+    [1e-23, "0.000000000000000000001"],
+    [1.23456789012345e-12, "0.000000000123456789012345"],
+    [Number.MIN_VALUE, `0.${"0".repeat(321)}5`],
+  ])("formats probability %p as the plain percent %p", (threshold, percent) => {
+    expect(formatKeepThresholdPercent(threshold)).toBe(percent);
+  });
+
+  test("every probability formats to a plain percent that parses back to itself", () => {
+    const probabilities = [
+      0,
+      Number.MIN_VALUE,
+      Number.EPSILON,
+      0.5,
+      0.1 + 0.2,
+      1 - 2 ** -53,
+      1 - 2 ** -52,
+      1,
+    ];
+    for (let i = 1; i <= 3_000; i += 1) {
+      const fraction = (i * 0.6180339887498949) % 1;
+      probabilities.push(fraction * 10 ** -(i % 320), fraction);
+    }
+    for (const probability of probabilities) {
+      const percent = formatKeepThresholdPercent(probability);
+      expect(percent).toMatch(/^(?:0|[1-9]\d*|\d+\.\d*[1-9])$/);
+      expect(percentThreshold(percent)).toBe(probability);
+    }
   });
 
   test("the rejection never echoes the value and the key is not read first", () => {
@@ -1088,6 +1573,183 @@ describe("retention keep threshold", () => {
     },
   );
 
+  test("an explicit --threshold wins without reading the environment percent", () => {
+    const reads: string[] = [];
+    const trapped = (percent: string) => ({
+      get TYPESAFE_API_KEY() {
+        reads.push("key");
+        return "sk";
+      },
+      get [RETENTION_KEEP_THRESHOLD_PERCENT_ENV]() {
+        reads.push("percent");
+        return percent;
+      },
+    });
+    for (const keepThreshold of [0, 0.705, 1]) {
+      reads.length = 0;
+      expect(
+        trimRetentionPolicy(
+          { keepTurns: 2, heuristic: false, keepThreshold, truncate: true },
+          trapped("not a percent"),
+        ),
+      ).toEqual({
+        mode: "task-aware",
+        apiKey: "sk",
+        keepThreshold,
+        trim: { keepTurns: 2, keepThreshold, truncate: true },
+      });
+      expect(reads).toEqual(["key"]);
+    }
+    reads.length = 0;
+    expect(
+      trimRetentionPolicy(
+        { keepTurns: 0, heuristic: false, truncate: false },
+        trapped("70"),
+      ),
+    ).toMatchObject({ keepThreshold: 0.7, trim: { truncate: false } });
+    expect(reads).toEqual(["percent", "key"]);
+    expect(() =>
+      trimRetentionPolicy(
+        { keepTurns: 0, heuristic: false, truncate: false },
+        trapped("70%"),
+      ),
+    ).toThrow(RETENTION_KEEP_THRESHOLD_PERCENT_ENV);
+    reads.length = 0;
+    expect(
+      trimRetentionPolicy({ keepTurns: 1, heuristic: true }, trapped("70%")),
+    ).toEqual({ mode: "heuristic" });
+    expect(reads).toEqual([]);
+    expect(
+      trimRetentionPolicy(
+        { keepTurns: 0, heuristic: false, truncate: false },
+        { TYPESAFE_API_KEY: "sk" },
+      ).keepThreshold,
+    ).toBe(RETENTION_KEEP_THRESHOLD);
+  });
+
+  test("a /magic-trim failure suggests its own arguments within the toast limit", async () => {
+    const refuse = async (
+      trim: { keepTurns: number; keepThreshold?: number; truncate: boolean },
+      summary: string,
+      respond: (call: number) => Response,
+    ) => {
+      let calls = 0;
+      return failure(
+        decideRetentionWith(
+          { latestUserRequest: "Ship it.", candidates: [candidate("a")] },
+          {
+            mode: "task-aware",
+            apiKey: "key",
+            keepThreshold: trim.keepThreshold ?? 0.6,
+            trim,
+            fetch: async () => respond(calls++),
+          },
+          async () => summary,
+        ),
+      );
+    };
+    const limit = () => tokenLimitResponse();
+    const long = "s".repeat(20_000);
+    const plain = await refuse(
+      { keepTurns: 3, keepThreshold: 0.601, truncate: false },
+      long,
+      limit,
+    );
+    expect(plain.message).toContain(
+      "Run /magic-trim 3 --threshold 60.1 --truncate to retry",
+    );
+    expect(plain.message).toContain("or /magic-trim 3 --heuristic to trim");
+    expect(plain.message).toContain(
+      "--threshold does not reduce the Jev request size.",
+    );
+    const defaults = await refuse(
+      { keepTurns: 0, truncate: false },
+      long,
+      limit,
+    );
+    expect(defaults.message).toContain("Run /magic-trim --truncate to retry");
+    const exhausted = await refuse(
+      { keepTurns: 3, keepThreshold: 0.7, truncate: true },
+      long,
+      limit,
+    );
+    expect(exhausted.message).toContain("the retry limit was exceeded");
+    expect(exhausted.message).toEndWith(
+      "Run /magic-trim 3 --heuristic to trim without task-aware keep protection.",
+    );
+    // With or without the flag, a summary within the excerpt has no shorter
+    // retry and no --truncate suggestion.
+    const unavailable = [
+      await refuse({ keepTurns: 3, truncate: true }, "short", limit),
+      await refuse({ keepTurns: 3, truncate: false }, "short", limit),
+    ];
+    for (const error of unavailable) {
+      expect(error.diagnostics?.truncation).toBe("unavailable");
+      expect(error.message).toContain("--truncate cannot shorten the request");
+      expect(error.message).not.toContain("--truncate to retry");
+      expect(error.message).toEndWith(
+        "Run /magic-trim 3 --heuristic to trim without task-aware keep protection.",
+      );
+    }
+    const unauthorized = await refuse(
+      { keepTurns: 3, truncate: true },
+      long,
+      () => new Response("", { status: 401 }),
+    );
+    expect(unauthorized.message).toContain("TYPESAFE_API_KEY");
+    expect(unauthorized.message).not.toContain("--threshold");
+    // The longest arguments still leave both commands whole in a toast, and
+    // the threshold is never shortened or rounded.
+    const longest: RetentionClassificationError[] = [];
+    for (const keepThreshold of [
+      1.23456789012345e-12,
+      1e-23,
+      Number.MIN_VALUE,
+      0.9999999999999999,
+    ]) {
+      const error = await refuse(
+        { keepTurns: Number.MAX_SAFE_INTEGER, keepThreshold, truncate: false },
+        long,
+        limit,
+      );
+      expect(error.message).toContain(
+        `Run /magic-trim ${Number.MAX_SAFE_INTEGER} --threshold ${formatKeepThresholdPercent(keepThreshold)} --truncate`,
+      );
+      expect(error.message).toContain(
+        `or /magic-trim ${Number.MAX_SAFE_INTEGER} --heuristic`,
+      );
+      expect(error.message).toContain("--threshold does not");
+      longest.push(error);
+    }
+    for (const error of [plain, exhausted, ...unavailable, ...longest]) {
+      expect(error.message.length).toBeLessThan(700);
+      expect(error.kind).toBe("token-limit");
+    }
+  });
+
+  test("a /magic-compact token-limit refusal offers --truncate only when the summary is long", async () => {
+    const refuse = (summary: string) =>
+      failure(
+        decideRetentionWith(
+          { latestUserRequest: "Ship it.", candidates: [candidate("a")] },
+          {
+            mode: "task-aware",
+            apiKey: "key",
+            fetch: async () => tokenLimitResponse(),
+          },
+          async () => summary,
+        ),
+      );
+    expect((await refuse("s".repeat(20_000))).message).toContain(
+      "Run /magic-trim --truncate to retry",
+    );
+    const short = await refuse("short");
+    expect(short.message).not.toContain("--truncate to retry");
+    expect(short.message).toEndWith(
+      "Run /magic-trim --heuristic to trim without task-aware keep protection.",
+    );
+  });
+
   test("the policy rejects an invalid threshold before the session summary", async () => {
     let summaries = 0;
     const error = await failure(
@@ -1181,6 +1843,8 @@ describe("retention keep threshold in the OpenCode 1 server environment", () => 
 
   test.each([
     ["magic-trim", "--heuristic"],
+    ["magic-trim", "--threshold 70"],
+    ["magic-trim", "2 --truncate --threshold 0"],
     ["magic-stats", ""],
   ])("%s %s neither reads nor validates the percent", async (name, args) => {
     const hooks = await server({} as PluginInput);
@@ -1248,10 +1912,12 @@ describe("retention feedback", () => {
       mode: "task-aware" as const,
       evaluated: 12,
       keep: new Set(parts.map(part => part.id)),
+      keepThreshold: 0.6,
+      truncated: 0,
     };
     const feedback = retentionFeedback(plan, messages);
     expect(feedback).toBe(
-      "Task-aware retention kept 8 of 12 evaluated tool call(s) whole (read 3, task 2, bash 1, +2 other calls).",
+      "Task-aware retention at keep threshold 60% kept 8 of 12 evaluated tool call(s) whole (read 3, task 2, bash 1, +2 other calls).",
     );
     expect(
       retentionFeedback(plan, [
@@ -1275,6 +1941,8 @@ describe("retention feedback", () => {
         mode: "task-aware",
         evaluated: 3,
         keep: new Set(parts.map(part => part.id)),
+        keepThreshold: 0.6,
+        truncated: 0,
       },
       [assistantMessage("assistant", parts)],
     );
@@ -1282,7 +1950,7 @@ describe("retention feedback", () => {
     expect(feedback).toContain("read tool 1");
     expect(feedback).toContain("unnamed 1");
     expect(feedback).not.toMatch(/[\p{C}]/u);
-    expect(feedback.length).toBeLessThan(180);
+    expect(feedback.length).toBeLessThan(200);
 
     const astralPart = tool(
       "a".repeat(20) + "😀" + "bbbb",
@@ -1296,6 +1964,8 @@ describe("retention feedback", () => {
         mode: "task-aware",
         evaluated: 1,
         keep: new Set([astralPart.id]),
+        keepThreshold: 0.6,
+        truncated: 0,
       },
       [assistantMessage("assistant", [astralPart])],
     );
@@ -1303,6 +1973,30 @@ describe("retention feedback", () => {
     expect(label).toBe("a".repeat(20) + "😀...");
     expect(label.isWellFormed()).toBeTrue();
     expect(Array.from(label)).toHaveLength(24);
+  });
+
+  test("states the effective threshold, no candidates and the actual truncated decisions", () => {
+    const kept = tool("read", {}, "", false, "kept");
+    const messages = [assistantMessage("assistant", [kept])];
+    const plan = (keepThreshold: number, evaluated: number, truncated = 0) => ({
+      mode: "task-aware" as const,
+      evaluated,
+      keep: new Set(evaluated > 0 ? [kept.id] : []),
+      keepThreshold,
+      truncated,
+    });
+    expect(retentionFeedback(plan(0.601, 0))).toBe(
+      "Task-aware retention at keep threshold 60.1%: no tool calls needed evaluation.",
+    );
+    expect(retentionFeedback(plan(0, 2), messages)).toBe(
+      "Task-aware retention at keep threshold 0% kept 1 of 2 evaluated tool call(s) whole (read 1).",
+    );
+    expect(retentionFeedback(plan(0.705, 2, 1), messages)).toBe(
+      "Task-aware retention at keep threshold 70.5% kept 1 of 2 evaluated tool call(s) whole (read 1). 1 decision(s) used a shortened session summary after a Jev token-limit refusal (--truncate) and could have missed useful context.",
+    );
+    expect(retentionFeedback(HEURISTIC_RETENTION)).toBe(
+      "Heuristic mode: tool calls not evaluated.",
+    );
   });
 });
 
@@ -1452,7 +2146,13 @@ describe("retention candidates", () => {
       },
       { controlTimeoutMs: 1_000 },
     );
-    expect(plan).toEqual({ mode: "task-aware", evaluated: 0, keep: new Set() });
+    expect(plan).toEqual({
+      mode: "task-aware",
+      evaluated: 0,
+      keep: new Set(),
+      keepThreshold: 0.6,
+      truncated: 0,
+    });
     expect(calls).toBe(0);
   });
 

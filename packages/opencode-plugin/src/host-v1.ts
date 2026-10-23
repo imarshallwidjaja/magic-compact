@@ -24,8 +24,10 @@ import {
 import { executeMagicCompact } from "./magic-compact";
 import { STATS_SUCCESS, executeMagicStats } from "./magic-stats";
 import { executeMagicTrim } from "./magic-trim";
-import { taskAwareRetentionPolicy } from "./policy/retention";
-import type { RetentionPolicy } from "./retention/retention";
+import {
+  taskAwareRetentionPolicy,
+  trimRetentionPolicy,
+} from "./policy/retention";
 import { rejectNativeCompactionOfSummaryFork } from "./retention/summary";
 import { omissionReadDiagnostic, readOmittedContent } from "./storage/omission";
 import { handleStatsEvent } from "./stats/events";
@@ -132,13 +134,12 @@ const server: Plugin = async input => {
         const { keepTurns, retention, v2 } = await preflight(
           "Magic Trim",
           async () => {
-            const { keepTurns, heuristic } = parseMagicTrimArguments(
-              command.arguments,
-            );
-            const retention: RetentionPolicy = heuristic
-              ? { mode: "heuristic" }
-              : taskAwareRetentionPolicy(process.env);
-            return { keepTurns, retention, v2: await listener() };
+            const args = parseMagicTrimArguments(command.arguments);
+            return {
+              keepTurns: args.keepTurns,
+              retention: trimRetentionPolicy(args, process.env),
+              v2: await listener(),
+            };
           },
         );
         const successor = await executeMagicTrim(

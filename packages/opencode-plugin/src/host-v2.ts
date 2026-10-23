@@ -21,7 +21,7 @@ import {
 import { getCompactionCount } from "./compact/session";
 import {
   taskAwareRetentionPolicy,
-  type RetentionPolicy,
+  trimRetentionPolicy,
 } from "./policy/retention";
 import { recordAssistantCompletion } from "./stats/events";
 import { statsSummaryMessage } from "./stats/constants";
@@ -147,16 +147,14 @@ export async function setup(
       description: COMMAND_DESCRIPTIONS[TRIM_COMMAND],
       execute: async ({ sessionID, prompt }) => {
         const result = await commandResult("Magic Trim", async () => {
-          const { keepTurns, heuristic } = parseMagicTrimArguments(prompt.text);
-          const retention: RetentionPolicy = heuristic
-            ? { mode: "heuristic" }
-            : taskAwareRetentionPolicy(process.env);
+          const args = parseMagicTrimArguments(prompt.text);
+          const retention = trimRetentionPolicy(args, process.env);
           const host = await connect(sessionID);
           const { successor, outcome } = await executeV2Trim(
             host,
             owned,
             sessionID,
-            keepTurns,
+            args.keepTurns,
             { retention, controlTimeoutMs },
           );
           return successor

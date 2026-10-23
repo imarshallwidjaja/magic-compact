@@ -66,6 +66,7 @@ import {
   commandFailureMessage,
   TRIM_ARGUMENTS_ERROR,
   TRIM_NOOP,
+  TRIM_THRESHOLD_ERROR,
 } from "../src/commands";
 import { preservedTurnsFeedback, statsMessage } from "../src/stats/constants";
 import {
@@ -1488,6 +1489,12 @@ describe("bounded native compaction generation", () => {
         "/magic-compact argument must be a non-negative integer.",
       ],
       ["magic-trim", "1 1", "Magic Trim Failed", TRIM_ARGUMENTS_ERROR],
+      [
+        "magic-trim",
+        "--threshold 70%",
+        "Magic Trim Failed",
+        TRIM_THRESHOLD_ERROR,
+      ],
     ] as const) {
       await expect(
         hooks["command.execute.before"]!(
@@ -1502,7 +1509,7 @@ describe("bounded native compaction generation", () => {
         duration: expect.any(Number),
       });
     }
-    expect(toasts).toHaveLength(2);
+    expect(toasts).toHaveLength(3);
   });
 
   test("leaves outcome and execution-failure toasts to the verified listener", async () => {
@@ -7794,7 +7801,7 @@ describe("magic compact task-aware retention", () => {
       "Historical read result omitted",
     );
     expect(harness.toasts.at(-1)?.message).toBe(
-      `Compacted 2 request turn(s) into successor session successor. ${preservedTurnsFeedback({ requested: 0, preserved: 0 })} Task-aware retention kept 1 of 2 evaluated tool call(s) whole.`,
+      `Compacted 2 request turn(s) into successor session successor. ${preservedTurnsFeedback({ requested: 0, preserved: 0 })} Task-aware retention at keep threshold 60% kept 1 of 2 evaluated tool call(s) whole.`,
     );
   });
 
@@ -7829,7 +7836,7 @@ describe("magic compact task-aware retention", () => {
       ).resolves.toMatchObject({ session: { id: "successor" } });
 
       expect(harness.toasts.at(-1)?.message).toContain(
-        `Task-aware retention kept ${kept} of 2 evaluated tool call(s) whole`,
+        `Task-aware retention at keep threshold ${percent ?? 60}% kept ${kept} of 2 evaluated tool call(s) whole`,
       );
     },
   );
@@ -7879,11 +7886,15 @@ describe("magic compact task-aware retention", () => {
         },
       });
 
+      let calls = 0;
       const error = await executeMagicCompact(harness.v2, "source", 0, {
         retention: {
           mode: "task-aware",
           apiKey: "test-key",
-          fetch: async () => respond(),
+          fetch: async () => {
+            calls += 1;
+            return respond();
+          },
         },
       }).then(
         () => undefined,
@@ -7893,6 +7904,13 @@ describe("magic compact task-aware retention", () => {
       expect(error).toBeInstanceOf(RetentionClassificationError);
       expect((error as RetentionClassificationError).kind).toBe(kind);
       expect(String(error)).toContain("/magic-trim --heuristic");
+      // Compact never retries. This short summary has no shorter excerpt, so
+      // a token-limit refusal suggests only /magic-trim --heuristic.
+      expect(calls).toBe(2);
+      if (kind === "token-limit") {
+        expect(String(error)).toContain("--truncate cannot shorten");
+        expect(String(error)).not.toContain("--truncate to retry");
+      }
       expect(String(error)).not.toContain("private");
       expect(messages).toEqual(before);
       expect(harness.modelPrompts).toEqual([]);

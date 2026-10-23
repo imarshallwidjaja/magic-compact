@@ -5,6 +5,7 @@
 // are reassessed next time.
 import {
   classifyRetention,
+  formatKeepThresholdPercent,
   resolveKeepThreshold,
   RETENTION_FAILURE_GUIDANCE,
   RETENTION_KEEP_THRESHOLD,
@@ -13,6 +14,7 @@ import {
   type RetentionCandidate,
   type RetentionFetch,
 } from "../retention/classifier";
+import type { MagicTrimArguments } from "../commands";
 import { PluginMessageError } from "./feedback";
 import { toolTrimChangesContent, type ToolCallView } from "./tool-rules";
 
@@ -24,47 +26,104 @@ export type RetentionPolicy =
       apiKey: string | undefined;
       // Probability threshold from 0 to 1; defaults to RETENTION_KEEP_THRESHOLD.
       keepThreshold?: number;
+      // Set only for /magic-trim: its arguments, for `--truncate` and for the
+      // command a failure suggests.
+      trim?: TaskAwareTrimArguments;
       fetch?: RetentionFetch;
     };
 
-const PERCENT_TEXT = /^\d+(?:\.\d+)?$/;
+// The task-aware /magic-trim arguments. `keepThreshold` is the explicit
+// `--threshold` probability, absent when it was not given.
+export type TaskAwareTrimArguments = {
+  keepTurns: number;
+  keepThreshold?: number;
+  truncate: boolean;
+};
 
-// Percent text, such as "60" or "70.5", to a 0..1 threshold. The `e-2` suffix
-// moves the decimal point in the text, so "60.1" becomes the double nearest
-// 0.601 and not 60.1 / 100. Signs, "%", exponents, hex and other forms fail.
+const PERCENT_TEXT = /^(\d+)(?:\.(\d+))?$/;
+
+// Percent text, such as "60" or "70.5", to a 0..1 threshold, or undefined.
+// The `e-2` suffix moves the decimal point in the text, so "60.1" becomes the
+// double nearest 0.601 and not 60.1 / 100. The range is checked on the digits,
+// before any rounding, so "100.00000000000000001" is above 100 and not 1; a
+// nonzero percent too small for a double is undefined and never reads as 0.
+// Signs, "%", exponents, hex, whitespace and other forms are undefined.
+// Shared by RETENTION_KEEP_THRESHOLD_PERCENT_ENV and /magic-trim --threshold.
+export function percentThreshold(text: string): number | undefined {
+  const match = PERCENT_TEXT.exec(text);
+  if (!match) return undefined;
+  const [, whole, fraction = ""] = match;
+  const wholePercent = Number(whole);
+  if (wholePercent > 100 || (wholePercent === 100 && /[1-9]/.test(fraction))) {
+    return undefined;
+  }
+  const threshold = Number(`${text}e-2`);
+  return threshold === 0 && /[1-9]/.test(text) ? undefined : threshold;
+}
+
+// The server environment's percent, with surrounding whitespace ignored.
 export function parseKeepThresholdPercent(text: string): number {
-  const trimmed = text.trim();
-  const threshold = PERCENT_TEXT.test(trimmed) ? Number(`${trimmed}e-2`) : NaN;
-  if (!(threshold <= 1)) {
+  const threshold = percentThreshold(text.trim());
+  if (threshold === undefined) {
     throw new RetentionClassificationError("invalid-threshold-percent");
   }
   return threshold;
 }
 
-// The task-aware policy for one command invocation, from the server
-// environment. The percent is validated before the key is read, and an
-// invalid or empty value fails instead of falling back to the default.
+// The task-aware policy for one command invocation. The threshold is the
+// explicit /magic-trim --threshold when given, and the environment's percent
+// or the default is then never read; otherwise an invalid or empty percent
+// fails instead of falling back to the default. The threshold is resolved
+// before the key is read.
 export function taskAwareRetentionPolicy(
   env: Readonly<Record<string, string | undefined>>,
+  trim?: TaskAwareTrimArguments,
 ): Extract<RetentionPolicy, { mode: "task-aware" }> {
-  const percent = env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV];
-  const keepThreshold =
-    percent === undefined
-      ? RETENTION_KEEP_THRESHOLD
-      : parseKeepThresholdPercent(percent);
+  const keepThreshold = trim?.keepThreshold ?? environmentKeepThreshold(env);
   return {
     mode: "task-aware",
     apiKey: env["TYPESAFE_API_KEY"] || undefined,
     keepThreshold,
+    ...(trim ? { trim } : {}),
   };
 }
 
-export type RetentionPlan = {
-  mode: RetentionPolicy["mode"];
-  evaluated: number;
-  // Host tool-call references kept whole for this invocation.
-  keep: ReadonlySet<string>;
-};
+// The /magic-trim policy from its parsed arguments, shared by both hosts.
+// `--heuristic` reads nothing from the environment.
+export function trimRetentionPolicy(
+  args: MagicTrimArguments,
+  env: Readonly<Record<string, string | undefined>>,
+): RetentionPolicy {
+  if (args.heuristic) return { mode: "heuristic" };
+  const { keepTurns, keepThreshold, truncate } = args;
+  return taskAwareRetentionPolicy(env, {
+    keepTurns,
+    ...(keepThreshold === undefined ? {} : { keepThreshold }),
+    truncate,
+  });
+}
+
+function environmentKeepThreshold(
+  env: Readonly<Record<string, string | undefined>>,
+): number {
+  const percent = env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV];
+  return percent === undefined
+    ? RETENTION_KEEP_THRESHOLD
+    : parseKeepThresholdPercent(percent);
+}
+
+export type RetentionPlan =
+  | { mode: "heuristic"; evaluated: 0; keep: ReadonlySet<string> }
+  | {
+      mode: "task-aware";
+      evaluated: number;
+      // Host tool-call references kept whole for this invocation.
+      keep: ReadonlySet<string>;
+      // The effective probability threshold.
+      keepThreshold: number;
+      // Decisions made from the --truncate summary excerpt.
+      truncated: number;
+    };
 
 export const HEURISTIC_RETENTION: RetentionPlan = {
   mode: "heuristic",
@@ -135,28 +194,55 @@ export async function decideRetentionWith(
 ): Promise<RetentionPlan> {
   const keepThreshold = resolveKeepThreshold(policy.keepThreshold);
   if (found.candidates.length === 0) {
-    return { mode: "task-aware", evaluated: 0, keep: new Set() };
-  }
-  if (!policy.apiKey) {
-    throw new RetentionClassificationError("missing-api-key");
-  }
-  const sessionSummary = await summarize();
-  const { decisions } = await classifyRetention(
-    { latestUserRequest: found.latestUserRequest, sessionSummary },
-    found.candidates,
-    {
-      apiKey: policy.apiKey,
+    return {
+      mode: "task-aware",
+      evaluated: 0,
+      keep: new Set(),
       keepThreshold,
-      ...(policy.fetch ? { fetch: policy.fetch } : {}),
-    },
-  );
-  const keep = new Set<string>();
-  for (const candidate of found.candidates) {
-    const decision = decisions.get(candidate.id);
-    if (!decision) throw new RetentionClassificationError("invalid-response");
-    if (decision.keep) keep.add(candidate.id);
+      truncated: 0,
+    };
   }
-  return { mode: "task-aware", evaluated: found.candidates.length, keep };
+  const { trim } = policy;
+  try {
+    if (!policy.apiKey) {
+      throw new RetentionClassificationError("missing-api-key");
+    }
+    const sessionSummary = await summarize();
+    const { decisions, truncated } = await classifyRetention(
+      { latestUserRequest: found.latestUserRequest, sessionSummary },
+      found.candidates,
+      {
+        apiKey: policy.apiKey,
+        keepThreshold,
+        ...(trim?.truncate ? { truncateSummary: true } : {}),
+        ...(policy.fetch ? { fetch: policy.fetch } : {}),
+      },
+    );
+    const keep = new Set<string>();
+    for (const candidate of found.candidates) {
+      const decision = decisions.get(candidate.id);
+      if (!decision) throw new RetentionClassificationError("invalid-response");
+      if (decision.keep) keep.add(candidate.id);
+    }
+    return {
+      mode: "task-aware",
+      evaluated: found.candidates.length,
+      keep,
+      keepThreshold,
+      truncated,
+    };
+  } catch (error) {
+    // A /magic-trim failure suggests repeating the person's own arguments.
+    if (trim && error instanceof RetentionClassificationError) {
+      throw new RetentionClassificationError(
+        error.kind,
+        error.status,
+        error.diagnostics,
+        trim,
+      );
+    }
+    throw error;
+  }
 }
 
 // `calls` names every tool call of the source by reference and tool name.
@@ -167,8 +253,9 @@ export function formatRetentionFeedback(
   if (plan.mode === "heuristic") {
     return "Heuristic mode: tool calls not evaluated.";
   }
+  const retention = `Task-aware retention at keep threshold ${formatKeepThresholdPercent(plan.keepThreshold)}%`;
   if (plan.evaluated === 0) {
-    return "Task-aware retention: no tool calls needed evaluation.";
+    return `${retention}: no tool calls needed evaluation.`;
   }
   const counts = new Map<string, number>();
   for (const call of calls) {
@@ -189,7 +276,11 @@ export function formatRetentionFeedback(
   const other =
     plan.keep.size - shown.reduce((sum, [, count]) => sum + count, 0);
   if (shown.length > 0 && other > 0) breakdown.push(`+${other} other calls`);
-  return `Task-aware retention kept ${plan.keep.size} of ${plan.evaluated} evaluated tool call(s) whole${breakdown.length > 0 ? ` (${breakdown.join(", ")})` : ""}.`;
+  const truncated =
+    plan.truncated === 0
+      ? ""
+      : ` ${plan.truncated} decision(s) used a shortened session summary after a Jev token-limit refusal (--truncate) and could have missed useful context.`;
+  return `${retention} kept ${plan.keep.size} of ${plan.evaluated} evaluated tool call(s) whole${breakdown.length > 0 ? ` (${breakdown.join(", ")})` : ""}.${truncated}`;
 }
 
 export type SessionSummaryStage =
