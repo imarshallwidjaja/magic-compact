@@ -1,7 +1,7 @@
 // The command surface both hosts register: names, arguments, and the result
 // messages their handlers throw or report.
 import { hasPluginMessage, PluginMessageError } from "./policy/feedback";
-import { percentThreshold } from "./policy/retention";
+import { percentThreshold, type RetentionArguments } from "./policy/retention";
 import {
   classifyFailure,
   SuccessorFailure,
@@ -14,7 +14,8 @@ export const STATS_COMMAND = "magic-stats" as const;
 export const RECOVER_COMMAND = "magic-recover" as const;
 
 export const COMMAND_DESCRIPTIONS = {
-  [COMPACT_COMMAND]: "Lossless context compression",
+  [COMPACT_COMMAND]:
+    "Lossless context compression ([N] [--threshold P] [--truncate], or [N] --heuristic to skip task-aware retention; turns are still summarized)",
   [TRIM_COMMAND]:
     "Trim historical tool inputs and outputs ([N] [--threshold P] [--truncate], or [N] --heuristic to skip task-aware retention)",
   [STATS_COMMAND]: "Show Magic Compact token and cost savings stats",
@@ -26,10 +27,15 @@ export const COMPACT_NOOP = "No assistant turns are old enough to compact.";
 export const TRIM_NOOP = "No eligible tool calls need trimming.";
 export const RECOVER_NOOP =
   "No unfinished records or undelivered background results need recovery; no successor was created.";
-export const TRIM_ARGUMENTS_ERROR =
-  "/magic-trim accepts an optional non-negative integer N plus either --heuristic or any of --threshold P and --truncate, each at most once and in any order.";
-export const TRIM_THRESHOLD_ERROR =
-  "/magic-trim --threshold needs a plain decimal percent from 0 to 100 after a space, such as --threshold 70 or --threshold 60.5.";
+// Fixed per command and never built from a token the person typed.
+const retentionArgumentsError = (command: string) =>
+  `/${command} accepts an optional non-negative integer N plus either --heuristic or any of --threshold P and --truncate, each at most once and in any order.`;
+const retentionThresholdError = (command: string) =>
+  `/${command} --threshold needs a plain decimal percent from 0 to 100 after a space, such as --threshold 70 or --threshold 60.5.`;
+export const COMPACT_ARGUMENTS_ERROR = retentionArgumentsError(COMPACT_COMMAND);
+export const COMPACT_THRESHOLD_ERROR = retentionThresholdError(COMPACT_COMMAND);
+export const TRIM_ARGUMENTS_ERROR = retentionArgumentsError(TRIM_COMMAND);
+export const TRIM_THRESHOLD_ERROR = retentionThresholdError(TRIM_COMMAND);
 export const STATS_ARGUMENTS_ERROR = "/magic-stats does not accept arguments.";
 export const RECOVER_ARGUMENTS_ERROR =
   "/magic-recover does not accept arguments.";
@@ -76,29 +82,31 @@ export function commandFailureMessage(
   return `${command} stopped on an unexpected error${details.length > 0 ? ` (${details.join(", ")})` : ""}. The original session was left unchanged. Retry; if it fails again, check the OpenCode server log.`;
 }
 
-export function parseMagicCompactArguments(raw: string): number {
-  const trimmed = raw.trim();
-  if (!/^\d*$/.test(trimmed)) {
-    throw new PluginMessageError(
-      "/magic-compact argument must be a non-negative integer.",
-    );
-  }
-  return trimmed ? Number(trimmed) : 0;
+// `/magic-compact` and `/magic-trim` share one grammar and differ only in the
+// fixed error text.
+export function parseMagicCompactArguments(raw: string): RetentionArguments {
+  return parseRetentionArguments(
+    raw,
+    COMPACT_ARGUMENTS_ERROR,
+    COMPACT_THRESHOLD_ERROR,
+  );
 }
 
-export type MagicTrimArguments =
-  | { keepTurns: number; heuristic: true }
-  | {
-      keepTurns: number;
-      heuristic: false;
-      // The --threshold probability, absent when it was not given.
-      keepThreshold?: number;
-      truncate: boolean;
-    };
+export function parseMagicTrimArguments(raw: string): RetentionArguments {
+  return parseRetentionArguments(
+    raw,
+    TRIM_ARGUMENTS_ERROR,
+    TRIM_THRESHOLD_ERROR,
+  );
+}
 
 // Validates every token before any work, so nothing reads the environment
 // or contacts the host for a malformed command. Errors never echo a token.
-export function parseMagicTrimArguments(raw: string): MagicTrimArguments {
+function parseRetentionArguments(
+  raw: string,
+  argumentsError: string,
+  thresholdError: string,
+): RetentionArguments {
   let keepTurns: number | undefined;
   let heuristic = false;
   let truncate = false;
@@ -115,7 +123,7 @@ export function parseMagicTrimArguments(raw: string): MagicTrimArguments {
       const value = tokens[index];
       keepThreshold = value === undefined ? undefined : percentThreshold(value);
       if (keepThreshold === undefined) {
-        throw new PluginMessageError(TRIM_THRESHOLD_ERROR);
+        throw new PluginMessageError(thresholdError);
       }
     } else if (
       /^\d+$/u.test(token)
@@ -124,12 +132,12 @@ export function parseMagicTrimArguments(raw: string): MagicTrimArguments {
     ) {
       keepTurns = Number(token);
     } else {
-      throw new PluginMessageError(TRIM_ARGUMENTS_ERROR);
+      throw new PluginMessageError(argumentsError);
     }
   }
   if (heuristic) {
     if (truncate || keepThreshold !== undefined) {
-      throw new PluginMessageError(TRIM_ARGUMENTS_ERROR);
+      throw new PluginMessageError(argumentsError);
     }
     return { keepTurns: keepTurns ?? 0, heuristic: true };
   }

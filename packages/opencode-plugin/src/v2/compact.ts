@@ -17,6 +17,7 @@ import {
   decideRetentionWith,
   formatRetentionFeedback,
   HEURISTIC_RETENTION,
+  retentionWithoutCandidates,
   type RetentionPlan,
   type RetentionPolicy,
 } from "../policy/retention";
@@ -35,6 +36,7 @@ import { planOmission, type PlannedOmission } from "../storage/omission";
 import { isRecord } from "../util";
 import {
   trimV2Tool,
+  v2RetentionCalls,
   v2ToolCalls,
   v2RetentionTurns,
   v2ToolCallView,
@@ -262,7 +264,10 @@ export async function executeV2Compact(
       turn => !turn.assistants.some(isV2SummaryCarrier),
     );
     if (targets.length === 0) {
-      return { successor: null, outcome: noopMessage(preserved) };
+      return {
+        successor: null,
+        outcome: `${noopMessage(preserved)} ${formatRetentionFeedback(retentionWithoutCandidates(options.retention), [])}`,
+      };
     }
 
     // One descriptor serves the retention summary and every generation.
@@ -393,16 +398,14 @@ export async function executeV2Compact(
     }
 
     const compactionCount = getCompactionCount(source.session) + 1;
-    const outcome = [
-      statsMessage(
-        compactionCount,
-        before.tokens,
-        after.tokens,
-        selected.length,
-        preserved,
-      ),
-      `Retention | ${formatRetentionFeedback(retention, [])}`,
-    ].join("\n");
+    const outcome = statsMessage(
+      compactionCount,
+      before.tokens,
+      after.tokens,
+      selected.length,
+      preserved,
+      formatRetentionFeedback(retention, v2RetentionCalls(source.messages)),
+    );
     const successor = await createV2Successor(host, {
       command: COMMAND,
       source,

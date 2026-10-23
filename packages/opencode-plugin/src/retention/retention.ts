@@ -16,6 +16,7 @@ import { generateSessionSummary } from "./summary";
 
 export {
   HEURISTIC_RETENTION,
+  retentionWithoutCandidates,
   type RetentionPlan,
   type RetentionPolicy,
 } from "../policy/retention";

@@ -12,6 +12,11 @@ import {
 import { projectToolTrim } from "../src/compact/prune";
 import server from "../src/host-v1";
 import {
+  COMPACT_ARGUMENTS_ERROR,
+  COMPACT_THRESHOLD_ERROR,
+  parseMagicCompactArguments,
+} from "../src/magic-compact";
+import {
   TRIM_ARGUMENTS_ERROR,
   TRIM_THRESHOLD_ERROR,
   TRIM_NOOP,
@@ -20,8 +25,8 @@ import {
 } from "../src/magic-trim";
 import type { PluginInput } from "@opencode-ai/plugin";
 import {
+  commandRetentionPolicy,
   taskAwareRetentionPolicy,
-  trimRetentionPolicy,
 } from "../src/policy/retention";
 import {
   excerpt,
@@ -819,94 +824,149 @@ describe("magic trim task-aware retention", () => {
       await cleanupSessions(sessionID, ...harness.created);
     }
   });
-  test.each([
-    ["", { keepTurns: 0, heuristic: false, truncate: false }],
-    [" 3 ", { keepTurns: 3, heuristic: false, truncate: false }],
-    ["--heuristic", { keepTurns: 0, heuristic: true }],
-    ["--heuristic 2", { keepTurns: 2, heuristic: true }],
-    ["2  --heuristic", { keepTurns: 2, heuristic: true }],
-    ["--truncate", { keepTurns: 0, heuristic: false, truncate: true }],
+  // /magic-compact and /magic-trim share one retention grammar; each has its
+  // own fixed argument errors.
+  describe.each([
     [
-      "1 --threshold 70 --truncate",
-      { keepTurns: 1, heuristic: false, keepThreshold: 0.7, truncate: true },
+      "magic-compact",
+      parseMagicCompactArguments,
+      COMPACT_ARGUMENTS_ERROR,
+      COMPACT_THRESHOLD_ERROR,
     ],
     [
-      "--truncate --threshold 60.1 1",
-      { keepTurns: 1, heuristic: false, keepThreshold: 0.601, truncate: true },
+      "magic-trim",
+      parseMagicTrimArguments,
+      TRIM_ARGUMENTS_ERROR,
+      TRIM_THRESHOLD_ERROR,
     ],
-    [
-      "--threshold 0",
-      { keepTurns: 0, heuristic: false, keepThreshold: 0, truncate: false },
-    ],
-    [
-      "--threshold 100 4",
-      { keepTurns: 4, heuristic: false, keepThreshold: 1, truncate: false },
-    ],
-    [
-      `${Number.MAX_SAFE_INTEGER}`,
-      { keepTurns: Number.MAX_SAFE_INTEGER, heuristic: false, truncate: false },
-    ],
-  ] as const)("parses %p", (raw, expected) => {
-    expect(parseMagicTrimArguments(raw)).toEqual(expected);
-  });
+  ] as const)(
+    "%s arguments",
+    (command, parse, ARGUMENTS_ERROR, THRESHOLD_ERROR) => {
+      test.each([
+        ["", { keepTurns: 0, heuristic: false, truncate: false }],
+        [" 3 ", { keepTurns: 3, heuristic: false, truncate: false }],
+        ["--heuristic", { keepTurns: 0, heuristic: true }],
+        ["--heuristic 2", { keepTurns: 2, heuristic: true }],
+        ["2  --heuristic", { keepTurns: 2, heuristic: true }],
+        ["--truncate", { keepTurns: 0, heuristic: false, truncate: true }],
+        [
+          "1 --threshold 70 --truncate",
+          {
+            keepTurns: 1,
+            heuristic: false,
+            keepThreshold: 0.7,
+            truncate: true,
+          },
+        ],
+        [
+          "--truncate --threshold 60.1 1",
+          {
+            keepTurns: 1,
+            heuristic: false,
+            keepThreshold: 0.601,
+            truncate: true,
+          },
+        ],
+        [
+          "--threshold 0",
+          { keepTurns: 0, heuristic: false, keepThreshold: 0, truncate: false },
+        ],
+        [
+          "--threshold 100 4",
+          { keepTurns: 4, heuristic: false, keepThreshold: 1, truncate: false },
+        ],
+        [
+          `${Number.MAX_SAFE_INTEGER}`,
+          {
+            keepTurns: Number.MAX_SAFE_INTEGER,
+            heuristic: false,
+            truncate: false,
+          },
+        ],
+      ] as const)("parses %p", (raw, expected) => {
+        expect(parse(raw)).toEqual(expected);
+      });
 
-  test.each([
-    ["--heuristic --heuristic", TRIM_ARGUMENTS_ERROR],
-    ["--truncate --truncate", TRIM_ARGUMENTS_ERROR],
-    ["--threshold 70 --threshold 70", TRIM_ARGUMENTS_ERROR],
-    ["1 2", TRIM_ARGUMENTS_ERROR],
-    ["-1", TRIM_ARGUMENTS_ERROR],
-    ["1.5", TRIM_ARGUMENTS_ERROR],
-    [`${Number.MAX_SAFE_INTEGER + 1}`, TRIM_ARGUMENTS_ERROR],
-    ["--Heuristic", TRIM_ARGUMENTS_ERROR],
-    ["--heuristic=true", TRIM_ARGUMENTS_ERROR],
-    ["heuristic", TRIM_ARGUMENTS_ERROR],
-    ["--threshold=70", TRIM_ARGUMENTS_ERROR],
-    ["--thresholds 70", TRIM_ARGUMENTS_ERROR],
-    ["--heuristic --truncate", TRIM_ARGUMENTS_ERROR],
-    ["--threshold 70 --heuristic", TRIM_ARGUMENTS_ERROR],
-    ["--threshold", TRIM_THRESHOLD_ERROR],
-    ["--threshold --truncate", TRIM_THRESHOLD_ERROR],
-    ["--threshold 101", TRIM_THRESHOLD_ERROR],
-    ["--threshold 100.5", TRIM_THRESHOLD_ERROR],
-    ["--threshold -1", TRIM_THRESHOLD_ERROR],
-    ["--threshold +60", TRIM_THRESHOLD_ERROR],
-    ["--threshold 70%", TRIM_THRESHOLD_ERROR],
-    ["--threshold 6e1", TRIM_THRESHOLD_ERROR],
-    ["--threshold .5", TRIM_THRESHOLD_ERROR],
-    ["--threshold 5.", TRIM_THRESHOLD_ERROR],
-    ["--threshold NaN", TRIM_THRESHOLD_ERROR],
-    ["--threshold Infinity", TRIM_THRESHOLD_ERROR],
-    ["--threshold 0x3c", TRIM_THRESHOLD_ERROR],
-    ["--threshold 100.00000000000000001", TRIM_THRESHOLD_ERROR],
-    [`--threshold 0.${"0".repeat(400)}1`, TRIM_THRESHOLD_ERROR],
-  ])("rejects %p", (raw, message) => {
-    expect(() => parseMagicTrimArguments(raw)).toThrow(message);
-  });
+      test.each([
+        ["--heuristic --heuristic", "arguments"],
+        ["--truncate --truncate", "arguments"],
+        ["--threshold 70 --threshold 70", "arguments"],
+        ["two", "arguments"],
+        ["1 2", "arguments"],
+        ["-1", "arguments"],
+        ["1.5", "arguments"],
+        [`${Number.MAX_SAFE_INTEGER + 1}`, "arguments"],
+        ["--Heuristic", "arguments"],
+        ["--heuristic=true", "arguments"],
+        ["heuristic", "arguments"],
+        ["--threshold=70", "arguments"],
+        ["--thresholds 70", "arguments"],
+        ["--heuristic --truncate", "arguments"],
+        ["--threshold 70 --heuristic", "arguments"],
+        ["--threshold", "threshold"],
+        ["--threshold --truncate", "threshold"],
+        ["--threshold 101", "threshold"],
+        ["--threshold 100.5", "threshold"],
+        ["--threshold -1", "threshold"],
+        ["--threshold +60", "threshold"],
+        ["--threshold 70%", "threshold"],
+        ["--threshold 6e1", "threshold"],
+        ["--threshold .5", "threshold"],
+        ["--threshold 5.", "threshold"],
+        ["--threshold NaN", "threshold"],
+        ["--threshold Infinity", "threshold"],
+        ["--threshold 0x3c", "threshold"],
+        ["--threshold 100.00000000000000001", "threshold"],
+        [`--threshold 0.${"0".repeat(400)}1`, "threshold"],
+      ] as const)("rejects %p", (raw, kind) => {
+        expect(() => parse(raw)).toThrow(
+          kind === "arguments" ? ARGUMENTS_ERROR : THRESHOLD_ERROR,
+        );
+      });
 
-  // One grammar and one threshold error reach the host before any work; the
-  // parser table above owns every other form.
-  test.each([
-    ["--heuristic --truncate", TRIM_ARGUMENTS_ERROR],
-    ["--threshold 101", TRIM_THRESHOLD_ERROR],
-  ])("rejects %p before any work", async (raw, message) => {
-    const hooks = await server({} as PluginInput);
-    const failure = await hooks["command.execute.before"]!(
-      { command: "magic-trim", arguments: raw, sessionID: "session" },
-      { parts: [] },
-    ).then(
-      () => undefined,
-      (error: unknown) => error,
-    );
-    expect((failure as Error).message).toBe(message);
-  });
+      // The parser table above owns every form. Here one grammar error and
+      // one threshold error reach this command's host handler, which stops
+      // before it reads the environment or looks for a server.
+      test.each([
+        ["--heuristic --truncate", ARGUMENTS_ERROR],
+        ["--threshold 101", THRESHOLD_ERROR],
+      ])("rejects %p before any work", async (raw, message) => {
+        const inherited = process.env;
+        const reads: string[] = [];
+        process.env = new Proxy(
+          {},
+          {
+            get: (_target, key) => {
+              reads.push(String(key));
+              return undefined;
+            },
+          },
+        ) as NodeJS.ProcessEnv;
+        try {
+          const hooks = await server({} as PluginInput);
+          const failure = await hooks["command.execute.before"]!(
+            { command, arguments: raw, sessionID: "session" },
+            { parts: [] },
+          ).then(
+            () => undefined,
+            (error: unknown) => error,
+          );
+          expect((failure as Error).message).toBe(message);
+        } finally {
+          process.env = inherited;
+        }
+        expect(reads).toEqual([]);
+      });
 
-  test("the argument errors name the flags and echo no value", () => {
-    for (const message of [TRIM_ARGUMENTS_ERROR, TRIM_THRESHOLD_ERROR]) {
-      expect(message).toContain("--threshold");
-      expect(message).not.toMatch(/MAGIC_COMPACT|%|Infinity|0x/);
-    }
-  });
+      test("the argument errors name this command and the flags and echo no value", () => {
+        for (const message of [ARGUMENTS_ERROR, THRESHOLD_ERROR]) {
+          expect(message).toStartWith(`/${command} `);
+          expect(message).toContain("--threshold");
+          expect(message).not.toMatch(/MAGIC_COMPACT|%|Infinity|0x/);
+        }
+      });
+    },
+  );
 
   test("keeps judged-useful calls whole and trims the rest by the existing rules", async () => {
     const sessionID = `ses_trim_retain_${randomUUID().replaceAll("-", "")}`;
@@ -1255,7 +1315,8 @@ describe("magic trim task-aware retention", () => {
     try {
       const successor = await executeMagicTrim(harness.v2, sessionID, 0, {
         retention: {
-          ...trimRetentionPolicy(
+          ...commandRetentionPolicy(
+            "trim",
             parseMagicTrimArguments("--threshold 70 --truncate"),
             { TYPESAFE_API_KEY: "test-key" },
           ),
@@ -1308,9 +1369,11 @@ describe("magic trim task-aware retention", () => {
     try {
       const failure = await executeMagicTrim(harness.v2, sessionID, 1, {
         retention: {
-          ...trimRetentionPolicy(parseMagicTrimArguments("--threshold 70 1"), {
-            TYPESAFE_API_KEY: "test-key",
-          }),
+          ...commandRetentionPolicy(
+            "trim",
+            parseMagicTrimArguments("--threshold 70 1"),
+            { TYPESAFE_API_KEY: "test-key" },
+          ),
           fetch: async () => {
             calls += 1;
             return tokenLimitResponse();

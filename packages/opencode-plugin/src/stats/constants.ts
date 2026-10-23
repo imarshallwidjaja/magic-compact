@@ -63,12 +63,14 @@ export function statsMessage(
   afterTokens: number,
   summarizedTurnCount: number,
   preserved: PreservedTurns,
+  retentionFeedback: string,
 ): string {
   return [
     `Magic Compaction #${compactionCount}`,
     `${CONTEXT_LABEL} | ${contextReductionLine(beforeTokens, afterTokens)}`,
     `Changes | Request turns summarized: ${summarizedTurnCount}`,
     `Preserved | ${preservedTurnsFeedback(preserved)}`,
+    `Retention | ${retentionFeedback}`,
   ].join("\n");
 }
 

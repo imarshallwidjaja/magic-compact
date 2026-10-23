@@ -5,19 +5,27 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GENERATION_PROTOCOL } from "../src/compact/constants";
 import {
+  COMPACT_ARGUMENTS_ERROR,
+  COMPACT_NOOP,
+  COMPACT_THRESHOLD_ERROR,
   commandFailureMessage,
+  parseMagicCompactArguments,
   parseMagicTrimArguments,
   TRIM_ARGUMENTS_ERROR,
   TRIM_THRESHOLD_ERROR,
 } from "../src/commands";
+import { preservedTurnsFeedback } from "../src/stats/constants";
 import { setup } from "../src/host-v2";
 import {
+  commandRetentionPolicy,
   taskAwareRetentionPolicy,
-  trimRetentionPolicy,
 } from "../src/policy/retention";
 import {
+  excerpt,
   RETENTION_KEEP_THRESHOLD_PERCENT_ENV,
+  RETENTION_SUMMARY_EXCERPT_BYTES,
   RetentionClassificationError,
+  type RetentionFetch,
 } from "../src/retention/classifier";
 import plugin from "../src/index";
 import tuiPlugin from "../src/tui";
@@ -1315,7 +1323,8 @@ describe("OpenCode 2 trim successors", () => {
       0,
       {
         retention: {
-          ...trimRetentionPolicy(
+          ...commandRetentionPolicy(
+            "trim",
             parseMagicTrimArguments("--truncate --threshold 70"),
             { TYPESAFE_API_KEY: "test-key" },
           ),
@@ -1405,9 +1414,11 @@ describe("OpenCode 2 trim successors", () => {
     let jevCalls = 0;
     const error = await executeV2Trim(host, owned, "ses_src", 0, {
       retention: {
-        ...trimRetentionPolicy(parseMagicTrimArguments("--threshold 60.1"), {
-          TYPESAFE_API_KEY: "test-key",
-        }),
+        ...commandRetentionPolicy(
+          "trim",
+          parseMagicTrimArguments("--threshold 60.1"),
+          { TYPESAFE_API_KEY: "test-key" },
+        ),
         fetch: async () => {
           jevCalls += 1;
           return tokenLimitResponse();
@@ -2028,6 +2039,200 @@ describe("OpenCode 2 compaction", () => {
       ),
     ).rejects.toThrow(/needs a model on the `magic-compact-summarizer` agent/);
     expect(state.requests).toHaveLength(0);
+  });
+
+  describe("task-aware retention", () => {
+    const longSummary = `## Objective\n${"- A dense detail line.\n".repeat(1_500)}## Next Move`;
+    // Answers the generation prompt per turn and the retention summary with
+    // `summary`.
+    const withSummary =
+      (summary: string) =>
+      (text: string): FakeReply => {
+        const reply = echoGeneration()(text);
+        return "tool" in reply ? reply : { text: summary };
+      };
+    // The policy a person's `/magic-compact <args>` builds on the server.
+    const policyFor = (args: string, fetch: RetentionFetch) => ({
+      ...commandRetentionPolicy("compact", parseMagicCompactArguments(args), {
+        TYPESAFE_API_KEY: "test-key",
+      }),
+      fetch,
+    });
+    const compact = (
+      reply: (text: string) => FakeReply,
+      keepTurns: number,
+      retention: Parameters<typeof executeV2Compact>[4]["retention"],
+      messages = [...turn(1), ...turn(2), ...turn(3)],
+    ) => {
+      const state = fakeV2State();
+      sourceSession(state, "ses_src", messages);
+      const owned = new OwnedSessions();
+      const result = executeV2Compact(
+        fakeV2Host(state, owned, reply),
+        owned,
+        "ses_src",
+        keepTurns,
+        { retention, controlTimeoutMs: 1_000 },
+      );
+      return { state, result };
+    };
+
+    test("keeps a judged-useful call whole and reports mode, threshold, counts and kept tools", async () => {
+      const { state, result } = compact(
+        echoGeneration(),
+        1,
+        policyFor(
+          "1 --threshold 70",
+          scoredJevFetch(output => (output.startsWith("R1-") ? 0.8 : 0.1)),
+        ),
+      );
+      const { successor, outcome } = await result;
+      const line =
+        "Task-aware retention at keep threshold 70% kept 1 of 2 evaluated tool call(s) whole (read 1).";
+      expect(outcome.split("\n").at(-1)).toBe(`Retention | ${line}`);
+      expect(outcome.match(/Retention \|/gu)).toHaveLength(1);
+      expect(
+        (successor!.session.metadata as { magicCompact: { outcome: string } })
+          .magicCompact.outcome,
+      ).toBe(outcome);
+      // One retention summary, then one request per summarized turn.
+      expect(state.requests).toHaveLength(3);
+      const stored = state.messages.get(successor!.session.id)!;
+      const calls = stored.flatMap(message => v2ToolCalls(message));
+      expect(
+        (calls[0]!.tool.state as { content: Array<{ text?: string }> })
+          .content[0]!.text,
+      ).toBe(words("R1", 300));
+      expect(JSON.stringify(calls[1]!.tool)).toContain("omitted");
+    });
+
+    test("--heuristic skips only the retention summary and Jev, and the turns are still summarized", async () => {
+      const { state, result } = compact(
+        echoGeneration(),
+        1,
+        commandRetentionPolicy(
+          "compact",
+          parseMagicCompactArguments("1 --heuristic"),
+          {
+            get TYPESAFE_API_KEY(): string {
+              throw new Error("the key must not be read");
+            },
+            get [RETENTION_KEEP_THRESHOLD_PERCENT_ENV](): string {
+              throw new Error("the percent must not be read");
+            },
+          },
+        ),
+      );
+      const { successor, outcome } = await result;
+      expect(successor).not.toBeNull();
+      // Two summarized turns, no retention summary.
+      expect(state.requests).toHaveLength(2);
+      expect(outcome.split("\n").at(-1)).toBe(
+        "Retention | Heuristic mode: tool calls not evaluated.",
+      );
+      expect(outcome).toContain("Request turns summarized: 2");
+    });
+
+    test("--truncate retries only the confirmed refusal's summary and reports the actual decisions", async () => {
+      const summaries: string[] = [];
+      const answer = scoredJevFetch(output =>
+        output.startsWith("R1-") ? 0.75 : 0.1,
+      );
+      const { state, result } = compact(
+        withSummary(longSummary),
+        1,
+        policyFor("1 --truncate --threshold 70", async (url, init) => {
+          const body = JSON.parse(String(init.body));
+          summaries.push(body.state.task.sessionSummary);
+          return body.state.task.sessionSummary === longSummary
+            && body.state.candidates[0].output.startsWith("R1-")
+            ? tokenLimitResponse()
+            : answer(url, init);
+        }),
+      );
+      const { successor, outcome } = await result;
+      expect(successor).not.toBeNull();
+      expect(summaries.filter(text => text === longSummary)).toHaveLength(2);
+      expect(summaries.filter(text => text !== longSummary)).toEqual([
+        excerpt(longSummary, RETENTION_SUMMARY_EXCERPT_BYTES),
+      ]);
+      // No turn request carries the shortened summary or its marker.
+      expect(JSON.stringify(state.requests)).not.toContain(
+        "characters omitted",
+      );
+      expect(outcome.split("\n").at(-1)).toBe(
+        "Retention | Task-aware retention at keep threshold 70% kept 1 of 2 evaluated tool call(s) whole (read 1). 1 decision(s) used a shortened session summary after a Jev token-limit refusal (--truncate) and could have missed useful context.",
+      );
+    });
+
+    test("a token-limit refusal without --truncate fails once with the person's own retry and no successor", async () => {
+      let calls = 0;
+      const { state, result } = compact(
+        withSummary(longSummary),
+        1,
+        policyFor("1 --threshold 60.1", async () => {
+          calls += 1;
+          return tokenLimitResponse();
+        }),
+      );
+      const error = await result.then(
+        () => undefined,
+        (caught: unknown) => caught,
+      );
+      expect(error).toBeInstanceOf(RetentionClassificationError);
+      // OpenCode 2 returns this text as the command error.
+      const message = commandFailureMessage("Magic Compact", error);
+      expect(message).toBe((error as Error).message);
+      expect(message.length).toBeLessThan(700);
+      expect(message).toContain(
+        "no retention decisions were applied. Run /magic-compact 1 --threshold 60.1 --truncate to retry",
+      );
+      expect(message).toContain(
+        "or /magic-compact 1 --heuristic to compact without task-aware keep protection (turn summaries are still generated)",
+      );
+      expect(message).not.toContain("/magic-trim");
+      // Both candidates were admitted together; nothing was retried.
+      expect(calls).toBe(2);
+      // Only the retention summary was requested: no turn generation.
+      expect(state.requests).toHaveLength(1);
+      expect([...state.sessions.keys()]).toEqual(["ses_src"]);
+    });
+
+    test.each([
+      [
+        "--threshold 70",
+        "Task-aware retention at keep threshold 70%: no tool calls needed evaluation.",
+      ],
+      ["--heuristic", "Heuristic mode: tool calls not evaluated."],
+    ])(
+      "a no-op under %p reports its retention mode without a request",
+      async (args, line) => {
+        let fetches = 0;
+        const preserving = compact(
+          echoGeneration(),
+          1,
+          {
+            ...commandRetentionPolicy(
+              "compact",
+              parseMagicCompactArguments(args),
+              { TYPESAFE_API_KEY: "test-key" },
+            ),
+            fetch: async () => {
+              fetches += 1;
+              return tokenLimitResponse();
+            },
+          },
+          turn(1),
+        );
+        const { successor, outcome } = await preserving.result;
+        expect(successor).toBeNull();
+        expect(outcome).toBe(
+          `${COMPACT_NOOP} ${preservedTurnsFeedback({ requested: 1, preserved: 1 })} ${line}`,
+        );
+        expect(preserving.state.requests).toHaveLength(0);
+        expect(fetches).toBe(0);
+      },
+    );
   });
 });
 
@@ -3130,26 +3335,37 @@ describe("OpenCode 2 retention keep threshold environment", () => {
     },
   );
 
-  test.each(["--heuristic", "--threshold 70", "1 --truncate --threshold 0"])(
-    "magic-trim %s neither reads nor validates the percent",
-    async args => {
+  test.each(["magic-compact", "magic-trim"])(
+    "%s neither reads nor validates the percent under --heuristic or --threshold",
+    async name => {
       const run = await commands();
-      const error = await withPercent("60%", () => run("magic-trim", args));
-      expect(error).not.toBeInstanceOf(RetentionClassificationError);
-      expect(String(error)).toContain(V2_ENDPOINT_REQUIRED);
+      for (const args of [
+        "--heuristic",
+        "--threshold 70",
+        "1 --truncate --threshold 0",
+      ]) {
+        const error = await withPercent("60%", () => run(name, args));
+        expect(error).not.toBeInstanceOf(RetentionClassificationError);
+        expect(String(error)).toContain(V2_ENDPOINT_REQUIRED);
+      }
     },
   );
 
   test.each([
-    ["--threshold 70%", TRIM_THRESHOLD_ERROR],
-    ["--threshold=70", TRIM_ARGUMENTS_ERROR],
-    ["--heuristic --truncate", TRIM_ARGUMENTS_ERROR],
+    ["magic-compact", COMPACT_THRESHOLD_ERROR, COMPACT_ARGUMENTS_ERROR],
+    ["magic-trim", TRIM_THRESHOLD_ERROR, TRIM_ARGUMENTS_ERROR],
   ])(
-    "magic-trim %s fails with the argument error before the environment or the server",
-    async (args, message) => {
+    "%s fails with its argument error before the environment or the server",
+    async (name, thresholdError, argumentsError) => {
       const run = await commands();
-      const error = await withPercent("60%", () => run("magic-trim", args));
-      expect((error as Error).message).toBe(message);
+      for (const [args, message] of [
+        ["--threshold 70%", thresholdError],
+        ["--threshold=70", argumentsError],
+        ["--heuristic --truncate", argumentsError],
+      ] as const) {
+        const error = await withPercent("60%", () => run(name, args));
+        expect((error as Error).message).toBe(message);
+      }
     },
   );
 });

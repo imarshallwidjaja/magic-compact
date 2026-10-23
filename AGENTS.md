@@ -30,7 +30,7 @@ Magic Compact performs per-turn conversation compaction while preserving the con
 
 ### Runtime Surfaces
 
-- `/magic-compact [N]` slash command.
+- `/magic-compact [N] [--threshold P] [--truncate]` or `/magic-compact [N] --heuristic` slash command.
 - `/magic-trim [N] [--threshold P] [--truncate]` or `/magic-trim [N] --heuristic` slash command.
 - `/magic-recover` slash command.
 - `/magic-stats` slash command.
@@ -41,7 +41,7 @@ Magic Compact performs per-turn conversation compaction while preserving the con
 - Preserve the current conversation structure while reducing context size.
 - Preserve user messages exactly.
 - Replace old assistant turns with validated per-turn continuation summaries.
-- Keep useful tool calls visible while removing bulky tool I/O. Task-aware retention (TypeSafe Jev, `TYPESAFE_API_KEY` in the OpenCode server environment) can keep a call whole; `--heuristic` skips it.
+- Keep useful tool calls visible while removing bulky tool I/O. Task-aware retention (TypeSafe Jev, `TYPESAFE_API_KEY` in the OpenCode server environment) can keep a call whole; `--heuristic` skips it (on `/magic-compact` it skips retention only, and turns are still summarized).
 - Store omitted tool I/O outside context but make it retrievable.
 - Write compact, trim and recover results to a verified successor session; never mutate or delete the original session or its child sessions.
 - Compact and trim refuse stored unfinished records and undelivered background results. Only the explicit `/magic-recover` treats them as abandoned: it keeps every live-work check, closes records with the host's native interrupted form and refuses records that have none. Its successor also carries one complete model-visible recovery context (`recoveryContext`) for what those stored forms leave out; a new record kind updates it. Never infer abandonment from age or idleness or route compact or trim through recovery.
@@ -51,4 +51,5 @@ Magic Compact performs per-turn conversation compaction while preserving the con
 - Tests never read `TYPESAFE_API_KEY` or reach the network: pass `retention` with a fake `fetch` (see `packages/opencode-plugin/test/retention-host.ts`), or `{ mode: "heuristic" }` for tests of the unchanged tool rules.
 - The operator-selected default is 0.60; the server may override it with `MAGIC_COMPACT_KEEP_THRESHOLD_PERCENT`. Further default or Jev-question changes require the evaluation protocol in `docs/RetentionEvaluation.md`; never tune against held-out results.
 - Keep archived evaluation thresholds independent of the runtime default and environment override.
-- Judge calls independently: useful duplicates and recoverable content qualify, as does unchanged useful content in a partly edited read. Do not categorically exclude task procedures, skills or todos. Send the session summary whole by default and keep the other request allocations fixed until a new development-only calibration is frozen. Enforce TypeSafe's 32 MiB request-body limit locally; let Jev enforce token limits. Only /magic-trim --truncate may retry a confirmed token-limit refusal, once per rejected candidate with the summary head/tail excerpt capped at 8,000 UTF-8 JSON bytes. No other request fields change. Unrecovered token-limit refusals fail the whole command unchanged with explicit /magic-trim --heuristic guidance; do not add byte-to-token proxies or automatic heuristic fallbacks.
+- Judge calls independently: useful duplicates and recoverable content qualify, as does unchanged useful content in a partly edited read. Do not categorically exclude task procedures, skills or todos. Send the session summary whole by default and keep the other request allocations fixed until a new development-only calibration is frozen. Enforce TypeSafe's 32 MiB request-body limit locally; let Jev enforce token limits. Only `--truncate` on /magic-compact or /magic-trim may retry a confirmed token-limit refusal, once per rejected candidate with the summary head/tail excerpt capped at 8,000 UTF-8 JSON bytes. No other request fields change. Unrecovered token-limit refusals fail the whole command unchanged with the person's own command and `--heuristic` guidance (/magic-compact's says turn summaries are still generated); do not add byte-to-token proxies or automatic heuristic fallbacks.
+- Retention arguments, policy, retry, failure advice and reporting belong to /magic-compact and /magic-trim on both hosts through the shared parser, policy builder and formatter. Diverge only for an operation-specific reason.

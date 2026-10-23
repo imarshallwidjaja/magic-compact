@@ -75,10 +75,10 @@ export type RetentionOptions = {
   // A finite probability from 0 to 1; a candidate is kept at or above it.
   // Defaults to RETENTION_KEEP_THRESHOLD.
   keepThreshold?: number;
-  // /magic-trim --truncate: a request Jev refuses as over its token limit is
-  // sent once more, identical except that the session summary is cut to its
-  // head and tail within RETENTION_SUMMARY_EXCERPT_BYTES. Only singleton
-  // requests (batchSize 1) support it.
+  // `--truncate` on /magic-compact or /magic-trim: a request Jev refuses as
+  // over its token limit is sent once more, identical except that the session
+  // summary is cut to its head and tail within RETENTION_SUMMARY_EXCERPT_BYTES.
+  // Only singleton requests (batchSize 1) support it.
   truncateSummary?: boolean;
 };
 
@@ -87,9 +87,15 @@ export type RetentionDecision = {
   keep: boolean;
 };
 
-// The /magic-trim arguments a failure suggests running again: the turn
-// count and the keep threshold only when the person gave them explicitly.
-export type TrimRetryArguments = { keepTurns: number; keepThreshold?: number };
+// The command a person ran, as /magic-compact or /magic-trim, with the
+// arguments that shape what a failure suggests running again: the turn count
+// always, the keep threshold only when `--threshold` gave it explicitly.
+export type RetentionInvocation = {
+  command: "compact" | "trim";
+  keepTurns: number;
+  keepThreshold?: number;
+  truncate: boolean;
+};
 
 export type RetentionRequest = {
   body: {
@@ -185,24 +191,45 @@ export type RetentionFailureKind =
   | "http"
   | "invalid-response";
 
-export const RETENTION_FAILURE_GUIDANCE =
-  "No tool content was changed. Run /magic-trim --heuristic to trim without classification.";
+// The closing advice of a failure before or around classification. Without an
+// invocation it names /magic-trim without the caller's N or an explicit
+// threshold.
+export function retentionFailureGuidance(
+  invocation?: RetentionInvocation,
+): string {
+  const compact = invocation?.command === "compact";
+  const command = invocationCommand(invocation);
+  return compact
+    ? `No tool content was changed. Run ${command} --heuristic to compact without classification (turn summaries are still generated).`
+    : `No tool content was changed. Run ${command} --heuristic to trim without classification.`;
+}
+
+export const RETENTION_FAILURE_GUIDANCE = retentionFailureGuidance();
+
+// The command a person ran, with its turn count when not 0.
+function invocationCommand(invocation: RetentionInvocation | undefined) {
+  const turns =
+    invocation && invocation.keepTurns > 0 ? ` ${invocation.keepTurns}` : "";
+  return `/magic-${invocation?.command === "compact" ? "compact" : "trim"}${turns}`;
+}
 
 const UNCHANGED =
   "The original session is unchanged and no retention decisions were applied.";
 
 // Public messages are fixed text plus an optional HTTP status and the
-// validated numbers of `trim`. They never carry request state, response
-// bodies, credentials, or a rejected value. `trim` is given only when
-// /magic-trim ran, so its suggestions repeat the person's own arguments.
+// validated numbers of `invocation`. They never carry request state, response
+// bodies, credentials, or a rejected value. `invocation` is given only when a
+// command ran, so its suggestions repeat the person's own command and
+// arguments; without one they name /magic-trim without the caller's N or an
+// explicit threshold.
 export class RetentionClassificationError extends PluginMessageError {
   constructor(
     readonly kind: RetentionFailureKind,
     readonly status?: number,
     readonly diagnostics?: RetentionFailureDiagnostics,
-    trim?: TrimRetryArguments,
+    invocation?: RetentionInvocation,
   ) {
-    super(retentionFailureText(kind, status, diagnostics, trim));
+    super(retentionFailureText(kind, status, diagnostics, invocation));
     this.name = "RetentionClassificationError";
   }
 }
@@ -231,14 +258,20 @@ export function formatKeepThresholdPercent(threshold: number): string {
 // The failure toast shows at most 700 characters (`src/util.ts`).
 const MESSAGE_CHARACTER_LIMIT = 700;
 
+// `--heuristic` skips only the retention step. /magic-trim then makes no
+// request at all, while /magic-compact still summarizes its turns with the
+// model, so its suggestion says so.
 function retentionFailureText(
   kind: RetentionFailureKind,
   status: number | undefined,
   diagnostics: RetentionFailureDiagnostics | undefined,
-  trim: TrimRetryArguments | undefined,
+  invocation: RetentionInvocation | undefined,
 ): string {
-  const turns = trim && trim.keepTurns > 0 ? ` ${trim.keepTurns}` : "";
-  const heuristic = `Run /magic-trim${turns} --heuristic to trim without task-aware keep protection.`;
+  const compact = invocation?.command === "compact";
+  const command = invocationCommand(invocation);
+  const heuristic = compact
+    ? `Run ${command} --heuristic to compact without task-aware keep protection (turn summaries are still generated).`
+    : `Run ${command} --heuristic to trim without task-aware keep protection.`;
   if (kind === "token-limit") {
     const refused =
       "TypeSafe Jev refused a task-aware retention request because it exceeds the model's token limit.";
@@ -249,20 +282,20 @@ function retentionFailureText(
       return `${refused} The session summary already fits the 8,000-byte excerpt that --truncate would use, so --truncate cannot shorten the request. ${UNCHANGED} ${heuristic}`;
     }
     const threshold =
-      trim?.keepThreshold === undefined
+      invocation?.keepThreshold === undefined
         ? ""
-        : ` --threshold ${formatKeepThresholdPercent(trim.keepThreshold)}`;
-    const full = `${refused} ${UNCHANGED} Run /magic-trim${turns}${threshold} --truncate to retry each refused call once with a shorter session summary, which can omit useful context, or /magic-trim${turns} --heuristic to trim without task-aware keep protection. --threshold does not reduce the Jev request size.`;
+        : ` --threshold ${formatKeepThresholdPercent(invocation.keepThreshold)}`;
+    const full = `${refused} ${UNCHANGED} Run ${command}${threshold} --truncate to retry each refused call once with a shorter session summary, which can omit useful context, or ${command} --heuristic to ${compact ? "compact" : "trim"} without task-aware keep protection${compact ? " (turn summaries are still generated)" : ""}. --threshold does not reduce the Jev request size.`;
     // A threshold of hundreds of digits would push the --heuristic command
     // out of the toast, so the same guidance is then worded more briefly.
     return full.length < MESSAGE_CHARACTER_LIMIT
       ? full
-      : `TypeSafe Jev refused a task-aware retention request as over its token limit. ${UNCHANGED} Run /magic-trim${turns}${threshold} --truncate (a shorter session summary can omit useful context) or /magic-trim${turns} --heuristic. --threshold does not shrink the request.`;
+      : `TypeSafe Jev refused a retention request as over its token limit. ${UNCHANGED} Run ${command}${threshold} --truncate (a shorter summary can omit context) or ${command} --heuristic${compact ? " (turns are still summarized)" : ""}. --threshold does not shrink the request.`;
   }
   if (kind === "budget") {
     return `A task-aware retention request is larger than TypeSafe's 32 MiB request body limit and was not sent; --truncate does not apply to this limit. ${UNCHANGED} ${heuristic}`;
   }
-  return `${retentionFailureDetail(kind, status)} ${RETENTION_FAILURE_GUIDANCE}`;
+  return `${retentionFailureDetail(kind, status)} ${retentionFailureGuidance(invocation)}`;
 }
 
 function retentionFailureDetail(

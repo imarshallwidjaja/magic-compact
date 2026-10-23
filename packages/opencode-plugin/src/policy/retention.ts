@@ -1,4 +1,4 @@
-// Task-aware retention for /magic-trim and /magic-compact, shared by both
+// Task-aware retention for /magic-compact and /magic-trim, shared by both
 // hosts. The existing tool rules still decide which calls would change; this
 // step only vetoes changes to calls Jev judges likely to help the current
 // task. Decisions are made per invocation and never persisted, so kept calls
@@ -8,14 +8,15 @@ import {
   formatKeepThresholdPercent,
   resolveKeepThreshold,
   RETENTION_FAILURE_GUIDANCE,
+  retentionFailureGuidance,
   RETENTION_KEEP_THRESHOLD,
   RETENTION_KEEP_THRESHOLD_PERCENT_ENV,
   RetentionClassificationError,
   type RetentionCandidate,
   type RetentionFetch,
+  type RetentionInvocation,
 } from "../retention/classifier";
-import type { MagicTrimArguments } from "../commands";
-import { PluginMessageError } from "./feedback";
+import { hasPluginMessage, PluginMessageError } from "./feedback";
 import { toolTrimChangesContent, type ToolCallView } from "./tool-rules";
 
 export type RetentionPolicy =
@@ -26,19 +27,23 @@ export type RetentionPolicy =
       apiKey: string | undefined;
       // Probability threshold from 0 to 1; defaults to RETENTION_KEEP_THRESHOLD.
       keepThreshold?: number;
-      // Set only for /magic-trim: its arguments, for `--truncate` and for the
-      // command a failure suggests.
-      trim?: TaskAwareTrimArguments;
+      // Set when a command ran: its arguments, for `--truncate` and for the
+      // command a failure suggests. Absent for API and evaluation callers.
+      invocation?: RetentionInvocation;
       fetch?: RetentionFetch;
     };
 
-// The task-aware /magic-trim arguments. `keepThreshold` is the explicit
-// `--threshold` probability, absent when it was not given.
-export type TaskAwareTrimArguments = {
-  keepTurns: number;
-  keepThreshold?: number;
-  truncate: boolean;
-};
+// The retention arguments /magic-compact and /magic-trim share, after
+// parsing. `keepThreshold` is the explicit `--threshold` probability, absent
+// when it was not given.
+export type RetentionArguments =
+  | { keepTurns: number; heuristic: true }
+  | {
+      keepTurns: number;
+      heuristic: false;
+      keepThreshold?: number;
+      truncate: boolean;
+    };
 
 const PERCENT_TEXT = /^(\d+)(?:\.(\d+))?$/;
 
@@ -48,7 +53,7 @@ const PERCENT_TEXT = /^(\d+)(?:\.(\d+))?$/;
 // before any rounding, so "100.00000000000000001" is above 100 and not 1; a
 // nonzero percent too small for a double is undefined and never reads as 0.
 // Signs, "%", exponents, hex, whitespace and other forms are undefined.
-// Shared by RETENTION_KEEP_THRESHOLD_PERCENT_ENV and /magic-trim --threshold.
+// Shared by RETENTION_KEEP_THRESHOLD_PERCENT_ENV and `--threshold`.
 export function percentThreshold(text: string): number | undefined {
   const match = PERCENT_TEXT.exec(text);
   if (!match) return undefined;
@@ -71,32 +76,36 @@ export function parseKeepThresholdPercent(text: string): number {
 }
 
 // The task-aware policy for one command invocation. The threshold is the
-// explicit /magic-trim --threshold when given, and the environment's percent
-// or the default is then never read; otherwise an invalid or empty percent
-// fails instead of falling back to the default. The threshold is resolved
-// before the key is read.
+// explicit `--threshold` when given, and the environment's percent or the
+// default is then never read; otherwise an invalid or empty percent fails
+// instead of falling back to the default. The threshold is resolved before
+// the key is read.
 export function taskAwareRetentionPolicy(
   env: Readonly<Record<string, string | undefined>>,
-  trim?: TaskAwareTrimArguments,
+  invocation?: RetentionInvocation,
 ): Extract<RetentionPolicy, { mode: "task-aware" }> {
-  const keepThreshold = trim?.keepThreshold ?? environmentKeepThreshold(env);
+  const keepThreshold =
+    invocation?.keepThreshold ?? environmentKeepThreshold(env, invocation);
   return {
     mode: "task-aware",
     apiKey: env["TYPESAFE_API_KEY"] || undefined,
     keepThreshold,
-    ...(trim ? { trim } : {}),
+    ...(invocation ? { invocation } : {}),
   };
 }
 
-// The /magic-trim policy from its parsed arguments, shared by both hosts.
-// `--heuristic` reads nothing from the environment.
-export function trimRetentionPolicy(
-  args: MagicTrimArguments,
+// The policy of /magic-compact or /magic-trim from its parsed arguments,
+// shared by both commands on both hosts. `--heuristic` reads nothing from the
+// environment.
+export function commandRetentionPolicy(
+  command: RetentionInvocation["command"],
+  args: RetentionArguments,
   env: Readonly<Record<string, string | undefined>>,
 ): RetentionPolicy {
   if (args.heuristic) return { mode: "heuristic" };
   const { keepTurns, keepThreshold, truncate } = args;
   return taskAwareRetentionPolicy(env, {
+    command,
     keepTurns,
     ...(keepThreshold === undefined ? {} : { keepThreshold }),
     truncate,
@@ -105,11 +114,41 @@ export function trimRetentionPolicy(
 
 function environmentKeepThreshold(
   env: Readonly<Record<string, string | undefined>>,
+  invocation: RetentionInvocation | undefined,
 ): number {
   const percent = env[RETENTION_KEEP_THRESHOLD_PERCENT_ENV];
-  return percent === undefined
-    ? RETENTION_KEEP_THRESHOLD
-    : parseKeepThresholdPercent(percent);
+  if (percent === undefined) return RETENTION_KEEP_THRESHOLD;
+  try {
+    return parseKeepThresholdPercent(percent);
+  } catch (error) {
+    // The failure suggests the person's own command.
+    if (invocation && error instanceof RetentionClassificationError) {
+      throw new RetentionClassificationError(
+        error.kind,
+        error.status,
+        error.diagnostics,
+        invocation,
+      );
+    }
+    throw error;
+  }
+}
+
+// What a command reports when it evaluated nothing: heuristic mode, or the
+// task-aware mode with its effective threshold and no candidate to judge.
+// Makes no request and reads no key.
+export function retentionWithoutCandidates(
+  policy: RetentionPolicy,
+): RetentionPlan {
+  return policy.mode === "heuristic"
+    ? HEURISTIC_RETENTION
+    : {
+        mode: "task-aware",
+        evaluated: 0,
+        keep: new Set(),
+        keepThreshold: resolveKeepThreshold(policy.keepThreshold),
+        truncated: 0,
+      };
 }
 
 export type RetentionPlan =
@@ -192,17 +231,9 @@ export async function decideRetentionWith(
   policy: Extract<RetentionPolicy, { mode: "task-aware" }>,
   summarize: () => Promise<string>,
 ): Promise<RetentionPlan> {
+  if (found.candidates.length === 0) return retentionWithoutCandidates(policy);
   const keepThreshold = resolveKeepThreshold(policy.keepThreshold);
-  if (found.candidates.length === 0) {
-    return {
-      mode: "task-aware",
-      evaluated: 0,
-      keep: new Set(),
-      keepThreshold,
-      truncated: 0,
-    };
-  }
-  const { trim } = policy;
+  const { invocation } = policy;
   try {
     if (!policy.apiKey) {
       throw new RetentionClassificationError("missing-api-key");
@@ -214,7 +245,7 @@ export async function decideRetentionWith(
       {
         apiKey: policy.apiKey,
         keepThreshold,
-        ...(trim?.truncate ? { truncateSummary: true } : {}),
+        ...(invocation?.truncate ? { truncateSummary: true } : {}),
         ...(policy.fetch ? { fetch: policy.fetch } : {}),
       },
     );
@@ -232,16 +263,32 @@ export async function decideRetentionWith(
       truncated,
     };
   } catch (error) {
-    // A /magic-trim failure suggests repeating the person's own arguments.
-    if (trim && error instanceof RetentionClassificationError) {
+    // A command's failure suggests repeating the person's own arguments.
+    if (invocation && error instanceof RetentionClassificationError) {
       throw new RetentionClassificationError(
         error.kind,
         error.status,
         error.diagnostics,
-        trim,
+        invocation,
       );
     }
+    if (invocation) addOwnCommandGuidance(error, invocation);
     throw error;
+  }
+}
+
+// A session-summary failure ends in the guidance for a caller with no command.
+// The error keeps its type, stage and any sessions it names; only the closing
+// advice becomes the person's own command, as for a classification failure.
+function addOwnCommandGuidance(
+  error: unknown,
+  invocation: RetentionInvocation,
+): void {
+  if (
+    hasPluginMessage(error)
+    && error.message.endsWith(RETENTION_FAILURE_GUIDANCE)
+  ) {
+    error.message = `${error.message.slice(0, -RETENTION_FAILURE_GUIDANCE.length)}${retentionFailureGuidance(invocation)}`;
   }
 }
 

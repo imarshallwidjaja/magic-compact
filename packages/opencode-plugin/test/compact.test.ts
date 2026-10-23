@@ -63,7 +63,10 @@ import {
   unfinishedHistoryRefusal,
 } from "../src/policy/successor";
 import {
+  COMPACT_ARGUMENTS_ERROR,
+  COMPACT_THRESHOLD_ERROR,
   commandFailureMessage,
+  parseMagicCompactArguments,
   TRIM_ARGUMENTS_ERROR,
   TRIM_NOOP,
   TRIM_THRESHOLD_ERROR,
@@ -106,10 +109,16 @@ import {
   readStats,
   writeStats,
 } from "../src/storage/stats";
-import { taskAwareRetentionPolicy } from "../src/policy/retention";
 import {
+  commandRetentionPolicy,
+  taskAwareRetentionPolicy,
+} from "../src/policy/retention";
+import {
+  excerpt,
   RETENTION_KEEP_THRESHOLD_PERCENT_ENV,
+  RETENTION_SUMMARY_EXCERPT_BYTES,
   RetentionClassificationError,
+  type RetentionFetch,
 } from "../src/retention/classifier";
 import {
   hostClock,
@@ -139,8 +148,9 @@ type GenerationResponse = { turns: TurnResult[] };
 
 let storageDirectory: string;
 const HEURISTIC_OPTIONS = { retention: { mode: "heuristic" } } as const;
+const HEURISTIC_FEEDBACK = "Heuristic mode: tool calls not evaluated.";
 // N=1 over a single eligible turn preserves that turn and summarizes nothing.
-const NOOP_PRESERVING_ONE_TURN = `${COMPACT_NOOP} ${preservedTurnsFeedback({ requested: 1, preserved: 1 })}`;
+const NOOP_PRESERVING_ONE_TURN = `${COMPACT_NOOP} ${preservedTurnsFeedback({ requested: 1, preserved: 1 })} ${HEURISTIC_FEEDBACK}`;
 const originalDataHome = process.env.XDG_DATA_HOME;
 const PLUGIN_TEXT = "Magic Compact wrote this text for the person running it.";
 
@@ -1481,6 +1491,70 @@ describe("bounded native compaction generation", () => {
     expect(process.env).toBe(inheritedEnv);
   });
 
+  // Both commands build their policy from the same grammar before they look
+  // for a listener, so the environment is read, or skipped, the same way.
+  test.each(["magic-compact", "magic-trim"])(
+    "%s reads the server environment only when no flag overrides it",
+    async command => {
+      const decoy = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch: () => Response.json({ agent: {} }),
+      });
+      const inheritedEnv = process.env;
+      const reads: string[] = [];
+      process.env = {
+        get TYPESAFE_API_KEY() {
+          reads.push("key");
+          return "fake-key";
+        },
+        get [RETENTION_KEEP_THRESHOLD_PERCENT_ENV]() {
+          reads.push("percent");
+          return "60%";
+        },
+      } as unknown as NodeJS.ProcessEnv;
+      const { client } = hostToastClient();
+      try {
+        const hooks = await server({
+          serverUrl: new URL(`http://127.0.0.1:${decoy.port}/`),
+          directory: "/workspace",
+          client,
+        } as unknown as PluginInput);
+        await hooks.config?.({} as Config);
+        const run = (args: string) =>
+          hooks["command.execute.before"]!(
+            { command, arguments: args, sessionID: "session" },
+            { parts: [] },
+          ).then(
+            () => undefined,
+            (error: unknown) => error,
+          );
+
+        // The invalid server percent fails the plain command before a
+        // listener is sought.
+        const plain = await run("");
+        expect(plain).toBeInstanceOf(RetentionClassificationError);
+        expect(String(plain)).toContain(RETENTION_KEEP_THRESHOLD_PERCENT_ENV);
+        expect(String(plain)).toContain(`Run /${command} --heuristic`);
+        expect(reads).toEqual(["percent"]);
+
+        // An explicit threshold, including 0, never reads or validates it,
+        // and --heuristic reads neither variable.
+        for (const args of ["--threshold 70", "1 --truncate --threshold 0"]) {
+          reads.length = 0;
+          expect(String(await run(args))).toContain(LISTENER_REQUIRED);
+          expect(reads).toEqual(["key"]);
+        }
+        reads.length = 0;
+        expect(String(await run("2 --heuristic"))).toContain(LISTENER_REQUIRED);
+        expect(reads).toEqual([]);
+      } finally {
+        process.env = inheritedEnv;
+        await decoy.stop(true);
+      }
+    },
+  );
+
   test("reports invalid arguments through the host client before any connection", async () => {
     const { client, toasts } = hostToastClient();
     const hooks = await server({
@@ -1489,11 +1563,12 @@ describe("bounded native compaction generation", () => {
       client,
     } as unknown as PluginInput);
     for (const [command, args, title, text] of [
+      ["magic-compact", "two", "Magic Compact Failed", COMPACT_ARGUMENTS_ERROR],
       [
         "magic-compact",
-        "two",
+        "--threshold 70%",
         "Magic Compact Failed",
-        "/magic-compact argument must be a non-negative integer.",
+        COMPACT_THRESHOLD_ERROR,
       ],
       ["magic-trim", "1 1", "Magic Trim Failed", TRIM_ARGUMENTS_ERROR],
       [
@@ -1516,7 +1591,7 @@ describe("bounded native compaction generation", () => {
         duration: expect.any(Number),
       });
     }
-    expect(toasts).toHaveLength(3);
+    expect(toasts).toHaveLength(4);
   });
 
   test("leaves outcome and execution-failure toasts to the verified listener", async () => {
@@ -4496,10 +4571,17 @@ describe("compaction orchestration", () => {
             ?.stats === true,
       );
     expect(notice?.text).toBe(
-      statsMessage(1, storedBefore, storedAfter, 1, preserved),
+      statsMessage(
+        1,
+        storedBefore,
+        storedAfter,
+        1,
+        preserved,
+        HEURISTIC_FEEDBACK,
+      ),
     );
     expect(harness.toasts.at(-1)?.message).toBe(
-      `Compacted 1 request turn(s) into successor session successor. ${preservedTurnsFeedback(preserved)} Heuristic mode: tool calls not evaluated.`,
+      `Compacted 1 request turn(s) into successor session successor. ${preservedTurnsFeedback(preserved)} ${HEURISTIC_FEEDBACK}`,
     );
 
     expect((await readStats("successor"))?.totalTokensPruned).toBe(
@@ -4568,6 +4650,7 @@ describe("compaction orchestration", () => {
         countCanonicalContentTokens(successor),
         2,
         { requested: 0, preserved: 0 },
+        HEURISTIC_FEEDBACK,
       ),
     );
     expect(withoutIdentity(successor.slice(0, 4))).toEqual(
@@ -4596,7 +4679,7 @@ describe("compaction orchestration", () => {
     ).resolves.toBeNull();
 
     expect(harness.toasts.at(-1)?.message).toBe(
-      `${COMPACT_NOOP} ${preservedTurnsFeedback({ requested: 5, preserved: 2 })}`,
+      `${COMPACT_NOOP} ${preservedTurnsFeedback({ requested: 5, preserved: 2 })} ${HEURISTIC_FEEDBACK}`,
     );
     expect(harness.forks).toEqual([]);
     expect(harness.sourceWrites).toEqual([]);
@@ -5542,27 +5625,43 @@ describe("compaction orchestration", () => {
       });
     });
 
-    test("refuses a command with an unfinished stored message before any generation or write", async () => {
-      const messages = [
-        open("msg_old", [running("prt_old", "msg_old")]),
-        ...compactableCommandMessages("later", "large output ".repeat(1_000)),
-      ];
-      const before = structuredClone(messages);
-      const harness = commandHarness(messages, {
-        generationResponse: { turns: [result(1, "Completed.")] },
-      });
+    // --heuristic and --truncate change retention only; neither bypasses this
+    // check, and no classifier request is made before it.
+    test.each(["--heuristic", "--truncate"])(
+      "refuses a command with an unfinished stored message before any generation or write (%s)",
+      async flag => {
+        const messages = [
+          open("msg_old", [running("prt_old", "msg_old")]),
+          ...compactableCommandMessages("later", "large output ".repeat(1_000)),
+        ];
+        const before = structuredClone(messages);
+        const harness = commandHarness(messages, {
+          generationResponse: { turns: [result(1, "Completed.")] },
+        });
 
-      await expect(
-        executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
-      ).rejects.toThrow(
-        "Record: assistant message msg_old; no completion time or error; running task call prt_old-call.",
-      );
-      expect(messages).toEqual(before);
-      expect(harness.forks).toEqual([]);
-      expect(harness.successors).toEqual([]);
-      expect(harness.sourceWrites).toEqual([]);
-      expect(await readStats("source")).toBeNull();
-    });
+        await expect(
+          executeMagicCompact(harness.v2, "source", 0, {
+            retention: {
+              ...commandRetentionPolicy(
+                "compact",
+                parseMagicCompactArguments(flag),
+                { TYPESAFE_API_KEY: "test-key" },
+              ),
+              fetch: async () => {
+                throw new Error("unexpected classifier request");
+              },
+            },
+          }),
+        ).rejects.toThrow(
+          "Record: assistant message msg_old; no completion time or error; running task call prt_old-call.",
+        );
+        expect(messages).toEqual(before);
+        expect(harness.forks).toEqual([]);
+        expect(harness.successors).toEqual([]);
+        expect(harness.sourceWrites).toEqual([]);
+        expect(await readStats("source")).toBeNull();
+      },
+    );
   });
 
   test("refuses a second command for the same source while the first runs", async () => {
@@ -7274,6 +7373,8 @@ const generationForkOrdinal = (sessionID: string): number | undefined => {
 
 type CommandHarnessOptions = {
   generationResponse: GenerationResponse;
+  // The retention summary the fork answers with.
+  summaryText?: string;
   generationErrorForFirstOrdinal?: number;
   generationErrorsByFirstOrdinal?: Record<number, Error>;
   generationAbortErrorForFirstOrdinal?: number;
@@ -7529,7 +7630,12 @@ function commandHarness(
         if (request.format === undefined) {
           events.push("retention-summary");
           const fork = history.read(sessionID);
-          const reply = summaryReply(fork, request as never, sessionID);
+          const reply = summaryReply(
+            fork,
+            request as never,
+            sessionID,
+            options.summaryText,
+          );
           fork
             .slice(-2)
             .forEach((item, index) => history.write(item, 100 + index));
@@ -7895,9 +8001,22 @@ describe("magic compact task-aware retention", () => {
     expect(JSON.stringify(tools[1])).toContain(
       "Historical read result omitted",
     );
+    const line =
+      "Task-aware retention at keep threshold 60% kept 1 of 2 evaluated tool call(s) whole (read 1).";
     expect(harness.toasts.at(-1)?.message).toBe(
-      `Compacted 2 request turn(s) into successor session successor. ${preservedTurnsFeedback({ requested: 0, preserved: 0 })} Task-aware retention at keep threshold 60% kept 1 of 2 evaluated tool call(s) whole.`,
+      `Compacted 2 request turn(s) into successor session successor. ${preservedTurnsFeedback({ requested: 0, preserved: 0 })} ${line}`,
     );
+    // The ignored notice ends with the same line, once.
+    const notice = successor
+      .flatMap(item => item.parts)
+      .find(
+        (part): part is TextPart =>
+          part.type === "text"
+          && (part.metadata?.magicCompact as { stats?: true } | undefined)
+            ?.stats === true,
+      );
+    expect(notice?.text.split("\n").at(-1)).toBe(`Retention | ${line}`);
+    expect(notice?.text.match(/Retention \|/gu)).toHaveLength(1);
   });
 
   test.each([
@@ -7967,6 +8086,16 @@ describe("magic compact task-aware retention", () => {
     expect(await readStats("source")).toBeNull();
   });
 
+  // The policy a person's `/magic-compact <args>` builds on the server.
+  const policyFor = (args: string, fetch: RetentionFetch) => ({
+    ...commandRetentionPolicy("compact", parseMagicCompactArguments(args), {
+      TYPESAFE_API_KEY: "test-key",
+    }),
+    fetch,
+  });
+  const errorToasts = (harness: ReturnType<typeof commandHarness>) =>
+    harness.toasts.filter(toast => toast.variant === "error");
+
   test.each([
     ["an HTTP 429", "http", () => new Response("private", { status: 429 })],
     ["a token-limit refusal", "token-limit", tokenLimitResponse],
@@ -7983,14 +8112,10 @@ describe("magic compact task-aware retention", () => {
 
       let calls = 0;
       const error = await executeMagicCompact(harness.v2, "source", 0, {
-        retention: {
-          mode: "task-aware",
-          apiKey: "test-key",
-          fetch: async () => {
-            calls += 1;
-            return respond();
-          },
-        },
+        retention: policyFor("", async () => {
+          calls += 1;
+          return respond();
+        }),
       }).then(
         () => undefined,
         (caught: unknown) => caught,
@@ -7998,10 +8123,17 @@ describe("magic compact task-aware retention", () => {
 
       expect(error).toBeInstanceOf(RetentionClassificationError);
       expect((error as RetentionClassificationError).kind).toBe(kind);
-      expect(String(error)).toContain("/magic-trim --heuristic");
-      // Compact never retries. This short summary has no shorter excerpt, so
-      // a token-limit refusal suggests only /magic-trim --heuristic.
+      // Without --truncate nothing is retried: one request per candidate.
       expect(calls).toBe(2);
+      // The suggestion is this command's own, and says that --heuristic still
+      // summarizes turns with the model.
+      expect(String(error)).toContain(
+        "Run /magic-compact --heuristic to compact without",
+      );
+      expect(String(error)).toContain("turn summaries are still generated");
+      expect(String(error)).not.toContain("/magic-trim");
+      // This short summary has no shorter excerpt, so a token-limit refusal
+      // does not offer --truncate.
       if (kind === "token-limit") {
         expect(String(error)).toContain("--truncate cannot shorten");
         expect(String(error)).not.toContain("--truncate to retry");
@@ -8012,7 +8144,247 @@ describe("magic compact task-aware retention", () => {
       expect(harness.forks).toEqual(["generation-fork"]);
       expect(harness.activeGenerationForks).toEqual([]);
       expect(harness.sourceWrites).toEqual([]);
+      expect(harness.successors).toEqual([]);
       expect(await readStats("source")).toBeNull();
+    },
+  );
+
+  test("a token-limit refusal without --truncate toasts the person's own retry once", async () => {
+    const messages = [
+      ...retainedTurns(),
+      ...compactableCommandMessages("third", "third listing ".repeat(400)),
+    ];
+    const before = structuredClone(messages);
+    const harness = commandHarness(messages, {
+      generationResponse: { turns: [] },
+      summaryText: "s".repeat(20_000),
+    });
+    let calls = 0;
+    const error = await executeMagicCompact(harness.v2, "source", 1, {
+      retention: policyFor("1 --threshold 70", async () => {
+        calls += 1;
+        return tokenLimitResponse();
+      }),
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(RetentionClassificationError);
+    expect(calls).toBe(2);
+    const toasts = errorToasts(harness);
+    expect(toasts).toHaveLength(1);
+    const text = toasts[0]!.message!;
+    expect(text).toBe((error as Error).message);
+    expect(text.length).toBeLessThan(700);
+    expect(text).toContain(
+      "Run /magic-compact 1 --threshold 70 --truncate to retry each refused call once",
+    );
+    expect(text).toContain(
+      "or /magic-compact 1 --heuristic to compact without task-aware keep protection (turn summaries are still generated)",
+    );
+    expect(text).not.toContain("/magic-trim");
+    expect(text).not.toContain("sss");
+    expect(messages).toEqual(before);
+    expect(harness.modelPrompts).toEqual([]);
+    expect(harness.successors).toEqual([]);
+    expect(await readStats("source")).toBeNull();
+  });
+
+  test("--heuristic skips only the retention summary and Jev, and the turns are still summarized", async () => {
+    const reads: string[] = [];
+    const env = {
+      get TYPESAFE_API_KEY() {
+        reads.push("key");
+        return "sk-secret";
+      },
+      get [RETENTION_KEEP_THRESHOLD_PERCENT_ENV]() {
+        reads.push("percent");
+        return "not a percent";
+      },
+    };
+    const policy = commandRetentionPolicy(
+      "compact",
+      parseMagicCompactArguments("--heuristic"),
+      env,
+    );
+    const harness = commandHarness(retainedTurns(), {
+      generationResponse: {
+        turns: [result(1, "Useful turn summary."), result(2, "Stale summary.")],
+      },
+    });
+
+    await expect(
+      executeMagicCompact(harness.v2, "source", 0, { retention: policy }),
+    ).resolves.toMatchObject({ session: { id: "successor" } });
+
+    expect(reads).toEqual([]);
+    expect(harness.events).not.toContain("retention-summary");
+    expect(
+      harness.events.filter(event => event === "generation-prompt"),
+    ).toHaveLength(2);
+    expect(harness.modelPrompts).toHaveLength(2);
+    expect(summaryParts(harness.successorMessages())).toHaveLength(2);
+    expect(harness.toasts.at(-1)?.message).toBe(
+      `Compacted 2 request turn(s) into successor session successor. ${preservedTurnsFeedback({ requested: 0, preserved: 0 })} ${HEURISTIC_FEEDBACK}`,
+    );
+  });
+
+  test("--truncate retries only the confirmed refusal's summary and reports the actual decisions", async () => {
+    const summaryText = `## Objective\n${"- A dense detail line.\n".repeat(1_500)}## Next Move`;
+    const messages = retainedTurns();
+    const usefulTool = structuredClone(
+      messages[1]!.parts.find(part => part.type === "tool")!,
+    );
+    const harness = commandHarness(messages, {
+      generationResponse: {
+        turns: [result(1, "Useful turn summary."), result(2, "Stale summary.")],
+      },
+      summaryText,
+    });
+    const summaries: string[] = [];
+    const answer = scoredJevFetch(output =>
+      output.includes("useful") ? 0.75 : 0.1,
+    );
+
+    await expect(
+      executeMagicCompact(harness.v2, "source", 0, {
+        retention: policyFor("--threshold 70 --truncate", async (url, init) => {
+          const body = JSON.parse(String(init.body));
+          summaries.push(body.state.task.sessionSummary);
+          // Only the useful call's whole-summary request is refused.
+          return body.state.task.sessionSummary === summaryText
+            && body.state.candidates[0].output.includes("useful")
+            ? tokenLimitResponse()
+            : answer(url, init);
+        }),
+      }),
+    ).resolves.toMatchObject({ session: { id: "successor" } });
+
+    expect(summaries.filter(text => text === summaryText)).toHaveLength(2);
+    expect(summaries.filter(text => text !== summaryText)).toEqual([
+      excerpt(summaryText, RETENTION_SUMMARY_EXCERPT_BYTES),
+    ]);
+    // The excerpt reaches only the retention request, never a turn prompt.
+    expect(JSON.stringify(harness.modelPrompts)).not.toContain(
+      "characters omitted",
+    );
+    expect(harness.modelPrompts).toHaveLength(2);
+    const feedback =
+      "Task-aware retention at keep threshold 70% kept 1 of 2 evaluated tool call(s) whole (read 1). 1 decision(s) used a shortened session summary after a Jev token-limit refusal (--truncate) and could have missed useful context.";
+    expect(harness.toasts.at(-1)?.message).toBe(
+      `Compacted 2 request turn(s) into successor session successor. ${preservedTurnsFeedback({ requested: 0, preserved: 0 })} ${feedback}`,
+    );
+    const notice = harness
+      .successorMessages()
+      .flatMap(item => item.parts)
+      .find(
+        (part): part is TextPart =>
+          part.type === "text"
+          && (part.metadata?.magicCompact as { stats?: true } | undefined)
+            ?.stats === true,
+      );
+    expect(notice?.text).toContain(`Retention | ${feedback}`);
+    const kept = harness
+      .successorMessages()
+      .flatMap(item => item.parts)
+      .filter(part => part.type === "tool");
+    expect(withoutPartIdentity(kept[0]!)).toEqual(
+      withoutPartIdentity(usefulTool),
+    );
+  });
+
+  test("--truncate leaves a second refusal terminal, with no successor and no generation", async () => {
+    const summaryText = "s".repeat(20_000);
+    const messages = retainedTurns();
+    const before = structuredClone(messages);
+    const harness = commandHarness(messages, {
+      generationResponse: { turns: [] },
+      summaryText,
+    });
+    const sent: string[] = [];
+
+    const error = await executeMagicCompact(harness.v2, "source", 0, {
+      retention: policyFor("2 --truncate", async (_url, init) => {
+        sent.push(JSON.parse(String(init.body)).state.task.sessionSummary);
+        return tokenLimitResponse();
+      }),
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(RetentionClassificationError);
+    expect((error as Error).message).toContain("the retry limit was exceeded");
+    expect((error as Error).message).toEndWith(
+      "Run /magic-compact 2 --heuristic to compact without task-aware keep protection (turn summaries are still generated).",
+    );
+    // One whole-summary request and one excerpt retry per candidate.
+    expect(sent.filter(text => text === summaryText)).toHaveLength(2);
+    expect(sent.filter(text => text !== summaryText)).toHaveLength(2);
+    expect(errorToasts(harness)).toHaveLength(1);
+    expect(messages).toEqual(before);
+    expect(harness.modelPrompts).toEqual([]);
+    expect(harness.successors).toEqual([]);
+    expect(await readStats("source")).toBeNull();
+  });
+
+  test.each([
+    ["--threshold 70", "70%", "Task-aware retention"],
+    ["--heuristic", undefined, HEURISTIC_FEEDBACK],
+  ] as const)(
+    "a no-op under %p reports its retention mode without a request or successor",
+    async (args, threshold, line) => {
+      let requests = 0;
+      const policy = {
+        ...commandRetentionPolicy("compact", parseMagicCompactArguments(args), {
+          TYPESAFE_API_KEY: "test-key",
+        }),
+        fetch: async () => {
+          requests += 1;
+          return tokenLimitResponse();
+        },
+      };
+      // N=1 over one eligible turn preserves it: nothing to summarize.
+      const nothingEligible = commandHarness(
+        compactableCommandMessages("only", "only listing ".repeat(400)),
+        { generationResponse: { turns: [] } },
+      );
+      // Every eligible turn already holds a summary.
+      const allOpaque = commandHarness(
+        [
+          ...persistedSummaryTurn("v2-a", 2),
+          ...persistedSummaryTurn("v2-b", 2),
+        ],
+        { generationResponse: { turns: [] } },
+      );
+
+      await expect(
+        executeMagicCompact(nothingEligible.v2, "source", 1, {
+          retention: policy,
+        }),
+      ).resolves.toBeNull();
+      await expect(
+        executeMagicCompact(allOpaque.v2, "source", 0, { retention: policy }),
+      ).resolves.toBeNull();
+
+      const expected =
+        threshold === undefined
+          ? line
+          : `${line} at keep threshold ${threshold}: no tool calls needed evaluation.`;
+      expect(nothingEligible.toasts.at(-1)?.message).toBe(
+        `${COMPACT_NOOP} ${preservedTurnsFeedback({ requested: 1, preserved: 1 })} ${expected}`,
+      );
+      expect(allOpaque.toasts.at(-1)?.message).toBe(
+        `${COMPACT_NOOP} ${expected}`,
+      );
+      for (const harness of [nothingEligible, allOpaque]) {
+        expect(harness.events).toEqual([]);
+        expect(harness.modelPrompts).toEqual([]);
+        expect(harness.successors).toEqual([]);
+        expect(harness.sourceWrites).toEqual([]);
+      }
+      expect(requests).toBe(0);
     },
   );
 });

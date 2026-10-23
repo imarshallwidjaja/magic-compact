@@ -14,6 +14,7 @@ import { planOmission, type PlannedOmission } from "../storage/omission";
 import { CONTROL_OPERATION_TIMEOUT_MS } from "../util";
 import {
   trimV2Tool,
+  v2RetentionCalls,
   v2ToolCalls,
   v2RetentionTurns,
   v2ToolCallView,
@@ -93,12 +94,7 @@ export async function executeV2Trim(
     }
     const retentionLine = formatRetentionFeedback(
       retention,
-      source.messages.flatMap(message =>
-        v2ToolCalls(message).map(call => ({
-          ref: call.ref,
-          tool: call.tool.name,
-        })),
-      ),
+      v2RetentionCalls(source.messages),
     );
 
     const omissions: PlannedOmission[] = [];

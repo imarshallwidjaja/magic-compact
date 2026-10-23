@@ -13,10 +13,11 @@ import {
 import { trimWouldChangeContent } from "../src/compact/prune";
 import server from "../src/host-v1";
 import {
+  commandRetentionPolicy,
   decideRetentionWith,
   percentThreshold,
+  retentionWithoutCandidates,
   taskAwareRetentionPolicy,
-  trimRetentionPolicy,
 } from "../src/policy/retention";
 import {
   decideRetention,
@@ -45,6 +46,7 @@ import {
   classifyRetention,
   excerpt,
   formatKeepThresholdPercent,
+  RETENTION_FAILURE_GUIDANCE,
   RETENTION_KEEP_THRESHOLD,
   RETENTION_KEEP_THRESHOLD_PERCENT_ENV,
   RETENTION_MAX_CONCURRENCY,
@@ -1573,161 +1575,268 @@ describe("retention keep threshold", () => {
     },
   );
 
-  test("an explicit --threshold wins without reading the environment percent", () => {
-    const reads: string[] = [];
-    const trapped = (percent: string) => ({
-      get TYPESAFE_API_KEY() {
-        reads.push("key");
-        return "sk";
-      },
-      get [RETENTION_KEEP_THRESHOLD_PERCENT_ENV]() {
-        reads.push("percent");
-        return percent;
-      },
-    });
-    for (const keepThreshold of [0, 0.705, 1]) {
+  describe.each(["compact", "trim"] as const)("/magic-%s", command => {
+    test("an explicit --threshold wins without reading the environment percent", () => {
+      const reads: string[] = [];
+      const trapped = (percent: string) => ({
+        get TYPESAFE_API_KEY() {
+          reads.push("key");
+          return "sk";
+        },
+        get [RETENTION_KEEP_THRESHOLD_PERCENT_ENV]() {
+          reads.push("percent");
+          return percent;
+        },
+      });
+      for (const keepThreshold of [0, 0.705, 1]) {
+        reads.length = 0;
+        expect(
+          commandRetentionPolicy(
+            command,
+            { keepTurns: 2, heuristic: false, keepThreshold, truncate: true },
+            trapped("not a percent"),
+          ),
+        ).toEqual({
+          mode: "task-aware",
+          apiKey: "sk",
+          keepThreshold,
+          invocation: { command, keepTurns: 2, keepThreshold, truncate: true },
+        });
+        expect(reads).toEqual(["key"]);
+      }
       reads.length = 0;
       expect(
-        trimRetentionPolicy(
-          { keepTurns: 2, heuristic: false, keepThreshold, truncate: true },
-          trapped("not a percent"),
+        commandRetentionPolicy(
+          command,
+          { keepTurns: 0, heuristic: false, truncate: false },
+          trapped("70"),
         ),
-      ).toEqual({
-        mode: "task-aware",
-        apiKey: "sk",
-        keepThreshold,
-        trim: { keepTurns: 2, keepThreshold, truncate: true },
+      ).toMatchObject({
+        keepThreshold: 0.7,
+        invocation: { command, truncate: false },
       });
-      expect(reads).toEqual(["key"]);
-    }
-    reads.length = 0;
-    expect(
-      trimRetentionPolicy(
-        { keepTurns: 0, heuristic: false, truncate: false },
-        trapped("70"),
-      ),
-    ).toMatchObject({ keepThreshold: 0.7, trim: { truncate: false } });
-    expect(reads).toEqual(["percent", "key"]);
-    expect(() =>
-      trimRetentionPolicy(
-        { keepTurns: 0, heuristic: false, truncate: false },
-        trapped("70%"),
-      ),
-    ).toThrow(RETENTION_KEEP_THRESHOLD_PERCENT_ENV);
-    reads.length = 0;
-    expect(
-      trimRetentionPolicy({ keepTurns: 1, heuristic: true }, trapped("70%")),
-    ).toEqual({ mode: "heuristic" });
-    expect(reads).toEqual([]);
-    expect(
-      trimRetentionPolicy(
-        { keepTurns: 0, heuristic: false, truncate: false },
-        { TYPESAFE_API_KEY: "sk" },
-      ).keepThreshold,
-    ).toBe(RETENTION_KEEP_THRESHOLD);
-  });
+      expect(reads).toEqual(["percent", "key"]);
+      expect(() =>
+        commandRetentionPolicy(
+          command,
+          { keepTurns: 0, heuristic: false, truncate: false },
+          trapped("70%"),
+        ),
+      ).toThrow(RETENTION_KEEP_THRESHOLD_PERCENT_ENV);
+      reads.length = 0;
+      expect(
+        commandRetentionPolicy(
+          command,
+          { keepTurns: 1, heuristic: true },
+          trapped("70%"),
+        ),
+      ).toEqual({ mode: "heuristic" });
+      expect(reads).toEqual([]);
+      expect(
+        commandRetentionPolicy(
+          command,
+          { keepTurns: 0, heuristic: false, truncate: false },
+          { TYPESAFE_API_KEY: "sk" },
+        ).keepThreshold,
+      ).toBe(RETENTION_KEEP_THRESHOLD);
+    });
 
-  test("a /magic-trim failure suggests its own arguments within the toast limit", async () => {
-    const refuse = async (
-      trim: { keepTurns: number; keepThreshold?: number; truncate: boolean },
-      summary: string,
-      respond: (call: number) => Response,
-    ) => {
-      let calls = 0;
-      return failure(
-        decideRetentionWith(
+    test("an invalid environment percent names this command's own retry", () => {
+      const error = thrown(() =>
+        commandRetentionPolicy(
+          command,
+          { keepTurns: 3, heuristic: false, truncate: false },
+          percentEnv("60%"),
+        ),
+      ) as RetentionClassificationError;
+      expect(error.kind).toBe("invalid-threshold-percent");
+      expect(error.message).toContain(RETENTION_KEEP_THRESHOLD_PERCENT_ENV);
+      expect(error.message).toContain(`Run /magic-${command} 3 --heuristic`);
+      expect(error.message).not.toContain("60%");
+    });
+
+    test("a token-limit failure suggests its own arguments within the toast limit", async () => {
+      const refuse = async (
+        invocation: {
+          keepTurns: number;
+          keepThreshold?: number;
+          truncate: boolean;
+        },
+        summary: string,
+        respond: (call: number) => Response,
+      ) => {
+        let calls = 0;
+        return failure(
+          decideRetentionWith(
+            { latestUserRequest: "Ship it.", candidates: [candidate("a")] },
+            {
+              mode: "task-aware",
+              apiKey: "key",
+              keepThreshold: invocation.keepThreshold ?? 0.6,
+              invocation: { command, ...invocation },
+              fetch: async () => respond(calls++),
+            },
+            async () => summary,
+          ),
+        );
+      };
+      // What --heuristic does differs: trim then makes no request, while
+      // compact still summarizes its turns with the model and says so.
+      const heuristic = (turns: string) =>
+        command === "trim"
+          ? `Run /magic-trim${turns} --heuristic to trim without task-aware keep protection.`
+          : `Run /magic-compact${turns} --heuristic to compact without task-aware keep protection (turn summaries are still generated).`;
+      const limit = () => tokenLimitResponse();
+      const long = "s".repeat(20_000);
+      const plain = await refuse(
+        { keepTurns: 3, keepThreshold: 0.601, truncate: false },
+        long,
+        limit,
+      );
+      expect(plain.message).toContain(
+        `Run /magic-${command} 3 --threshold 60.1 --truncate to retry`,
+      );
+      expect(plain.message).toContain(
+        `or /magic-${command} 3 --heuristic to ${command} without task-aware keep protection`,
+      );
+      expect(plain.message).toContain(
+        "--threshold does not reduce the Jev request size.",
+      );
+      const defaults = await refuse(
+        { keepTurns: 0, truncate: false },
+        long,
+        limit,
+      );
+      expect(defaults.message).toContain(
+        `Run /magic-${command} --truncate to retry`,
+      );
+      const exhausted = await refuse(
+        { keepTurns: 3, keepThreshold: 0.7, truncate: true },
+        long,
+        limit,
+      );
+      expect(exhausted.message).toContain("the retry limit was exceeded");
+      expect(exhausted.message).toEndWith(heuristic(" 3"));
+      // With or without the flag, a summary within the excerpt has no shorter
+      // retry and no --truncate suggestion.
+      const unavailable = [
+        await refuse({ keepTurns: 3, truncate: true }, "short", limit),
+        await refuse({ keepTurns: 3, truncate: false }, "short", limit),
+      ];
+      for (const error of unavailable) {
+        expect(error.diagnostics?.truncation).toBe("unavailable");
+        expect(error.message).toContain(
+          "--truncate cannot shorten the request",
+        );
+        expect(error.message).not.toContain("--truncate to retry");
+        expect(error.message).toEndWith(heuristic(" 3"));
+      }
+      const unauthorized = await refuse(
+        { keepTurns: 3, truncate: true },
+        long,
+        () => new Response("", { status: 401 }),
+      );
+      expect(unauthorized.message).toContain("TYPESAFE_API_KEY");
+      expect(unauthorized.message).not.toContain("--threshold");
+      expect(unauthorized.message).toContain(
+        `Run /magic-${command} 3 --heuristic`,
+      );
+      // The longest arguments still leave both commands whole in a toast, and
+      // the threshold is never shortened or rounded.
+      const longest: RetentionClassificationError[] = [];
+      for (const keepThreshold of [
+        1.23456789012345e-12,
+        1e-23,
+        Number.MIN_VALUE,
+        0.9999999999999999,
+      ]) {
+        const error = await refuse(
+          {
+            keepTurns: Number.MAX_SAFE_INTEGER,
+            keepThreshold,
+            truncate: false,
+          },
+          long,
+          limit,
+        );
+        expect(error.message).toContain(
+          `Run /magic-${command} ${Number.MAX_SAFE_INTEGER} --threshold ${formatKeepThresholdPercent(keepThreshold)} --truncate`,
+        );
+        expect(error.message).toContain(
+          `or /magic-${command} ${Number.MAX_SAFE_INTEGER} --heuristic`,
+        );
+        expect(error.message).toContain("--threshold does not");
+        longest.push(error);
+      }
+      for (const error of [plain, exhausted, ...unavailable, ...longest]) {
+        expect(error.message.length).toBeLessThan(700);
+        expect(error.kind).toBe("token-limit");
+      }
+      // Only /magic-compact says its turns are still summarized.
+      for (const error of [plain, exhausted, ...unavailable, ...longest]) {
+        expect(/still (generated|summarized)/.test(error.message)).toBe(
+          command === "compact",
+        );
+      }
+    });
+
+    test("a session-summary failure ends in this command's own heuristic advice", async () => {
+      const summaryFailure = async (error: Error, keepTurns: number) => {
+        const caught = await decideRetentionWith(
           { latestUserRequest: "Ship it.", candidates: [candidate("a")] },
           {
             mode: "task-aware",
             apiKey: "key",
-            keepThreshold: trim.keepThreshold ?? 0.6,
-            trim,
-            fetch: async () => respond(calls++),
+            invocation: { command, keepTurns, truncate: false },
+            fetch: async () => {
+              throw new Error("unexpected request");
+            },
           },
-          async () => summary,
-        ),
+          async () => {
+            throw error;
+          },
+        ).then(
+          () => undefined,
+          (rejected: unknown) => rejected,
+        );
+        // The same error, not a copy: its type and stage are kept.
+        expect(caught).toBe(error);
+        return error;
+      };
+      const advice = (turns: string) =>
+        command === "trim"
+          ? `No tool content was changed. Run /magic-trim${turns} --heuristic to trim without classification.`
+          : `No tool content was changed. Run /magic-compact${turns} --heuristic to compact without classification (turn summaries are still generated).`;
+
+      const provider = await summaryFailure(
+        new SessionSummaryError("provider", 429),
+        3,
       );
-    };
-    const limit = () => tokenLimitResponse();
-    const long = "s".repeat(20_000);
-    const plain = await refuse(
-      { keepTurns: 3, keepThreshold: 0.601, truncate: false },
-      long,
-      limit,
-    );
-    expect(plain.message).toContain(
-      "Run /magic-trim 3 --threshold 60.1 --truncate to retry",
-    );
-    expect(plain.message).toContain("or /magic-trim 3 --heuristic to trim");
-    expect(plain.message).toContain(
-      "--threshold does not reduce the Jev request size.",
-    );
-    const defaults = await refuse(
-      { keepTurns: 0, truncate: false },
-      long,
-      limit,
-    );
-    expect(defaults.message).toContain("Run /magic-trim --truncate to retry");
-    const exhausted = await refuse(
-      { keepTurns: 3, keepThreshold: 0.7, truncate: true },
-      long,
-      limit,
-    );
-    expect(exhausted.message).toContain("the retry limit was exceeded");
-    expect(exhausted.message).toEndWith(
-      "Run /magic-trim 3 --heuristic to trim without task-aware keep protection.",
-    );
-    // With or without the flag, a summary within the excerpt has no shorter
-    // retry and no --truncate suggestion.
-    const unavailable = [
-      await refuse({ keepTurns: 3, truncate: true }, "short", limit),
-      await refuse({ keepTurns: 3, truncate: false }, "short", limit),
-    ];
-    for (const error of unavailable) {
-      expect(error.diagnostics?.truncation).toBe("unavailable");
-      expect(error.message).toContain("--truncate cannot shorten the request");
-      expect(error.message).not.toContain("--truncate to retry");
-      expect(error.message).toEndWith(
-        "Run /magic-trim 3 --heuristic to trim without task-aware keep protection.",
+      expect(provider).toBeInstanceOf(SessionSummaryError);
+      expect((provider as SessionSummaryError).stage).toBe("provider");
+      expect(provider.message).toBe(
+        `Task-aware retention session summary failed (provider 429). ${advice(" 3")}`,
       );
-    }
-    const unauthorized = await refuse(
-      { keepTurns: 3, truncate: true },
-      long,
-      () => new Response("", { status: 401 }),
-    );
-    expect(unauthorized.message).toContain("TYPESAFE_API_KEY");
-    expect(unauthorized.message).not.toContain("--threshold");
-    // The longest arguments still leave both commands whole in a toast, and
-    // the threshold is never shortened or rounded.
-    const longest: RetentionClassificationError[] = [];
-    for (const keepThreshold of [
-      1.23456789012345e-12,
-      1e-23,
-      Number.MIN_VALUE,
-      0.9999999999999999,
-    ]) {
-      const error = await refuse(
-        { keepTurns: Number.MAX_SAFE_INTEGER, keepThreshold, truncate: false },
-        long,
-        limit,
+      const budget = await summaryFailure(new SessionSummaryError("budget"), 0);
+      expect(budget.message).toEndWith(advice(""));
+      expect(budget.message).not.toContain(
+        command === "trim" ? "/magic-compact" : "/magic-trim",
       );
-      expect(error.message).toContain(
-        `Run /magic-trim ${Number.MAX_SAFE_INTEGER} --threshold ${formatKeepThresholdPercent(keepThreshold)} --truncate`,
+      for (const error of [provider, budget]) {
+        expect(error.message.length).toBeLessThan(700);
+      }
+      // An error the plugin did not write is not edited.
+      const foreign = await summaryFailure(
+        new Error(`provider said ${RETENTION_FAILURE_GUIDANCE}`),
+        3,
       );
-      expect(error.message).toContain(
-        `or /magic-trim ${Number.MAX_SAFE_INTEGER} --heuristic`,
+      expect(foreign.message).toBe(
+        `provider said ${RETENTION_FAILURE_GUIDANCE}`,
       );
-      expect(error.message).toContain("--threshold does not");
-      longest.push(error);
-    }
-    for (const error of [plain, exhausted, ...unavailable, ...longest]) {
-      expect(error.message.length).toBeLessThan(700);
-      expect(error.kind).toBe("token-limit");
-    }
+    });
   });
 
-  test("a /magic-compact token-limit refusal offers --truncate only when the summary is long", async () => {
+  test("a failure without a command context suggests /magic-trim without arguments", async () => {
     const refuse = (summary: string) =>
       failure(
         decideRetentionWith(
@@ -1748,6 +1857,49 @@ describe("retention keep threshold", () => {
     expect(short.message).toEndWith(
       "Run /magic-trim --heuristic to trim without task-aware keep protection.",
     );
+  });
+
+  test("a command without candidates reports its mode and threshold without a request", async () => {
+    const quiet = {
+      mode: "task-aware",
+      apiKey: undefined,
+      invocation: {
+        command: "compact",
+        keepTurns: 0,
+        keepThreshold: 0,
+        truncate: true,
+      },
+      keepThreshold: 0,
+      fetch: async () => {
+        throw new Error("unexpected request");
+      },
+    } as const;
+    expect(retentionWithoutCandidates(quiet)).toEqual({
+      mode: "task-aware",
+      evaluated: 0,
+      keep: new Set(),
+      keepThreshold: 0,
+      truncated: 0,
+    });
+    await expect(
+      decideRetentionWith(
+        { latestUserRequest: "", candidates: [] },
+        quiet,
+        async () => {
+          throw new Error("unexpected summary");
+        },
+      ),
+    ).resolves.toEqual(retentionWithoutCandidates(quiet));
+    expect(retentionWithoutCandidates({ mode: "heuristic" })).toBe(
+      HEURISTIC_RETENTION,
+    );
+    expect(() =>
+      retentionWithoutCandidates({
+        mode: "task-aware",
+        apiKey: undefined,
+        keepThreshold: 2,
+      }),
+    ).toThrow(RetentionClassificationError);
   });
 
   test("the policy rejects an invalid threshold before the session summary", async () => {

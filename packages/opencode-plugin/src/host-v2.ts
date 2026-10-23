@@ -23,10 +23,7 @@ import {
   READ_OMITTED_CONTENT_ID_DESCRIPTION,
 } from "./compact/constants";
 import { getCompactionCount } from "./compact/session";
-import {
-  taskAwareRetentionPolicy,
-  trimRetentionPolicy,
-} from "./policy/retention";
+import { commandRetentionPolicy } from "./policy/retention";
 import { recordAssistantCompletion } from "./stats/events";
 import { statsSummaryMessage } from "./stats/constants";
 import { omissionReadDiagnostic, readOmittedContent } from "./storage/omission";
@@ -128,16 +125,20 @@ export async function setup(
       description: COMMAND_DESCRIPTIONS[COMPACT_COMMAND],
       execute: async ({ sessionID, prompt }) => {
         const result = await commandResult("Magic Compact", async () => {
-          const keepTurns = parseMagicCompactArguments(prompt.text);
+          const args = parseMagicCompactArguments(prompt.text);
           // Read per command and reject an invalid threshold before session
           // work.
-          const retention = taskAwareRetentionPolicy(process.env);
+          const retention = commandRetentionPolicy(
+            "compact",
+            args,
+            process.env,
+          );
           const host = await connect(sessionID);
           const { successor, outcome } = await executeV2Compact(
             host,
             owned,
             sessionID,
-            keepTurns,
+            args.keepTurns,
             { retention, controlTimeoutMs },
           );
           return successor
@@ -153,7 +154,7 @@ export async function setup(
       execute: async ({ sessionID, prompt }) => {
         const result = await commandResult("Magic Trim", async () => {
           const args = parseMagicTrimArguments(prompt.text);
-          const retention = trimRetentionPolicy(args, process.env);
+          const retention = commandRetentionPolicy("trim", args, process.env);
           const host = await connect(sessionID);
           const { successor, outcome } = await executeV2Trim(
             host,

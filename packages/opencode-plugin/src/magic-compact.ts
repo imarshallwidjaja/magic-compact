@@ -51,12 +51,18 @@ import {
   findRetentionCandidates,
   HEURISTIC_RETENTION,
   retentionFeedback,
-  type RetentionPlan,
+  retentionWithoutCandidates,
   type RetentionPolicy,
 } from "./retention/retention";
 import { PluginMessageError } from "./policy/feedback";
 
-export { COMPACT_NOOP, compactSuccess } from "./commands";
+export {
+  COMPACT_ARGUMENTS_ERROR,
+  COMPACT_NOOP,
+  COMPACT_THRESHOLD_ERROR,
+  compactSuccess,
+  parseMagicCompactArguments,
+} from "./commands";
 export { COMPACT_INSUFFICIENT_SAVINGS };
 const COMMAND = "Magic Compact";
 
@@ -67,8 +73,8 @@ type CompactionSelection = {
 };
 
 export type MagicCompactExecutionOptions = {
-  // The command always uses task-aware retention; heuristic exists for tests
-  // of the unchanged tool rules.
+  // Heuristic skips only the retention step; turn summaries are generated
+  // either way.
   retention: RetentionPolicy;
   controlTimeoutMs?: number;
 };
@@ -96,7 +102,7 @@ export async function executeMagicCompact(
   let successor: Successor;
   let summarizedTurnCount: number;
   let preserved: PreservedTurns;
-  let retention: RetentionPlan = HEURISTIC_RETENTION;
+  let retentionLine: string;
 
   try {
     const outcome = await withExclusiveSource(COMMAND, sessionID, async () => {
@@ -111,24 +117,33 @@ export async function executeMagicCompact(
         requested: keepTurns,
         preserved: plan.preservedTurnCount,
       };
-      if (plan.summarizedTurns.length === 0) return null;
+      if (plan.summarizedTurns.length === 0) {
+        retentionLine = retentionFeedback(
+          retentionWithoutCandidates(options.retention),
+        );
+        return null;
+      }
 
       const before = countModelFacingContentTokens(source.messages);
-      if (options.retention.mode === "task-aware") {
-        // Opaque summary-bearing turns are never pruned, so they hold no
-        // candidates. Retention runs before per-turn generation.
-        retention = await decideRetention(
-          v2,
-          source.session,
-          source.messages,
-          await findRetentionCandidates(
-            source.messages,
-            plan.summarizedTurns.filter(turn => !turnHasPersistedSummary(turn)),
-          ),
-          options.retention,
-          { controlTimeoutMs },
-        );
-      }
+      // Opaque summary-bearing turns are never pruned, so they hold no
+      // candidates. Retention runs before per-turn generation.
+      const retention =
+        options.retention.mode === "task-aware"
+          ? await decideRetention(
+              v2,
+              source.session,
+              source.messages,
+              await findRetentionCandidates(
+                source.messages,
+                plan.summarizedTurns.filter(
+                  turn => !turnHasPersistedSummary(turn),
+                ),
+              ),
+              options.retention,
+              { controlTimeoutMs },
+            )
+          : HEURISTIC_RETENTION;
+      retentionLine = retentionFeedback(retention, source.messages);
       const summaries = await generateCompactionSummaries(
         v2,
         source.session,
@@ -178,6 +193,7 @@ export async function executeMagicCompact(
                 after.tokens,
                 selection.turns.length,
                 preserved,
+                retentionLine,
               ),
               ignored: true,
               metadata: STATS_METADATA,
@@ -222,7 +238,7 @@ export async function executeMagicCompact(
     if (outcome === null) {
       await toastFeedback.showTerminal({
         title: COMMAND,
-        message: noopFeedback(preserved!),
+        message: `${noopFeedback(preserved!)} ${retentionLine!}`,
         variant: "info",
         duration: 5000,
       });
@@ -236,7 +252,7 @@ export async function executeMagicCompact(
 
   await toastFeedback.showTerminal({
     title: COMMAND,
-    message: `Compacted ${summarizedTurnCount!} request turn(s) into successor session ${successor.session.id}. ${preservedTurnsFeedback(preserved!)} ${retentionFeedback(retention)}`,
+    message: `Compacted ${summarizedTurnCount!} request turn(s) into successor session ${successor.session.id}. ${preservedTurnsFeedback(preserved!)} ${retentionLine!}`,
     variant: "info",
     duration: 5000,
   });

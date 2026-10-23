@@ -29,10 +29,7 @@ import { executeMagicCompact } from "./magic-compact";
 import { executeMagicRecover } from "./magic-recover";
 import { STATS_SUCCESS, executeMagicStats } from "./magic-stats";
 import { executeMagicTrim } from "./magic-trim";
-import {
-  taskAwareRetentionPolicy,
-  trimRetentionPolicy,
-} from "./policy/retention";
+import { commandRetentionPolicy } from "./policy/retention";
 import { rejectNativeCompactionOfSummaryFork } from "./retention/summary";
 import { omissionReadDiagnostic, readOmittedContent } from "./storage/omission";
 import { handleStatsEvent } from "./stats/events";
@@ -114,13 +111,16 @@ const server: Plugin = async input => {
       if (command.command === COMPACT_COMMAND) {
         const { keepTurns, retention, v2 } = await preflight(
           "Magic Compact",
-          async () => ({
-            keepTurns: parseMagicCompactArguments(command.arguments),
-            // Read per command and reject an invalid threshold before session
-            // work.
-            retention: taskAwareRetentionPolicy(process.env),
-            v2: await listener(),
-          }),
+          async () => {
+            const args = parseMagicCompactArguments(command.arguments);
+            return {
+              keepTurns: args.keepTurns,
+              // Read per command and reject an invalid threshold before
+              // session work.
+              retention: commandRetentionPolicy("compact", args, process.env),
+              v2: await listener(),
+            };
+          },
         );
 
         // Shows its own progress and terminal toasts.
@@ -143,7 +143,7 @@ const server: Plugin = async input => {
             const args = parseMagicTrimArguments(command.arguments);
             return {
               keepTurns: args.keepTurns,
-              retention: trimRetentionPolicy(args, process.env),
+              retention: commandRetentionPolicy("trim", args, process.env),
               v2: await listener(),
             };
           },

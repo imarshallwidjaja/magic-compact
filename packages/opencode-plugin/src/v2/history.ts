@@ -82,6 +82,19 @@ export function v2RetentionTurns(
   }));
 }
 
+// Every tool call of the source by reference and tool name, whatever its
+// state: what a command's kept-call breakdown counts from.
+export function v2RetentionCalls(
+  messages: readonly V2Message[],
+): Array<{ ref: string; tool: string }> {
+  return messages.flatMap(message =>
+    v2ToolCalls(message).map(call => ({
+      ref: call.ref,
+      tool: call.tool.name,
+    })),
+  );
+}
+
 // The text output the rules judge: completed text content in order. File
 // content is not text output; it stays in place whatever the rules decide.
 export function v2ToolCallView(tool: V2Tool): ToolCallView | null {
