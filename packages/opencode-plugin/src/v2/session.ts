@@ -11,6 +11,7 @@ import {
   SourceNotAtRestError,
   successorFailure,
   SuccessorVerificationError,
+  undeliveredBackgroundRefusal,
   unfinishedHistoryRefusal,
   type SuccessorCommand,
   type SuccessorStage,
@@ -26,6 +27,7 @@ import { deleteStats, readStats, writeStats } from "../storage/stats";
 import { attemptWithinDeadline, isRecord } from "../util";
 import type { V2Host } from "./host";
 import { PluginMessageError } from "../policy/feedback";
+import { abandonedDeliveryJob, type RecoveryRecord } from "../policy/recovery";
 
 export type V2Message = SessionMessageInfo;
 
@@ -60,7 +62,11 @@ async function within<T>(
 
 // The complete history in stored order. Pages are read oldest first, and the
 // result must equal the unsanitized export, so a host-side filter or a page
-// boundary that loses or reorders records fails instead of being copied.
+// boundary that loses or reorders records fails instead of being copied. The
+// one record OpenCode 2.0.28 leaves out of an export (and drops from an
+// import) is an assistant message without a completion time, such as a step
+// the host stopped without closing; the pages keep it, so the at-rest check
+// can name it.
 export async function readV2History(
   host: V2Host,
   sessionID: string,
@@ -87,7 +93,11 @@ export async function readV2History(
   const exported = await read(signal =>
     host.session.export({ sessionID, sanitize: false }, { signal }),
   );
-  if (!isDeepStrictEqual(json(exported.messages), json(messages))) {
+  const exportable = messages.filter(
+    message =>
+      message.type !== "assistant" || message.time.completed !== undefined,
+  );
+  if (!isDeepStrictEqual(json(exported.messages), json(exportable))) {
     throw new Error("Session history pages did not match its export.");
   }
   return messages;
@@ -122,6 +132,36 @@ export async function readV2SourceAtRest(
   sessionID: string,
   controlTimeoutMs: number,
 ): Promise<V2Source> {
+  return (
+    await inspectV2Source(host, command, sessionID, controlTimeoutMs, false)
+  ).source;
+}
+
+// An unfinished record or undelivered background launch in a subagent
+// session's own history. Recovery never writes or copies a subagent session,
+// so it names the record and leaves it as it is.
+export type V2SubagentRecord = { sessionID: string; messageID: string };
+
+// The source as `/magic-recover` reads it: every live check of
+// `readV2SourceAtRest` still refuses, including running background jobs, but
+// unfinished stored records and undelivered background results are left for
+// the caller, because running the command declared their work abandoned.
+export async function readV2RecoverableSource(
+  host: V2Host,
+  command: SuccessorCommand,
+  sessionID: string,
+  controlTimeoutMs: number,
+): Promise<{ source: V2Source; subagentRecords: V2SubagentRecord[] }> {
+  return inspectV2Source(host, command, sessionID, controlTimeoutMs, true);
+}
+
+async function inspectV2Source(
+  host: V2Host,
+  command: SuccessorCommand,
+  sessionID: string,
+  controlTimeoutMs: number,
+  abandonedHistory: boolean,
+): Promise<{ source: V2Source; subagentRecords: V2SubagentRecord[] }> {
   const read = <T>(request: (signal: AbortSignal) => Promise<T>) =>
     within(command, controlTimeoutMs, request);
   const notAtRest = (reason: string) =>
@@ -157,6 +197,7 @@ export async function readV2SourceAtRest(
 
   const active = await read(signal => host.session.active({ signal }));
   const jobs: BackgroundJob[] = [];
+  const subagentRecords: V2SubagentRecord[] = [];
   for (const [id, history] of tree) {
     const child = id !== sessionID;
     if (active[id] !== undefined) {
@@ -166,20 +207,43 @@ export async function readV2SourceAtRest(
     }
     // Not active, so what remains is history the host never finished.
     const unfinished = history.flatMap(unfinishedRecord);
-    if (unfinished.length > 0) {
-      throw unfinishedHistoryRefusal(
-        command,
-        unfinished,
-        child ? id : undefined,
+    const background = backgroundJobs(history);
+    jobs.push(...background.jobs);
+    if (!abandonedHistory) {
+      if (unfinished.length > 0) {
+        throw unfinishedHistoryRefusal(
+          command,
+          unfinished,
+          child ? id : undefined,
+        );
+      }
+      const [first] = background.undelivered;
+      if (first !== undefined) {
+        throw first.jobID === undefined
+          ? notAtRest(
+              "a background command or subagent cannot be matched to its result",
+            )
+          : undeliveredBackgroundRefusal(
+              command,
+              "a background command or subagent has not delivered its result yet",
+            );
+      }
+    } else if (child) {
+      subagentRecords.push(
+        ...[
+          ...unfinished.map(record => record.messageID),
+          ...background.undelivered.map(launch => launch.messageID),
+        ].map(messageID => ({ sessionID: id, messageID })),
       );
     }
-    const started = deliveredBackgroundJobs(history);
-    if (started === undefined) {
-      throw notAtRest(
-        "a background command or subagent has not delivered its result yet",
-      );
-    }
-    jobs.push(...started);
+    // An abandoned job must have stopped too.
+    jobs.push(
+      ...background.undelivered.flatMap(launch =>
+        launch.jobID === undefined
+          ? []
+          : [{ tool: launch.tool, id: launch.jobID }],
+      ),
+    );
     const inbox = await read(signal =>
       host.session.inbox.list({ sessionID: id }, { signal }),
     );
@@ -229,7 +293,7 @@ export async function readV2SourceAtRest(
   const instructions = await read(signal =>
     host.session.instructions.entry.list({ sessionID }, { signal }),
   );
-  return { session, messages, instructions };
+  return { source: { session, messages, instructions }, subagentRecords };
 }
 
 async function readHistoryOrRefuse(
@@ -250,15 +314,31 @@ async function readHistoryOrRefuse(
   }
 }
 
+type V2Assistant = Extract<V2Message, { type: "assistant" }>;
+
+// The host's own test of an unfinished record: an assistant message with
+// neither a completion time nor an error, a tool call that is neither
+// completed nor an error, or a compaction or shell record still running.
+export function isUnfinishedV2Assistant(message: V2Assistant): boolean {
+  return message.time.completed === undefined && message.error === undefined;
+}
+
+export function isUnfinishedV2Tool(
+  item: V2Assistant["content"][number],
+): boolean {
+  return (
+    item.type === "tool"
+    && item.state.status !== "completed"
+    && item.state.status !== "error"
+  );
+}
+
 function unfinishedRecord(message: V2Message): UnfinishedHistoryRecord[] {
   switch (message.type) {
     case "assistant": {
-      const unfinished =
-        message.time.completed === undefined && message.error === undefined;
+      const unfinished = isUnfinishedV2Assistant(message);
       const tools = message.content.flatMap(item =>
-        item.type === "tool"
-        && item.state.status !== "completed"
-        && item.state.status !== "error"
+        item.type === "tool" && isUnfinishedV2Tool(item)
           ? [{ name: item.name, callID: item.id, state: item.state.status }]
           : [],
       );
@@ -292,29 +372,56 @@ type BackgroundJob = { tool: "shell" | "subagent"; id: string };
 // foreground call the user detached afterwards (OpenCode 2.0.28 gives both the
 // same running result and leaves the original input unchanged). Until the
 // notification is stored, a successor would lose the result, so every such
-// call must be matched by the notification for its job. Returns every
-// background job the history started, or undefined when one is undelivered.
-// A cancellation notice is written when the cancel is accepted, so the caller
-// still checks that each job has stopped.
+// call must be matched by a notification for its job, one per call: in stored
+// order a notification settles the oldest launch of its job that is still
+// open, and one with no open launch settles nothing, so a job started twice
+// owes two. A call that `/magic-recover` recorded as never delivered is
+// abandoned, owes none, and settles only itself.
+// Returns the jobs that owe no notification, which the caller checks have
+// stopped (a cancellation notice is written when the cancel is accepted), and
+// every launch still owed one; a launch without a job ID can never be linked.
 const NOTIFICATION_STATES = new Set(["completed", "cancelled", "error"]);
 
-function deliveredBackgroundJobs(
-  messages: V2Message[],
-): BackgroundJob[] | undefined {
-  const jobs: BackgroundJob[] = [];
-  const delivered = new Set<string>();
-  for (const message of messages) {
-    if (message.type !== "synthetic" || !isRecord(message.metadata)) continue;
-    const { source, shellID, childID, state } = message.metadata;
-    if (typeof state === "string" && !NOTIFICATION_STATES.has(state)) continue;
-    if (source === "shell" && typeof shellID === "string")
-      delivered.add(`shell:${shellID}`);
-    if (source === "subagent" && typeof childID === "string")
-      delivered.add(`subagent:${childID}`);
+export type V2BackgroundLaunch = {
+  messageID: string;
+  // The call's position in the message's content.
+  index: number;
+  tool: BackgroundJob["tool"];
+  jobID: string | undefined;
+};
+
+// The job a notification message reports, as `tool:jobID`.
+function notifiedJob(message: V2Message): string | undefined {
+  if (message.type !== "synthetic" || !isRecord(message.metadata)) {
+    return undefined;
   }
+  const { source, shellID, childID, state } = message.metadata;
+  if (typeof state === "string" && !NOTIFICATION_STATES.has(state)) {
+    return undefined;
+  }
+  if (source === "shell" && typeof shellID === "string")
+    return `shell:${shellID}`;
+  if (source === "subagent" && typeof childID === "string")
+    return `subagent:${childID}`;
+  return undefined;
+}
+
+export function backgroundJobs(messages: V2Message[]): {
+  jobs: BackgroundJob[];
+  undelivered: V2BackgroundLaunch[];
+} {
+  const launches: V2BackgroundLaunch[] = [];
+  const open = new Map<string, V2BackgroundLaunch[]>();
+  const settled = new Set<V2BackgroundLaunch>();
   for (const message of messages) {
+    const notified = notifiedJob(message);
+    if (notified !== undefined) {
+      const launch = open.get(notified)?.shift();
+      if (launch !== undefined) settled.add(launch);
+      continue;
+    }
     if (message.type !== "assistant") continue;
-    for (const item of message.content) {
+    for (const [index, item] of message.content.entries()) {
       if (
         item.type !== "tool"
         || item.state.status !== "completed"
@@ -329,20 +436,34 @@ function deliveredBackgroundJobs(
       ) {
         continue;
       }
-      const jobID =
+      const tool = item.name;
+      const id =
         item.name === "shell" ? metadata["shellID"] : metadata["sessionID"];
-      // A background call this version cannot link to its notification is
-      // treated as undelivered.
-      if (
-        typeof jobID !== "string"
-        || !delivered.has(`${item.name}:${jobID}`)
-      ) {
-        return undefined;
+      const jobID = typeof id === "string" ? id : undefined;
+      const launch: V2BackgroundLaunch = {
+        messageID: message.id,
+        index,
+        tool,
+        jobID,
+      };
+      launches.push(launch);
+      if (jobID === undefined) continue;
+      if (abandonedDeliveryJob(metadata) === jobID) {
+        settled.add(launch);
+      } else {
+        const key = `${tool}:${jobID}`;
+        open.set(key, [...(open.get(key) ?? []), launch]);
       }
-      jobs.push({ tool: item.name as BackgroundJob["tool"], id: jobID });
     }
   }
-  return jobs;
+  return {
+    jobs: launches.flatMap(launch =>
+      settled.has(launch) && launch.jobID !== undefined
+        ? [{ tool: launch.tool, id: launch.jobID }]
+        : [],
+    ),
+    undelivered: launches.filter(launch => !settled.has(launch)),
+  };
 }
 
 // The fields a successor copies from its source. A change to any of them, to
@@ -390,13 +511,15 @@ export function isInstructionNotice(message: V2Message): boolean {
 // Successor lineage stored on the new session. `ready` turns true only after
 // the history, instructions, caches and stats are verified and the source was
 // rechecked. `outcome` is the command's result for clients that did not run it.
+// `recovery` lists every source record a recovery closed or left alone.
 export type V2SuccessorMetadata = {
   compactionCount: number;
   successorOf: string;
-  operation: "compact" | "trim";
+  operation: "compact" | "trim" | "recover";
   createdAt: number;
   ready: boolean;
   outcome: string;
+  recovery?: RecoveryRecord[];
 };
 
 export type V2SuccessorRequest = {
@@ -407,6 +530,7 @@ export type V2SuccessorRequest = {
   operation: V2SuccessorMetadata["operation"];
   compactionCount: number;
   outcome: string;
+  recovery?: RecoveryRecord[];
   omissions: PlannedOmission[];
   tokensPruned: number;
   mediaTokensProjected: number;
@@ -503,6 +627,7 @@ export async function createV2Successor(
     createdAt,
     ready,
     outcome: request.outcome,
+    ...(request.recovery === undefined ? {} : { recovery: request.recovery }),
   });
   const successorID = mintV2ID("ses_", createdAt, 1, true);
   const expected = withFreshMessageIDs(

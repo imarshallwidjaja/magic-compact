@@ -24,7 +24,7 @@ export function unwrap<T, E>(response: { data?: T; error?: E }): T {
 export const LISTENER_IDENTITY_AGENT = "magic-compact-listener-identity";
 
 export const LISTENER_REQUIRED =
-  "Magic Compact and Magic Trim need this OpenCode instance's HTTP listener to create a successor session, and it could not be verified. Nothing was changed. Restart OpenCode with `opencode --port 0`, or run `opencode serve` and connect with `opencode attach`. With basic auth, set OPENCODE_SERVER_PASSWORD (and OPENCODE_SERVER_USERNAME if not `opencode`) in the server environment.";
+  "Magic Compact, Magic Trim and Magic Recover need this OpenCode instance's HTTP listener to create a successor session, and it could not be verified. Nothing was changed. Restart OpenCode with `opencode --port 0`, or run `opencode serve` and connect with `opencode attach`. With basic auth, set OPENCODE_SERVER_PASSWORD (and OPENCODE_SERVER_USERNAME if not `opencode`) in the server environment.";
 
 export type ListenerIdentity = {
   readonly description: string;

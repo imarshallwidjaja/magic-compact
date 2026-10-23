@@ -32,6 +32,7 @@ Magic Compact performs per-turn conversation compaction while preserving the con
 
 - `/magic-compact [N]` slash command.
 - `/magic-trim [N] [--threshold P] [--truncate]` or `/magic-trim [N] --heuristic` slash command.
+- `/magic-recover` slash command.
 - `/magic-stats` slash command.
 - `read_omitted_content` tool.
 
@@ -42,7 +43,8 @@ Magic Compact performs per-turn conversation compaction while preserving the con
 - Replace old assistant turns with validated per-turn continuation summaries.
 - Keep useful tool calls visible while removing bulky tool I/O. Task-aware retention (TypeSafe Jev, `TYPESAFE_API_KEY` in the OpenCode server environment) can keep a call whole; `--heuristic` skips it.
 - Store omitted tool I/O outside context but make it retrievable.
-- Write compact and trim results to a verified successor session; never mutate or delete the original session or its child sessions.
+- Write compact, trim and recover results to a verified successor session; never mutate or delete the original session or its child sessions.
+- Compact and trim refuse stored unfinished records and undelivered background results. Only the explicit `/magic-recover` treats them as abandoned: it keeps every live-work check, closes records with the host's native interrupted form and refuses records that have none. Its successor also carries one complete model-visible recovery context (`recoveryContext`) for what those stored forms leave out; a new record kind updates it. Never infer abandonment from age or idleness or route compact or trim through recovery.
 
 ## Task-Aware Retention
 

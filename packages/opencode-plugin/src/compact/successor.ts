@@ -6,9 +6,11 @@ import type {
   Session,
   SessionStatus,
   TextPart,
+  ToolPart,
 } from "@opencode-ai/sdk/v2";
 import { isDeepStrictEqual } from "node:util";
 import type { V2Client } from "../api";
+import { abandonedDeliveryJob, type RecoveryRecord } from "../policy/recovery";
 import {
   commitPlannedOmission,
   copyCache,
@@ -21,7 +23,7 @@ import {
   writeStats,
   type ConversationStats,
 } from "../storage/stats";
-import { attemptWithinDeadline } from "../util";
+import { attemptWithinDeadline, isRecord } from "../util";
 import {
   ForkHistoryError,
   loadHistory,
@@ -35,6 +37,7 @@ import {
   SourceNotAtRestError,
   successorFailure,
   SuccessorVerificationError,
+  undeliveredBackgroundRefusal,
   unfinishedHistoryRefusal,
   type SuccessorCommand,
   type SuccessorStage,
@@ -52,12 +55,14 @@ export {
 
 // Successor lineage stored on the new session. `ready` turns true only after
 // the history, caches and stats are verified and the source was rechecked.
+// `recovery` lists every source record a recovery closed or left alone.
 export type SuccessorMetadata = {
   compactionCount: number;
   successorOf: string;
-  operation: "compact" | "trim";
+  operation: "compact" | "trim" | "recover";
   createdAt: number;
   ready: boolean;
+  recovery?: RecoveryRecord[];
 };
 
 export function sessionRoute(session: Session): HistoryRoute {
@@ -76,6 +81,52 @@ export type SourceState = {
 // for work that is still in flight. A status this version does not define is
 // treated as active.
 export async function readSourceAtRest(
+  v2: V2Client,
+  command: SuccessorCommand,
+  sessionID: string,
+  controlTimeoutMs: number,
+): Promise<SourceState> {
+  const source = await readRecoverableSource(
+    v2,
+    command,
+    sessionID,
+    controlTimeoutMs,
+  );
+  // After the live checks, so work that is actually running is reported as
+  // running; what remains is history the host never finished.
+  assertHistoryFinished(command, source.messages);
+  return source;
+}
+
+// Refuses a history that holds an unfinished record or a background launch
+// still owed its result.
+export function assertHistoryFinished(
+  command: SuccessorCommand,
+  messages: MessageWithParts[],
+): void {
+  const unfinished = messages.flatMap(unfinishedRecord);
+  if (unfinished.length > 0) {
+    throw unfinishedHistoryRefusal(command, unfinished);
+  }
+  const first = undeliveredBackgroundTasks(messages)[0];
+  if (first !== undefined) {
+    throw first.childID === undefined
+      ? new SourceNotAtRestError(
+          command,
+          "a background subagent cannot be matched to its result",
+        )
+      : undeliveredBackgroundRefusal(
+          command,
+          `background subagent session ${first.childID} has not delivered its result to this session (OpenCode 1.18.30 never delivers a cancelled one)`,
+        );
+  }
+}
+
+// The source as `/magic-recover` reads it: every live check of
+// `readSourceAtRest` still refuses, but unfinished stored records and
+// undelivered background results are returned for the caller to close,
+// because running the command declared their work abandoned.
+export async function readRecoverableSource(
   v2: V2Client,
   command: SuccessorCommand,
   sessionID: string,
@@ -164,20 +215,6 @@ export async function readSourceAtRest(
   if (questions.some(request => tree.has(request.sessionID))) {
     throw notAtRest("a question is waiting for an answer");
   }
-  // After the live checks, so work that is actually running is reported as
-  // running; what remains is history the host never finished.
-  const unfinished = messages.flatMap(unfinishedRecord);
-  if (unfinished.length > 0) {
-    throw unfinishedHistoryRefusal(command, unfinished);
-  }
-  const undelivered = undeliveredBackgroundTask(messages);
-  if (undelivered !== undefined) {
-    throw notAtRest(
-      undelivered === ""
-        ? "a background subagent cannot be matched to its result"
-        : `background subagent session ${undelivered} has not delivered its result to this session (OpenCode 1.18.30 never delivers a cancelled one)`,
-    );
-  }
   return { session, messages };
 }
 
@@ -191,12 +228,22 @@ export async function readSourceAtRest(
 // so every started job needs its own later delivery. A message to a job that
 // is still running (`Background task updated`) starts nothing new. A cancelled
 // job is never delivered and the host lists no jobs publicly, so it stays
-// undelivered. Returns the first undelivered child session ID, an empty string
-// for a background call without one, or undefined when every job delivered.
-function undeliveredBackgroundTask(
+// undelivered. A launch `/magic-recover` recorded as never delivered is
+// abandoned and owes no delivery. Returns every launch still owed a delivery
+// in stored order; deliveries settle the oldest open launch of their child
+// first. A launch without a child session ID can never be matched.
+export type UndeliveredBackgroundTask = {
+  messageID: string;
+  part: ToolPart;
+  childID: string | undefined;
+};
+
+export function undeliveredBackgroundTasks(
   messages: MessageWithParts[],
-): string | undefined {
-  const pending = new Map<string, number>();
+): UndeliveredBackgroundTask[] {
+  const launches: UndeliveredBackgroundTask[] = [];
+  const open = new Map<string, UndeliveredBackgroundTask[]>();
+  const delivered = new Set<UndeliveredBackgroundTask>();
   for (const message of messages) {
     for (const part of message.parts) {
       if (part.type === "tool") {
@@ -207,16 +254,21 @@ function undeliveredBackgroundTask(
         ) {
           continue;
         }
-        const childID = part.state.metadata["sessionId"];
-        if (typeof childID !== "string") return "";
+        const sessionId = part.state.metadata["sessionId"];
+        const childID = typeof sessionId === "string" ? sessionId : undefined;
         if (
-          part.state.output.startsWith(
+          childID !== undefined
+          && (part.state.output.startsWith(
             `<task id="${childID}" state="running">\n<summary>Background task updated</summary>`,
           )
+            || abandonedDeliveryJob(part.state.metadata) === childID)
         ) {
           continue;
         }
-        pending.set(childID, (pending.get(childID) ?? 0) + 1);
+        const launch = { messageID: message.info.id, part, childID };
+        launches.push(launch);
+        if (childID !== undefined)
+          open.set(childID, [...(open.get(childID) ?? []), launch]);
       } else if (
         part.type === "text"
         && part.synthetic === true
@@ -226,29 +278,42 @@ function undeliveredBackgroundTask(
           /^<task id="([^"]+)" state="(?:completed|error)">\n/u.exec(
             part.text,
           )?.[1];
-        const count = childID === undefined ? 0 : (pending.get(childID) ?? 0);
-        if (childID !== undefined && count > 0) pending.set(childID, count - 1);
+        const settled =
+          childID === undefined ? undefined : open.get(childID)?.shift();
+        if (settled !== undefined) delivered.add(settled);
       }
     }
   }
-  return [...pending].find(([, count]) => count > 0)?.[0];
+  return launches.filter(launch => !delivered.has(launch));
+}
+
+// The host's own test of an unfinished record: an assistant message with
+// neither a completion time nor an error, or a tool part that is neither
+// completed nor an error.
+export function isUnfinishedAssistant(info: Message): boolean {
+  return (
+    info.role === "assistant"
+    && info.time.completed === undefined
+    && info.error === undefined
+  );
+}
+
+export function isUnfinishedTool(part: Part): part is ToolPart {
+  return (
+    part.type === "tool"
+    && part.state.status !== "completed"
+    && part.state.status !== "error"
+  );
 }
 
 // The stored message's unfinished assistant response or tool calls, if any.
-// The test is the host's own: an assistant message with neither a completion
-// time nor an error, or a tool part that is neither completed nor an error.
 function unfinishedRecord(
   message: MessageWithParts,
 ): UnfinishedHistoryRecord[] {
   const info = message.info;
-  const unfinished =
-    info.role === "assistant"
-    && info.time.completed === undefined
-    && info.error === undefined;
+  const unfinished = isUnfinishedAssistant(info);
   const tools = message.parts.flatMap(part =>
-    part.type === "tool"
-    && part.state.status !== "completed"
-    && part.state.status !== "error"
+    isUnfinishedTool(part)
       ? [{ name: part.tool, callID: part.callID, state: part.state.status }]
       : [],
   );
@@ -302,6 +367,34 @@ export function assertSourceUnchanged(
   if (!same) throw new SourceChangedError(command);
 }
 
+// `assertSourceUnchanged` plus the lifecycle the drift snapshot normalizes
+// away with the other timing fields: whether each assistant message and each
+// timed part has finished. Recovery closes records by exactly that state, so
+// a record the host finished meanwhile must stop it rather than be closed.
+export function assertRecoverySourceUnchanged(
+  command: SuccessorCommand,
+  initial: SourceState,
+  current: SourceState,
+): void {
+  assertSourceUnchanged(command, initial, current);
+  const lifecycle = (messages: MessageWithParts[]) =>
+    messages.map(message => ({
+      completed:
+        message.info.role === "assistant"
+        && message.info.time.completed !== undefined,
+      parts: message.parts.map(part =>
+        "time" in part && isRecord(part.time)
+          ? (part.time as { end?: unknown }).end !== undefined
+          : null,
+      ),
+    }));
+  if (
+    !isDeepStrictEqual(lifecycle(current.messages), lifecycle(initial.messages))
+  ) {
+    throw new SourceChangedError(command);
+  }
+}
+
 // Closed edits applied to a clone of the exact source records. Nothing else in
 // the source changes on its way into the successor.
 export type SuccessorEdit =
@@ -309,6 +402,7 @@ export type SuccessorEdit =
   | { type: "replace-part"; messageID: string; part: Part }
   | { type: "delete-part"; messageID: string; partID: string }
   | { type: "delete-message"; messageID: string }
+  | { type: "replace-info"; info: Message }
   | { type: "append-message"; message: MessageWithParts };
 
 export function applySuccessorEdits(
@@ -329,6 +423,10 @@ export function applySuccessorEdits(
   for (const edit of edits) {
     if (edit.type === "append-message") {
       messages.push(structuredClone(edit.message));
+      continue;
+    }
+    if (edit.type === "replace-info") {
+      find(edit.info.id).info = structuredClone(edit.info);
       continue;
     }
     const message = find(edit.messageID);
@@ -456,6 +554,7 @@ export type SuccessorRequest = {
   omissions: PlannedOmission[];
   tokensPruned: number;
   mediaTokensProjected: number;
+  recovery?: RecoveryRecord[];
   // Rechecks the source after the candidate is complete; throws on drift.
   recheckSource: () => Promise<void>;
   controlTimeoutMs: number;
@@ -489,6 +588,7 @@ export async function createSuccessor(
     operation: request.operation,
     createdAt: Date.now(),
     ready: false,
+    ...(request.recovery === undefined ? {} : { recovery: request.recovery }),
   };
   const sessionMetadata = (ready: boolean) => ({
     ...source.session.metadata,

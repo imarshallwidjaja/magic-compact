@@ -1,13 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
-import type {
-  Message,
-  Part,
-  Session,
-  TextPart,
-  ToolPart,
-} from "@opencode-ai/sdk/v2";
+import type { Message, Part, TextPart, ToolPart } from "@opencode-ai/sdk/v2";
 import type { V2Client } from "../src/api";
 import {
   createCompactionPlan,
@@ -36,26 +30,28 @@ import {
   RetentionClassificationError,
 } from "../src/retention/classifier";
 import {
-  summarizerAgent,
-  persistedForkHistory,
-  providerCatalog,
   scoredJevFetch,
   SESSION_SUMMARY_TEXT,
-  summaryReply,
   tokenLimitResponse,
   type JevCall,
 } from "./retention-host";
 import {
+  cleanupSessions,
+  completedTool,
+  message,
+  PRIVATE_BODY,
+  userText,
+  v1CommandHarness,
+} from "./v1-host";
+import {
   allocateOmission,
   cachePath,
   commitPlannedOmission,
-  deleteCache,
   readCache,
   readOmittedContent,
 } from "../src/storage/omission";
 import {
   type ConversationStats,
-  deleteStats,
   readStats,
   writeStats,
 } from "../src/storage/stats";
@@ -528,7 +524,7 @@ describe("magic trim", () => {
       message("usr_accounting", "user", []),
       message("ast_accounting", "assistant", [tool]),
     ];
-    const harness = trimCommandHarness(sessionID, messages);
+    const harness = v1CommandHarness(sessionID, messages);
     const original = structuredClone(messages);
 
     try {
@@ -593,7 +589,7 @@ describe("magic trim", () => {
       );
     } finally {
       harness.history.close();
-      await cleanupTrimSessions(sessionID, harness.successorID);
+      await cleanupSessions(sessionID, harness.successorID);
     }
   });
 
@@ -605,7 +601,7 @@ describe("magic trim", () => {
       message("usr_noop", "user", []),
       message("ast_noop", "assistant", [alreadyTrimmed]),
     ];
-    const harness = trimCommandHarness(sessionID, messages);
+    const harness = v1CommandHarness(sessionID, messages);
 
     try {
       await allocateOmission(sessionID, { content: "source cache" });
@@ -625,7 +621,7 @@ describe("magic trim", () => {
       );
     } finally {
       harness.history.close();
-      await cleanupTrimSessions(sessionID);
+      await cleanupSessions(sessionID);
     }
   });
 
@@ -637,7 +633,7 @@ describe("magic trim", () => {
         readTool("tool_1", "large output ".repeat(100)),
       ]),
     ];
-    const harness = trimCommandHarness(sessionID, messages, {
+    const harness = v1CommandHarness(sessionID, messages, {
       duringSuccessorCreate: () => {
         const late = message("usr_late", "user", [
           userText("usr_late", "concurrent request"),
@@ -667,7 +663,7 @@ describe("magic trim", () => {
       );
     } finally {
       harness.history.close();
-      await cleanupTrimSessions(sessionID, harness.successorID);
+      await cleanupSessions(sessionID, harness.successorID);
     }
   });
 
@@ -679,7 +675,7 @@ describe("magic trim", () => {
         readTool("tool_1", "large output ".repeat(100)),
       ]),
     ];
-    const harness = trimCommandHarness(sessionID, messages, {
+    const harness = v1CommandHarness(sessionID, messages, {
       failSourceReadAfter: 0,
     });
 
@@ -698,7 +694,7 @@ describe("magic trim", () => {
       expect(harness.sourceWrites).toEqual([]);
     } finally {
       harness.history.close();
-      await cleanupTrimSessions(sessionID);
+      await cleanupSessions(sessionID);
     }
   });
 
@@ -782,7 +778,7 @@ describe("magic trim task-aware retention", () => {
         part.messageID = item.info.id;
       });
     });
-    const harness = trimCommandHarness(sessionID, source);
+    const harness = v1CommandHarness(sessionID, source);
     const originalUser = structuredClone(source[0]);
     const retention = {
       mode: "task-aware" as const,
@@ -820,7 +816,7 @@ describe("magic trim task-aware retention", () => {
       ).toHaveLength(2);
     } finally {
       harness.history.close();
-      await cleanupTrimSessions(sessionID, ...harness.created);
+      await cleanupSessions(sessionID, ...harness.created);
     }
   });
   test.each([
@@ -928,7 +924,7 @@ describe("magic trim task-aware retention", () => {
       message("ast_2", "assistant", []),
     ];
     const calls: JevCall[] = [];
-    const harness = trimCommandHarness(sessionID, messages);
+    const harness = v1CommandHarness(sessionID, messages);
     const usefulBefore = structuredClone(useful);
 
     try {
@@ -977,7 +973,7 @@ describe("magic trim task-aware retention", () => {
         "Retention | Task-aware retention at keep threshold 60% kept 1 of 2 evaluated tool call(s) whole (read 1).",
       );
     } finally {
-      await cleanupTrimSessions(sessionID, ...harness.created);
+      await cleanupSessions(sessionID, ...harness.created);
     }
   });
 
@@ -996,7 +992,7 @@ describe("magic trim task-aware retention", () => {
           readTool("tool_read", "large output ".repeat(100)),
         ]),
       ];
-      const harness = trimCommandHarness(sessionID, messages);
+      const harness = v1CommandHarness(sessionID, messages);
       const before = structuredClone(messages);
       try {
         const retention = {
@@ -1029,7 +1025,7 @@ describe("magic trim task-aware retention", () => {
           expect(notice.text).toContain("Changes | Tool calls trimmed: 1");
         }
       } finally {
-        await cleanupTrimSessions(sessionID, ...harness.created);
+        await cleanupSessions(sessionID, ...harness.created);
       }
     },
   );
@@ -1046,7 +1042,7 @@ describe("magic trim task-aware retention", () => {
         completedTool("tool_small", "bash", "ok"),
       ]),
     ];
-    const harness = trimCommandHarness(sessionID, messages);
+    const harness = v1CommandHarness(sessionID, messages);
 
     try {
       await expect(
@@ -1066,14 +1062,14 @@ describe("magic trim task-aware retention", () => {
         "Retention | Task-aware retention at keep threshold 60%: no tool calls needed evaluation.",
       );
     } finally {
-      await cleanupTrimSessions(sessionID, ...harness.created);
+      await cleanupSessions(sessionID, ...harness.created);
     }
   });
 
   test("heuristic mode trims candidates without a key, model, or classifier", async () => {
     const sessionID = `ses_trim_heuristic_${randomUUID().replaceAll("-", "")}`;
     const tool = readTool("tool_read", "large output ".repeat(100));
-    const harness = trimCommandHarness(sessionID, [
+    const harness = v1CommandHarness(sessionID, [
       message("usr_1", "user", []),
       message("ast_1", "assistant", [tool]),
     ]);
@@ -1089,7 +1085,7 @@ describe("magic trim task-aware retention", () => {
       if (trimmed.state.status !== "completed") throw new Error("completed");
       expect(trimmed.state.output).toContain("Historical read result omitted");
     } finally {
-      await cleanupTrimSessions(sessionID, ...harness.created);
+      await cleanupSessions(sessionID, ...harness.created);
     }
   });
 
@@ -1144,7 +1140,7 @@ describe("magic trim task-aware retention", () => {
     const marker = messages.find(item => item.info.id === "usr_marker")!;
     (marker.parts[0] as unknown as { tail_start_id: string }).tail_start_id =
       "ast_media";
-    const harness = trimCommandHarness(sessionID, messages);
+    const harness = v1CommandHarness(sessionID, messages);
     const storedBefore = countCanonicalContentTokens(messages);
 
     try {
@@ -1165,7 +1161,7 @@ describe("magic trim task-aware retention", () => {
         storedBefore - storedAfter,
       );
     } finally {
-      await cleanupTrimSessions(sessionID, ...harness.created);
+      await cleanupSessions(sessionID, ...harness.created);
     }
   });
 
@@ -1191,7 +1187,7 @@ describe("magic trim task-aware retention", () => {
           readTool("tool_read", "large output ".repeat(100)),
         ]),
       ];
-      const harness = trimCommandHarness(sessionID, messages);
+      const harness = v1CommandHarness(sessionID, messages);
       const before = structuredClone(messages);
       let failure: unknown;
 
@@ -1234,7 +1230,7 @@ describe("magic trim task-aware retention", () => {
           "/magic-trim --heuristic",
         );
       } finally {
-        await cleanupTrimSessions(sessionID, ...harness.created);
+        await cleanupSessions(sessionID, ...harness.created);
       }
     },
   );
@@ -1251,7 +1247,7 @@ describe("magic trim task-aware retention", () => {
       ]),
     ];
     const usefulBefore = structuredClone(useful);
-    const harness = trimCommandHarness(sessionID, messages, { summaryText });
+    const harness = v1CommandHarness(sessionID, messages, { summaryText });
     const summaries: string[] = [];
     const answer = scoredJevFetch(output =>
       output.includes("useful") ? 0.75 : 0.1,
@@ -1290,7 +1286,7 @@ describe("magic trim task-aware retention", () => {
         usefulBefore.state,
       );
     } finally {
-      await cleanupTrimSessions(sessionID, ...harness.created);
+      await cleanupSessions(sessionID, ...harness.created);
     }
   });
 
@@ -1304,7 +1300,7 @@ describe("magic trim task-aware retention", () => {
       message("usr_2", "user", [userText("usr_2", "Continue.")]),
       message("ast_2", "assistant", []),
     ];
-    const harness = trimCommandHarness(sessionID, messages, {
+    const harness = v1CommandHarness(sessionID, messages, {
       summaryText: "s".repeat(20_000),
     });
     const before = structuredClone(messages);
@@ -1342,7 +1338,7 @@ describe("magic trim task-aware retention", () => {
       expect(harness.created).toEqual([]);
       expect(await readStats(sessionID)).toBeNull();
     } finally {
-      await cleanupTrimSessions(sessionID, ...harness.created);
+      await cleanupSessions(sessionID, ...harness.created);
     }
   });
 
@@ -1374,7 +1370,7 @@ describe("magic trim task-aware retention", () => {
           readTool("tool_read", "large output ".repeat(100)),
         ]),
       ];
-      const harness = trimCommandHarness(sessionID, messages);
+      const harness = v1CommandHarness(sessionID, messages);
       const before = structuredClone(messages);
       let failure: unknown;
 
@@ -1399,7 +1395,7 @@ describe("magic trim task-aware retention", () => {
         expect(await readCache(sessionID)).toBeNull();
         expect(await readStats(sessionID)).toBeNull();
       } finally {
-        await cleanupTrimSessions(sessionID, ...harness.created);
+        await cleanupSessions(sessionID, ...harness.created);
       }
     },
   );
@@ -1424,7 +1420,7 @@ describe("magic trim task-aware retention", () => {
         message("usr_1", "user", [userText("usr_1", "Add the parser.")]),
         message("ast_1", "assistant", [tool]),
       ];
-      const harness = trimCommandHarness(sessionID, messages, {
+      const harness = v1CommandHarness(sessionID, messages, {
         duringSummary: () => {
           if (when === "revert") {
             harness.setRevert({ messageID: "ast_1" });
@@ -1462,245 +1458,11 @@ describe("magic trim task-aware retention", () => {
         expect(await readStats(sessionID)).toBeNull();
         expect(await readStats(harness.successorID)).toBeNull();
       } finally {
-        await cleanupTrimSessions(sessionID, ...harness.created);
+        await cleanupSessions(sessionID, ...harness.created);
       }
     },
   );
 });
-
-const PRIVATE_BODY = "PRIVATE-SESSION-BODY-7f3a";
-
-// Every string reachable from an error: messages, stacks, causes, aggregate
-// members, and any other own property.
-
-type TrimCommandHarnessOptions = {
-  toastMode?: "hang" | "fail";
-  sessionRevert?: { messageID: string };
-  // Runs while the retention summary request is in flight.
-  duringSummary?: () => void;
-  // Runs once the successor session exists, before its final source recheck.
-  duringSuccessorCreate?: () => void;
-  // Replaces source message reads after this many successful reads.
-  failSourceReadAfter?: number;
-  // The retention summary the fake summarizer replies with.
-  summaryText?: string;
-};
-
-// Fake OpenCode host for trim command tests. `messages` is the live source;
-// the retention summary fork and successors live in the persisted host fake.
-function trimCommandHarness(
-  sessionID: string,
-  messages: MessageWithParts[],
-  options: TrimCommandHarnessOptions = {},
-) {
-  messages.forEach((item, index) => {
-    item.info.sessionID = sessionID;
-    item.info.time ??= { created: index + 1 };
-    if (item.info.role === "assistant")
-      (item.info.time as { completed?: number }).completed ??=
-        item.info.time.created;
-    for (const part of item.parts) {
-      part.sessionID = sessionID;
-      part.messageID = item.info.id;
-    }
-  });
-  const history = persistedForkHistory([]);
-  const successorIDs: string[] = [];
-  const summaryForkID = `${sessionID}_summary`;
-  const sourceSession = {
-    id: sessionID,
-    title: "Trim source",
-    directory: "/workspace",
-    time: { created: 1, updated: 1 },
-  } as Session;
-  const toasts: Array<{ message?: string }> = [];
-  const deletedSessions: string[] = [];
-  const forks: string[] = [];
-  const modelCalls: string[] = [];
-  const sourceWrites: string[] = [];
-  const created: string[] = [];
-  let sourceReads = 0;
-  let revert = options.sessionRevert;
-  const sessions = new Map<string, Session>();
-  const v2 = {
-    app: {
-      agents: async () => {
-        modelCalls.push("agents");
-        return { data: [summarizerAgent()] };
-      },
-    },
-    provider: {
-      list: async () => {
-        modelCalls.push("providers");
-        return { data: providerCatalog() };
-      },
-    },
-    permission: { list: async () => ({ data: [] }) },
-    question: { list: async () => ({ data: [] }) },
-    session: {
-      messages: async (request: { sessionID: string }) => {
-        if (request.sessionID !== sessionID)
-          return { data: history.read(request.sessionID) };
-        sourceReads += 1;
-        if (
-          options.failSourceReadAfter !== undefined
-          && sourceReads > options.failSourceReadAfter
-        ) {
-          return { error: { data: { message: PRIVATE_BODY } } };
-        }
-        return { data: structuredClone(messages) };
-      },
-      get: async (request: { sessionID: string }) => ({
-        data:
-          request.sessionID === sessionID
-            ? { ...sourceSession, ...(revert ? { revert } : {}) }
-            : sessions.get(request.sessionID),
-      }),
-      status: async () => ({ data: {} }),
-      children: async () => ({ data: [] }),
-      fork: async (request: { messageID?: string }) => {
-        forks.push(summaryForkID);
-        history.delete(sessionID);
-        messages.forEach((item, index) => history.write(item, index));
-        history.delete(summaryForkID);
-        history.fork(sessionID, summaryForkID, request.messageID);
-        history.delete(sessionID);
-        return { data: { ...sourceSession, id: summaryForkID } as Session };
-      },
-      create: async (request: Record<string, unknown>) => {
-        const successorID = `${sessionID}_successor${created.length === 0 ? "" : `_${created.length + 1}`}`;
-        successorIDs.push(successorID);
-        created.push(successorID);
-        const info = {
-          ...sourceSession,
-          id: successorID,
-          title: String(request.title),
-          metadata: request.metadata,
-        } as Session;
-        sessions.set(successorID, info);
-        options.duringSuccessorCreate?.();
-        return { data: info };
-      },
-      update: async (request: Record<string, unknown>) => {
-        const id = String(request.sessionID);
-        if (id === sessionID) sourceWrites.push("session.update");
-        const info = {
-          ...(sessions.get(id) ?? { ...sourceSession, id }),
-          ...(request.title === undefined ? {} : { title: request.title }),
-          ...(request.metadata === undefined
-            ? {}
-            : { metadata: request.metadata }),
-        } as Session;
-        sessions.set(id, info);
-        return { data: info };
-      },
-      abort: async () => ({ data: true }),
-      prompt: async (request: {
-        sessionID: string;
-        messageID?: string;
-        agent?: string;
-        parts?: Part[];
-      }) => {
-        if (request.sessionID !== summaryForkID) {
-          sourceWrites.push("session.prompt");
-          throw new Error("unexpected prompt");
-        }
-        modelCalls.push("summary");
-        options.duringSummary?.();
-        const fork = history.read(summaryForkID);
-        const reply = summaryReply(
-          fork,
-          request,
-          summaryForkID,
-          options.summaryText,
-        );
-        fork
-          .slice(-2)
-          .forEach((item, index) => history.write(item, 100 + index));
-        return reply;
-      },
-      delete: async (request: { sessionID: string }) => {
-        if (request.sessionID === sessionID) sourceWrites.push("delete");
-        deletedSessions.push(request.sessionID);
-        history.delete(request.sessionID);
-        return { data: true };
-      },
-    },
-    part: {
-      update: async () => {
-        sourceWrites.push("part.update");
-        throw new Error("unexpected part update");
-      },
-    },
-    sync: {
-      replay: async (request: {
-        events: Parameters<typeof history.replay>[0];
-      }) => {
-        history.replay(request.events);
-        return { data: { sessionID: request.events[0]!.aggregateID } };
-      },
-    },
-    tui: {
-      showToast: async (toast: { message?: string }) => {
-        toasts.push(toast);
-        if (options.toastMode === "hang") return new Promise(() => {});
-        if (options.toastMode === "fail") throw new Error("toast failed");
-        return { data: true };
-      },
-    },
-  } as unknown as V2Client;
-
-  return {
-    v2,
-    sessionID,
-    // The most recent successor; IDs are reserved before any is created.
-    get successorID() {
-      return successorIDs.at(-1) ?? `${sessionID}_successor`;
-    },
-    summaryForkID,
-    messages,
-    toasts,
-    deletedSessions,
-    sourceWrites,
-    forks,
-    modelCalls,
-    history,
-    get created() {
-      return [...created];
-    },
-    successorMessages() {
-      return history.read(this.successorID);
-    },
-    successorInfo() {
-      return sessions.get(this.successorID);
-    },
-    // Trim keeps every record in place, so a source part has the same
-    // message and part position in the successor.
-    successorPart(partID: string): ToolPart {
-      const messageIndex = messages.findIndex(item =>
-        item.parts.some(part => part.id === partID),
-      );
-      const partIndex = messages[messageIndex]!.parts.findIndex(
-        part => part.id === partID,
-      );
-      return this.successorMessages()[messageIndex]!.parts[
-        partIndex
-      ] as ToolPart;
-    },
-    setRevert(value: { messageID: string }) {
-      revert = value;
-    },
-  };
-}
-
-async function cleanupTrimSessions(...sessionIDs: string[]): Promise<void> {
-  await Promise.all(
-    sessionIDs.flatMap(sessionID => [
-      deleteCache(sessionID),
-      deleteStats(sessionID),
-    ]),
-  );
-}
 
 function trimStats(sessionID: string): ConversationStats {
   return {
@@ -1727,27 +1489,6 @@ function trimErrorMessages(value: unknown): string[] {
   return [];
 }
 
-function message(
-  id: string,
-  role: "user" | "assistant",
-  parts: Part[],
-): MessageWithParts {
-  return {
-    info: { id, role } as Message,
-    parts,
-  };
-}
-
-function userText(messageID: string, text: string): TextPart {
-  return {
-    id: `${messageID}_text`,
-    sessionID: "session",
-    messageID,
-    type: "text",
-    text,
-  };
-}
-
 function turn(...parts: Part[]): Turn {
   return {
     user: [message("user", "user", [])],
@@ -1759,25 +1500,6 @@ function turn(...parts: Part[]): Turn {
 
 function readTool(id: string, output: string): ToolPart {
   return completedTool(id, "read", output);
-}
-
-function completedTool(id: string, tool: string, output: string): ToolPart {
-  return {
-    id,
-    sessionID: "session",
-    messageID: "assistant",
-    type: "tool",
-    callID: `call_${id}`,
-    tool,
-    state: {
-      status: "completed",
-      input: {},
-      output,
-      title: tool,
-      metadata: {},
-      time: { start: 1, end: 2 },
-    },
-  };
 }
 
 function taskTool(id: string, prompt: string): ToolPart {

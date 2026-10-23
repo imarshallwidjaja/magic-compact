@@ -2,7 +2,7 @@
 import type { ForkFailureDetail } from "../compact/fork";
 import { PluginMessageError } from "./feedback";
 
-export type SuccessorCommand = "Magic Compact" | "Magic Trim";
+export type SuccessorCommand = "Magic Compact" | "Magic Trim" | "Magic Recover";
 
 export const COMPACT_INSUFFICIENT_SAVINGS =
   "Magic Compact projected no useful canonical active-content savings; the source session was left unchanged.";
@@ -84,7 +84,7 @@ export type UnfinishedHistoryRecord = {
 
 // Host-derived labels are cut to a conservative character set and length so a
 // reference cannot carry control characters, markup or prose into a message.
-function boundedLabel(value: string, limit: number): string {
+export function boundedLabel(value: string, limit: number): string {
   const label = value.replace(/[^A-Za-z0-9_.:-]/gu, "?");
   if (label === "") return "unnamed";
   return label.length > limit ? `${label.slice(0, limit - 3)}...` : label;
@@ -139,8 +139,25 @@ export function unfinishedHistoryRefusal(
   return new SourceNotAtRestError(
     command,
     "its stored history has an unfinished record, which blocks even an idle session",
-    `If work may still be running, wait and retry. Otherwise continue without ${command} or in another session.${command === "Magic Trim" ? " `--heuristic` does not skip this check." : ""}`,
+    `If work may still be running, wait and retry. If it was abandoned, ${ABANDONED_WORK_GUIDANCE}${command === "Magic Trim" ? " `--heuristic` does not skip this check." : ""}`,
     `Record: ${segments.join("; ")}.`,
+  );
+}
+
+// The next step for history whose work the user knows was abandoned. Only an
+// explicit `/magic-recover` may treat stored records that way.
+export const ABANDONED_WORK_GUIDANCE =
+  "/magic-recover continues in a copy that records it as interrupted.";
+
+// Refusal for a background job whose result never reached the source.
+export function undeliveredBackgroundRefusal(
+  command: SuccessorCommand,
+  reason: string,
+): SourceNotAtRestError {
+  return new SourceNotAtRestError(
+    command,
+    reason,
+    `Wait for it to deliver, then retry. If it was abandoned, ${ABANDONED_WORK_GUIDANCE}`,
   );
 }
 

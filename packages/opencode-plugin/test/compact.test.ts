@@ -78,7 +78,13 @@ import {
   COMPACT_NOOP,
   executeMagicCompact,
 } from "../src/magic-compact";
+import { executeMagicRecover } from "../src/magic-recover";
 import { executeMagicStats } from "../src/magic-stats";
+import {
+  isRecoveryContext,
+  recoveryContext,
+  type RecoveryRecord,
+} from "../src/policy/recovery";
 import server from "../src/host-v1";
 import tuiPlugin from "../src/tui";
 import {
@@ -113,6 +119,7 @@ import {
   tokenLimitResponse,
   type JevCall,
 } from "./retention-host";
+import { interruptedHistory, recoverHarness, words } from "./v1-host";
 import {
   dependencyError,
   PRIVATE_SENTINEL,
@@ -5348,7 +5355,7 @@ describe("compaction orchestration", () => {
           open("msg_open"),
         ]),
       ).toBe(
-        "Magic Compact requires the session to be at rest, but its stored history has an unfinished record, which blocks even an idle session. If work may still be running, wait and retry. Otherwise continue without Magic Compact or in another session. The session was left unchanged.\nRecord: assistant message msg_open; no completion time or error.",
+        "Magic Compact requires the session to be at rest, but its stored history has an unfinished record, which blocks even an idle session. If work may still be running, wait and retry. If it was abandoned, /magic-recover continues in a copy that records it as interrupted. The session was left unchanged.\nRecord: assistant message msg_open; no completion time or error.",
       );
     });
 
@@ -5500,10 +5507,10 @@ describe("compaction orchestration", () => {
       const compact = await refusal([open("msg_open")]);
       const trim = await refusal([open("msg_open")], "Magic Trim");
       for (const text of [compact, trim]) {
+        // Only an explicit /magic-recover treats the record as abandoned.
         expect(text).toContain(
-          "If work may still be running, wait and retry. Otherwise continue without",
+          "If work may still be running, wait and retry. If it was abandoned, /magic-recover continues in a copy that records it as interrupted.",
         );
-        expect(text).toContain("or in another session.");
         expect(text).not.toMatch(/restart|database|compacting|repair it/iu);
         expect(text).not.toContain("is still active");
         expect(text).not.toContain("is running");
@@ -7733,6 +7740,94 @@ function commandHarness(
     },
   };
 }
+
+// Recovery ends with a successor that holds closed records and a trailing
+// notice; the next compaction of it must work and keep what recovery recorded.
+describe("magic compact after magic recover", () => {
+  test.each([
+    ["heuristic", HEURISTIC_OPTIONS],
+    [
+      "task-aware",
+      {
+        retention: {
+          mode: "task-aware" as const,
+          apiKey: "test-key",
+          fetch: scoredJevFetch(() => 0.1),
+        },
+      },
+    ],
+  ])(
+    "compacts the recovered successor under %s retention and keeps the recovery references",
+    async (_name, options) => {
+      const recovering = recoverHarness("ses_recovering", interruptedHistory());
+      await executeMagicRecover(recovering.v2, "ses_recovering");
+      const recovered = recovering.successorMessages().map(item => ({
+        info: { ...item.info, sessionID: "source" } as Message,
+        parts: item.parts.map(part => ({ ...part, sessionID: "source" })),
+      })) as MessageWithParts[];
+      // The user carries on: the notice joins the next request's turn, which
+      // is then summarized.
+      recovered.push(
+        message("carry-user", "user", [
+          textPart("carry-user-text", "carry-user", "Carry on."),
+        ]),
+        message("carry-assistant", "assistant", [
+          textPart("carry-assistant-text", "carry-assistant", "Continuing."),
+        ]),
+      );
+      const lineage = recovering.successorInfo()!.metadata![
+        "magicCompact"
+      ] as unknown as { recovery: RecoveryRecord[] };
+      const before = structuredClone(recovered);
+      const harness = commandHarness(recovered, {
+        generationResponse: {
+          turns: [
+            result(1, "Started the job."),
+            result(2, "Delegated the fix."),
+            result(3, "Carried on after recovery."),
+          ],
+        },
+      });
+
+      await expect(
+        executeMagicCompact(harness.v2, "source", 0, options),
+      ).resolves.toMatchObject({ session: { id: "successor" } });
+
+      expect(recovered).toEqual(before);
+      expect(harness.sourceWrites).toEqual([]);
+      const successor = harness.successorMessages();
+      const parts = successor.flatMap(item => item.parts);
+      // The model context stays once; the marks and errors it names stay.
+      expect(parts.filter(part => isRecoveryContext(part.metadata))).toEqual([
+        expect.objectContaining({
+          type: "text",
+          synthetic: true,
+          text: recoveryContext(lineage.recovery),
+        }),
+      ]);
+      const tool = (callID: string) =>
+        parts.find(
+          (part): part is Extract<Part, { type: "tool" }> =>
+            part.type === "tool" && part.callID === callID,
+        )!;
+      expect(
+        (tool("call_prt_launch").state as { metadata: unknown }).metadata,
+      ).toMatchObject({
+        magicCompact: {
+          recovered: { delivery: "abandoned", job: "ses_bg" },
+        },
+      });
+      expect(tool("call_prt_task").state.status).toBe("error");
+      expect(tool("call_prt_pending").state.status).toBe("error");
+      const contentID = /Content ID: ([^\s\]]+)/u.exec(
+        JSON.stringify(tool("call_prt_read")),
+      )![1]!;
+      expect(await readOmittedContent("successor", contentID)).toContain(
+        words("R", 400),
+      );
+    },
+  );
+});
 
 describe("magic compact task-aware retention", () => {
   function retainedTurns() {

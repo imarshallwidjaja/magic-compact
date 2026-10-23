@@ -11,21 +11,28 @@ import {
 export const COMPACT_COMMAND = "magic-compact" as const;
 export const TRIM_COMMAND = "magic-trim" as const;
 export const STATS_COMMAND = "magic-stats" as const;
+export const RECOVER_COMMAND = "magic-recover" as const;
 
 export const COMMAND_DESCRIPTIONS = {
   [COMPACT_COMMAND]: "Lossless context compression",
   [TRIM_COMMAND]:
     "Trim historical tool inputs and outputs ([N] [--threshold P] [--truncate], or [N] --heuristic to skip task-aware retention)",
   [STATS_COMMAND]: "Show Magic Compact token and cost savings stats",
+  [RECOVER_COMMAND]:
+    "Continue in a copy that closes abandoned unfinished records as interrupted (stops no work)",
 } as const;
 
 export const COMPACT_NOOP = "No assistant turns are old enough to compact.";
 export const TRIM_NOOP = "No eligible tool calls need trimming.";
+export const RECOVER_NOOP =
+  "No unfinished records or undelivered background results need recovery; no successor was created.";
 export const TRIM_ARGUMENTS_ERROR =
   "/magic-trim accepts an optional non-negative integer N plus either --heuristic or any of --threshold P and --truncate, each at most once and in any order.";
 export const TRIM_THRESHOLD_ERROR =
   "/magic-trim --threshold needs a plain decimal percent from 0 to 100 after a space, such as --threshold 70 or --threshold 60.5.";
 export const STATS_ARGUMENTS_ERROR = "/magic-stats does not accept arguments.";
+export const RECOVER_ARGUMENTS_ERROR =
+  "/magic-recover does not accept arguments.";
 
 export function compactSuccess(successorID: string): string {
   return `Magic compaction successful. Continue in successor session ${successorID}; the original session was left unchanged.`;
@@ -33,6 +40,14 @@ export function compactSuccess(successorID: string): string {
 
 export function trimSuccess(successorID: string): string {
   return `Magic trimming successful. Continue in successor session ${successorID}; the original session was left unchanged.`;
+}
+
+export function recoverSuccess(successorID: string): string {
+  return `Magic recovery successful. Continue in successor session ${successorID}; the original session was left unchanged.`;
+}
+
+export function parseMagicRecoverArguments(raw: string): void {
+  if (raw.trim() !== "") throw new PluginMessageError(RECOVER_ARGUMENTS_ERROR);
 }
 
 // What a person sees when compact or trim fails: a toast on OpenCode 1, the

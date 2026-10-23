@@ -392,9 +392,15 @@ export function fakeV2Host(
         cursor: { previous: null, next: null },
       }),
       active: async () => clone(state.active),
+      // Like 2.0.28, the export leaves out an assistant message without a
+      // completion time, and the import below drops one.
       export: async (input: { sessionID: string }) => ({
         info: get(input.sessionID),
-        messages: history(input.sessionID),
+        messages: history(input.sessionID).filter(
+          message =>
+            message.type !== "assistant"
+            || message.time.completed !== undefined,
+        ),
       }),
       import: async (input: { info: SessionInfo; messages: V2Message[] }) => {
         await state.beforeWrite?.("import", input.info.id);
@@ -407,7 +413,14 @@ export function fakeV2Host(
         if (input.messages.some(message => ids.has(message.id)))
           throw new Error("duplicate message ID");
         state.sessions.set(input.info.id, clone(input.info));
-        state.messages.set(input.info.id, clone(input.messages));
+        state.messages.set(
+          input.info.id,
+          clone(input.messages).filter(
+            message =>
+              message.type !== "assistant"
+              || message.time.completed !== undefined,
+          ),
+        );
         write("import", input.info.id);
         return get(input.info.id);
       },

@@ -7,7 +7,7 @@ import { PluginMessageError } from "../policy/feedback";
 export type V2Host = OpenCodeClient;
 
 export const V2_ENDPOINT_REQUIRED =
-  "Magic Compact and Magic Trim need this OpenCode server's HTTP API to create a successor session, and could not prove that a reachable endpoint belongs to this server. Nothing was changed. Run OpenCode through its registered background service (the default for the OpenCode 2 TUI and `opencode run`, or `opencode serve --service`), or set the plugin's `serverUrl` option to this server's own listener and export OPENCODE_SERVER_PASSWORD (and OPENCODE_SERVER_USERNAME when it is not `opencode`) in its environment.";
+  "Magic Compact, Magic Trim and Magic Recover need this OpenCode server's HTTP API to create a successor session, and could not prove that a reachable endpoint belongs to this server. Nothing was changed. Run OpenCode through its registered background service (the default for the OpenCode 2 TUI and `opencode run`, or `opencode serve --service`), or set the plugin's `serverUrl` option to this server's own listener and export OPENCODE_SERVER_PASSWORD (and OPENCODE_SERVER_USERNAME when it is not `opencode`) in its environment.";
 
 export type V2HostOptions = {
   // The plugin's `serverUrl` option, when the operator configured one.

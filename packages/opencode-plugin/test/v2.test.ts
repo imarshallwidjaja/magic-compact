@@ -797,6 +797,30 @@ describe("OpenCode 2 source at rest", () => {
     });
   });
 
+  test("reads an open assistant the export leaves out and refuses any other difference from the export", async () => {
+    const state = fakeV2State();
+    sourceSession(state, "ses_src", [
+      ...toolHistory(),
+      assistantMessage("msg_open", [], { time: { created: 9 } }),
+    ]);
+    const host = fakeV2Host(state, new OwnedSessions());
+    // The export the host returns lacks the open assistant; the pages keep it
+    // and the refusal names it.
+    await expect(
+      readV2SourceAtRest(host, "Magic Trim", "ses_src", 1_000),
+    ).rejects.toThrow("Record: assistant message msg_open;");
+    const exportOf = host.session.export.bind(host.session);
+    host.session.export = (async (input: never) => {
+      const exported = await exportOf(input);
+      return { ...exported, messages: exported.messages.slice(1) };
+    }) as never;
+    await expect(
+      readV2SourceAtRest(host, "Magic Trim", "ses_src", 1_000),
+    ).rejects.toThrow(
+      "Magic Trim could not read a complete session history. The session was left unchanged.",
+    );
+  });
+
   test("refuses a subagent session", async () => {
     const state = fakeV2State();
     sourceSession(state, "ses_src", toolHistory(), {

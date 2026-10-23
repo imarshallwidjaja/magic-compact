@@ -5,6 +5,7 @@ import { planOmission, type PlannedOmission } from "../storage/omission";
 import { isRecord } from "../util";
 import { coveredAssistantImagePartIDs } from "./media";
 import { keepsHostInjectedText } from "../policy/host-text";
+import { isRecoveryContext } from "../policy/recovery";
 import {
   childSessionID,
   planToolTrim,
@@ -237,6 +238,6 @@ function isImportantSyntheticPart(part: Part): boolean {
   return (
     part.type === "text"
     && part.synthetic === true
-    && keepsHostInjectedText(part.text)
+    && (keepsHostInjectedText(part.text) || isRecoveryContext(part.metadata))
   );
 }

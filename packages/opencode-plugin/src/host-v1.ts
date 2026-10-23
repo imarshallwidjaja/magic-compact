@@ -14,7 +14,11 @@ import {
   COMPACT_NOOP,
   compactSuccess,
   parseMagicCompactArguments,
+  parseMagicRecoverArguments,
   parseMagicTrimArguments,
+  RECOVER_COMMAND,
+  RECOVER_NOOP,
+  recoverSuccess,
   STATS_ARGUMENTS_ERROR,
   STATS_COMMAND,
   TRIM_COMMAND,
@@ -22,6 +26,7 @@ import {
   trimSuccess,
 } from "./commands";
 import { executeMagicCompact } from "./magic-compact";
+import { executeMagicRecover } from "./magic-recover";
 import { STATS_SUCCESS, executeMagicStats } from "./magic-stats";
 import { executeMagicTrim } from "./magic-trim";
 import {
@@ -88,6 +93,7 @@ const server: Plugin = async input => {
         COMPACT_COMMAND,
         STATS_COMMAND,
         TRIM_COMMAND,
+        RECOVER_COMMAND,
       ] as const) {
         config.command[name] = {
           template: "",
@@ -150,6 +156,17 @@ const server: Plugin = async input => {
         );
         throw new Error(
           successor ? trimSuccess(successor.session.id) : TRIM_NOOP,
+        );
+      }
+
+      if (command.command === RECOVER_COMMAND) {
+        const v2 = await preflight("Magic Recover", async () => {
+          parseMagicRecoverArguments(command.arguments);
+          return listener();
+        });
+        const successor = await executeMagicRecover(v2, command.sessionID);
+        throw new Error(
+          successor ? recoverSuccess(successor.session.id) : RECOVER_NOOP,
         );
       }
     },

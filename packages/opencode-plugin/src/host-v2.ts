@@ -5,7 +5,11 @@ import {
   COMPACT_COMMAND,
   compactSuccess,
   parseMagicCompactArguments,
+  parseMagicRecoverArguments,
   parseMagicTrimArguments,
+  RECOVER_COMMAND,
+  RECOVER_NOOP,
+  recoverSuccess,
   STATS_ARGUMENTS_ERROR,
   STATS_COMMAND,
   TRIM_COMMAND,
@@ -45,6 +49,7 @@ import {
 import { OwnedSessions } from "./v2/owned";
 import type { SuccessorCommand } from "./policy/successor";
 import { readV2History, v2StorageKey, type V2Message } from "./v2/session";
+import { executeV2Recover } from "./v2/recover";
 import { executeV2Trim } from "./v2/trim";
 
 type Context = Plugin.Context;
@@ -160,6 +165,23 @@ export async function setup(
           return successor
             ? `${trimSuccess(successor.session.id)}\n${outcome}`
             : `${TRIM_NOOP} ${outcome}`;
+        });
+        throw new Error(result);
+      },
+    });
+    editor.add({
+      name: RECOVER_COMMAND,
+      description: COMMAND_DESCRIPTIONS[RECOVER_COMMAND],
+      execute: async ({ sessionID, prompt }) => {
+        const result = await commandResult("Magic Recover", async () => {
+          parseMagicRecoverArguments(prompt.text);
+          const host = await connect(sessionID);
+          const recovered = await executeV2Recover(host, sessionID, {
+            controlTimeoutMs,
+          });
+          return recovered
+            ? `${recoverSuccess(recovered.successor.session.id)}\n${recovered.outcome}`
+            : RECOVER_NOOP;
         });
         throw new Error(result);
       },

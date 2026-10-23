@@ -351,6 +351,7 @@ describe("preflight", () => {
       "magic-compact",
       "magic-trim",
       "magic-stats",
+      "magic-recover",
       "arkive-eval-control",
       "arkive-eval-witness",
     ],
