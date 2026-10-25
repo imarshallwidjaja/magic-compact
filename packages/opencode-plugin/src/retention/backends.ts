@@ -61,6 +61,9 @@ export type RetentionBackend = {
   requestIdHeader: string;
   // A cap on the exact wire body, only where the provider documents one.
   bodyByteLimit: number | null;
+  // How many more times one candidate's identical request is sent after an
+  // HTTP 503, across all of its attempts, summary variants included.
+  serviceUnavailableRetries: number;
   serialize(request: RetentionRequest): string;
   parse(payload: unknown, request: RetentionRequest): BackendAnswers;
   isTokenLimitBody(text: string): boolean;
@@ -81,6 +84,7 @@ export const RETENTION_BACKENDS: Readonly<
     model: RETENTION_MODEL,
     requestIdHeader: "x-typesafe-request-id",
     bodyByteLimit: RETENTION_REQUEST_BODY_BYTE_LIMIT,
+    serviceUnavailableRetries: 0,
     // The canonical body is Jev's own format.
     serialize: request => JSON.stringify(request.body),
     parse: (payload, request) =>
@@ -97,6 +101,9 @@ export const RETENTION_BACKENDS: Readonly<
     requestIdHeader: "x-request-id",
     // OpenAI documents no request body cap; the service enforces its limits.
     bodyByteLimit: null,
+    // A transient 503 from Decisions is retried rather than failing an
+    // otherwise valid command (see `classifier.ts`).
+    serviceUnavailableRetries: 2,
     // The predicate is named by its opaque question key, never by a host ID.
     serialize: request =>
       openAIDecisionsBody(

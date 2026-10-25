@@ -32,6 +32,13 @@ export const RETENTION_KEEP_THRESHOLD_PERCENT_ENV =
   "MAGIC_COMPACT_KEEP_THRESHOLD_PERCENT";
 export const RETENTION_MAX_CONCURRENCY = 4;
 export const RETENTION_REQUEST_TIMEOUT_MS = 30_000;
+// Waits before a backend's HTTP 503 retry (`serviceUnavailableRetries`): the
+// nth retry waits RETENTION_RETRY_BASE_DELAY_MS * 2^n plus up to
+// RETENTION_RETRY_JITTER_MS, or exactly what a valid Retry-After asks. A
+// Retry-After beyond RETENTION_RETRY_MAX_DELAY_MS fails the request instead.
+export const RETENTION_RETRY_BASE_DELAY_MS = 1_000;
+export const RETENTION_RETRY_JITTER_MS = 500;
+export const RETENTION_RETRY_MAX_DELAY_MS = 30_000;
 
 // Only a 400 body this small is read, to recognize a backend's token-limit
 // refusal.
@@ -94,6 +101,10 @@ export type RetentionOptions = {
   // RETENTION_SUMMARY_EXCERPT_BYTES.
   // Only singleton requests (batchSize 1) support it.
   truncateSummary?: boolean;
+  // Tests only: replaces the timer before an HTTP 503 retry. It must settle
+  // by `ms` or once `signal` aborts; the classifier aborts it when the
+  // invocation settles and never sends a retry after that.
+  retryWait?: (ms: number, signal: AbortSignal) => Promise<void>;
 };
 
 export type RetentionDecision = {
@@ -128,7 +139,8 @@ export type RetentionClassification = {
   decisions: Map<string, RetentionDecision>;
   // Logical requests, each answered once; one per candidate in production.
   requests: number;
-  // HTTP attempts sent: every request once, plus each --truncate retry.
+  // HTTP attempts sent: every request once, plus each --truncate retry and
+  // each HTTP 503 retry.
   attempts: number;
   // Requests answered by their --truncate retry, with the summary excerpt.
   truncated: number;
@@ -142,9 +154,9 @@ export type RetentionClassification = {
 
 // Logical requests: planned = succeeded + failed + cancelled + unstarted,
 // and started = planned - unstarted. `cancelled` requests were refused as
-// over the token limit but their --truncate retry was never sent because
-// the invocation had already failed. `attempts` counts HTTP requests sent,
-// retries included.
+// over the token limit or with HTTP 503, but their retry was never sent
+// because the invocation had already failed. `attempts` counts HTTP requests
+// sent, retries included.
 export type RetentionRequestCounts = {
   planned: number;
   started: number;
@@ -599,8 +611,12 @@ export async function classifyRetention(
   const fetchImpl = options.fetch ?? fetch;
   const run = await runAttempts(
     requests.length,
-    RETENTION_MAX_CONCURRENCY,
-    summaryExcerpt !== undefined,
+    {
+      limit: RETENTION_MAX_CONCURRENCY,
+      truncate: summaryExcerpt !== undefined,
+      unavailableRetries: backend.serviceUnavailableRetries,
+      wait: options.retryWait ?? waitFor,
+    },
     (ordinal, summary, rejected) =>
       sendRequest(
         summary === "whole"
@@ -681,23 +697,36 @@ type AttemptRun =
 // drain, and then that failure is returned in place of every result, so no
 // partial result is returned and a later failure never replaces it.
 //
-// With `retry`, a whole-summary attempt rejected with HTTP 400 is not yet a
-// failure: it pauses admission while its body is classified. A confirmed
+// With `truncate`, a whole-summary attempt rejected with HTTP 400 is not yet
+// a failure: it pauses admission while its body is classified. A confirmed
 // token-limit refusal queues one excerpt attempt for the same request,
 // ahead of unstarted requests; any other outcome is terminal. Admission
 // resumes once no attempt holds a pause and is checked for every attempt
 // immediately before it is sent, so a retry still queued when a terminal
 // failure stops admission is never sent and counts as cancelled.
+//
+// An HTTP 503 is not a failure while its request has some of its
+// `unavailableRetries` left and any Retry-After is within the wait bound:
+// admission continues, and after `wait` the same request and summary variant
+// is queued ahead of unstarted requests. The budget belongs to the request,
+// so an excerpt retry spends what its whole-summary attempts left. A wait
+// still running when the invocation settles is aborted and its retry never
+// sent; that request counts as cancelled.
 function runAttempts(
   count: number,
-  limit: number,
-  retry: boolean,
+  policy: {
+    limit: number;
+    truncate: boolean;
+    unavailableRetries: number;
+    wait: (ms: number, signal: AbortSignal) => Promise<void>;
+  },
   send: (
     ordinal: number,
     summary: SummaryVariant,
-    rejected: (status: number) => void,
+    rejected: (status: number, headers: Headers) => void,
   ) => Promise<RetentionAnswers>,
 ): Promise<AttemptRun> {
+  const { limit, truncate, unavailableRetries, wait } = policy;
   const queue = Array.from({ length: count }, (_, ordinal) => ({
     ordinal,
     summary: "whole" as SummaryVariant,
@@ -708,19 +737,29 @@ function runAttempts(
     "pending" | "succeeded" | "failed" | "cancelled" | undefined
   >(count);
   const errors = new Map<number, unknown>();
+  // HTTP 503 retries spent, by request.
+  const retried = new Array<number>(count).fill(0);
+  const waits = new AbortController();
   let first: number | undefined;
   let active = 0;
   let paused = 0;
+  let waiting = 0;
   let attempts = 0;
+  let settled = false;
   return new Promise(resolve => {
     const finish = () => {
+      if (settled) return;
+      settled = true;
+      waits.abort();
       if (first === undefined) {
         resolve({ results, attempts });
         return;
       }
-      for (const item of queue) {
-        if (item.summary === "excerpt") outcomes[item.ordinal] = "cancelled";
-      }
+      // Nothing is in flight, so a request still pending awaits a retry that
+      // will never be sent.
+      outcomes.forEach((outcome, ordinal) => {
+        if (outcome === "pending") outcomes[ordinal] = "cancelled";
+      });
       const tally = (outcome: (typeof outcomes)[number]) =>
         outcomes.filter(value => value === outcome).length;
       const unstarted = count - outcomes.filter(Boolean).length;
@@ -748,9 +787,25 @@ function runAttempts(
       ) {
         start(queue.shift()!);
       }
-      if (active === 0 && (first !== undefined || queue.length === 0)) {
+      if (
+        active === 0
+        && (first !== undefined || (queue.length === 0 && waiting === 0))
+      ) {
         finish();
       }
+    };
+    const retryAfter = (
+      item: { ordinal: number; summary: SummaryVariant },
+      ms: number,
+    ) => {
+      waiting += 1;
+      const resume = () => {
+        waiting -= 1;
+        // Admission is checked again before it is sent.
+        if (!settled && first === undefined) queue.unshift(item);
+        pump();
+      };
+      wait(ms, waits.signal).then(resume, resume);
     };
     const start = ({
       ordinal,
@@ -763,13 +818,22 @@ function runAttempts(
       active += 1;
       outcomes[ordinal] = "pending";
       let pausing = false;
-      const rejected = (status: number) => {
-        if (retry && summary === "whole" && status === 400) {
+      // The wait before this attempt's 503 retry, once one is allowed.
+      let unavailable: number | undefined;
+      const rejected = (status: number, headers: Headers) => {
+        if (truncate && summary === "whole" && status === 400) {
           pausing = true;
           paused += 1;
-        } else {
-          first ??= id;
+          return;
         }
+        if (status === 503 && retried[ordinal]! < unavailableRetries) {
+          unavailable = unavailableRetryDelay(
+            headers.get("retry-after"),
+            retried[ordinal]!,
+          );
+          if (unavailable !== undefined) return;
+        }
+        first ??= id;
       };
       send(ordinal, summary, rejected)
         .then(
@@ -785,6 +849,18 @@ function runAttempts(
             if (recoverable) {
               // Admission is checked again before it is sent.
               queue.unshift({ ordinal, summary: "excerpt" });
+            } else if (
+              unavailable !== undefined
+              && error instanceof RetentionClassificationError
+              && error.kind === "http"
+              && error.status === 503
+            ) {
+              retried[ordinal]! += 1;
+              // After a terminal failure the request stays pending and
+              // counts as cancelled.
+              if (first === undefined) {
+                retryAfter({ ordinal, summary }, unavailable);
+              }
             } else {
               errors.set(id, error);
               first ??= id;
@@ -802,6 +878,144 @@ function runAttempts(
   });
 }
 
+// The wait before the retry after `retried` earlier 503 retries of the same
+// request. A valid Retry-After, delay-seconds or an HTTP-date, is
+// waited exactly (a past date as 0); a malformed one is ignored. Undefined
+// means the server asked for more than RETENTION_RETRY_MAX_DELAY_MS, so the
+// request fails rather than retrying earlier than it was told to.
+export function unavailableRetryDelay(
+  retryAfter: string | null,
+  retried: number,
+  now = Date.now(),
+  random = Math.random,
+): number | undefined {
+  const asked = retryAfterDelay(retryAfter, now);
+  if (asked !== undefined) {
+    return asked <= RETENTION_RETRY_MAX_DELAY_MS ? asked : undefined;
+  }
+  return (
+    RETENTION_RETRY_BASE_DELAY_MS * 2 ** retried
+    + Math.floor(random() * RETENTION_RETRY_JITTER_MS)
+  );
+}
+
+function retryAfterDelay(
+  value: string | null,
+  now: number,
+): number | undefined {
+  if (value === null) return undefined;
+  if (/^\d+$/.test(value)) return Number(value) * 1_000;
+  const date = httpDate(value, now);
+  return date === undefined ? undefined : Math.max(0, date - now);
+}
+
+const HTTP_DATE_MONTHS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+];
+const HTTP_DATE_DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const HTTP_DATE_LONG_DAYS = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+];
+const HTTP_TIME = String.raw`(?<hour>\d{2}):(?<minute>\d{2}):(?<second>\d{2})`;
+// The three HTTP-date formats of RFC 9110 section 5.6.7: IMF-fixdate, the
+// obsolete RFC 850 date and asctime. Case-sensitive, always UTC.
+const HTTP_DATES: ReadonlyArray<readonly [RegExp, readonly string[]]> = [
+  [
+    new RegExp(
+      String.raw`^(?<weekday>[A-Z][a-z]{2}), (?<day>\d{2}) (?<month>[A-Z][a-z]{2}) (?<year>\d{4}) ${HTTP_TIME} GMT$`,
+    ),
+    HTTP_DATE_DAYS,
+  ],
+  [
+    new RegExp(
+      String.raw`^(?<weekday>[A-Z][a-z]+day), (?<day>\d{2})-(?<month>[A-Z][a-z]{2})-(?<year>\d{2}) ${HTTP_TIME} GMT$`,
+    ),
+    HTTP_DATE_LONG_DAYS,
+  ],
+  [
+    new RegExp(
+      String.raw`^(?<weekday>[A-Z][a-z]{2}) (?<month>[A-Z][a-z]{2}) (?<day>[ \d]\d) ${HTTP_TIME} (?<year>\d{4})$`,
+    ),
+    HTTP_DATE_DAYS,
+  ],
+];
+
+// The UTC time of an HTTP-date in any of the three formats, or undefined.
+// Read by hand because Date.parse takes asctime as local time and accepts far
+// more shapes than these. The fields and weekday must print back unchanged,
+// so impossible dates read as malformed. A two-digit year is the latest year
+// with those digits that is not more than 50 years after `now`.
+function httpDate(value: string, now: number): number | undefined {
+  for (const [pattern, weekdays] of HTTP_DATES) {
+    const found = pattern.exec(value)?.groups;
+    if (found === undefined) continue;
+    const month = HTTP_DATE_MONTHS.indexOf(found.month!);
+    const [day, hour, minute, second] = [
+      found.day!,
+      found.hour!,
+      found.minute!,
+      found.second!,
+    ].map(Number) as [number, number, number, number];
+    const at = (year: number) =>
+      Date.UTC(year, month, day, hour, minute, second);
+    let year = Number(found.year);
+    if (found.year!.length === 2) {
+      const limit = new Date(now).setUTCFullYear(
+        new Date(now).getUTCFullYear() + 50,
+      );
+      year += Math.floor(new Date(limit).getUTCFullYear() / 100) * 100;
+      if (at(year) > limit) year -= 100;
+    }
+    const time = at(year);
+    const date = new Date(time);
+    const printed = [
+      date.getUTCFullYear(),
+      date.getUTCMonth(),
+      date.getUTCDate(),
+      date.getUTCHours(),
+      date.getUTCMinutes(),
+      date.getUTCSeconds(),
+    ];
+    return month >= 0
+      && printed.join() === [year, month, day, hour, minute, second].join()
+      && weekdays[date.getUTCDay()] === found.weekday
+      ? time
+      : undefined;
+  }
+  return undefined;
+}
+
+// Settles after `ms`, or at once when `signal` aborts.
+function waitFor(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise(resolve => {
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    if (signal.aborted) done();
+    else signal.addEventListener("abort", done, { once: true });
+  });
+}
+
 type RetentionAnswers = {
   // Keyed by question key.
   probabilities: Map<string, number>;
@@ -815,7 +1029,7 @@ async function sendRequest(
   apiKey: string,
   timeoutMs: number,
   fetchImpl: RetentionFetch,
-  rejected: (status: number) => void,
+  rejected: (status: number, headers: Headers) => void,
 ): Promise<RetentionAnswers> {
   // Serialized once; the bytes measured are the bytes sent.
   const body = backend.serialize(request);
@@ -855,7 +1069,7 @@ async function sendRequest(
       facts.requestId = requestId;
     }
     if (!response.ok) {
-      rejected(response.status);
+      rejected(response.status, response.headers);
       if (response.status !== 400) {
         discardBody(response);
         throw fail("http", status);

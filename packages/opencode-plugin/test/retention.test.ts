@@ -64,8 +64,12 @@ import {
   RETENTION_MAX_CONCURRENCY,
   RETENTION_MODEL,
   RETENTION_REQUEST_BODY_BYTE_LIMIT,
+  RETENTION_RETRY_BASE_DELAY_MS,
+  RETENTION_RETRY_JITTER_MS,
+  RETENTION_RETRY_MAX_DELAY_MS,
   RETENTION_SUMMARY_EXCERPT_BYTES,
   RetentionClassificationError,
+  unavailableRetryDelay,
   type RetentionCandidate,
   type RetentionFetch,
 } from "../src/retention/classifier";
@@ -2535,6 +2539,556 @@ describe("OpenAI Decisions retention backend", () => {
       expect(error.message).not.toContain("elsewhere");
     },
   );
+});
+
+describe("OpenAI Decisions HTTP 503 retry", () => {
+  const KEY = "sk-openai-test";
+  const unavailable = (headers: Record<string, string> = {}) =>
+    new Response("private overload body", { status: 503, headers });
+  const answer = (init: RequestInit, probability = 0.8) =>
+    openAIAnswer(init, { type: "predicate", probability });
+  // Records every wait and settles it at once, unless `hold` keeps it
+  // pending until the classifier aborts it.
+  const waits = (hold = false) => {
+    const asked: Array<{ ms: number; signal: AbortSignal }> = [];
+    const wait = (ms: number, signal: AbortSignal) => {
+      asked.push({ ms, signal });
+      if (!hold) return Promise.resolve();
+      return new Promise<void>(resolve =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+    };
+    return { asked, wait };
+  };
+  const openai = (
+    fetchImpl: RetentionFetch,
+    extra: Partial<Parameters<typeof classifyRetention>[2]> = {},
+  ) => ({
+    backend: "openai-decisions" as const,
+    apiKey: KEY,
+    fetch: fetchImpl,
+    ...extra,
+  });
+
+  test.each([1, 2])(
+    "recovers after %p 503s, resending identical bytes after backoff",
+    async failures => {
+      const bodies: string[] = [];
+      const { asked, wait } = waits();
+      const result = await classifyRetention(
+        context,
+        [candidate("a")],
+        openai(
+          async (_url, init) => {
+            bodies.push(String(init.body));
+            return bodies.length <= failures ? unavailable() : answer(init);
+          },
+          { retryWait: wait },
+        ),
+      );
+      expect(result.decisions.get("a")).toEqual({ useful: 0.8, keep: true });
+      expect(result).toMatchObject({
+        requests: 1,
+        attempts: failures + 1,
+        truncated: 0,
+        // Only the answered attempt reported usage.
+        reportedUsageRequests: 1,
+      });
+      expect(new Set(bodies).size).toBe(1);
+      expect(asked).toHaveLength(failures);
+      asked.forEach(({ ms }, retry) => {
+        const base = RETENTION_RETRY_BASE_DELAY_MS * 2 ** retry;
+        expect(ms).toBeGreaterThanOrEqual(base);
+        expect(ms).toBeLessThan(base + RETENTION_RETRY_JITTER_MS);
+      });
+    },
+  );
+
+  test("stops after two retries without reading any 503 body", async () => {
+    let calls = 0;
+    let pulls = 0;
+    const { asked, wait } = waits();
+    const error = await failure(
+      classifyRetention(
+        context,
+        [candidate("a")],
+        openai(
+          async () => {
+            calls += 1;
+            return new Response(
+              new ReadableStream<Uint8Array>(
+                {
+                  pull(controller) {
+                    pulls += 1;
+                    controller.close();
+                  },
+                },
+                { highWaterMark: 0 },
+              ),
+              { status: 503, headers: { "x-request-id": "req_503" } },
+            );
+          },
+          { retryWait: wait },
+        ),
+      ),
+    );
+    expect({ calls, pulls, waits: asked.length }).toEqual({
+      calls: 3,
+      pulls: 0,
+      waits: 2,
+    });
+    expect(error.kind).toBe("http");
+    expect(error.status).toBe(503);
+    expect(error.diagnostics).toEqual({
+      backend: "openai-decisions",
+      model: "gpt-6-luna",
+      request: {
+        ordinal: 0,
+        summary: "whole",
+        bodyBytes: expect.any(Number),
+        status: 503,
+        requestId: "req_503",
+      },
+      truncation: "unavailable",
+      counts: {
+        planned: 1,
+        started: 1,
+        succeeded: 0,
+        failed: 1,
+        cancelled: 0,
+        unstarted: 0,
+        attempts: 3,
+      },
+    });
+    expect(error.message).toBe(
+      "Task-aware retention classification with openai-decisions failed (http 503). No tool content was changed. Run /magic-trim --heuristic to trim without classification.",
+    );
+  });
+
+  test.each([429, 500, 502, 504])("never retries HTTP %p", async status => {
+    let calls = 0;
+    const { asked, wait } = waits();
+    const error = await failure(
+      classifyRetention(
+        context,
+        [candidate("a")],
+        openai(
+          async () => {
+            calls += 1;
+            return new Response("", {
+              status,
+              headers: { "retry-after": "1" },
+            });
+          },
+          { retryWait: wait },
+        ),
+      ),
+    );
+    expect(error.status).toBe(status);
+    expect({ calls, waits: asked.length }).toEqual({ calls: 1, waits: 0 });
+  });
+
+  test.each([
+    ["a network failure", "network"],
+    ["a timeout", "timeout"],
+  ] as const)("never retries %s", async (_name, kind) => {
+    let calls = 0;
+    const { asked, wait } = waits();
+    const error = await failure(
+      classifyRetention(
+        context,
+        [candidate("a")],
+        openai(
+          async (_url, init) => {
+            calls += 1;
+            if (kind === "network") throw new TypeError("fetch failed");
+            await new Promise((_, reject) =>
+              init.signal!.addEventListener("abort", () =>
+                reject(init.signal!.reason),
+              ),
+            );
+            throw new Error("unreachable");
+          },
+          { retryWait: wait, timeoutMs: 5 },
+        ),
+      ),
+    );
+    expect(error.kind).toBe(kind);
+    expect({ calls, waits: asked.length }).toEqual({ calls: 1, waits: 0 });
+  });
+
+  test("Jev never retries a 503", async () => {
+    let calls = 0;
+    const { asked, wait } = waits();
+    const error = await failure(
+      classifyRetention(context, [candidate("a")], {
+        apiKey: "key",
+        retryWait: wait,
+        fetch: async () => {
+          calls += 1;
+          return unavailable();
+        },
+      }),
+    );
+    expect(error.status).toBe(503);
+    expect(error.diagnostics?.counts?.attempts).toBe(1);
+    expect({ calls, waits: asked.length }).toEqual({ calls: 1, waits: 0 });
+  });
+
+  test("waits exactly what a valid Retry-After asks, within the bound", () => {
+    const now = Date.parse("Sun, 25 Oct 2026 12:00:00 GMT");
+    const delay = (header: string | null, retried = 0) =>
+      unavailableRetryDelay(header, retried, now, () => 0.5);
+    expect(delay("0")).toBe(0);
+    expect(delay("3")).toBe(3_000);
+    expect(delay("30")).toBe(RETENTION_RETRY_MAX_DELAY_MS);
+    // Asked to wait longer than the bound: fail, never retry early.
+    expect(delay("31")).toBeUndefined();
+    expect(delay("99999999999999999999999")).toBeUndefined();
+    // Absent or malformed: backoff with bounded jitter.
+    const backoff = [1_250, 2_250];
+    for (const header of [
+      null,
+      "",
+      "1.5",
+      "-1",
+      " 3",
+      "soon",
+      "Sun, 31 Feb 2026 12:00:00 GMT",
+      "Sun, 25 Oct 2026 24:00:00 GMT",
+      "Sun, 25 Oct 2026 12:00:60 GMT",
+      "Sun, 25 Oct 2026 12:00:10 UTC",
+      "Sun, 25 Oct 2026 12:00:10 +0000",
+      "sun, 25 oct 2026 12:00:10 gmt",
+      "Mon, 25 Oct 2026 12:00:10 GMT",
+      "Sun, 25 Foo 2026 12:00:10 GMT",
+      "Sun, 5 Oct 2026 12:00:10 GMT",
+      "Sunday, 25 Oct 2026 12:00:10 GMT",
+      "Sun, 25-Oct-26 12:00:10 GMT",
+      "Sunday, 25-Oct-2026 12:00:10 GMT",
+      "Sunday, 25-Oct-26 12:00:10 UTC",
+      "Monday, 25-Oct-26 12:00:10 GMT",
+      "Sunday, 31-Feb-26 12:00:10 GMT",
+      "Sun Oct 25 12:00:10 26",
+      "Sun Oct 25 12:00:10 2026 GMT",
+      "Sun Oct 25 12:00:10 2026 ",
+      "Sun Oct 5 12:00:10 2026",
+      "Mon Oct 25 12:00:10 2026",
+      "Sun Feb 31 12:00:10 2026",
+      "2026-10-25T12:00:10Z",
+      "2026-10-25",
+    ]) {
+      expect([delay(header, 0), delay(header, 1)]).toEqual(backoff);
+    }
+    expect(unavailableRetryDelay(null, 1, now, () => 0.999_999)).toBe(
+      2_000 + RETENTION_RETRY_JITTER_MS - 1,
+    );
+  });
+
+  test("accepts each RFC 9110 HTTP-date format, waits exactly and fails past the bound", () => {
+    const delay = (header: string, now: number) =>
+      unavailableRetryDelay(header, 0, now, () => 0.5);
+    // The RFC 9110 section 5.6.7 examples, one instant in three formats.
+    const instant = Date.parse("1994-11-06T08:49:37Z");
+    const formats = [
+      "Sun, 06 Nov 1994 08:49:37 GMT",
+      "Sunday, 06-Nov-94 08:49:37 GMT",
+      "Sun Nov  6 08:49:37 1994",
+    ];
+    for (const header of formats) {
+      expect(delay(header, instant - 10_000)).toBe(10_000);
+      expect(delay(header, instant - RETENTION_RETRY_MAX_DELAY_MS)).toBe(
+        RETENTION_RETRY_MAX_DELAY_MS,
+      );
+      // Over the bound by one millisecond: terminal, never an early retry.
+      expect(
+        delay(header, instant - RETENTION_RETRY_MAX_DELAY_MS - 1),
+      ).toBeUndefined();
+      expect(delay(header, instant)).toBe(0);
+      expect(delay(header, instant + 60_000)).toBe(0);
+    }
+    // A two-digit day has no padding, and asctime's single digit has one space.
+    expect(
+      delay("Sun Nov 20 08:49:37 1994", Date.parse("1994-11-20T08:49:27Z")),
+    ).toBe(10_000);
+    expect(
+      delay(
+        "Sunday, 20-Nov-94 08:49:37 GMT",
+        Date.parse("1994-11-20T08:49:27Z"),
+      ),
+    ).toBe(10_000);
+  });
+
+  test("reads asctime and every HTTP-date as UTC whatever the local time zone", () => {
+    const zone = process.env.TZ;
+    const instant = Date.parse("2026-10-25T12:00:10Z");
+    const formats = [
+      "Sun, 25 Oct 2026 12:00:10 GMT",
+      "Sunday, 25-Oct-26 12:00:10 GMT",
+      "Sun Oct 25 12:00:10 2026",
+    ];
+    try {
+      for (const tz of ["UTC", "Pacific/Kiritimati", "America/Los_Angeles"]) {
+        process.env.TZ = tz;
+        for (const header of formats) {
+          expect(
+            unavailableRetryDelay(header, 0, instant - 10_000, () => 0.5),
+          ).toBe(10_000);
+        }
+      }
+    } finally {
+      if (zone === undefined) delete process.env.TZ;
+      else process.env.TZ = zone;
+    }
+  });
+
+  test("reads a two-digit RFC 850 year more than 50 years ahead as the most recent past year", () => {
+    const backoff = 1_250;
+    const delay = (header: string, now: string) =>
+      unavailableRetryDelay(header, 0, Date.parse(now), () => 0.5);
+    const now = "2026-10-25T12:00:00Z";
+    // This year, in the current century.
+    expect(delay("Sunday, 25-Oct-26 12:00:10 GMT", now)).toBe(10_000);
+    // 2075 is 49 years ahead, so it stays 2075 (a Friday) and is a far future
+    // date; 1975 (a Saturday) is the year it must not be read as.
+    expect(delay("Friday, 25-Oct-75 12:00:00 GMT", now)).toBeUndefined();
+    expect(delay("Saturday, 25-Oct-75 12:00:00 GMT", now)).toBe(backoff);
+    // Exactly 50 years ahead is not more than 50: 2076 (a Sunday).
+    expect(delay("Sunday, 25-Oct-76 12:00:00 GMT", now)).toBeUndefined();
+    expect(delay("Monday, 25-Oct-76 12:00:00 GMT", now)).toBe(backoff);
+    // One second more is the most recent past 1976 (a Monday), a past date.
+    expect(delay("Monday, 25-Oct-76 12:00:01 GMT", now)).toBe(0);
+    expect(delay("Sunday, 25-Oct-76 12:00:01 GMT", now)).toBe(backoff);
+    // 2077 (a Monday) is more than 50 years ahead, so 77 is 1977 (a Tuesday).
+    expect(delay("Tuesday, 25-Oct-77 12:00:10 GMT", now)).toBe(0);
+    expect(delay("Monday, 25-Oct-77 12:00:10 GMT", now)).toBe(backoff);
+    // The century follows the clock: from 2090-01-01, 40 is 2140 (a Friday,
+    // exactly 50 years ahead) and 41 is 2041 (a Tuesday), not 2141.
+    const later = "2090-01-01T00:00:00Z";
+    expect(delay("Friday, 01-Jan-40 00:00:00 GMT", later)).toBeUndefined();
+    expect(delay("Tuesday, 01-Jan-41 00:00:00 GMT", later)).toBe(0);
+  });
+
+  test("a Retry-After beyond the bound fails the request without waiting", async () => {
+    let calls = 0;
+    const { asked, wait } = waits();
+    const error = await failure(
+      classifyRetention(
+        context,
+        [candidate("a")],
+        openai(
+          async () => {
+            calls += 1;
+            return unavailable({ "retry-after": "31" });
+          },
+          { retryWait: wait },
+        ),
+      ),
+    );
+    expect(error.status).toBe(503);
+    expect(error.diagnostics?.counts).toMatchObject({ attempts: 1, failed: 1 });
+    expect({ calls, waits: asked.length }).toEqual({ calls: 1, waits: 0 });
+  });
+
+  test("passes the server's Retry-After to the wait and uses the real timer by default", async () => {
+    const { asked, wait } = waits();
+    let calls = 0;
+    await classifyRetention(
+      context,
+      [candidate("a")],
+      openai(
+        async (_url, init) =>
+          ++calls === 1 ? unavailable({ "retry-after": "7" }) : answer(init),
+        { retryWait: wait },
+      ),
+    );
+    expect(asked.map(({ ms }) => ms)).toEqual([7_000]);
+    // `Retry-After: 0` goes through the default timer without a test hook.
+    calls = 0;
+    const result = await classifyRetention(
+      context,
+      [candidate("a")],
+      openai(async (_url, init) =>
+        ++calls === 1 ? unavailable({ "retry-after": "0" }) : answer(init),
+      ),
+    );
+    expect(result.attempts).toBe(2);
+  });
+
+  test("a terminal failure during the wait aborts it and the retry is never sent", async () => {
+    const { asked, wait } = waits(true);
+    const sent: string[] = [];
+    const error = await failure(
+      classifyRetention(
+        context,
+        [candidate("a", "first"), candidate("b", "second")],
+        openai(
+          async (_url, init) => {
+            const output = JSON.parse(JSON.parse(String(init.body)).input)
+              .candidates[0].output as string;
+            sent.push(output);
+            if (output === "first") return unavailable();
+            // The 401 arrives only once the 503 retry is waiting.
+            while (asked.length === 0) await Bun.sleep(1);
+            return new Response("", { status: 401 });
+          },
+          { retryWait: wait },
+        ),
+      ),
+    );
+    expect(error.status).toBe(401);
+    expect(asked).toHaveLength(1);
+    expect(asked[0]!.signal.aborted).toBe(true);
+    await Bun.sleep(5);
+    expect(sent).toEqual(["first", "second"]);
+    expect(error.diagnostics?.counts).toEqual({
+      planned: 2,
+      started: 2,
+      succeeded: 0,
+      failed: 1,
+      cancelled: 1,
+      unstarted: 0,
+      attempts: 2,
+    });
+  });
+
+  test("a 503 after a terminal failure starts no wait and counts as cancelled", async () => {
+    const { asked, wait } = waits();
+    let calls = 0;
+    const error = await failure(
+      classifyRetention(
+        context,
+        [candidate("a"), candidate("b")],
+        openai(
+          async () => {
+            const call = calls++;
+            if (call === 0) return new Response("", { status: 401 });
+            await Bun.sleep(5);
+            return unavailable();
+          },
+          { retryWait: wait },
+        ),
+      ),
+    );
+    expect(error.status).toBe(401);
+    expect({ calls, waits: asked.length }).toEqual({ calls: 2, waits: 0 });
+    expect(error.diagnostics?.counts).toMatchObject({
+      failed: 1,
+      cancelled: 1,
+      attempts: 2,
+    });
+  });
+
+  test("the default timer is aborted when another request fails", async () => {
+    let calls = 0;
+    const started = performance.now();
+    const error = await failure(
+      classifyRetention(
+        context,
+        [candidate("a"), candidate("b")],
+        openai(async () => {
+          const call = calls++;
+          if (call === 0) return unavailable();
+          await Bun.sleep(20);
+          return new Response("", { status: 401 });
+        }),
+      ),
+    );
+    expect(error.status).toBe(401);
+    expect(calls).toBe(2);
+    // Well under the first backoff of 1 second.
+    expect(performance.now() - started).toBeLessThan(
+      RETENTION_RETRY_BASE_DELAY_MS / 2,
+    );
+  });
+
+  test("retries share the concurrency limit and every request is answered once", async () => {
+    const seen = new Map<string, number>();
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const { asked, wait } = waits();
+    const result = await classifyRetention(
+      context,
+      Array.from({ length: 12 }, (_, i) => candidate(`c${i}`, `out${i}`)),
+      openai(
+        async (_url, init) => {
+          const body = String(init.body);
+          const call = (seen.get(body) ?? 0) + 1;
+          seen.set(body, call);
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await Bun.sleep(2);
+          inFlight -= 1;
+          return call === 1 ? unavailable() : answer(init, 0.9);
+        },
+        { retryWait: wait },
+      ),
+    );
+    expect(maxInFlight).toBe(RETENTION_MAX_CONCURRENCY);
+    expect([...seen.values()]).toEqual(Array(12).fill(2));
+    expect(asked).toHaveLength(12);
+    expect(result.decisions.size).toBe(12);
+    expect(result).toMatchObject({ requests: 12, attempts: 24 });
+  });
+
+  test("with --truncate, a 503 resends the excerpt variant and shares one budget", async () => {
+    const longSummary = `## Objective\n${"- A dense detail line.\n".repeat(1_500)}`;
+    const summaries: string[] = [];
+    const bodies: string[] = [];
+    const run = (respond: (call: number, init: RequestInit) => Response) =>
+      classifyRetention(
+        { ...context, sessionSummary: longSummary },
+        [candidate("a")],
+        openai(
+          async (_url, init) => {
+            bodies.push(String(init.body));
+            summaries.push(
+              JSON.parse(JSON.parse(String(init.body)).input).task
+                .sessionSummary === longSummary
+                ? "whole"
+                : "excerpt",
+            );
+            return respond(bodies.length, init);
+          },
+          { truncateSummary: true, retryWait: waits().wait },
+        ),
+      );
+
+    // Refused, then the excerpt meets one 503 and is resent byte for byte.
+    const result = await run((call, init) =>
+      call === 1
+        ? openAITokenLimitResponse()
+        : call === 2
+          ? unavailable()
+          : answer(init),
+    );
+    expect(summaries).toEqual(["whole", "excerpt", "excerpt"]);
+    expect(bodies[1]).toBe(bodies[2]);
+    expect(result).toMatchObject({ requests: 1, attempts: 3, truncated: 1 });
+
+    // Two whole-summary 503s spend the budget, so the excerpt's 503 is final
+    // and the token-limit retry still happens only once.
+    summaries.length = 0;
+    bodies.length = 0;
+    const error = await failure(
+      run(call =>
+        call <= 2
+          ? unavailable()
+          : call === 3
+            ? openAITokenLimitResponse()
+            : unavailable(),
+      ),
+    );
+    expect(summaries).toEqual(["whole", "whole", "whole", "excerpt"]);
+    expect(new Set(bodies.slice(0, 3)).size).toBe(1);
+    expect(error.status).toBe(503);
+    expect(error.diagnostics?.request?.summary).toBe("excerpt");
+    expect(error.diagnostics?.counts).toMatchObject({
+      failed: 1,
+      cancelled: 0,
+      attempts: 4,
+    });
+  });
 });
 
 // A 200 body is provider data. Its own `ok` and `reason` fields describe
