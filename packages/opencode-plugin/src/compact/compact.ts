@@ -56,11 +56,32 @@ import {
 } from "../policy/generation";
 import {
   distinctReasons,
+  hasPluginMessage,
   markPluginMessage,
   PluginMessageError,
   undeletedSessionIDs,
 } from "../policy/feedback";
 import { ForkCleanupError, ForkHistoryError, forkSession } from "./fork";
+import {
+  chooseStage,
+  matchCandidate,
+  reasoningContextMode,
+  stageReport as sharedStageReport,
+  verifiedReasoning,
+  type MatchCandidate,
+  type ModelIdentity,
+  type Qualifies,
+  type ReasoningReports,
+  type ReasoningRoute,
+  type StageChoice,
+  type StageReport,
+} from "../policy/reasoning";
+import {
+  indexReplay,
+  reasoningUnits,
+  type ReplayContext,
+  type ReplayIndex,
+} from "./reasoning";
 import {
   assertForkMessageShape,
   buildTurns,
@@ -86,6 +107,13 @@ export type CompactionSettings = {
   descriptor: {
     limit: { context: number; input?: number; output?: number };
     capabilities?: { input?: { image?: boolean } };
+    // The provider package, wire model ID and earlier-reasoning field the
+    // host lists, which decide the verified reasoning routes, and the
+    // variants it offers.
+    npm?: string;
+    wireModelID?: string;
+    reasoningField?: string;
+    variants?: readonly string[];
   };
 };
 
@@ -108,6 +136,9 @@ type GenerationBatchPlan = NativeGenerationBatch<GenerationCandidate> & {
 type GenerationBatch = GenerationBatchPlan & {
   generationNonce: string;
   prompt: string;
+  // The summary model this request runs on: the configured summarizer, or
+  // under `--match-model` the model that wrote the target's reasoning.
+  settings: CompactionSettings;
 };
 
 type ForkMessageIdentity = {
@@ -127,6 +158,15 @@ type ForkMessageIdentity = {
 type SummaryGenerationOptions = {
   controlTimeoutMs?: number;
   nonceFactory?: () => string;
+  reasoning?: SummaryReasoningOptions;
+};
+
+// `--match-model`, and the list each summary request's reasoning report is
+// added to for the command's feedback.
+export type SummaryReasoningOptions = ReasoningReports & {
+  // Set by per-turn generation once it has read the model list: the model
+  // the successor continues with and its reasoning context.
+  replay?: ReplayContext | undefined;
 };
 
 type GenerationRoute = {
@@ -155,6 +195,39 @@ export type GeneratedSummary = {
 // plugin's compacting hook ends the fork's prompt loop as a context overflow,
 // which reports trim-first guidance.
 const ownedGenerationForks = new Set<string>();
+
+export function isOwnedGenerationFork(sessionID: string): boolean {
+  return ownedGenerationForks.has(sessionID);
+}
+
+// A summary request carries the protected reasoning of earlier turns only
+// when OpenAI Responses runs it with every turn's reasoning context. The
+// plugin's `chat.params` hook asks for that on this plugin's own summary and
+// generation forks on a verified model, and changes nothing else. Whether a
+// later hook changes it again is not observed; budgets already assume the
+// costlier `all_turns`.
+export function requestAllTurnsReasoning(
+  owned: boolean,
+  model: {
+    providerID: string;
+    id: string;
+    api?: { id?: string; npm?: string };
+  },
+  options: Record<string, unknown>,
+): void {
+  if (!owned) return;
+  if (
+    !verifiedReasoning(
+      v1ReasoningRoute(
+        { providerID: model.providerID, modelID: model.id },
+        { npm: model.api?.npm, wireModelID: model.api?.id },
+      ),
+    )
+  ) {
+    return;
+  }
+  options["reasoningContext"] = "all_turns";
+}
 
 export function rejectNativeCompactionOfGenerationFork(
   sessionID: string,
@@ -207,12 +280,13 @@ export async function generateCompactionSummaries(
   });
   if (candidates.length === 0) return generated;
 
-  const settings = await resolveCompactionSettings(
+  const catalog = await resolveSummarizerCatalog(
     v2,
     session,
     historyMayExposeImages(plan.sourceSnapshot),
   );
-  const budget = computeNativeBatchBudget(settings.descriptor.limit);
+  const configured = catalog.configured;
+  if (options.reasoning) options.reasoning.replay = catalog.replayContext();
   const protocol: NativeBatchProtocol<GenerationCandidate> = {
     explicitRequestTokens: batchCandidates =>
       estimateGenerationExplicitRequestTokens(
@@ -221,34 +295,117 @@ export async function generateCompactionSummaries(
       ),
     responseProtocolTokens: estimateGenerationResponseProtocolTokens,
   };
-  const batchPlans = planNativeGenerationBatches(
-    candidates,
-    budget,
-    protocol,
-  ).map(batch => createGenerationBatch(batch, plan, budget));
   const generationNonces = new Set<string>();
-  const batches = batchPlans.map(batch =>
-    finalizeGenerationBatch(
-      batch,
-      plan,
+  // One attribution of the source for every request's replay estimate.
+  const replayIndex = indexReplay(plan.sourceMessages);
+  // A request's input with each attributable protected unit its model is sent
+  // counted by that unit's replay estimate instead of its visible text.
+  const planBatch = (
+    candidate: GenerationCandidate,
+    settings: CompactionSettings,
+    nonce: string,
+  ): GenerationBatch => {
+    const budget = computeNativeBatchBudget(settings.descriptor.limit);
+    const replayDelta = (turn: Turn) => {
+      const estimate = replayIndex.estimate(
+        catalog.requestContext(settings.model),
+        new Set(turnMessages(turn).map(message => message.info.id)),
+      );
+      return estimate.tokens - estimate.visibleTokens;
+    };
+    const target = plan.summarizedTurns[candidate.planIndex]!;
+    const [batch] = planNativeGenerationBatches(
+      [
+        {
+          ...candidate,
+          inputTokens: candidate.inputTokens + replayDelta(target),
+        },
+      ],
       budget,
-      globalTurnIndexPrompt,
+      protocol,
+    );
+    return {
+      ...finalizeGenerationBatch(
+        createGenerationBatch(batch!, plan, budget, replayDelta),
+        budget,
+        globalTurnIndexPrompt,
+        nonce,
+      ),
+      settings,
+    };
+  };
+  const sourceTurns = buildTurns(plan.sourceSnapshot as MessageWithParts[]);
+  const matchModel = options.reasoning?.matchModel === true;
+  const batches = candidates.map(candidate => {
+    const turn = plan.summarizedTurns[candidate.planIndex]!;
+    // One nonce per target, shared by the matched model's fit check and the
+    // request that runs, so a plan that is not used claims none.
+    const nonce = selectGenerationNonce(
+      [plan.sourceSnapshot],
       options.nonceFactory ?? createGenerationNonce,
       generationNonces,
-    ),
-  );
-  const retainedMessageIndexes = new Set(
-    batches.flatMap(batch => batch.retainedMessageIndexes),
-  );
-  if (
-    historyMayExposeImages(
-      plan.sourceSnapshot.filter((_, index) =>
-        retainedMessageIndexes.has(index),
-      ),
-    )
-  ) {
-    assertConfiguredModelSupportsImages(settings);
-  }
+    );
+    // The target's own reasoning decides the match, never the halo's. The
+    // image check covers the turn that may join it as context.
+    const exposesImages = historyMayExposeImages([
+      ...(sourceTurns[candidate.sourceTurnIndex - 1]
+        ? turnMessages(sourceTurns[candidate.sourceTurnIndex - 1]!)
+        : []),
+      ...turnMessages(turn),
+    ]);
+    const match = matchCandidate(
+      reasoningUnits(turn.assistants),
+      catalog.qualifies,
+    );
+    let choice = chooseStage(match, configured, model => {
+      const descriptor = catalog.describe(model);
+      return {
+        variants: new Set(descriptor?.variants ?? []),
+        optionsConflict: catalog.summarizerOptions,
+        imagesBlocked:
+          exposesImages && descriptor?.capabilities?.input?.image !== true,
+      };
+    });
+    let batch: GenerationBatch | undefined;
+    if (choice.kind === "match") {
+      try {
+        const matched = planBatch(
+          candidate,
+          {
+            model: choice.model,
+            ...(choice.variant === undefined
+              ? {}
+              : { variant: choice.variant }),
+            descriptor: catalog.describe(choice.model)!,
+          },
+          nonce,
+        );
+        if (matchModel) batch = matched;
+      } catch (error) {
+        if (!hasPluginMessage(error)) throw error;
+        choice = { kind: "fallback", reason: "capacity" };
+      }
+    }
+    batch ??= planBatch(candidate, configured, nonce);
+    const retained = batch.retainedMessageIndexes.map(
+      index => plan.sourceSnapshot[index] as MessageWithParts,
+    );
+    if (historyMayExposeImages(retained)) {
+      assertConfiguredModelSupportsImages(batch.settings);
+    }
+    options.reasoning?.reports.push(
+      stageReport({
+        stage: "turn",
+        candidate: match,
+        choice,
+        settings: batch.settings,
+        history: retained,
+        catalog,
+        replay: replayIndex,
+      }),
+    );
+    return batch;
+  });
   const sourceOutcome = await attemptWithinDeadline(
     signal =>
       v2.session
@@ -282,7 +439,6 @@ export async function generateCompactionSummaries(
   const results = await requestCompactionGenerationBatches(
     v2,
     session,
-    settings,
     batches,
     plan,
     sourceOutcome.value,
@@ -300,10 +456,13 @@ export async function generateCompactionSummaries(
   return generated;
 }
 
+// `replayDelta` is what a turn's protected reasoning adds to the request
+// model's input beyond its visible text, which the halo choice counts too.
 function createGenerationBatch(
   batch: NativeGenerationBatch<GenerationCandidate>,
   plan: CompactionPlan,
   budget: NativeBatchBudget,
+  replayDelta: (turn: Turn) => number,
 ): GenerationBatchPlan {
   const sourceMessages = plan.sourceSnapshot as MessageWithParts[];
   const sourceTurns = buildTurns(sourceMessages);
@@ -328,7 +487,9 @@ function createGenerationBatch(
     && !retainedTurnIndexes.has(firstTurnIndex - 1)
     && !turnHasNativeCheckpointArtifact(precedingTurn)
   ) {
-    const precedingCost = estimateNativeTurnCost(precedingTurn).inputTokens;
+    const precedingCost =
+      estimateNativeTurnCost(precedingTurn).inputTokens
+      + replayDelta(precedingTurn);
     if (retainedInput + precedingCost <= budget.haloInputLimit) {
       retainedInput += precedingCost;
       inputLimit = budget.haloInputLimit;
@@ -371,17 +532,10 @@ function createGenerationBatch(
 
 function finalizeGenerationBatch(
   batch: GenerationBatchPlan,
-  plan: CompactionPlan,
   budget: NativeBatchBudget,
   globalTurnIndexPrompt: string,
-  nonceFactory: () => string,
-  generationNonces: Set<string>,
-): GenerationBatch {
-  const generationNonce = selectGenerationNonce(
-    [plan.sourceSnapshot],
-    nonceFactory,
-    generationNonces,
-  );
+  generationNonce: string,
+): Omit<GenerationBatch, "settings"> {
   const candidates = batch.candidates.map(candidate => ({
     ...candidate,
     marker: generationTurnMarker(generationNonce, candidate.ordinal),
@@ -429,6 +583,36 @@ function finalizeGenerationBatch(
   };
 }
 
+function turnMessages(turn: Turn): MessageWithParts[] {
+  return [...turn.user, ...turn.assistants];
+}
+
+// One summary request's reasoning report over the history it sends, with the
+// protected units whose replay cost its input estimate leaves out.
+export function stageReport(request: {
+  stage: StageReport["stage"];
+  candidate: MatchCandidate;
+  choice: StageChoice;
+  settings: CompactionSettings;
+  history: readonly MessageWithParts[];
+  catalog: Pick<SummarizerCatalog, "qualifies" | "requestContext">;
+  replay: ReplayIndex;
+}): StageReport {
+  const model = request.settings.model;
+  return sharedStageReport({
+    stage: request.stage,
+    candidate: request.candidate,
+    choice: request.choice,
+    model,
+    units: reasoningUnits(request.history),
+    qualifies: request.catalog.qualifies,
+    replayUnknown: request.replay.estimate(
+      request.catalog.requestContext(model),
+      new Set(request.history.map(message => message.info.id)),
+    ).unknown,
+  });
+}
+
 function turnHasNativeCheckpointArtifact(turn: Turn | undefined): boolean {
   if (!turn) return false;
   return [...turn.user, ...turn.assistants].some(
@@ -441,7 +625,6 @@ function turnHasNativeCheckpointArtifact(turn: Turn | undefined): boolean {
 async function requestCompactionGenerationBatches(
   v2: V2Client,
   sourceSession: Session,
-  settings: CompactionSettings,
   batches: GenerationBatch[],
   plan: CompactionPlan,
   sourceMessages: MessageWithParts[],
@@ -465,7 +648,6 @@ async function requestCompactionGenerationBatches(
         const batchResults = await requestCompactionGeneration(
           v2,
           sourceSession,
-          settings,
           batch,
           plan,
           sourceMessages,
@@ -539,7 +721,6 @@ async function requestCompactionGenerationBatches(
 async function requestCompactionGeneration(
   v2: V2Client,
   sourceSession: Session,
-  settings: CompactionSettings,
   batch: GenerationBatch,
   plan: CompactionPlan,
   sourceMessages: MessageWithParts[],
@@ -762,8 +943,10 @@ async function requestCompactionGeneration(
           sessionID: fork.id,
           ...route,
           agent: MAGIC_COMPACT_SUMMARIZER_AGENT,
-          model: settings.model,
-          ...(settings.variant ? { variant: settings.variant } : {}),
+          model: batch.settings.model,
+          ...(batch.settings.variant
+            ? { variant: batch.settings.variant }
+            : {}),
           format: GENERATION_FORMAT,
           parts: [
             {
@@ -1010,11 +1193,27 @@ function generationMarkerPart(
 
 export const SUMMARIZER_MODEL_REQUIRED = `Magic Compact requires an explicit model on its ${MAGIC_COMPACT_SUMMARIZER_AGENT} agent. Set agent["${MAGIC_COMPACT_SUMMARIZER_AGENT}"].model (and optionally variant) in your OpenCode config.`;
 
-export async function resolveCompactionSettings(
+// The configured summarizer plus the live model list, read once per summary
+// stage. `describe` gives another listed model's descriptor for
+// `--match-model`, `qualifies` says whether a model's protected reasoning
+// behavior is verified, `requestContext` is the reasoning context a summary
+// request on a model uses, and `replayContext` names the model the successor
+// continues with and the reasoning context its requests use.
+export type SummarizerCatalog = {
+  configured: CompactionSettings;
+  // The summarizer agent carries operator options written for its own model.
+  summarizerOptions: boolean;
+  describe: (model: ModelIdentity) => ModelDescriptor | undefined;
+  qualifies: Qualifies;
+  requestContext: (model: ModelIdentity) => ReplayContext;
+  replayContext: () => ReplayContext | undefined;
+};
+
+export async function resolveSummarizerCatalog(
   v2: V2Client,
   sourceSession: Session,
   requiresImages: boolean,
-): Promise<CompactionSettings> {
+): Promise<SummarizerCatalog> {
   let agents: Agent[];
   try {
     agents = unwrap(
@@ -1064,55 +1263,145 @@ export async function resolveCompactionSettings(
         : "Magic Compact could not resolve the configured compaction model descriptor.",
     );
   }
-  const provider =
-    isRecord(catalog) && Array.isArray(catalog["all"])
-      ? catalog["all"].find(
-          value =>
-            isRecord(value) && value["id"] === summarizer.model!.providerID,
-        )
-      : undefined;
-  const models = isRecord(provider) ? provider["models"] : undefined;
-  const descriptor = isRecord(models)
-    ? models[summarizer.model.modelID]
-    : undefined;
-  const limit = isRecord(descriptor) ? descriptor["limit"] : undefined;
-  if (
-    !isRecord(descriptor)
-    || !isRecord(limit)
-    || typeof limit["context"] !== "number"
-  ) {
+  const providers =
+    isRecord(catalog) && Array.isArray(catalog["all"]) ? catalog["all"] : [];
+  const providerRecord = (providerID: string) =>
+    providers.find(value => isRecord(value) && value["id"] === providerID) as
+      Record<string, unknown> | undefined;
+  const modelRecord = (model: ModelIdentity) => {
+    const models = providerRecord(model.providerID)?.["models"];
+    const record = isRecord(models) ? models[model.modelID] : undefined;
+    return isRecord(record) ? record : undefined;
+  };
+  const describe = (model: ModelIdentity) =>
+    modelDescriptor(modelRecord(model));
+  const descriptor = describe(summarizer.model);
+  if (!descriptor) {
     throw new PluginMessageError(
       requiresImages
         ? "Magic Compact requires an image-capable configured compaction model for retained fork history containing images."
         : "Magic Compact could not resolve the configured compaction model descriptor.",
     );
   }
-  const capabilities = descriptor["capabilities"];
+  const options = (value: unknown) =>
+    isRecord(value) && isRecord(value["options"]) ? value["options"] : {};
+  const verified = (model: ModelIdentity) =>
+    verifiedReasoning(v1ReasoningRoute(model, describe(model)));
+  return {
+    configured: {
+      model: summarizer.model,
+      ...(summarizer.variant ? { variant: summarizer.variant } : {}),
+      descriptor,
+    },
+    summarizerOptions: Object.keys(options(summarizer)).length > 0,
+    describe,
+    qualifies: model => verified(model) !== undefined,
+    // The `chat.params` hook asks for `all_turns` on owned summary requests on
+    // a verified model, the costlier context.
+    requestContext: model => ({
+      primary: model,
+      mode: verified(model) ? "all_turns" : "unknown",
+    }),
+    replayContext: () => {
+      const primary = sourceSession.model;
+      if (!primary?.providerID || !primary.id) return undefined;
+      const model = { providerID: primary.providerID, modelID: primary.id };
+      const record = modelRecord(model);
+      const facts = verified(model);
+      if (!record || !facts) return { primary: model, mode: "unknown" };
+      const variants = record["variants"];
+      const variant =
+        primary.variant !== undefined && isRecord(variants)
+          ? variants[primary.variant]
+          : undefined;
+      const agent = agents.find(item => item.name === sourceSession.agent);
+      return {
+        primary: model,
+        mode: reasoningContextMode(
+          [
+            options(providerRecord(model.providerID)),
+            options(record),
+            isRecord(variant) ? variant : {},
+            options(agent),
+          ].map(value => value["reasoningContext"]),
+          facts,
+        ),
+      };
+    },
+  };
+}
+
+export type ModelDescriptor = CompactionSettings["descriptor"];
+
+function modelDescriptor(
+  record: Record<string, unknown> | undefined,
+): ModelDescriptor | undefined {
+  const limit = record?.["limit"];
+  if (!record || !isRecord(limit) || typeof limit["context"] !== "number") {
+    return undefined;
+  }
+  const capabilities = record["capabilities"];
   const inputCapabilities = isRecord(capabilities)
     ? capabilities["input"]
     : undefined;
+  const interleaved = isRecord(capabilities)
+    ? capabilities["interleaved"]
+    : undefined;
+  const api = record["api"];
+  const variants = record["variants"];
   return {
-    model: summarizer.model,
-    ...(summarizer.variant ? { variant: summarizer.variant } : {}),
-    descriptor: {
-      limit: {
-        context: limit["context"],
-        ...(typeof limit["input"] === "number"
-          ? { input: limit["input"] }
-          : {}),
-        ...(typeof limit["output"] === "number"
-          ? { output: limit["output"] }
-          : {}),
-      },
-      ...(isRecord(inputCapabilities)
-        ? {
-            capabilities: {
-              input: { image: inputCapabilities["image"] === true },
-            },
-          }
+    limit: {
+      context: limit["context"],
+      ...(typeof limit["input"] === "number" ? { input: limit["input"] } : {}),
+      ...(typeof limit["output"] === "number"
+        ? { output: limit["output"] }
         : {}),
     },
+    ...(isRecord(inputCapabilities)
+      ? {
+          capabilities: {
+            input: { image: inputCapabilities["image"] === true },
+          },
+        }
+      : {}),
+    ...(isRecord(api) && typeof api["npm"] === "string"
+      ? { npm: api["npm"] }
+      : {}),
+    ...(isRecord(api) && typeof api["id"] === "string"
+      ? { wireModelID: api["id"] }
+      : {}),
+    ...(isRecord(interleaved) && typeof interleaved["field"] === "string"
+      ? { reasoningField: interleaved["field"] }
+      : {}),
+    variants: isRecord(variants) ? Object.keys(variants) : [],
   };
+}
+
+// The route facts of an OpenCode 1 model descriptor: OpenCode 1 serializes
+// `@ai-sdk/openai` models with OpenAI Responses and sends `api.id` as the
+// wire model.
+function v1ReasoningRoute(
+  model: ModelIdentity,
+  descriptor: Pick<ModelDescriptor, "npm" | "wireModelID"> | undefined,
+): ReasoningRoute | undefined {
+  if (!descriptor) return undefined;
+  return {
+    model,
+    wireModelID: descriptor.wireModelID,
+    responses: descriptor.npm === "@ai-sdk/openai",
+  };
+}
+
+// The DeepSeek route whose earlier plain reasoning OpenCode 1 sends back as
+// `reasoning_content`, which DeepSeek reads only when the request has tools.
+export function isQualifiedDeepSeekModel(
+  model: ModelIdentity,
+  descriptor: ModelDescriptor | undefined,
+): boolean {
+  return (
+    model.providerID === "deepseek"
+    && descriptor?.reasoningField === "reasoning_content"
+  );
 }
 
 export function assertConfiguredModelSupportsImages(

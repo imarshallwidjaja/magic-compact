@@ -6,20 +6,36 @@
 // accepted.
 import type { PermissionRuleset, Session } from "@opencode-ai/sdk/v2";
 import { randomBytes } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type { V2Client } from "../api";
 import {
   computeNativeBatchBudget,
   estimateNativeHistoryTokens,
   NATIVE_BATCH_FIXED_RESERVE_TOKENS,
-  type NativeBatchBudget,
 } from "../compact/batch";
 import {
   assertConfiguredModelSupportsImages,
   assertForkRecordIdentity,
   historyMayExposeImages,
-  resolveCompactionSettings,
+  isQualifiedDeepSeekModel,
+  resolveSummarizerCatalog,
+  stageReport,
   type CompactionSettings,
+  type SummarizerCatalog,
+  type SummaryReasoningOptions,
 } from "../compact/compact";
+import {
+  indexReplay,
+  reasoningUnits,
+  type ReplayIndex,
+} from "../compact/reasoning";
+import {
+  chooseStage,
+  matchCandidate,
+  sameModel,
+  type StageChoice,
+  type StageReport,
+} from "../policy/reasoning";
 import {
   hasPluginMessage,
   markPluginMessage,
@@ -40,11 +56,14 @@ import {
 import {
   MAGIC_COMPACT_SUMMARIZER_AGENT,
   SESSION_SUMMARY_PROMPT,
+  SESSION_SUMMARY_RESPONSE_SCHEMA,
+  SESSION_SUMMARY_TOOL_PROMPT,
 } from "../compact/constants";
 import { countGptTokens } from "../stats/tokenize";
 import { attemptWithinDeadline, CONTROL_OPERATION_TIMEOUT_MS } from "../util";
 import {
   SessionSummaryError,
+  structuredSessionSummary,
   type SessionSummaryStage,
 } from "../policy/retention";
 import { RETENTION_FAILURE_GUIDANCE } from "./classifier";
@@ -57,6 +76,20 @@ const SUMMARY_AGENT = MAGIC_COMPACT_SUMMARIZER_AGENT;
 const SUMMARY_FORK_PERMISSION: PermissionRuleset = [
   { permission: "*", pattern: "*", action: "deny" },
 ];
+// The structured summary keeps the host's response tool, as per-turn
+// generation does; the last matching rule wins.
+const STRUCTURED_SUMMARY_FORK_PERMISSION: PermissionRuleset = [
+  ...SUMMARY_FORK_PERMISSION,
+  { permission: "StructuredOutput", pattern: "*", action: "allow" },
+];
+const STRUCTURED_SUMMARY_FORMAT = {
+  type: "json_schema" as const,
+  schema: SESSION_SUMMARY_RESPONSE_SCHEMA,
+};
+// The first page of a structured fork read holds only the reply and the
+// prompt; later pages hold older history.
+const STRUCTURED_FIRST_PAGE = 2;
+const FORK_PAGE_SIZE = 500;
 const ASSISTANT_PART_TYPES = new Set([
   "step-start",
   "step-finish",
@@ -93,6 +126,16 @@ export { SessionSummaryError, type SessionSummaryStage };
 
 export type SessionSummaryOptions = {
   controlTimeoutMs?: number;
+  reasoning?: SummaryReasoningOptions;
+};
+
+// How the summary request is made: as plain text, or on the DeepSeek route
+// through the host's response tool, which is the only way that model reads
+// the earlier plain reasoning the history carries.
+type SummaryRequest = {
+  settings: CompactionSettings;
+  structured: boolean;
+  prompt: string;
 };
 
 export async function generateSessionSummary(
@@ -113,13 +156,98 @@ export async function generateSessionSummary(
     throw new SessionSummaryError("history");
   }
   const requiresImages = historyMayExposeImages(visible);
-  let settings: CompactionSettings;
-  let budget: NativeBatchBudget;
+  // One attribution of the history for every candidate request's estimate.
+  const replay = indexReplay(visible);
+  let request: SummaryRequest;
+  let report: StageReport;
   try {
-    settings = await resolveCompactionSettings(v2, session, requiresImages);
-    if (requiresImages) assertConfiguredModelSupportsImages(settings);
-    budget = computeNativeBatchBudget(settings.descriptor.limit);
+    const catalog = await resolveSummarizerCatalog(v2, session, requiresImages);
+    const configured = catalog.configured;
+    // Matching unlocks only the current model's own protected reasoning;
+    // reasoning from other models in the history stays unreadable.
+    const primary = session.model;
+    const units = reasoningUnits(visible).filter(
+      unit =>
+        primary !== undefined
+        && unit.origin !== undefined
+        && sameModel(unit.origin, {
+          providerID: primary.providerID,
+          modelID: primary.id,
+        }),
+    );
+    const match = matchCandidate(units, catalog.qualifies);
+    let choice: StageChoice = chooseStage(match, configured, model => {
+      const descriptor = catalog.describe(model);
+      return {
+        variants: new Set(descriptor?.variants ?? []),
+        optionsConflict: catalog.summarizerOptions,
+        imagesBlocked:
+          requiresImages && descriptor?.capabilities?.input?.image !== true,
+      };
+    });
+    const summaryRequest = (settings: CompactionSettings): SummaryRequest => {
+      const structured =
+        isQualifiedDeepSeekModel(settings.model, settings.descriptor)
+        && visible.some(message =>
+          message.parts.some(
+            part => part.type === "reasoning" && part.text.trim() !== "",
+          ),
+        );
+      return {
+        settings,
+        structured,
+        prompt: structured
+          ? SESSION_SUMMARY_TOOL_PROMPT
+          : SESSION_SUMMARY_PROMPT,
+      };
+    };
+    const fits = (candidate: SummaryRequest) => {
+      try {
+        return (
+          summaryRequestTokens(candidate, visible, replay, catalog)
+          <= computeNativeBatchBudget(candidate.settings.descriptor.limit)
+            .hardSingleTurnInput
+        );
+      } catch (error) {
+        if (hasPluginMessage(error)) return false;
+        throw error;
+      }
+    };
+    let selected = summaryRequest(configured);
+    if (choice.kind === "match") {
+      const matched = summaryRequest({
+        model: choice.model,
+        ...(choice.variant === undefined ? {} : { variant: choice.variant }),
+        descriptor: catalog.describe(choice.model)!,
+      });
+      if (!fits(matched)) {
+        choice = { kind: "fallback", reason: "capacity" };
+      } else if (options.reasoning?.matchModel) {
+        selected = matched;
+      }
+    }
+    request = selected;
+    if (requiresImages) assertConfiguredModelSupportsImages(request.settings);
+    const budget = computeNativeBatchBudget(request.settings.descriptor.limit);
+    // Fail before any fork when the request cannot fit. The compacting hook
+    // still stops native compaction if the estimate is exceeded anyway.
+    if (
+      summaryRequestTokens(request, visible, replay, catalog)
+      > budget.hardSingleTurnInput
+    ) {
+      throw new SessionSummaryError("budget");
+    }
+    report = stageReport({
+      stage: "session",
+      candidate: match,
+      choice,
+      settings: request.settings,
+      history: visible,
+      catalog,
+      replay,
+    });
   } catch (error) {
+    if (error instanceof SessionSummaryError) throw error;
     // Only this plugin's own configuration messages, which are fixed text
     // without session content, are repeated.
     throw new PluginMessageError(
@@ -127,16 +255,8 @@ export async function generateSessionSummary(
       { cause: error },
     );
   }
-  // Fail before any fork when the request cannot fit. The compacting hook
-  // still stops native compaction if the estimate is exceeded anyway.
-  if (
-    NATIVE_BATCH_FIXED_RESERVE_TOKENS
-      + countGptTokens(SESSION_SUMMARY_PROMPT)
-      + estimateNativeHistoryTokens(visible)
-    > budget.hardSingleTurnInput
-  ) {
-    throw new SessionSummaryError("budget");
-  }
+  options.reasoning?.reports.push(report);
+  const settings = request.settings;
 
   const route = {
     directory: session.directory,
@@ -176,7 +296,9 @@ export async function generateSessionSummary(
             {
               sessionID: fork.id,
               ...route,
-              permission: SUMMARY_FORK_PERMISSION,
+              permission: request.structured
+                ? STRUCTURED_SUMMARY_FORK_PERMISSION
+                : SUMMARY_FORK_PERMISSION,
             },
             { signal },
           )
@@ -212,7 +334,8 @@ export async function generateSessionSummary(
           agent: SUMMARY_AGENT,
           model: settings.model,
           ...(settings.variant ? { variant: settings.variant } : {}),
-          parts: [{ type: "text", text: SESSION_SUMMARY_PROMPT }],
+          ...(request.structured ? { format: STRUCTURED_SUMMARY_FORMAT } : {}),
+          parts: [{ type: "text", text: request.prompt }],
         }),
       );
     } catch (error) {
@@ -230,15 +353,28 @@ export async function generateSessionSummary(
       throw providerFailure(responseError);
     }
 
-    const final = await loadForkMessages(v2, fork.id, route, controlTimeoutMs);
+    const final = request.structured
+      ? await loadStructuredForkMessages(
+          v2,
+          fork.id,
+          route,
+          controlTimeoutMs,
+          history.length + 2,
+        )
+      : await loadForkMessages(v2, fork.id, route, controlTimeoutMs);
     // A native checkpoint in the fork means OpenCode found the request too
     // large, even when the compacting hook did not run.
     if (final.slice(history.length).some(isNativeCompactionArtifact)) {
       throw new SessionSummaryError("budget");
     }
-    summary = acceptedSummary(response, final, history, messageID, fork.id, {
-      sourceSnapshot,
-    });
+    summary = acceptedSummary(
+      response,
+      final,
+      history,
+      messageID,
+      fork.id,
+      request,
+    );
   } catch (error) {
     failure =
       error instanceof SessionSummaryError
@@ -275,34 +411,63 @@ export async function generateSessionSummary(
   return summary!;
 }
 
-// Accepts the fork only when it is the rewritten source history plus exactly
-// the one prompt and one ordinary summarizer-agent reply. Native overflow
+// The model-visible input of a summary request: the fixed host reserve, the
+// prompt, the history with each attributable protected unit the request's
+// model is sent counted by its replay estimate instead of its visible text,
+// and, for a structured request, the response schema the host sends as its
+// tool. Units whose replay cost is unknown count by their visible text and
+// are reported.
+function summaryRequestTokens(
+  request: SummaryRequest,
+  visible: MessageWithParts[],
+  replay: ReplayIndex,
+  catalog: Pick<SummarizerCatalog, "requestContext">,
+): number {
+  const estimate = replay.estimate(
+    catalog.requestContext(request.settings.model),
+  );
+  return (
+    NATIVE_BATCH_FIXED_RESERVE_TOKENS
+    + countGptTokens(request.prompt)
+    + (request.structured
+      ? countGptTokens(JSON.stringify(SESSION_SUMMARY_RESPONSE_SCHEMA))
+      : 0)
+    + estimateNativeHistoryTokens(visible)
+    - estimate.visibleTokens
+    + estimate.tokens
+  );
+}
+
+// Accepts the fork only when it is the unchanged rewritten source history
+// plus exactly the one prompt and one finished summarizer-agent reply. Native overflow
 // compaction or replay adds markers, summaries, or a re-created prompt, and a
-// partial native summary must never stand in for the whole session.
+// partial native summary must never stand in for the whole session. A plain
+// reply's text is the summary. A structured reply's only tool part is one
+// completed StructuredOutput call whose input is the object the host captured
+// for the reply, holding exactly one nonempty summary, and the prompt
+// response reports that same reply and object; its text is never read.
 function acceptedSummary(
   response: unknown,
   messages: MessageWithParts[],
   history: MessageWithParts[],
   messageID: string,
   forkID: string,
-  source: Parameters<typeof assertForkMessageShape>[1],
+  request: SummaryRequest,
 ): string {
   const invalid = () => new SessionSummaryError("validation");
   if (messages.length !== history.length + 2) throw invalid();
   const prefix = messages.slice(0, history.length);
   try {
-    assertForkMessageShape(prefix, source);
     assertForkRecordIdentity(messages, forkID);
   } catch {
     throw invalid();
   }
+  // The persisted history is the one the prompt was sent with, record for
+  // record, apart from times and usage.
   if (
-    prefix.some(
-      (message, index) =>
-        message.info.id !== history[index]!.info.id
-        || message.parts.some(
-          (part, partIndex) => part.id !== history[index]!.parts[partIndex]!.id,
-        ),
+    !isDeepStrictEqual(
+      snapshotSourceMessages(prefix),
+      snapshotSourceMessages(history),
     )
   ) {
     throw invalid();
@@ -310,14 +475,19 @@ function acceptedSummary(
 
   const prompt = messages[history.length]!;
   const promptPart = prompt.parts[0];
+  const format = prompt.info.role === "user" ? prompt.info.format : undefined;
   if (
     prompt.info.id !== messageID
     || prompt.info.role !== "user"
     || prompt.info.agent !== SUMMARY_AGENT
     || prompt.parts.length !== 1
     || promptPart?.type !== "text"
-    || promptPart.text !== SESSION_SUMMARY_PROMPT
+    || promptPart.text !== request.prompt
     || promptPart.synthetic === true
+    || (request.structured
+      ? format?.type !== "json_schema"
+        || !isDeepStrictEqual(format.schema, STRUCTURED_SUMMARY_FORMAT.schema)
+      : format !== undefined)
   ) {
     throw invalid();
   }
@@ -331,22 +501,49 @@ function acceptedSummary(
     || reply.info.parentID !== messageID
     || reply.info.agent !== SUMMARY_AGENT
     || reply.info.summary === true
-    || reply.info.finish !== "stop"
     || reply.info.error !== undefined
-    || reply.parts.some(part => !ASSISTANT_PART_TYPES.has(part.type))
+    || reply.info.time.completed === undefined
   ) {
     throw invalid();
   }
-  const text = reply.parts
-    .flatMap(part =>
-      part.type === "text" && part.synthetic !== true && part.ignored !== true
-        ? [part.text]
-        : [],
+  if (!request.structured) {
+    if (
+      reply.info.finish !== "stop"
+      || reply.parts.some(part => !ASSISTANT_PART_TYPES.has(part.type))
+    ) {
+      throw invalid();
+    }
+    const text = reply.parts
+      .flatMap(part =>
+        part.type === "text" && part.synthetic !== true && part.ignored !== true
+          ? [part.text]
+          : [],
+      )
+      .join("\n\n")
+      .trim();
+    if (!text) throw invalid();
+    return text;
+  }
+  const calls = reply.parts.filter(part => part.type === "tool");
+  const call = calls[0];
+  const captured = reply.info.structured;
+  const summary = structuredSessionSummary(captured);
+  if (
+    (reply.info.finish !== "stop" && reply.info.finish !== "tool-calls")
+    || reply.parts.some(
+      part => part.type !== "tool" && !ASSISTANT_PART_TYPES.has(part.type),
     )
-    .join("\n\n")
-    .trim();
-  if (!text) throw invalid();
-  return text;
+    || calls.length !== 1
+    || call?.type !== "tool"
+    || call.tool !== "StructuredOutput"
+    || call.state.status !== "completed"
+    || !isDeepStrictEqual(call.state.input, captured)
+    || !isDeepStrictEqual(responseInfo["structured"], captured)
+    || summary === undefined
+  ) {
+    throw invalid();
+  }
+  return summary;
 }
 
 async function loadForkMessages(
@@ -364,6 +561,59 @@ async function loadForkMessages(
   );
   if (outcome.kind !== "success") throw stageFailure("history", outcome);
   return outcome.value;
+}
+
+// OpenCode 1.18.30 and 1.19.0 answer HTTP 400 to a full message list, and to
+// a read of the prompt itself, once a prompt stored a JSON-schema format: the
+// response encoder rejects the stored format. A page that older history
+// follows is returned without that check, so a structured fork is read newest
+// first through the public `limit` and `before` cursor (`X-Next-Cursor`), the
+// first page holding only the reply and the prompt. A missing cursor ends the
+// read; a repeated cursor, or more pages than `expected` messages need, fails
+// it.
+async function loadStructuredForkMessages(
+  v2: V2Client,
+  forkID: string,
+  route: { directory: string; workspace?: string },
+  controlTimeoutMs: number,
+  expected: number,
+): Promise<MessageWithParts[]> {
+  const pages: MessageWithParts[][] = [];
+  const cursors = new Set<string>();
+  const maxPages = 2 + Math.ceil(expected / FORK_PAGE_SIZE);
+  let before: string | undefined;
+  for (;;) {
+    const page = before;
+    const outcome = await attemptWithinDeadline(
+      signal =>
+        v2.session
+          .messages(
+            {
+              sessionID: forkID,
+              ...route,
+              limit:
+                page === undefined ? STRUCTURED_FIRST_PAGE : FORK_PAGE_SIZE,
+              ...(page === undefined ? {} : { before: page }),
+            },
+            { signal },
+          )
+          .then(response => ({
+            messages: unwrapResponse(response),
+            cursor:
+              response.response?.headers.get("x-next-cursor") ?? undefined,
+          })),
+      controlTimeoutMs,
+    );
+    if (outcome.kind !== "success") throw stageFailure("history", outcome);
+    pages.unshift(outcome.value.messages);
+    const cursor = outcome.value.cursor;
+    if (!cursor) return pages.flat();
+    if (cursors.has(cursor) || pages.length >= maxPages) {
+      throw new SessionSummaryError("history");
+    }
+    cursors.add(cursor);
+    before = cursor;
+  }
 }
 
 function isNativeCompactionArtifact(message: MessageWithParts): boolean {

@@ -32,6 +32,11 @@ import {
   SessionSummaryError,
 } from "../src/retention/summary";
 import {
+  SESSION_SUMMARY_RESPONSE_SCHEMA,
+  SESSION_SUMMARY_TOOL_PROMPT,
+} from "../src/compact/constants";
+import type { StageReport } from "../src/policy/reasoning";
+import {
   summarizerAgent,
   persistedForkHistory,
   providerCatalog,
@@ -3987,6 +3992,435 @@ describe("retention session summary", () => {
     expect(host.source).toEqual(sourceHistory());
   });
 
+  // --match-model runs the session summary on the source's current model,
+  // which unlocks only that model's own protected reasoning; reasoning from
+  // other models stays unreadable and is counted as such.
+  test("runs the session summary on the current model only under --match-model", async () => {
+    const source = protectedSummaryHistory();
+    const sol = solSummaryProvider();
+    const current = solSession();
+    const before = structuredClone(source);
+    for (const matchModel of [false, true]) {
+      const host = summaryHost(source, { providers: [sol] });
+      const reasoning = { matchModel, reports: [] as StageReport[] };
+      await generateSessionSummary(host.v2, current, host.source, {
+        reasoning,
+      });
+      expect(host.prompts[0]).toMatchObject(
+        matchModel
+          ? {
+              model: { providerID: "openai", modelID: "gpt-6.1-sol" },
+              variant: "low",
+            }
+          : { model: summarizerAgent().model, variant: "low" },
+      );
+      expect(reasoning.reports).toEqual([
+        {
+          stage: "session",
+          choice: {
+            kind: "match",
+            model: { providerID: "openai", modelID: "gpt-6.1-sol" },
+            variant: "low",
+          },
+          onOrigin: matchModel,
+          access: matchModel
+            ? { compatible: 1, unavailable: 1, unknown: 0 }
+            : { compatible: 0, unavailable: 2, unknown: 0 },
+          // The matched model is sent its own unit, whose step has no
+          // counter, so its input estimate leaves that cost out.
+          replayUnknown: matchModel ? 1 : 0,
+        },
+      ]);
+      expect(JSON.stringify(host.prompts)).not.toContain("enc_");
+      expect(host.source).toEqual(before);
+    }
+  });
+
+  // On the DeepSeek route the summary goes through the host's response tool,
+  // because DeepSeek reads earlier plain reasoning only when a request has
+  // tools. Only a reply with exactly one completed StructuredOutput call and
+  // exactly one nonempty summary is accepted; the fork is always deleted.
+  test("submits the DeepSeek-route session summary through the host response tool and validates it strictly", async () => {
+    const deepseek = {
+      id: "deepseek",
+      models: {
+        "deepseek-flash": {
+          api: { npm: "@ai-sdk/openai-compatible" },
+          limit: { context: 200_000, output: 32_000 },
+          capabilities: {
+            input: { image: true },
+            interleaved: { field: "reasoning_content" },
+          },
+          variants: { low: {} },
+        },
+      },
+    };
+    const agent = {
+      ...summarizerAgent(),
+      model: { providerID: "deepseek", modelID: "deepseek-flash" },
+    };
+    const structuredReply =
+      (
+        structured: unknown,
+        options: { tools?: number; error?: unknown } = {},
+      ) =>
+      (
+        fork: MessageWithParts[],
+        request: Record<string, unknown>,
+        forkID: string,
+      ) => {
+        const body = summaryReply(
+          fork,
+          request as never,
+          forkID,
+          "ignored text",
+        );
+        const reply = fork.at(-1)!;
+        Object.assign(reply.info, {
+          finish: "tool-calls",
+          structured,
+          ...(options.error ? { error: options.error } : {}),
+        });
+        const tools = Array.from(
+          { length: options.tools ?? 1 },
+          (_, index) => ({
+            id: `${reply.info.id}-tool-${index}`,
+            sessionID: forkID,
+            messageID: reply.info.id,
+            type: "tool",
+            tool: "StructuredOutput",
+            callID: `call_${index}`,
+            state: {
+              status: "completed",
+              input: structured,
+              output: "",
+              title: "",
+              metadata: {},
+              time: { start: 1, end: 2 },
+            },
+          }),
+        ) as Part[];
+        reply.parts.splice(2, 0, ...tools);
+        Object.assign(body.data.info, reply.info);
+        return body;
+      };
+    const run = async (
+      reply: ReturnType<typeof structuredReply> | undefined,
+      history = plainReasoningHistory(),
+    ) => {
+      const host = summaryHost(history, { providers: [deepseek], agent });
+      host.reply = reply;
+      const outcome = await generateSessionSummary(
+        host.v2,
+        session(),
+        host.source,
+      ).then(
+        summary => ({ summary }),
+        (error: unknown) => ({ error }),
+      );
+      expect(host.calls.at(-1)).toBe("delete:fork-1");
+      return { host, outcome };
+    };
+
+    const accepted = await run(structuredReply({ summary: "  ## Goal\n- x " }));
+    expect(accepted.outcome).toEqual({ summary: "## Goal\n- x" });
+    expect(accepted.host.prompts[0]).toMatchObject({
+      model: { providerID: "deepseek", modelID: "deepseek-flash" },
+      format: {
+        type: "json_schema",
+        schema: SESSION_SUMMARY_RESPONSE_SCHEMA,
+      },
+      parts: [{ type: "text", text: SESSION_SUMMARY_TOOL_PROMPT }],
+    });
+    expect(accepted.host.permissions).toEqual([
+      [
+        { permission: "*", pattern: "*", action: "deny" },
+        { permission: "StructuredOutput", pattern: "*", action: "allow" },
+      ],
+    ]);
+
+    for (const reply of [
+      structuredReply({ summary: "" }),
+      structuredReply({ summary: "x", extra: 1 }),
+      structuredReply({ turns: [] }),
+      structuredReply({ summary: "x" }, { tools: 0 }),
+      structuredReply({ summary: "x" }, { tools: 2 }),
+      structuredReply(
+        { summary: "x" },
+        { error: { name: "ContentFilterError", data: {} } },
+      ),
+      undefined,
+    ]) {
+      const rejected = await run(reply);
+      expect(rejected.outcome).toMatchObject({
+        error: expect.any(SessionSummaryError),
+      });
+      expect(
+        String((rejected.outcome as { error: Error }).error.message),
+      ).not.toContain("ignored text");
+      expect(rejected.host.calls).toContain("abort:fork-1");
+    }
+
+    // Without plain reasoning to read, the route keeps the text request.
+    const plain = await run(undefined, sourceHistory());
+    expect(plain.outcome).toEqual({ summary: SESSION_SUMMARY_TEXT });
+    expect(plain.host.prompts[0]).not.toHaveProperty("format");
+  });
+
+  // The structured reply is read back from the persisted fork, in pages, and
+  // must be bound to it: the prompt response alone never stands in for the
+  // persisted history.
+  test("accepts a structured session summary only when the persisted fork matches the prompt response", async () => {
+    const deepseek = deepSeekSummaryProvider();
+    const agent = {
+      ...summarizerAgent(),
+      model: { providerID: "deepseek", modelID: "deepseek-flash" },
+    };
+    const run = async (tamper?: (fork: MessageWithParts[]) => void) => {
+      const host = summaryHost(plainReasoningHistory(), {
+        providers: [deepseek],
+        agent,
+      });
+      host.reply = (fork, request, forkID) =>
+        structuredSummaryReply(fork, request, forkID, { summary: "## Goal" });
+      host.afterPrompt = fork => tamper?.(fork);
+      const outcome = await generateSessionSummary(
+        host.v2,
+        session(),
+        host.source,
+      ).then(
+        summary => ({ summary }),
+        (error: unknown) => ({ error }),
+      );
+      expect(host.calls.at(-1)).toBe("delete:fork-1");
+      return outcome;
+    };
+    expect(await run()).toEqual({ summary: "## Goal" });
+    const reply = (fork: MessageWithParts[]) => fork.at(-1)!;
+    const call = (fork: MessageWithParts[]) =>
+      reply(fork).parts.find(part => part.type === "tool") as Extract<
+        Part,
+        { type: "tool" }
+      >;
+    for (const tamper of [
+      // An extra persisted message after the reply.
+      (fork: MessageWithParts[]) => {
+        const extra = structuredClone(fork.at(-2)!);
+        extra.info.id = `${extra.info.id}-extra`;
+        extra.parts = extra.parts.map(part => ({
+          ...part,
+          id: `${part.id}-extra`,
+          messageID: extra.info.id,
+        }));
+        fork.push(extra);
+      },
+      // A reply part owned by another session.
+      (fork: MessageWithParts[]) => {
+        reply(fork).parts[0]!.sessionID = "other-session";
+      },
+      // A reply that never finished.
+      (fork: MessageWithParts[]) => {
+        Object.assign(reply(fork).info, { time: { created: 1 } });
+      },
+      // A persisted call whose input is not the captured object.
+      (fork: MessageWithParts[]) => {
+        Object.assign(call(fork).state, { input: { summary: "other" } });
+      },
+      // A captured object other than the one the prompt response reported.
+      (fork: MessageWithParts[]) => {
+        Object.assign(reply(fork).info, { structured: { summary: "other" } });
+        Object.assign(call(fork).state, { input: { summary: "other" } });
+      },
+      // A changed copy of the source history.
+      (fork: MessageWithParts[]) => {
+        const part = fork[0]!.parts.find(item => item.type === "text");
+        if (part?.type === "text") part.text = "changed";
+      },
+      // The prompt stored without its format.
+      (fork: MessageWithParts[]) => {
+        delete (fork.at(-2)!.info as { format?: unknown }).format;
+      },
+    ].entries()) {
+      expect([tamper[0], await run(tamper[1])]).toMatchObject([
+        tamper[0],
+        { error: expect.any(SessionSummaryError) },
+      ]);
+    }
+  });
+
+  // A fork longer than the first two pages is read newest first in three
+  // pages and accepted only when they join back into the exact prefix the
+  // prompt was sent with; a cursor that repeats or never ends refuses the
+  // read, and every refusal aborts and deletes the fork.
+  test("reads a long structured fork in pages and refuses a looping or endless cursor", async () => {
+    const agent = {
+      ...summarizerAgent(),
+      model: { providerID: "deepseek", modelID: "deepseek-flash" },
+    };
+    // 300 request/reply pairs and a final request: 601 messages, 603 with the
+    // prompt and its reply.
+    const longHistory = () => [
+      ...Array.from({ length: 300 }, (_, index) => [
+        userMessage(`msg_u${index}`, `Request ${index}.`),
+        assistantMessage(`msg_a${index}`, [
+          {
+            id: `msg_a${index}-reasoning`,
+            sessionID: "source",
+            messageID: `msg_a${index}`,
+            type: "reasoning",
+            text: "plain reasoning the summary should read",
+            time: { start: 1, end: 2 },
+          } as Part,
+        ]),
+      ]).flat(),
+      userMessage("msg_last", "Continue."),
+    ];
+    type Messages = (request: {
+      limit?: number;
+      before?: string;
+    }) => Promise<{ data?: MessageWithParts[]; response?: Response }>;
+    const run = async (options: {
+      tamper?: (fork: MessageWithParts[]) => void;
+      // Replaces the cursor a paged read is told to follow next.
+      nextCursor?: (before: string) => string;
+    }) => {
+      const host = summaryHost(longHistory(), {
+        providers: [deepSeekSummaryProvider()],
+        agent,
+      });
+      host.reply = (fork, request, forkID) =>
+        structuredSummaryReply(fork, request, forkID, { summary: "## Goal" });
+      host.afterPrompt = fork => options.tamper?.(fork);
+      const pages: { limit: number; before?: string }[] = [];
+      const hostSession = host.v2.session as unknown as {
+        messages: Messages;
+      };
+      const read = hostSession.messages;
+      hostSession.messages = async request => {
+        const result = await read(request);
+        if (request.limit === undefined) return result;
+        pages.push({
+          limit: request.limit,
+          ...(request.before === undefined ? {} : { before: request.before }),
+        });
+        if (request.before === undefined || !options.nextCursor) return result;
+        return {
+          ...result,
+          response: new Response(null, {
+            headers: { "x-next-cursor": options.nextCursor(request.before) },
+          }),
+        };
+      };
+      const outcome = await generateSessionSummary(
+        host.v2,
+        session(),
+        host.source,
+      ).then(
+        summary => ({ summary }),
+        (error: unknown) => ({ error }),
+      );
+      return { host, outcome, pages };
+    };
+    const refused = (
+      result: Awaited<ReturnType<typeof run>>,
+      stage: string,
+      pages: number,
+    ) => {
+      const error = (result.outcome as { error?: unknown }).error;
+      expect(error).toBeInstanceOf(SessionSummaryError);
+      expect((error as SessionSummaryError).stage).toBe(stage);
+      expect(result.pages).toHaveLength(pages);
+      expect(result.host.calls).toContain("abort:fork-1");
+      expect(result.host.calls.at(-1)).toBe("delete:fork-1");
+    };
+
+    const accepted = await run({});
+    expect(accepted.outcome).toEqual({ summary: "## Goal" });
+    expect(accepted.pages).toEqual([
+      { limit: 2 },
+      { limit: 500, before: "cursor:601" },
+      { limit: 500, before: "cursor:101" },
+    ]);
+    expect(accepted.host.calls.at(-1)).toBe("delete:fork-1");
+
+    // A change in the oldest and in a middle page is not missed.
+    for (const index of [0, 300]) {
+      refused(
+        await run({
+          tamper: fork => {
+            const part = fork[index]!.parts.find(item => item.type === "text");
+            if (part?.type === "text") part.text = "changed";
+          },
+        }),
+        "validation",
+        3,
+      );
+    }
+
+    // The second page names the cursor it was read with.
+    refused(await run({ nextCursor: before => before }), "history", 2);
+    // Every page names a fresh cursor: the read stops at the page bound.
+    refused(
+      await run({
+        nextCursor: before => `cursor:${Number(before.slice(7)) - 1}`,
+      }),
+      "history",
+      4,
+    );
+  });
+
+  // A request on the model that wrote protected reasoning is sent it again, so
+  // its input counts each attributable unit's replay estimate: the matched
+  // model falls back when that does not fit, and a configured summarizer on
+  // that model refuses before any fork. Another model is sent none of it.
+  test("counts the session request's own attributable replay before choosing or refusing it", async () => {
+    const source = protectedSummaryHistory(170_000);
+    const sol = solSummaryProvider();
+    const reasoning = { matchModel: true, reports: [] as StageReport[] };
+    const host = summaryHost(source, { providers: [sol] });
+    await generateSessionSummary(host.v2, solSession(), host.source, {
+      reasoning,
+    });
+    expect(host.prompts[0]).toMatchObject({ model: summarizerAgent().model });
+    expect(reasoning.reports[0]).toMatchObject({
+      choice: { kind: "fallback", reason: "capacity" },
+      onOrigin: false,
+      replayUnknown: 0,
+    });
+    // Without the counter, the same request fits and reports the gap.
+    const unattributed = summaryHost(protectedSummaryHistory(), {
+      providers: [sol],
+    });
+    const reports = { matchModel: true, reports: [] as StageReport[] };
+    await generateSessionSummary(
+      unattributed.v2,
+      solSession(),
+      unattributed.source,
+      { reasoning: reports },
+    );
+    expect(unattributed.prompts[0]).toMatchObject({
+      model: { providerID: "openai", modelID: "gpt-6.1-sol" },
+    });
+    expect(reports.reports[0]).toMatchObject({
+      onOrigin: true,
+      replayUnknown: 1,
+    });
+
+    const configured = summaryHost(source, {
+      providers: [sol],
+      agent: {
+        ...summarizerAgent(),
+        model: { providerID: "openai", modelID: "gpt-6.1-sol" },
+      },
+    });
+    const refused = await promiseError(
+      generateSessionSummary(configured.v2, solSession(), configured.source),
+    );
+    expect(refused).toBeInstanceOf(SessionSummaryError);
+    expect((refused as SessionSummaryError).stage).toBe("budget");
+    expect(configured.calls).toEqual([]);
+  });
+
   // OpenCode runs this hook before any native compaction request, replay,
   // or auto-continue; the thrown error ends the fork's prompt loop, and the
   // host then fails or returns the prompt call.
@@ -4572,6 +5006,167 @@ function checkpointHistory(options: {
   ];
 }
 
+// The verified OpenAI model the --match-model and replay tests list next to
+// the configured summarizer, and a source session that continues on it.
+function solSummaryProvider() {
+  return {
+    id: "openai",
+    models: {
+      "gpt-6.1-sol": {
+        api: { id: "gpt-6.1-sol", npm: "@ai-sdk/openai" },
+        limit: { context: 200_000, output: 32_000 },
+        capabilities: { input: { image: true } },
+        variants: { low: {} },
+      },
+    },
+  };
+}
+
+function solSession() {
+  return {
+    ...session(),
+    model: { id: "gpt-6.1-sol", providerID: "openai" },
+  } as never;
+}
+
+function deepSeekSummaryProvider() {
+  return {
+    id: "deepseek",
+    models: {
+      "deepseek-flash": {
+        api: { npm: "@ai-sdk/openai-compatible" },
+        limit: { context: 200_000, output: 32_000 },
+        capabilities: {
+          input: { image: true },
+          interleaved: { field: "reasoning_content" },
+        },
+        variants: { low: {} },
+      },
+    },
+  };
+}
+
+// The host's structured reply: one completed StructuredOutput call whose
+// input is the captured object, persisted and reported by the prompt.
+function structuredSummaryReply(
+  fork: MessageWithParts[],
+  request: Record<string, unknown>,
+  forkID: string,
+  structured: unknown,
+) {
+  summaryReply(fork, request as never, forkID, "ignored text");
+  const reply = fork.at(-1)!;
+  Object.assign(reply.info, { finish: "tool-calls", structured });
+  reply.parts.splice(2, 0, {
+    id: `${reply.info.id}-tool`,
+    sessionID: forkID,
+    messageID: reply.info.id,
+    type: "tool",
+    tool: "StructuredOutput",
+    callID: "call_0",
+    state: {
+      status: "completed",
+      input: structured,
+      output: "",
+      title: "",
+      metadata: {},
+      time: { start: 1, end: 2 },
+    },
+  } as Part);
+  return {
+    data: {
+      info: structuredClone(reply.info),
+      parts: structuredClone(reply.parts),
+    },
+  };
+}
+
+// A source whose assistant steps carry protected reasoning from
+// openai/gpt-6.1-sol and from another OpenAI model. With `reasoningTokens`,
+// the gpt-6.1-sol step finishes with that reasoning counter.
+function protectedSummaryHistory(reasoningTokens?: number): MessageWithParts[] {
+  const reasoning = (messageID: string): Part =>
+    ({
+      id: `${messageID}-reasoning`,
+      sessionID: "source",
+      messageID,
+      type: "reasoning",
+      text: "visible summary",
+      metadata: {
+        openai: {
+          itemId: `rs_${messageID}`,
+          reasoningEncryptedContent: `enc_${messageID}`,
+        },
+      },
+      time: { start: 1, end: 2 },
+    }) as Part;
+  const fromModel = (message: MessageWithParts, modelID: string) => {
+    Object.assign(message.info, { providerID: "openai", modelID });
+    if (reasoningTokens !== undefined) {
+      Object.assign(message.info, { time: { created: 1, completed: 2 } });
+    }
+    return message;
+  };
+  return [
+    userMessage("msg_u1", "Add the parser."),
+    fromModel(
+      assistantMessage("msg_a1", [
+        reasoning("msg_a1"),
+        tool("read", {}, "listing", false, "prt_t1"),
+      ]),
+      "gpt-terra",
+    ),
+    userMessage("msg_u2", "Fix the tests."),
+    fromModel(
+      assistantMessage("msg_a2", [
+        reasoning("msg_a2"),
+        ...(reasoningTokens === undefined
+          ? []
+          : [
+              {
+                id: "msg_a2-finish",
+                sessionID: "source",
+                messageID: "msg_a2",
+                type: "step-finish",
+                reason: "stop",
+                cost: 0,
+                tokens: {
+                  input: 10,
+                  output: reasoningTokens + 2,
+                  reasoning: reasoningTokens,
+                  cache: { read: 0, write: 0 },
+                },
+              } as Part,
+            ]),
+      ]),
+      "gpt-6.1-sol",
+    ),
+    userMessage("msg_u3", "Continue."),
+  ];
+}
+
+// A source whose assistant steps carry plain reasoning text.
+function plainReasoningHistory(): MessageWithParts[] {
+  return sourceHistory().map(item =>
+    item.info.role !== "assistant"
+      ? item
+      : {
+          ...item,
+          parts: [
+            {
+              id: `${item.info.id}-reasoning`,
+              sessionID: item.info.sessionID,
+              messageID: item.info.id,
+              type: "reasoning",
+              text: "plain reasoning the summary should read",
+              time: { start: 1, end: 2 },
+            } as Part,
+            ...item.parts,
+          ],
+        },
+  );
+}
+
 function session() {
   return { id: "source", directory: "/workspace" } as never;
 }
@@ -4590,6 +5185,10 @@ function summaryHost(
   catalog: {
     limit?: { context: number; input?: number; output?: number };
     image?: boolean;
+    // Further listed providers, and a summarizer agent other than the
+    // default one, for --match-model and the DeepSeek route.
+    providers?: unknown[];
+    agent?: ReturnType<typeof summarizerAgent>;
   } = {},
 ) {
   let forkCount = 0;
@@ -4606,14 +5205,24 @@ function summaryHost(
       ((fork: MessageWithParts[], forkID: string) => void) | undefined,
     promptError: undefined as unknown,
     deleteError: undefined as unknown,
+    // Replaces the ordinary text reply, as a structured reply does.
+    reply: undefined as
+      | ((
+          fork: MessageWithParts[],
+          request: Record<string, unknown>,
+          forkID: string,
+        ) => unknown)
+      | undefined,
     v2: undefined as unknown as V2Client,
   };
+  const listed = providerCatalog(catalog.limit, catalog.image);
+  listed.all.push(...((catalog.providers ?? []) as typeof listed.all));
   host.v2 = {
-    app: { agents: async () => ({ data: [summarizerAgent()] }) },
+    app: {
+      agents: async () => ({ data: [catalog.agent ?? summarizerAgent()] }),
+    },
     provider: {
-      list: async () => ({
-        data: providerCatalog(catalog.limit, catalog.image),
-      }),
+      list: async () => ({ data: listed }),
     },
     session: {
       fork: async (request: { sessionID: string }) => {
@@ -4630,9 +5239,43 @@ function summaryHost(
         host.permissions.push(request.permission);
         return { data: {} };
       },
-      messages: async (request: { sessionID: string }) => ({
-        data: history.read(request.sessionID),
-      }),
+      // As OpenCode 1.18.30 and 1.19.0 answer: a list returned whole is
+      // checked against the message schema, which rejects a stored
+      // JSON-schema prompt format with HTTP 400; a page that older history
+      // follows carries `X-Next-Cursor` and is not checked.
+      messages: async (request: {
+        sessionID: string;
+        limit?: number;
+        before?: string;
+      }) => {
+        const all = history.read(request.sessionID);
+        const end =
+          request.before === undefined
+            ? all.length
+            : Number(request.before.slice("cursor:".length));
+        const start = request.limit ? Math.max(0, end - request.limit) : 0;
+        const page = all.slice(start, end);
+        const cursor = start > 0 ? `cursor:${start}` : undefined;
+        if (
+          cursor === undefined
+          && page.some(
+            item =>
+              item.info.role === "user"
+              && item.info.format?.type === "json_schema",
+          )
+        ) {
+          return {
+            error: { name: "BadRequest" },
+            response: new Response(null, { status: 400 }),
+          };
+        }
+        return {
+          data: page,
+          response: new Response(null, {
+            headers: cursor === undefined ? {} : { "x-next-cursor": cursor },
+          }),
+        };
+      },
       prompt: async (request: Record<string, unknown>) => {
         host.prompts.push(request);
         const forkID = String(request["sessionID"]);
@@ -4640,7 +5283,9 @@ function summaryHost(
         if (host.promptError) throw host.promptError;
         const fork = history.read(forkID);
         host.promptHistories.push(structuredClone(fork));
-        const reply = summaryReply(fork, request as never, forkID);
+        const reply = host.reply
+          ? host.reply(fork, request, forkID)
+          : summaryReply(fork, request as never, forkID);
         host.afterPrompt?.(fork, forkID);
         // The host persists the reply and any tampering made after it.
         history.delete(forkID);

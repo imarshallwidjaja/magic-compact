@@ -7,7 +7,11 @@ import {
   READ_OMITTED_CONTENT_ID_DESCRIPTION,
 } from "./compact/constants";
 import { connectListener, createListenerIdentity } from "./api";
-import { rejectNativeCompactionOfGenerationFork } from "./compact/compact";
+import {
+  isOwnedGenerationFork,
+  rejectNativeCompactionOfGenerationFork,
+  requestAllTurnsReasoning,
+} from "./compact/compact";
 import {
   COMMAND_DESCRIPTIONS,
   COMPACT_COMMAND,
@@ -30,7 +34,10 @@ import { executeMagicRecover } from "./magic-recover";
 import { STATS_SUCCESS, executeMagicStats } from "./magic-stats";
 import { executeMagicTrim } from "./magic-trim";
 import { commandRetentionPolicy } from "./policy/retention";
-import { rejectNativeCompactionOfSummaryFork } from "./retention/summary";
+import {
+  isOwnedSessionSummaryFork,
+  rejectNativeCompactionOfSummaryFork,
+} from "./retention/summary";
 import { omissionReadDiagnostic, readOmittedContent } from "./storage/omission";
 import { handleStatsEvent } from "./stats/events";
 import { projectManifestCoveredMedia } from "./compact/media";
@@ -109,12 +116,13 @@ const server: Plugin = async input => {
       }
 
       if (command.command === COMPACT_COMMAND) {
-        const { keepTurns, retention, v2 } = await preflight(
+        const { keepTurns, matchModel, retention, v2 } = await preflight(
           "Magic Compact",
           async () => {
             const args = parseMagicCompactArguments(command.arguments);
             return {
               keepTurns: args.keepTurns,
+              matchModel: args.matchModel,
               // Read per command and reject an invalid threshold before
               // session work.
               retention: commandRetentionPolicy("compact", args, process.env),
@@ -128,7 +136,7 @@ const server: Plugin = async input => {
           v2,
           command.sessionID,
           keepTurns,
-          { retention },
+          { retention, matchModel },
         );
         // Must throw error or OpenCode will send message to LLM
         throw new Error(
@@ -137,12 +145,13 @@ const server: Plugin = async input => {
       }
 
       if (command.command === TRIM_COMMAND) {
-        const { keepTurns, retention, v2 } = await preflight(
+        const { keepTurns, matchModel, retention, v2 } = await preflight(
           "Magic Trim",
           async () => {
             const args = parseMagicTrimArguments(command.arguments);
             return {
               keepTurns: args.keepTurns,
+              matchModel: args.matchModel,
               retention: commandRetentionPolicy("trim", args, process.env),
               v2: await listener(),
             };
@@ -152,7 +161,7 @@ const server: Plugin = async input => {
           v2,
           command.sessionID,
           keepTurns,
-          { retention },
+          { retention, matchModel },
         );
         throw new Error(
           successor ? trimSuccess(successor.session.id) : TRIM_NOOP,
@@ -176,6 +185,16 @@ const server: Plugin = async input => {
     "experimental.session.compacting": async input => {
       rejectNativeCompactionOfSummaryFork(input.sessionID);
       rejectNativeCompactionOfGenerationFork(input.sessionID);
+    },
+    // Only this plugin's own summary and generation forks, and only on the
+    // verified OpenAI Responses route, ask for every turn's reasoning.
+    "chat.params": async (input, output) => {
+      requestAllTurnsReasoning(
+        isOwnedSessionSummaryFork(input.sessionID)
+          || isOwnedGenerationFork(input.sessionID),
+        input.model,
+        output.options,
+      );
     },
     "experimental.chat.messages.transform": async (_input, output) => {
       const projected = projectManifestCoveredMedia(

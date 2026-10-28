@@ -47,6 +47,15 @@ import {
 } from "../src/v2/media";
 import { generateV2SessionSummary, OwnedSessions } from "../src/v2/owned";
 import {
+  READABLE_REASONING_HEADER,
+  type StageReport,
+} from "../src/policy/reasoning";
+import { SessionSummaryError } from "../src/policy/retention";
+import {
+  SESSION_SUMMARY_PROMPT,
+  SESSION_SUMMARY_TOOL_PROMPT,
+} from "../src/compact/constants";
+import {
   buildGenerationPrompt,
   estimateGenerationExplicitRequestTokens,
   GENERATION_RESPONSE_SCHEMA,
@@ -1852,6 +1861,243 @@ describe("OpenCode 2 generation responses", () => {
     return { state, owned, outcome, ownedID };
   };
 
+  // --match-model runs a turn summary on the model that wrote its target's
+  // protected reasoning, with the configured variant, and the imported
+  // session names that model; without the flag, or when the model is too
+  // small, the configured summarizer runs.
+  test("runs a turn summary on its target's reasoning model only under --match-model", async () => {
+    const sol = {
+      id: "gpt-6.1-sol",
+      modelID: "gpt-6.1-sol",
+      providerID: "openai",
+      package: "@opencode/ai/providers/openai",
+      name: "Sol",
+      capabilities: { tools: true, input: ["text"], output: ["text"] },
+      variants: [{ id: "summary" }],
+      time: { released: 0 },
+      cost: [],
+      status: "active",
+      enabled: true,
+      limit: { context: 200_000, output: 32_000 },
+    };
+    const turnOf = (modelID: string) => [
+      userMessage("msg_p", "Do it"),
+      assistantMessage(
+        "msg_pa",
+        [
+          {
+            type: "reasoning",
+            text: "visible summary",
+            state: { itemId: "rs_1", reasoningEncryptedContent: "enc_secret" },
+          },
+          { type: "text", text: words("A", 200) },
+        ],
+        { model: { providerID: "openai", id: modelID } },
+      ),
+      idleMessage("msg_pi"),
+    ];
+    const protectedTurn = turnOf("gpt-6.1-sol");
+    const run = async (
+      matchModel: boolean,
+      limit = sol.limit,
+      listed: Record<string, unknown> = sol,
+      messages = protectedTurn,
+    ) => {
+      const state = fakeV2State();
+      const source = sourceSession(state, "ses_src", messages);
+      const owned = new OwnedSessions();
+      const imported: unknown[] = [];
+      state.afterWrite = (method, sessionID) => {
+        if (method === "import")
+          imported.push(state.sessions.get(sessionID)!.model);
+      };
+      const reasoning = { matchModel, reports: [] as StageReport[] };
+      const outcome = await generateV2Summaries(
+        fakeV2Host(state, owned, echoGeneration()),
+        owned,
+        { session: source, messages, instructions: [] },
+        {
+          ref: state.summarizerModel!,
+          info: {
+            limit: state.modelLimit,
+            capabilities: { tools: true, input: ["text"], output: ["text"] },
+          },
+          others: [{ ...listed, limit }] as never,
+        },
+        [{ span: messages }],
+        "index",
+        { controlTimeoutMs: 1_000, reasoning },
+      );
+      expect(outcome).toEqual([{ text: "Summary of target 1." }]);
+      expect(JSON.stringify(state.requests)).not.toContain("enc_secret");
+      return { imported, reasoning };
+    };
+    const configured = {
+      providerID: "probe",
+      id: "probe-model",
+      variant: "summary",
+    };
+    expect((await run(false)).imported).toEqual([configured]);
+    const matched = await run(true);
+    expect(matched.imported).toEqual([
+      { providerID: "openai", id: "gpt-6.1-sol", variant: "summary" },
+    ]);
+    expect(matched.reasoning.reports[0]).toMatchObject({
+      access: { compatible: 1, unavailable: 0, unknown: 0 },
+      onOrigin: true,
+      // OpenCode 2 never estimates replay: the matched model's own unit is
+      // left out of its input estimate and reported.
+      replayUnknown: 1,
+    });
+    // The model list gives the fast entry its own `id` and the base
+    // `modelID`; a turn it wrote matches that exact entry.
+    const fast = { ...sol, id: "gpt-6.1-sol-fast" };
+    const fastMatched = await run(
+      true,
+      sol.limit,
+      fast,
+      turnOf("gpt-6.1-sol-fast"),
+    );
+    expect(fastMatched.imported).toEqual([
+      { providerID: "openai", id: "gpt-6.1-sol-fast", variant: "summary" },
+    ]);
+    expect(fastMatched.reasoning.reports[0]).toMatchObject({
+      access: { compatible: 1, unavailable: 0, unknown: 0 },
+      onOrigin: true,
+    });
+    // A model the host lists without the verified serializer, or another
+    // entry of the verified wire model, is not matched.
+    for (const others of [
+      { ...sol, package: "@opencode/ai/providers/openai-compatible" },
+      { ...sol, modelID: "gpt-6.1-sol-2026" },
+      { ...sol, id: "gpt-6.1-sol-pro" },
+      { ...sol, id: "gpt-6.1-sol-ultrafast" },
+      { ...fast, modelID: "gpt-6.1-sol-fast" },
+      { ...fast, package: "@opencode/ai/providers/openai-compatible" },
+    ]) {
+      // The turn was written by the listed entry itself.
+      const messages = turnOf(others.id);
+      const state = fakeV2State();
+      const source = sourceSession(state, "ses_src", messages);
+      const owned = new OwnedSessions();
+      const reasoning = { matchModel: true, reports: [] as StageReport[] };
+      await generateV2Summaries(
+        fakeV2Host(state, owned, echoGeneration()),
+        owned,
+        { session: source, messages, instructions: [] },
+        {
+          ref: state.summarizerModel!,
+          info: {
+            limit: state.modelLimit,
+            capabilities: { tools: true, input: ["text"], output: ["text"] },
+          },
+          others: [others] as never,
+        },
+        [{ span: messages }],
+        "index",
+        { controlTimeoutMs: 1_000, reasoning },
+      );
+      expect(reasoning.reports[0]!.choice).toEqual({
+        kind: "fallback",
+        reason: "unqualified",
+      });
+    }
+    const small = await run(true, { context: 9_000, output: 1_000 });
+    expect(small.imported).toEqual([configured]);
+    expect(small.reasoning.reports[0]!.choice).toEqual({
+      kind: "fallback",
+      reason: "capacity",
+    });
+  });
+
+  // On the DeepSeek route the session summary goes through the summary tool
+  // with the summary schema, because DeepSeek reads earlier plain reasoning
+  // only when a request has tools. Only one completed call with exactly one
+  // nonempty summary is accepted, and the owned session is always removed.
+  test("submits the DeepSeek-route session summary through the summary tool and validates it strictly", async () => {
+    const reasoned = [
+      userMessage("msg_r", "Do it"),
+      assistantMessage("msg_ra", [
+        {
+          type: "reasoning",
+          text: "plain reasoning to read",
+          state: { reasoningField: "reasoning_content" },
+        },
+        { type: "text", text: "Done." },
+      ]),
+      idleMessage("msg_ri"),
+    ];
+    const run = async (reply: FakeReply, history = reasoned) => {
+      const state = fakeV2State();
+      state.summarizerModel = { providerID: "deepseek", id: "deepseek-flash" };
+      const source = sourceSession(state, "ses_src", history);
+      const owned = new OwnedSessions();
+      let permissions: unknown;
+      let allowed = false;
+      state.afterWrite = (method, sessionID) => {
+        if (method !== "import") return;
+        permissions = state.sessions.get(sessionID)!.permissions;
+        allowed = owned.allowsSummaryTool(sessionID);
+      };
+      const outcome = await generateV2SessionSummary(
+        fakeV2Host(state, owned, () => reply),
+        owned,
+        { session: source, messages: history, instructions: [] },
+        {
+          ref: state.summarizerModel,
+          info: {
+            limit: state.modelLimit,
+            capabilities: { tools: true, input: ["text"], output: ["text"] },
+            compatibility: { reasoningField: "reasoning_content" },
+          },
+        },
+        1_000,
+      ).catch((error: Error) => error);
+      expect([...state.sessions.keys()]).toEqual(["ses_src"]);
+      return { state, outcome, permissions, allowed };
+    };
+    const submit = (input: unknown, status?: "error"): FakeReply => ({
+      tool: [{ name: "SessionSummary", input, ...(status ? { status } : {}) }],
+    });
+
+    const accepted = await run(submit({ summary: " ## Goal\n- x " }));
+    expect(accepted.outcome).toBe("## Goal\n- x");
+    expect(accepted.allowed).toBeTrue();
+    expect(accepted.permissions).toEqual([
+      { action: "*", resource: "*", effect: "deny" },
+      { action: "SessionSummary", resource: "*", effect: "allow" },
+    ]);
+    expect(accepted.state.requests[0]!.text).toBe(SESSION_SUMMARY_TOOL_PROMPT);
+
+    for (const reply of [
+      submit({ summary: "" }),
+      submit({ summary: "x", extra: true }),
+      submit({ summary: "x" }, "error"),
+      { tool: [] },
+      { tool: [{ name: "StructuredOutput", input: { summary: "x" } }] },
+      {
+        tool: [
+          { name: "SessionSummary", input: { summary: "x" } },
+          { name: "SessionSummary", input: { summary: "y" } },
+        ],
+      },
+      { text: "a text reply" },
+      { error: { type: "refusal", message: "declined" } },
+    ] as FakeReply[]) {
+      const rejected = await run(reply);
+      expect(rejected.outcome).toBeInstanceOf(SessionSummaryError);
+      expect(reachableStrings(rejected.outcome).join(" ")).not.toContain(
+        "declined",
+      );
+    }
+
+    // Without plain reasoning to read, the route keeps the text request.
+    const plain = await run({ text: "## Objective\n- Continue." }, target);
+    expect(plain.outcome).toBe("## Objective\n- Continue.");
+    expect(plain.allowed).toBeFalse();
+    expect(plain.state.requests[0]!.text).toBe(SESSION_SUMMARY_PROMPT);
+  });
+
   test("the retention summary keeps stopping an owned session whose removal failed", async () => {
     const { state, owned, outcome, ownedID } = await summarizeSession(state => {
       state.beforeWrite = method => {
@@ -2749,10 +2995,11 @@ describe("OpenCode 2 media projection", () => {
       // rewritten, and a copy with another image fails before any provider
       // request.
       const stored = JSON.stringify(history.records);
-      owned.register("ses_owned_a", "retention");
-      owned.register("ses_owned_b", "retention");
+      owned.register("ses_owned_a", "retention", false);
+      owned.register("ses_owned_b", "retention", false);
       const projected = {
         sessionID: "ses_owned_a",
+        model: { providerID: "test", id: "test-model" },
         tools: {},
         messages: copyOnly,
       };
@@ -3413,6 +3660,7 @@ describe("OpenCode 2 retention keep threshold environment", () => {
 
 describe("OpenCode 2 response tool boundary", () => {
   const RESPONSE = "StructuredOutput";
+  const SUMMARY = "SessionSummary";
   type Execute = (input: unknown, context: never) => Promise<unknown>;
   const harness = async (owned: OwnedSessions) => {
     const hooks = new Map<string, (event: never) => Promise<void> | void>();
@@ -3446,7 +3694,8 @@ describe("OpenCode 2 response tool boundary", () => {
     const advertised = async (kind: string, sessionID: string) => {
       const event = {
         sessionID,
-        tools: { [RESPONSE]: {}, read: {} },
+        model: { providerID: "test", id: "test-model" },
+        tools: { [RESPONSE]: {}, [SUMMARY]: {}, read: {} },
         messages: [],
       };
       await hooks.get(kind)!(event as never);
@@ -3454,10 +3703,27 @@ describe("OpenCode 2 response tool boundary", () => {
     };
     const respond = (sessionID: string) =>
       executors.get(RESPONSE)!({}, { sessionID } as never);
-    return { advertised, respond };
+    const submitSummary = (sessionID: string) =>
+      executors.get(SUMMARY)!({}, { sessionID } as never);
+    const request = async (
+      kind: string,
+      sessionID: string,
+      messages: Array<{ role: string; content: unknown[] }>,
+      providerID: string,
+    ) => {
+      const event = {
+        sessionID,
+        model: { providerID, id: "model" },
+        tools: {},
+        messages,
+      };
+      await hooks.get(kind)!(event as never);
+      return event.messages;
+    };
+    return { advertised, respond, submitSummary, request };
   };
 
-  test("a session this process does not own never sees the response tool, in any request kind", async () => {
+  test("a session this process does not own never sees the response or summary tool, in any request kind", async () => {
     const { advertised } = await harness(new OwnedSessions());
     for (const kind of ["context", "generate", "compaction"]) {
       expect([kind, await advertised(kind, "ses_user")]).toEqual([
@@ -3469,8 +3735,8 @@ describe("OpenCode 2 response tool boundary", () => {
 
   test("only the per-turn generation request of an owned session sees it", async () => {
     const owned = new OwnedSessions();
-    owned.register("ses_gen", "generation");
-    owned.register("ses_ret", "retention");
+    owned.register("ses_gen", "generation", false);
+    owned.register("ses_ret", "retention", false);
     const { advertised } = await harness(owned);
     expect(await advertised("context", "ses_gen")).toEqual([RESPONSE, "read"]);
     expect(await advertised("generate", "ses_gen")).toEqual(["read"]);
@@ -3481,10 +3747,71 @@ describe("OpenCode 2 response tool boundary", () => {
     expect(await advertised("generate", "ses_ret")).toEqual(["read"]);
   });
 
+  // The structured whole-session summary on the DeepSeek route has its own
+  // tool with the summary schema, never the per-turn response envelope.
+  test("only a structured session summary request sees the session summary tool, and only it acknowledges", async () => {
+    const owned = new OwnedSessions();
+    owned.register("ses_gen", "generation", false);
+    owned.register("ses_ret", "retention", false);
+    owned.register("ses_sum", "retention-tool", false);
+    const { advertised, respond, submitSummary } = await harness(owned);
+    expect(await advertised("context", "ses_sum")).toEqual([SUMMARY, "read"]);
+    expect(await advertised("context", "ses_gen")).toEqual([RESPONSE, "read"]);
+    expect(await advertised("context", "ses_ret")).toEqual(["read"]);
+    expect(await advertised("generate", "ses_sum")).toEqual(["read"]);
+    expect(await advertised("context", "ses_user")).toEqual(["read"]);
+    expect(await submitSummary("ses_sum")).toEqual({ content: "Recorded." });
+    for (const session of ["ses_gen", "ses_ret", "ses_user"]) {
+      await expect(submitSummary(session)).rejects.toThrow("only available");
+    }
+    await expect(respond("ses_sum")).rejects.toThrow("only available");
+  });
+
+  // Another model's plain reasoning reaches an owned request on the OpenAI
+  // Responses serializer as text at its own position; native metadata-bearing
+  // reasoning, other serializers and sessions this process does not own are
+  // left as the host built them.
+  test("shows another model's plain reasoning as text only in owned requests on the OpenAI Responses serializer", async () => {
+    const owned = new OwnedSessions();
+    // Each owned session makes one provider request.
+    // Registered with the serializer its request runs on.
+    owned.register("ses_gen", "generation", true);
+    owned.register("ses_gen_deepseek", "generation", false);
+    const { request } = await harness(owned);
+    const messages = () => [
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "deepseek analysis" },
+          {
+            type: "reasoning",
+            text: "native",
+            providerMetadata: {
+              openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" },
+            },
+          },
+          { type: "text", text: "answer" },
+        ],
+      },
+    ];
+    const openai = await request("context", "ses_gen", messages(), "openai");
+    expect(openai[0]!.content).toEqual([
+      { type: "text", text: `${READABLE_REASONING_HEADER}\ndeepseek analysis` },
+      messages()[0]!.content[1],
+      { type: "text", text: "answer" },
+    ]);
+    expect(
+      await request("context", "ses_gen_deepseek", messages(), "deepseek"),
+    ).toEqual(messages());
+    expect(await request("context", "ses_user", messages(), "openai")).toEqual(
+      messages(),
+    );
+  });
+
   test("the response tool acknowledges only inside a per-turn generation session", async () => {
     const owned = new OwnedSessions();
-    owned.register("ses_gen", "generation");
-    owned.register("ses_ret", "retention");
+    owned.register("ses_gen", "generation", false);
+    owned.register("ses_ret", "retention", false);
     const { respond } = await harness(owned);
     expect(await respond("ses_gen")).toEqual({ content: "Recorded." });
     await expect(respond("ses_user")).rejects.toThrow("only available");

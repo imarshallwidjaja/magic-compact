@@ -83,6 +83,7 @@ import {
 } from "../src/magic-compact";
 import { executeMagicRecover } from "../src/magic-recover";
 import { executeMagicStats } from "../src/magic-stats";
+import { reasoningFeedback, type StageReport } from "../src/policy/reasoning";
 import {
   isRecoveryContext,
   recoveryContext,
@@ -2510,6 +2511,289 @@ describe("bounded native compaction generation", () => {
     );
   });
 
+  // --match-model runs a turn summary on the model that wrote its target's
+  // protected reasoning; the preceding halo never decides, and without the
+  // flag the configured summarizer runs while the feedback names the gap.
+  test("runs a turn summary on its target's reasoning model only under --match-model", async () => {
+    const first = protectedReasoningTurn("match-first", "first request");
+    const second = candidateTurn("match-second", "second request", []);
+    const run = async (matchModel: boolean) => {
+      const harness = generationHarness(
+        [first, second],
+        responseFor([first, second]),
+        { extraProviders: [solProvider()] },
+      );
+      const reasoning = { matchModel, reports: [] as StageReport[] };
+      await generateCompactionSummaries(
+        harness.v2,
+        sourceSession(),
+        generationPlan([first, second]),
+        { reasoning },
+      );
+      const byOrdinal = new Map(
+        harness.prompts.map(request => [
+          generationPromptIndex(request).turns[0]!.ordinal,
+          request,
+        ]),
+      );
+      return { harness, reasoning, byOrdinal };
+    };
+
+    const plain = await run(false);
+    for (const request of plain.harness.prompts) {
+      expect(request).toMatchObject({
+        model: {
+          providerID: "configured-provider",
+          modelID: "configured-model",
+        },
+        variant: "configured-variant",
+      });
+    }
+    expect(reasoningFeedback(plain.reasoning.reports, false)).toContain(
+      "--match-model would run 1 request",
+    );
+
+    const matched = await run(true);
+    expect(matched.byOrdinal.get(1)).toMatchObject({
+      agent: "magic-compact-summarizer",
+      model: { providerID: "openai", modelID: "gpt-6.1-sol" },
+      variant: "configured-variant",
+    });
+    // The second turn retains the first as its halo, yet keeps the
+    // configured summarizer: only a target's own reasoning decides.
+    expect(matched.byOrdinal.get(2)).toMatchObject({
+      model: { providerID: "configured-provider", modelID: "configured-model" },
+    });
+    expect(matched.reasoning.reports.map(report => report.onOrigin)).toEqual([
+      true,
+      false,
+    ]);
+    expect(matched.reasoning.reports[0]!.access).toEqual({
+      compatible: 1,
+      unavailable: 0,
+      unknown: 0,
+    });
+    // The halo's protected unit is unreadable by the configured model.
+    expect(matched.reasoning.reports[1]!.access.unavailable).toBe(1);
+    // Ciphertext never enters a prompt or index.
+    for (const request of matched.harness.prompts) {
+      expect(promptText(request)).not.toContain("enc_match-first");
+    }
+  });
+
+  // Without the flag the matched model is still planned, only to learn
+  // whether it fits; that plan shares the target's one nonce with the request
+  // that runs.
+  test("checks the matched model's fit without --match-model, with one nonce per target shared by the fit check and the request", async () => {
+    const turn = protectedReasoningTurn("match-nonce", "request");
+    const harness = generationHarness([turn], responseFor([turn]), {
+      extraProviders: [solProvider()],
+    });
+    const reasoning = { matchModel: false, reports: [] as StageReport[] };
+    await generateCompactionSummaries(
+      harness.v2,
+      sourceSession(),
+      generationPlan([turn]),
+      { reasoning, nonceFactory: () => "uB_4fLx2Xv5Tz7E1M-8vQn" },
+    );
+    expect(harness.markerUpdates.map(update => update.part.text)).toEqual([
+      '<magic-compact-turn nonce="uB_4fLx2Xv5Tz7E1M-8vQn" ordinal="1" />',
+    ]);
+    expect(reasoning.reports[0]!.choice.kind).toBe("match");
+    expect(reasoning.reports[0]!.onOrigin).toBeFalse();
+  });
+
+  test("keeps the configured summarizer in preflight when the matched model is too small or lacks the configured variant", async () => {
+    const turn = protectedReasoningTurn("match-fallback", "request");
+    for (const [provider, reason] of [
+      [solProvider({ limit: { context: 9_000, output: 1_000 } }), "capacity"],
+      [solProvider({ variants: { high: {} } }), "variant"],
+      // The origin's route is no longer the verified one.
+      [solProvider({ npm: "@ai-sdk/openai-compatible" }), "unqualified"],
+    ] as const) {
+      const harness = generationHarness([turn], responseFor([turn]), {
+        extraProviders: [provider],
+      });
+      const reasoning = { matchModel: true, reports: [] as StageReport[] };
+      await generateCompactionSummaries(
+        harness.v2,
+        sourceSession(),
+        generationPlan([turn]),
+        { reasoning },
+      );
+      expect(harness.prompts[0]).toMatchObject({
+        model: {
+          providerID: "configured-provider",
+          modelID: "configured-model",
+        },
+        variant: "configured-variant",
+      });
+      expect(reasoning.reports[0]!.choice).toEqual({
+        kind: "fallback",
+        reason,
+      });
+    }
+  });
+
+  // The fast catalog entry sends the verified wire model and was observed live
+  // under its own ID, so a turn it wrote matches that entry. Records are
+  // compared by exact ID: nothing maps the fast ID to the base model, and
+  // other entries that send the same wire model stay unverified.
+  test("matches a turn written by the verified fast catalog entry to that exact entry only", async () => {
+    const run = async (
+      modelID: string,
+      provider: ReturnType<typeof solProvider>,
+    ) => {
+      const turn = protectedReasoningTurn(
+        "match-fast",
+        "request",
+        300,
+        modelID,
+      );
+      const harness = generationHarness([turn], responseFor([turn]), {
+        extraProviders: [provider],
+      });
+      const reasoning = { matchModel: true, reports: [] as StageReport[] };
+      await generateCompactionSummaries(
+        harness.v2,
+        sourceSession(),
+        generationPlan([turn]),
+        { reasoning },
+      );
+      return {
+        prompt: harness.prompts[0],
+        choice: reasoning.reports[0]!.choice,
+      };
+    };
+    const fast = await run(
+      "gpt-6.1-sol-fast",
+      solProvider({ id: "gpt-6.1-sol-fast" }),
+    );
+    expect(fast.prompt).toMatchObject({
+      model: { providerID: "openai", modelID: "gpt-6.1-sol-fast" },
+      variant: "configured-variant",
+    });
+    expect(fast.choice).toEqual({
+      kind: "match",
+      model: { providerID: "openai", modelID: "gpt-6.1-sol-fast" },
+      variant: "configured-variant",
+    });
+    for (const [modelID, provider] of [
+      // The base model is listed, but the fast entry that wrote the turn is not.
+      ["gpt-6.1-sol-fast", solProvider()],
+      // Other entries that send the verified wire model.
+      ["gpt-6.1-sol-pro", solProvider({ id: "gpt-6.1-sol-pro" })],
+      ["gpt-6.1-sol-ultrafast", solProvider({ id: "gpt-6.1-sol-ultrafast" })],
+      // The fast ID on another wire model.
+      [
+        "gpt-6.1-sol-fast",
+        solProvider({
+          id: "gpt-6.1-sol-fast",
+          wireModelID: "gpt-6.1-sol-2026",
+        }),
+      ],
+    ] as const) {
+      const rejected = await run(modelID, provider);
+      expect(rejected.choice).toEqual({
+        kind: "fallback",
+        reason: "unqualified",
+      });
+      expect(rejected.prompt).toMatchObject({
+        model: {
+          providerID: "configured-provider",
+          modelID: "configured-model",
+        },
+      });
+    }
+  });
+
+  // A request on the model that wrote protected reasoning is sent it again,
+  // so its input counts each attributable unit's replay estimate in place of
+  // the unit's visible text: a matched model that fits only the visible text
+  // falls back to the configured summarizer, and a halo whose replay does not
+  // fit stays out of the matched request. The configured summarizer, another
+  // model, is sent none of it and keeps the same halo.
+  test("counts each request model's own replay before matching and before keeping a halo", async () => {
+    // Visible text is small; the counter alone exceeds the matched model's
+    // 450,000-token hard input limit.
+    const large = protectedReasoningTurn(
+      "replay-large",
+      "large request",
+      445_000,
+    );
+    const small = protectedReasoningTurn("replay-small", "small request");
+    const harness = generationHarness(
+      [large, small],
+      responseFor([large, small]),
+      { extraProviders: [solProvider()] },
+    );
+    const reasoning = { matchModel: true, reports: [] as StageReport[] };
+    await generateCompactionSummaries(
+      harness.v2,
+      sourceSession(),
+      generationPlan([large, small]),
+      { reasoning },
+    );
+    const request = (ordinal: number) => {
+      const prompt = harness.prompts.find(
+        item => generationPromptIndex(item).turns[0]!.ordinal === ordinal,
+      )!;
+      const history = harness.promptHistories.find(
+        item => item.sessionID === prompt["sessionID"],
+      )!.messages;
+      return {
+        model: prompt["model"],
+        users: history.flatMap(message =>
+          message.info.role === "user"
+            ? message.parts.flatMap(part =>
+                part.type === "text" && part.synthetic !== true
+                  ? [part.text]
+                  : [],
+              )
+            : [],
+        ),
+      };
+    };
+    expect(request(1)).toEqual({
+      model: { providerID: "configured-provider", modelID: "configured-model" },
+      users: ["large request"],
+    });
+    expect(request(2)).toEqual({
+      model: { providerID: "openai", modelID: "gpt-6.1-sol" },
+      users: ["small request"],
+    });
+    expect(
+      reasoning.reports.map(report => [report.choice.kind, report.onOrigin]),
+    ).toEqual([
+      ["fallback", false],
+      ["match", true],
+    ]);
+    expect(reasoning.reports[0]!.choice).toEqual({
+      kind: "fallback",
+      reason: "capacity",
+    });
+
+    // The configured summarizer keeps the same halo.
+    const configured = generationHarness(
+      [large, small],
+      responseFor([large, small]),
+      { extraProviders: [solProvider()] },
+    );
+    await generateCompactionSummaries(
+      configured.v2,
+      sourceSession(),
+      generationPlan([large, small]),
+    );
+    const prompt = configured.prompts.find(
+      item => generationPromptIndex(item).turns[0]!.ordinal === 2,
+    )!;
+    expect(
+      configured.promptHistories
+        .find(item => item.sessionID === prompt["sessionID"])!
+        .messages.filter(message => message.info.role === "user"),
+    ).toHaveLength(2);
+  });
+
   test("orients by first ordinary user lines only in the global map, never in the target index", async () => {
     const long = `${"a".repeat(299)}😀tail`;
     const selected = candidateTurn("selected", long, []);
@@ -4889,6 +5173,182 @@ describe("compaction orchestration", () => {
     expect(await readStats("source")).toBeNull();
   });
 
+  // The continuing model is sent its own protected reasoning again, so a
+  // turn whose attributable replay cost exceeds its summary is worth
+  // replacing even though the stored history grows; the growth is reported as
+  // growth and recorded signed. Without an attributable counter the same turn
+  // is judged by visible content alone.
+  test("counts the estimated replay cost of the continuing model's reasoning and reports signed growth", async () => {
+    const source = () => {
+      const turn = protectedReasoningTurn("replay", "small request", 531);
+      return [...turn.user, ...turn.assistants];
+    };
+    const messages = source();
+    const before = structuredClone(messages);
+    const harness = commandHarness(messages, {
+      generationResponse: {
+        turns: [
+          result(
+            1,
+            "A generated summary longer than the visible reasoning summary it replaces.",
+          ),
+        ],
+      },
+      sessionOverrides: { model: { id: "gpt-6.1-sol", providerID: "openai" } },
+      extraProviders: [solProvider()],
+    });
+    await expect(
+      executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
+    ).resolves.toMatchObject({ session: { id: "successor" } });
+    expect(messages).toEqual(before);
+    const successor = harness.successorMessages();
+    const notice = noticeText(successor);
+    expect(notice).toMatch(/% grown \(~\d+ added\)/u);
+    expect(notice).toContain(
+      "Reasoning replay (estimate) | About 531 replay tokens removed with 1 protected reasoning unit",
+    );
+    const stats = await readStats("successor");
+    expect(stats!.totalTokensPruned).toBeLessThan(0);
+    expect(stats!.cachedTokensSaved).toBe(0);
+    expect(JSON.stringify(successor)).not.toContain("enc_replay");
+
+    // Unattributable: the producing step has no counter.
+    const unknown = source();
+    unknown[1]!.parts = unknown[1]!.parts.filter(
+      part => part.type !== "step-finish",
+    );
+    const rejected = commandHarness(unknown, {
+      generationResponse: {
+        turns: [
+          result(
+            1,
+            "A generated summary longer than the visible reasoning summary it replaces.",
+          ),
+        ],
+      },
+      sessionOverrides: { model: { id: "gpt-6.1-sol", providerID: "openai" } },
+      extraProviders: [solProvider()],
+    });
+    await expect(
+      executeMagicCompact(rejected.v2, "source", 0, HEURISTIC_OPTIONS),
+    ).rejects.toThrow(COMPACT_INSUFFICIENT_SAVINGS);
+    expect(rejected.sourceWrites).toEqual([]);
+  });
+
+  test("counts the continuing fast catalog entry's replay cost, and no other entry's", async () => {
+    const run = async (modelID: string) => {
+      const turn = protectedReasoningTurn(
+        "replay-fast",
+        "small request",
+        531,
+        modelID,
+      );
+      const harness = commandHarness([...turn.user, ...turn.assistants], {
+        generationResponse: {
+          turns: [
+            result(
+              1,
+              "A generated summary longer than the visible reasoning summary it replaces.",
+            ),
+          ],
+        },
+        sessionOverrides: { model: { id: modelID, providerID: "openai" } },
+        extraProviders: [solProvider({ id: modelID })],
+      });
+      return {
+        harness,
+        outcome: executeMagicCompact(
+          harness.v2,
+          "source",
+          0,
+          HEURISTIC_OPTIONS,
+        ),
+      };
+    };
+    const fast = await run("gpt-6.1-sol-fast");
+    await expect(fast.outcome).resolves.toMatchObject({
+      session: { id: "successor" },
+    });
+    expect(noticeText(fast.harness.successorMessages())).toContain(
+      "Reasoning replay (estimate) | About 531 replay tokens removed with 1 protected reasoning unit",
+    );
+    // Another entry of the same wire model is unverified: its reasoning is not
+    // counted as replayed, so the visible text alone decides and the generated
+    // summary that was profitable above is rejected.
+    const pro = await run("gpt-6.1-sol-pro");
+    await expect(pro.outcome).rejects.toThrow(COMPACT_INSUFFICIENT_SAVINGS);
+  });
+
+  // Removing a summarized copy of a repeated reasoning item would make the
+  // preserved copy look attributable if the result were measured afresh. The
+  // gate and the notice use the source's one attribution instead: the
+  // preserved copy stays unknown on both sides, so only the summarized turn's
+  // own change decides, and nothing is reported as a negative removal.
+  test("keeps a preserved repeat of a summarized reasoning item out of the savings gate", async () => {
+    const source = (preservedCounter: number) => {
+      const summarized = protectedReasoningTurn("dup-a", "first request", 50);
+      summarized.assistants[0]!.parts.splice(
+        2,
+        0,
+        textPart(
+          "dup-a-long",
+          summarized.assistants[0]!.info.id,
+          "detail ".repeat(400),
+        ),
+      );
+      const preserved = protectedReasoningTurn(
+        "dup-b",
+        "second request",
+        preservedCounter,
+      );
+      const repeated = preserved.assistants[0]!.parts.find(
+        part => part.type === "reasoning",
+      )!;
+      Object.assign(repeated, {
+        metadata: {
+          openai: {
+            itemId: "rs_dup-a",
+            reasoningEncryptedContent: "enc_dup-a",
+          },
+        },
+      });
+      return [
+        ...summarized.user,
+        ...summarized.assistants,
+        ...preserved.user,
+        ...preserved.assistants,
+      ];
+    };
+    const run = async (preservedCounter: number) => {
+      const harness = commandHarness(source(preservedCounter), {
+        generationResponse: { turns: [result(1, "Short summary.")] },
+        sessionOverrides: {
+          model: { id: "gpt-6.1-sol", providerID: "openai" },
+        },
+        extraProviders: [solProvider()],
+      });
+      return executeMagicCompact(
+        harness.v2,
+        "source",
+        1,
+        HEURISTIC_OPTIONS,
+      ).then(
+        () => ({ notice: noticeText(harness.successorMessages()) }),
+        (error: Error) => ({ error: error.message }),
+      );
+    };
+    // The preserved copy's counter, however large, changes nothing.
+    const small = await run(10);
+    expect(await run(400_000)).toEqual(small);
+    expect(small).not.toHaveProperty("error");
+    const notice = (small as { notice: string }).notice;
+    expect(notice).toContain(
+      "Reasoning replay (estimate) | 2 protected reasoning units the continuing model may be sent had no attributable provider count and are not counted.",
+    );
+    expect(notice).not.toContain("replay tokens removed");
+    expect(notice).not.toMatch(/-\d/u);
+  });
+
   test("both hosts' savings gate accepts exactly 20% of eligible tokens, at least 32", () => {
     expect(hasUsefulSavings(32, 0)).toBeTrue();
     expect(hasUsefulSavings(31, 0)).toBeFalse();
@@ -6526,6 +6986,8 @@ function generationHarness(
       output?: number;
     } | null;
     sourceMessages?: MessageWithParts[];
+    // Further providers the host lists, for --match-model.
+    extraProviders?: unknown[];
     // Edits the response to the numbered (1-based) read of a fork: reads 1 and
     // 2 are fork initialization, 3 the shape check, 4 the retained recheck.
     mutateForkRead?: (
@@ -6639,6 +7101,7 @@ function generationHarness(
                         },
                       },
               },
+              ...(options.extraProviders ?? []),
             ],
             connected: ["configured-provider"],
             default: {},
@@ -6943,12 +7406,111 @@ function generationPlan(
     effectiveSourceTurnStartIndex: 0,
     effectiveSourceTurnEndIndex: turns.length + (nextTurn ? 1 : 0),
     sourceSnapshot: snapshotSourceMessages(messages),
+    sourceMessages: messages,
   } as CompactionPlan;
 }
 
 function candidateTurn(id: string, userText: string, parts: Part[]): Turn {
   const messages = candidateMessages(id, userText, parts);
   return { user: [messages[0]!], assistants: [messages[1]!] };
+}
+
+// The text of a successor's ignored stats notice.
+function noticeText(messages: MessageWithParts[]): string {
+  const part = messages
+    .flatMap(item => item.parts)
+    .find(
+      part =>
+        part.type === "text"
+        && (
+          part.metadata?.["magicCompact"] as Record<string, unknown> | undefined
+        )?.["stats"] === true,
+    ) as TextPart | undefined;
+  return part?.text ?? "";
+}
+
+// The OpenAI provider the --match-model and replay tests list next to the
+// configured summarizer.
+function solProvider(
+  overrides: {
+    limit?: { context: number; input?: number; output?: number };
+    variants?: Record<string, unknown>;
+    npm?: string;
+    // The catalog ID, and the wire model it sends when that differs.
+    id?: string;
+    wireModelID?: string;
+  } = {},
+) {
+  return {
+    id: "openai",
+    models: {
+      [overrides.id ?? "gpt-6.1-sol"]: {
+        api: {
+          id: overrides.wireModelID ?? "gpt-6.1-sol",
+          npm: overrides.npm ?? "@ai-sdk/openai",
+        },
+        capabilities: { input: { image: true } },
+        limit: overrides.limit ?? {
+          context: 1_000_000,
+          input: 500_000,
+          output: 64_000,
+        },
+        variants: overrides.variants ?? { "configured-variant": {} },
+      },
+    },
+  };
+}
+
+// A turn whose assistant step carries one protected OpenAI reasoning item
+// from the OpenAI model (openai/gpt-6.1-sol by default) and that step's
+// reasoning counter.
+function protectedReasoningTurn(
+  id: string,
+  userText: string,
+  reasoningTokens = 300,
+  modelID = "gpt-6.1-sol",
+): Turn {
+  const turn = candidateTurn(id, userText, []);
+  const assistant = turn.assistants[0]!;
+  Object.assign(assistant.info, {
+    providerID: "openai",
+    modelID,
+  });
+  assistant.parts = [
+    {
+      id: `${id}-step-start`,
+      sessionID: "source",
+      messageID: assistant.info.id,
+      type: "step-start",
+    } as Part,
+    {
+      id: `${id}-reasoning`,
+      sessionID: "source",
+      messageID: assistant.info.id,
+      type: "reasoning",
+      text: "short visible summary",
+      metadata: {
+        openai: { itemId: `rs_${id}`, reasoningEncryptedContent: `enc_${id}` },
+      },
+      time: { start: 1, end: 2 },
+    } as Part,
+    textPart(`${id}-answer`, assistant.info.id, "ok"),
+    {
+      id: `${id}-step-finish`,
+      sessionID: "source",
+      messageID: assistant.info.id,
+      type: "step-finish",
+      reason: "stop",
+      cost: 0,
+      tokens: {
+        input: 10,
+        output: reasoningTokens + 2,
+        reasoning: reasoningTokens,
+        cache: { read: 0, write: 0 },
+      },
+    } as Part,
+  ];
+  return turn;
 }
 
 function nativeCompactionPart(id: string, messageID: string): Part {
@@ -7437,6 +7999,8 @@ type CommandHarnessOptions = {
   successorHostRefusals?: Partial<Record<"create" | "update", number>>;
   generationGate?: Promise<void>;
   toastMode?: "hang" | "fail" | "delay-progress";
+  // Further providers the host lists, for --match-model and replay estimates.
+  extraProviders?: unknown[];
 };
 
 // Fake OpenCode host for command-level tests. `messages` is the live source;
@@ -7522,6 +8086,7 @@ function commandHarness(
                 },
               },
             },
+            ...(options.extraProviders ?? []),
           ],
           connected: ["configured-provider"],
           default: {},

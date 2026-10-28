@@ -848,17 +848,40 @@ describe("magic trim task-aware retention", () => {
     "%s arguments",
     (command, parse, ARGUMENTS_ERROR, THRESHOLD_ERROR, BACKEND_ERROR) => {
       test.each([
-        ["", { keepTurns: 0, heuristic: false, truncate: false }],
-        [" 3 ", { keepTurns: 3, heuristic: false, truncate: false }],
-        ["--heuristic", { keepTurns: 0, heuristic: true }],
-        ["--heuristic 2", { keepTurns: 2, heuristic: true }],
-        ["2  --heuristic", { keepTurns: 2, heuristic: true }],
-        ["--truncate", { keepTurns: 0, heuristic: false, truncate: true }],
+        [
+          "",
+          {
+            keepTurns: 0,
+            heuristic: false,
+            matchModel: false,
+            truncate: false,
+          },
+        ],
+        [
+          " 3 ",
+          {
+            keepTurns: 3,
+            heuristic: false,
+            matchModel: false,
+            truncate: false,
+          },
+        ],
+        ["--heuristic", { keepTurns: 0, heuristic: true, matchModel: false }],
+        ["--heuristic 2", { keepTurns: 2, heuristic: true, matchModel: false }],
+        [
+          "2  --heuristic",
+          { keepTurns: 2, heuristic: true, matchModel: false },
+        ],
+        [
+          "--truncate",
+          { keepTurns: 0, heuristic: false, matchModel: false, truncate: true },
+        ],
         [
           "1 --threshold 70 --truncate",
           {
             keepTurns: 1,
             heuristic: false,
+            matchModel: false,
             keepThreshold: 0.7,
             truncate: true,
           },
@@ -868,35 +891,56 @@ describe("magic trim task-aware retention", () => {
           {
             keepTurns: 1,
             heuristic: false,
+            matchModel: false,
             keepThreshold: 0.601,
             truncate: true,
           },
         ],
         [
           "--threshold 0",
-          { keepTurns: 0, heuristic: false, keepThreshold: 0, truncate: false },
+          {
+            keepTurns: 0,
+            heuristic: false,
+            matchModel: false,
+            keepThreshold: 0,
+            truncate: false,
+          },
         ],
         [
           "--threshold 100 4",
-          { keepTurns: 4, heuristic: false, keepThreshold: 1, truncate: false },
+          {
+            keepTurns: 4,
+            heuristic: false,
+            matchModel: false,
+            keepThreshold: 1,
+            truncate: false,
+          },
         ],
         [
           `${Number.MAX_SAFE_INTEGER}`,
           {
             keepTurns: Number.MAX_SAFE_INTEGER,
             heuristic: false,
+            matchModel: false,
             truncate: false,
           },
         ],
         [
           "--backend jev",
-          { keepTurns: 0, heuristic: false, backend: "jev", truncate: false },
+          {
+            keepTurns: 0,
+            heuristic: false,
+            matchModel: false,
+            backend: "jev",
+            truncate: false,
+          },
         ],
         [
           "1 --backend openai-decisions --threshold 70 --truncate",
           {
             keepTurns: 1,
             heuristic: false,
+            matchModel: false,
             backend: "openai-decisions",
             keepThreshold: 0.7,
             truncate: true,
@@ -907,8 +951,23 @@ describe("magic trim task-aware retention", () => {
           {
             keepTurns: 2,
             heuristic: false,
+            matchModel: false,
             backend: "openai-decisions",
             truncate: true,
+          },
+        ],
+        [
+          "--match-model",
+          { keepTurns: 0, heuristic: false, truncate: false, matchModel: true },
+        ],
+        [
+          "2 --truncate --match-model --backend jev",
+          {
+            keepTurns: 2,
+            heuristic: false,
+            backend: "jev",
+            truncate: true,
+            matchModel: true,
           },
         ],
       ] as const)("parses %p", (raw, expected) => {
@@ -960,6 +1019,9 @@ describe("magic trim task-aware retention", () => {
         ["--backend openai", "backend"],
         ["--backend typesafe", "backend"],
         ["--backend jev|openai-decisions", "backend"],
+        ["--match-model --match-model", "arguments"],
+        ["--match-model=true", "arguments"],
+        ["--matchmodel", "arguments"],
       ] as const)("rejects %p", (raw, kind) => {
         expect(() => parse(raw)).toThrow(
           kind === "arguments"
@@ -1012,12 +1074,30 @@ describe("magic trim task-aware retention", () => {
           expect(message).not.toMatch(/MAGIC_COMPACT|%|Infinity|0x/);
         }
         expect(ARGUMENTS_ERROR).toContain("--backend jev|openai-decisions");
+        expect(ARGUMENTS_ERROR).toContain("--match-model");
         expect(BACKEND_ERROR).toBe(
           `/${command} --backend needs jev or openai-decisions after a space, such as --backend openai-decisions.`,
         );
       });
     },
   );
+
+  // --match-model chooses summary models. /magic-compact --heuristic still
+  // summarizes every turn, so it keeps the flag; /magic-trim --heuristic makes
+  // no summary request, so the combination is an argument error.
+  test("--heuristic --match-model parses for /magic-compact and is rejected by /magic-trim", () => {
+    expect(parseMagicCompactArguments("--match-model 1 --heuristic")).toEqual({
+      keepTurns: 1,
+      heuristic: true,
+      matchModel: true,
+    });
+    expect(() => parseMagicTrimArguments("--heuristic --match-model")).toThrow(
+      TRIM_ARGUMENTS_ERROR,
+    );
+    expect(() => parseMagicCompactArguments("--heuristic --truncate")).toThrow(
+      COMPACT_ARGUMENTS_ERROR,
+    );
+  });
 
   test("keeps judged-useful calls whole and trims the rest by the existing rules", async () => {
     const sessionID = `ses_trim_retain_${randomUUID().replaceAll("-", "")}`;

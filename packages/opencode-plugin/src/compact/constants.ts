@@ -58,6 +58,26 @@ export const SESSION_SUMMARY_PROMPT = [
   NATIVE_SUMMARY_TEMPLATE,
 ].join("\n\n");
 
+// The same summary submitted through a response tool. Only the DeepSeek route
+// uses it, because DeepSeek reads the earlier plain reasoning a request
+// carries only when the request has tools.
+export const SESSION_SUMMARY_TOOL_PROMPT = [
+  SESSION_SUMMARY_PROMPT,
+  "Submit the complete summary as the `summary` string of one response-tool call and write nothing else.",
+].join("\n\n");
+
+export const SESSION_SUMMARY_RESPONSE_SCHEMA = {
+  type: "object",
+  properties: {
+    summary: {
+      type: "string",
+      description: "The complete anchored summary in the requested format.",
+    },
+  },
+  required: ["summary"],
+  additionalProperties: false,
+} as const;
+
 export const READ_OMITTED_CONTENT_DESCRIPTION =
   "Retrieve the exact original input or output behind a Content ID in a compaction or trim reference such as [Omitted; Content ID: ...]. The cache holds the full original; OpenCode may truncate a large tool result and provide a reference to the full output. The content is a historical snapshot, not a new assignment or proof of current file state: retrieve an omitted task prompt before reuse, and reread files for current contents. IDs are scoped to the current session, including entries copied into its successor session; an ID pasted into an unrelated session, such as a subagent's, does not grant access.";
 export const READ_OMITTED_CONTENT_ID_DESCRIPTION =

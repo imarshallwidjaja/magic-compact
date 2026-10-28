@@ -21,6 +21,8 @@ import {
   type RetentionPolicy,
 } from "./retention/retention";
 import { STATS_METADATA, trimStatsMessage } from "./stats/constants";
+import type { SummaryReasoningOptions } from "./compact/compact";
+import { reasoningFeedback } from "./policy/reasoning";
 import { countModelFacingContentTokens } from "./stats/tokenize";
 import {
   CONTROL_OPERATION_TIMEOUT_MS,
@@ -43,6 +45,8 @@ export {
 
 export type MagicTrimExecutionOptions = {
   retention: RetentionPolicy;
+  // `--match-model` for the retention session summary.
+  matchModel?: boolean;
   controlTimeoutMs?: number;
 };
 
@@ -77,6 +81,10 @@ export async function executeMagicTrim(
         controlTimeoutMs,
       );
       const plan = planTrim(source.messages, keepTurns);
+      const reasoning: SummaryReasoningOptions = {
+        matchModel: options.matchModel === true,
+        reports: [],
+      };
       let retention: RetentionPlan = HEURISTIC_RETENTION;
       if (options.retention.mode === "task-aware") {
         retention = await decideRetention(
@@ -85,17 +93,26 @@ export async function executeMagicTrim(
           source.messages,
           await findRetentionCandidates(source.messages, plan.trimmedTurns),
           options.retention,
-          { controlTimeoutMs },
+          { controlTimeoutMs, reasoning },
         );
       }
+      const reasoningLine = reasoningFeedback(
+        reasoning.reports,
+        reasoning.matchModel,
+      );
       const retentionLine = retentionFeedback(retention, source.messages);
+      // The toast carries the reasoning line after the retention line; the
+      // notice gives it its own line.
+      const feedback = `${retentionLine}${
+        reasoningLine === undefined ? "" : ` ${reasoningLine}`
+      }`;
       const trim = await projectToolTrim(
         plan.trimmedTurns,
         sessionID,
         retention.keep,
       );
       if (trim.replacements.length === 0) {
-        return { successor: null, retentionLine };
+        return { successor: null, feedback };
       }
 
       const trimmed = applySuccessorEdits(
@@ -119,6 +136,9 @@ export async function executeMagicTrim(
                 after.tokens,
                 trim.replacements.length,
                 retentionLine,
+                reasoningLine === undefined
+                  ? []
+                  : [`Reasoning | ${reasoningLine}`],
               ),
               ignored: true,
               metadata: STATS_METADATA,
@@ -151,7 +171,7 @@ export async function executeMagicTrim(
       }
       return {
         successor,
-        retentionLine,
+        feedback,
         trimmedToolCalls: trim.replacements.length,
       };
     });
@@ -159,7 +179,7 @@ export async function executeMagicTrim(
     if (outcome.successor === null) {
       await toastFeedback.showTerminal({
         title: COMMAND,
-        message: `${TRIM_NOOP} ${outcome.retentionLine}`,
+        message: `${TRIM_NOOP} ${outcome.feedback}`,
         variant: "info",
         duration: 5000,
       });
@@ -167,7 +187,7 @@ export async function executeMagicTrim(
     }
     await toastFeedback.showTerminal({
       title: COMMAND,
-      message: `Trimmed ${outcome.trimmedToolCalls} tool call(s) into successor session ${outcome.successor.session.id}. ${outcome.retentionLine}`,
+      message: `Trimmed ${outcome.trimmedToolCalls} tool call(s) into successor session ${outcome.successor.session.id}. ${outcome.feedback}`,
       variant: "info",
       duration: 5000,
     });

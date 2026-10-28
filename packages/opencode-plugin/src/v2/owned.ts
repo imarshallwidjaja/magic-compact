@@ -9,9 +9,25 @@ import {
 import {
   MAGIC_COMPACT_SUMMARIZER_AGENT,
   SESSION_SUMMARY_PROMPT,
+  SESSION_SUMMARY_RESPONSE_SCHEMA,
+  SESSION_SUMMARY_TOOL_PROMPT,
 } from "../compact/constants";
 import {
+  chooseStage,
+  matchCandidate,
+  sameModel,
+  stageReport,
+  verifiedReasoning,
+  type MatchPreflight,
+  type ModelIdentity,
+  type Qualifies,
+  type ReasoningReports,
+  type ReasoningRoute,
+  type StageChoice,
+} from "../policy/reasoning";
+import {
   SessionSummaryError,
+  structuredSessionSummary,
   type SessionSummaryStage,
 } from "../policy/retention";
 import { RETENTION_FAILURE_GUIDANCE } from "../retention/classifier";
@@ -26,6 +42,12 @@ import { v2ModelVisibleHistory } from "./history";
 import type { V2Host } from "./host";
 import { v2HistoryShowsImages } from "./media";
 import {
+  readableReasoningHeaderTokens,
+  v2ReasoningRoute,
+  v2ReasoningUnits,
+  v2ReplayEstimate,
+} from "./reasoning";
+import {
   mintV2ID,
   readV2History,
   withFreshMessageIDs,
@@ -36,11 +58,15 @@ import { hasPluginMessage, PluginMessageError } from "../policy/feedback";
 
 // `generation` sessions run one per-turn summary request and may call the
 // response tool; `retention` sessions run the whole-session summary and may
-// call no tool.
-export type OwnedSessionRole = "generation" | "retention";
+// call no tool; `retention-tool` sessions run the whole-session summary on the
+// DeepSeek route and may call only the session summary tool.
+export type OwnedSessionRole = "generation" | "retention" | "retention-tool";
 
 type OwnedEntry = {
   role: OwnedSessionRole;
+  // The request runs on OpenCode 2's OpenAI Responses serializer, which needs
+  // another model's plain reasoning projected to stay readable.
+  readableReasoning: boolean;
   requests: number;
   closed: boolean;
 };
@@ -57,8 +83,17 @@ export class OwnedSessions {
   readonly compactionBlocked = `Magic Compact blocked native compaction of its owned session (${randomUUID()}).`;
   readonly #sessions = new Map<string, OwnedEntry>();
 
-  register(sessionID: string, role: OwnedSessionRole): void {
-    this.#sessions.set(sessionID, { role, requests: 0, closed: false });
+  register(
+    sessionID: string,
+    role: OwnedSessionRole,
+    readableReasoning: boolean,
+  ): void {
+    this.#sessions.set(sessionID, {
+      role,
+      readableReasoning,
+      requests: 0,
+      closed: false,
+    });
   }
 
   // Ends the session's requests for good: every later one is stopped, whether
@@ -79,6 +114,16 @@ export class OwnedSessions {
   // The response tool belongs to the per-turn generation request alone.
   allowsResponseTool(sessionID: string): boolean {
     return this.#sessions.get(sessionID)?.role === "generation";
+  }
+
+  // The session summary tool belongs to the structured whole-session summary
+  // alone.
+  allowsSummaryTool(sessionID: string): boolean {
+    return this.#sessions.get(sessionID)?.role === "retention-tool";
+  }
+
+  projectsReadableReasoning(sessionID: string): boolean {
+    return this.#sessions.get(sessionID)?.readableReasoning === true;
   }
 
   admitRequest(sessionID: string): void {
@@ -123,13 +168,14 @@ export async function removeOwnedSession(
 const DENY_ALL = [{ action: "*", resource: "*", effect: "deny" as const }];
 
 // The operator-configured summarizer model at the source session's location,
-// where a project's own agent settings apply. The source model and the native
-// compaction agent are never a fallback.
-export async function resolveV2Summarizer(
+// where a project's own agent settings apply, and whether the agent carries
+// operator request options (body or headers) written for that model. The
+// source model and the native compaction agent are never a fallback.
+async function resolveV2SummarizerAgent(
   host: V2Host,
   location: { directory: string },
   controlTimeoutMs: number,
-): Promise<ModelRef> {
+): Promise<{ model: ModelRef; optionsConflict: boolean }> {
   const outcome = await attemptWithinDeadline(
     signal =>
       host.agent.get(
@@ -138,58 +184,194 @@ export async function resolveV2Summarizer(
       ),
     controlTimeoutMs,
   );
-  const model =
-    outcome.kind === "success" ? outcome.value.data.model : undefined;
-  if (!model) {
+  const agent = outcome.kind === "success" ? outcome.value.data : undefined;
+  if (!agent?.model) {
     throw new PluginMessageError(
       `Magic Compact needs a model on the \`${MAGIC_COMPACT_SUMMARIZER_AGENT}\` agent. Set \`agents.${MAGIC_COMPACT_SUMMARIZER_AGENT}.model\` (for example \`provider/model#variant\`) in opencode.json.`,
     );
   }
-  return model;
+  const request: Record<string, unknown> = isRecord(agent.request)
+    ? agent.request
+    : {};
+  const filled = (value: unknown) =>
+    isRecord(value) && Object.keys(value).length > 0;
+  return {
+    model: agent.model,
+    optionsConflict: filled(request["body"]) || filled(request["headers"]),
+  };
 }
 
 // The summarizer model and the descriptor the host reports for it, resolved
-// once per command. A model the host does not list fails the command.
+// once per command, with the other listed models `--match-model` may choose.
+// A model the host does not list fails the command.
 export async function resolveV2SummarizerModel(
   host: V2Host,
   source: V2Source,
   controlTimeoutMs: number,
 ): Promise<V2SummarizerModel> {
   const location = { directory: source.session.location.directory };
-  const ref = await resolveV2Summarizer(host, location, controlTimeoutMs);
+  const { model: ref, optionsConflict } = await resolveV2SummarizerAgent(
+    host,
+    location,
+    controlTimeoutMs,
+  );
   const outcome = await attemptWithinDeadline(
     signal => host.model.list({ location }, { signal }),
     controlTimeoutMs,
   );
-  const info =
-    outcome.kind === "success"
-      ? outcome.value.data.find(
-          model => model.providerID === ref.providerID && model.id === ref.id,
-        )
-      : undefined;
+  const models = outcome.kind === "success" ? outcome.value.data : [];
+  const info = models.find(
+    model => model.providerID === ref.providerID && model.id === ref.id,
+  );
   if (!info) {
     throw new PluginMessageError(
       "Magic Compact could not resolve the configured compaction model descriptor.",
     );
   }
-  return { ref, info };
+  return { ref, info, others: models, optionsConflict };
+}
+
+function listedModel(summarizer: V2SummarizerModel, model: ModelIdentity) {
+  return summarizer.others?.find(
+    item => item.providerID === model.providerID && item.id === model.modelID,
+  );
+}
+
+// The model a summary request runs on in place of the configured one, with
+// the configured variant when the choice keeps it.
+export function matchedV2Model(
+  summarizer: V2SummarizerModel,
+  model: ModelIdentity,
+  variant: string | undefined,
+): V2SummarizerModel {
+  const info = listedModel(summarizer, model);
+  if (!info) throw new Error("Matched model is not listed.");
+  return {
+    ...summarizer,
+    ref: {
+      providerID: info.providerID,
+      id: info.id,
+      ...(variant === undefined ? {} : { variant }),
+    },
+    info,
+  };
+}
+
+// The route facts of a summary model, configured or matched.
+export function v2SummarizerRoute(
+  summarizer: V2SummarizerModel,
+): ReasoningRoute {
+  return v2ReasoningRoute(
+    { providerID: summarizer.ref.providerID, modelID: summarizer.ref.id },
+    summarizer.info,
+  );
+}
+
+// Whether a listed model's protected reasoning behavior is verified.
+export function v2Qualifies(summarizer: V2SummarizerModel): Qualifies {
+  return model => {
+    const info = listedModel(summarizer, model);
+    return (
+      info !== undefined
+      && verifiedReasoning(v2ReasoningRoute(model, info)) !== undefined
+    );
+  };
+}
+
+// What `--match-model` knows about a listed model before choosing it.
+export function v2MatchPreflight(
+  summarizer: V2SummarizerModel,
+  model: ModelIdentity,
+  requiresImages: boolean,
+): MatchPreflight {
+  const info = listedModel(summarizer, model);
+  return {
+    variants: new Set((info?.variants ?? []).map(variant => variant.id)),
+    optionsConflict: summarizer.optionsConflict === true,
+    imagesBlocked:
+      requiresImages
+      && !(info?.capabilities.input ?? []).some(input =>
+        input.startsWith("image"),
+      ),
+  };
+}
+
+// The configured summarizer as the reasoning policy names it.
+export function v2Configured(summarizer: V2SummarizerModel): {
+  model: ModelIdentity;
+  variant?: string;
+} {
+  return {
+    model: {
+      providerID: summarizer.ref.providerID,
+      modelID: summarizer.ref.id,
+    },
+    ...(summarizer.ref.variant === undefined
+      ? {}
+      : { variant: summarizer.ref.variant }),
+  };
+}
+
+// The DeepSeek route that reads earlier plain reasoning only when a request
+// has tools.
+function isV2DeepSeekRoute(summarizer: V2SummarizerModel): boolean {
+  return (
+    summarizer.ref.providerID === "deepseek"
+    && summarizer.info.compatibility?.reasoningField === "reasoning_content"
+  );
+}
+
+// The tool a structured whole-session summary submits through. It only
+// acknowledges, and only in a `retention-tool` session this process owns.
+export const V2_SUMMARY_TOOL = "SessionSummary";
+
+const SUMMARY_TOOL_PERMISSIONS = [
+  ...DENY_ALL,
+  { action: V2_SUMMARY_TOOL, resource: "*", effect: "allow" as const },
+];
+
+// How the summary request is made: on the configured or matched model, as
+// plain text, or on the DeepSeek route through the summary tool, which is
+// the only way that model reads the earlier plain reasoning in the history.
+type V2SummaryRequest = {
+  summarizer: V2SummarizerModel;
+  structured: boolean;
+  prompt: string;
+};
+
+function summaryRequestTokens(
+  request: V2SummaryRequest,
+  visible: readonly V2Message[],
+): number {
+  const destination = v2SummarizerRoute(request.summarizer);
+  return (
+    NATIVE_BATCH_FIXED_RESERVE_TOKENS
+    + countGptTokens(request.prompt)
+    + (request.structured
+      ? countGptTokens(JSON.stringify(SESSION_SUMMARY_RESPONSE_SCHEMA))
+      : 0)
+    + estimateV2HistoryTokens(visible).tokens
+    + readableReasoningHeaderTokens(visible, destination)
+  );
 }
 
 // The temporary whole-session summary for task-aware retention: a deny-all
 // copy of the source under fresh IDs, prompted once through the summarizer
-// agent and model, accepted only as that prompt plus one finished text reply,
-// and always removed. It never touches the source. Before anything is
-// created, the history OpenCode will send (see `v2ModelVisibleHistory`), the
-// prompt and the fixed host reserve must fit the model's hard input limit,
-// and a history that still shows an image needs an image-capable model.
+// agent, accepted only as that prompt plus one finished reply, and always
+// removed. It never touches the source. Before anything is created, the
+// history OpenCode will send (see `v2ModelVisibleHistory`), the prompt, any
+// readable-reasoning headers and the fixed host reserve must fit the model's
+// hard input limit, and a history that still shows an image needs an
+// image-capable model. Under `--match-model` the request runs on the source's
+// current model when that unlocks its own protected reasoning.
 export async function generateV2SessionSummary(
   host: V2Host,
   owned: OwnedSessions,
   source: V2Source,
   summarizer: V2SummarizerModel,
   controlTimeoutMs: number,
+  reasoning?: ReasoningReports,
 ): Promise<string> {
-  const model = summarizer.ref;
   let visible: V2Message[];
   let requiresImages: boolean;
   try {
@@ -198,15 +380,72 @@ export async function generateV2SessionSummary(
   } catch {
     throw new SessionSummaryError("history");
   }
+  const primary = source.session.model;
+  const units = v2ReasoningUnits(visible).filter(
+    unit =>
+      primary !== undefined
+      && unit.origin !== undefined
+      && sameModel(unit.origin, {
+        providerID: primary.providerID,
+        modelID: primary.id,
+      }),
+  );
+  const summaryRequest = (model: V2SummarizerModel): V2SummaryRequest => {
+    const structured =
+      isV2DeepSeekRoute(model)
+      && visible.some(
+        message =>
+          message.type === "assistant"
+          && message.content.some(
+            item => item.type === "reasoning" && item.text.trim() !== "",
+          ),
+      );
+    return {
+      summarizer: model,
+      structured,
+      prompt: structured ? SESSION_SUMMARY_TOOL_PROMPT : SESSION_SUMMARY_PROMPT,
+    };
+  };
+  const fits = (candidate: V2SummaryRequest) => {
+    try {
+      return (
+        summaryRequestTokens(candidate, visible)
+        <= computeNativeBatchBudget(candidate.summarizer.info.limit)
+          .hardSingleTurnInput
+      );
+    } catch (error) {
+      if (hasPluginMessage(error)) return false;
+      throw error;
+    }
+  };
+  const qualifies = v2Qualifies(summarizer);
+  const match = matchCandidate(units, qualifies);
+  let choice: StageChoice = chooseStage(
+    match,
+    v2Configured(summarizer),
+    model => v2MatchPreflight(summarizer, model, requiresImages),
+  );
+  let request = summaryRequest(summarizer);
+  if (choice.kind === "match") {
+    const matched = summaryRequest(
+      matchedV2Model(summarizer, choice.model, choice.variant),
+    );
+    if (!fits(matched)) {
+      choice = { kind: "fallback", reason: "capacity" };
+    } else if (reasoning?.matchModel) {
+      request = matched;
+    }
+  }
+  const model = request.summarizer.ref;
   let budget: NativeBatchBudget;
   try {
     if (
       requiresImages
-      && !summarizer.info.capabilities.input.includes("image")
+      && !request.summarizer.info.capabilities.input.includes("image")
     ) {
       throw new PluginMessageError(V2_IMAGE_MODEL_REQUIRED);
     }
-    budget = computeNativeBatchBudget(summarizer.info.limit);
+    budget = computeNativeBatchBudget(request.summarizer.info.limit);
   } catch (error) {
     // Only this plugin's own configuration messages, which are fixed text
     // without session content, are repeated.
@@ -215,14 +454,23 @@ export async function generateV2SessionSummary(
       { cause: error },
     );
   }
-  if (
-    NATIVE_BATCH_FIXED_RESERVE_TOKENS
-      + countGptTokens(SESSION_SUMMARY_PROMPT)
-      + estimateV2HistoryTokens(visible).tokens
-    > budget.hardSingleTurnInput
-  ) {
+  if (summaryRequestTokens(request, visible) > budget.hardSingleTurnInput) {
     throw new SessionSummaryError("budget");
   }
+  // OpenCode 2 replay cost is never estimated, so the request's own
+  // protected units are reported as left out of its input estimate.
+  const requestModel = { providerID: model.providerID, modelID: model.id };
+  reasoning?.reports.push(
+    stageReport({
+      stage: "session",
+      candidate: match,
+      choice,
+      model: requestModel,
+      units: v2ReasoningUnits(visible),
+      qualifies,
+      replayUnknown: v2ReplayEstimate(visible, requestModel).unknown,
+    }),
+  );
   const control = async <T>(
     stage: SessionSummaryStage,
     request: (signal: AbortSignal) => Promise<T>,
@@ -241,7 +489,7 @@ export async function generateV2SessionSummary(
     title: "Magic Compact retention summary",
     agent: MAGIC_COMPACT_SUMMARIZER_AGENT,
     model,
-    permissions: DENY_ALL,
+    permissions: request.structured ? SUMMARY_TOOL_PERMISSIONS : DENY_ALL,
     metadata: {},
     time: { created: now, updated: now },
   } as Record<string, unknown>;
@@ -249,7 +497,11 @@ export async function generateV2SessionSummary(
   delete info["fork"];
   delete info["revert"];
 
-  owned.register(sessionID, "retention");
+  owned.register(
+    sessionID,
+    request.structured ? "retention-tool" : "retention",
+    v2SummarizerRoute(request.summarizer).responses,
+  );
   const failures: SessionSummaryStage[] = [];
   let summary: string | undefined;
   try {
@@ -280,7 +532,7 @@ export async function generateV2SessionSummary(
       await host.session.prompt({
         sessionID,
         id: promptID,
-        text: SESSION_SUMMARY_PROMPT,
+        text: request.prompt,
       });
       await host.session.wait({ sessionID });
     } catch {
@@ -296,7 +548,9 @@ export async function generateV2SessionSummary(
     ) {
       throw new SessionSummaryError("budget");
     }
-    summary = acceptSummary(after, history, promptID);
+    summary = request.structured
+      ? acceptStructuredSummary(after, history, promptID, request.prompt, owned)
+      : acceptSummary(after, history, promptID);
   } catch (error) {
     failures.push(
       error instanceof SessionSummaryError ? error.stage : "validation",
@@ -360,6 +614,53 @@ function acceptSummary(
     throw new SessionSummaryError("validation");
   }
   return text;
+}
+
+// The structured summary: the copied history, the prompt, one summarizer
+// reply whose only tool call is one completed summary-tool call, and the
+// host's record of this plugin's own stop on the request after it. The
+// persisted call input keeps the model's raw arguments, which must be exactly
+// one nonempty `summary`; reply text is never read.
+function acceptStructuredSummary(
+  after: V2Message[],
+  history: V2Message[],
+  promptID: string,
+  promptText: string,
+  owned: OwnedSessions,
+): string {
+  if (!isDeepStrictEqual(json(after.slice(0, history.length)), json(history))) {
+    throw new SessionSummaryError("history");
+  }
+  const [prompt, reply, ...rest] = after.slice(history.length);
+  if (
+    prompt?.type !== "user"
+    || prompt.id !== promptID
+    || prompt.text !== promptText
+    || (prompt.files?.length ?? 0) > 0
+  ) {
+    throw new SessionSummaryError("validation");
+  }
+  if (reply?.type !== "assistant" || reply.error !== undefined) {
+    throw new SessionSummaryError("provider");
+  }
+  const calls = reply.content.filter(item => item.type === "tool");
+  const call = calls[0];
+  const summary =
+    call?.state.status === "completed"
+      ? structuredSessionSummary(call.state.input)
+      : undefined;
+  if (
+    reply.agent !== MAGIC_COMPACT_SUMMARIZER_AGENT
+    || calls.length !== 1
+    || call?.name !== V2_SUMMARY_TOOL
+    || summary === undefined
+    || rest.length !== 1
+    || rest[0]!.type !== "idle"
+    || rest[0]!.error?.message !== owned.stop
+  ) {
+    throw new SessionSummaryError("validation");
+  }
+  return summary;
 }
 
 function json(value: unknown): unknown {

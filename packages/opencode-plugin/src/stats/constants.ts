@@ -33,14 +33,20 @@ Note               | ${PROVIDER_METER_NOTE}
 `.trim();
 }
 
+// A compaction that removes estimated reasoning replay cost can still grow the
+// stored history, which is then reported as growth rather than as a removal.
 function contextReductionLine(
   beforeTokens: number,
   afterTokens: number,
 ): string {
   const savedTokens = beforeTokens - afterTokens;
-  const percent =
-    beforeTokens > 0 ? Math.round((savedTokens / beforeTokens) * 100) : 0;
-  return `${formatTokenCount(beforeTokens)} → ${formatTokenCount(afterTokens)} tokens | ${percent}% trimmed (~${formatTokenCount(savedTokens)} removed)`;
+  const percent = (tokens: number) =>
+    beforeTokens > 0 ? Math.round((tokens / beforeTokens) * 100) : 0;
+  return `${formatTokenCount(beforeTokens)} → ${formatTokenCount(afterTokens)} tokens | ${
+    savedTokens < 0
+      ? `${percent(-savedTokens)}% grown (~${formatTokenCount(-savedTokens)} added)`
+      : `${percent(savedTokens)}% trimmed (~${formatTokenCount(savedTokens)} removed)`
+  }`;
 }
 
 export type PreservedTurns = { requested: number; preserved: number };
@@ -64,6 +70,8 @@ export function statsMessage(
   summarizedTurnCount: number,
   preserved: PreservedTurns,
   retentionFeedback: string,
+  // Further `Label | text` lines, such as the reasoning lines.
+  extraLines: readonly string[] = [],
 ): string {
   return [
     `Magic Compaction #${compactionCount}`,
@@ -71,6 +79,7 @@ export function statsMessage(
     `Changes | Request turns summarized: ${summarizedTurnCount}`,
     `Preserved | ${preservedTurnsFeedback(preserved)}`,
     `Retention | ${retentionFeedback}`,
+    ...extraLines,
   ].join("\n");
 }
 
@@ -79,12 +88,14 @@ export function trimStatsMessage(
   afterTokens: number,
   trimmedToolCallCount: number,
   retentionFeedback: string,
+  extraLines: readonly string[] = [],
 ): string {
   return [
     "Magic Trim",
     `${CONTEXT_LABEL} | ${contextReductionLine(beforeTokens, afterTokens)}`,
     `Changes | Tool calls trimmed: ${trimmedToolCallCount}`,
     `Retention | ${retentionFeedback}`,
+    ...extraLines,
   ].join("\n");
 }
 

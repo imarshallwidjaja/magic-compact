@@ -43,7 +43,9 @@ import {
   requestImageMessageIDs,
   type V2RequestMessage,
 } from "./v2/media";
-import { OwnedSessions } from "./v2/owned";
+import { OwnedSessions, V2_SUMMARY_TOOL } from "./v2/owned";
+import { projectReadableReasoning } from "./v2/reasoning";
+import { SESSION_SUMMARY_RESPONSE_SCHEMA } from "./compact/constants";
 import type { SuccessorCommand } from "./policy/successor";
 import { readV2History, v2StorageKey, type V2Message } from "./v2/session";
 import { executeV2Recover } from "./v2/recover";
@@ -56,6 +58,9 @@ const MEDIA_HISTORY_REQUIRED =
 
 const RESPONSE_TOOL_REJECTED =
   "Magic Compact's response tool is only available in its own per-turn generation requests.";
+
+const SUMMARY_TOOL_REJECTED =
+  "Magic Compact's session summary tool is only available in its own structured session summary requests.";
 
 // Runs a compact or trim command and returns its success or no-op message.
 // A failure is rethrown as the error OpenCode 2 returns to the client: the
@@ -139,7 +144,7 @@ export async function setup(
             owned,
             sessionID,
             args.keepTurns,
-            { retention, controlTimeoutMs },
+            { retention, matchModel: args.matchModel, controlTimeoutMs },
           );
           return successor
             ? `${compactSuccess(successor.session.id)}\n${outcome}`
@@ -161,7 +166,7 @@ export async function setup(
             owned,
             sessionID,
             args.keepTurns,
-            { retention, controlTimeoutMs },
+            { retention, matchModel: args.matchModel, controlTimeoutMs },
           );
           return successor
             ? `${trimSuccess(successor.session.id)}\n${outcome}`
@@ -243,6 +248,22 @@ export async function setup(
         return { content: "Recorded." };
       },
     });
+    // The structured whole-session summary's tool, on the DeepSeek route
+    // only; like the response tool it only acknowledges, and only in a
+    // session this process owns for that purpose.
+    editor.add({
+      name: V2_SUMMARY_TOOL,
+      description:
+        "Submit the complete Magic Compact session summary as its summary string.",
+      input: SESSION_SUMMARY_RESPONSE_SCHEMA,
+      options: { codemode: false },
+      execute: async (_input, context) => {
+        if (!owned.allowsSummaryTool(context.sessionID)) {
+          throw new Error(SUMMARY_TOOL_REJECTED);
+        }
+        return { content: "Recorded." };
+      },
+    });
   });
 
   // The complete history of a session, read over this server's own HTTP API.
@@ -308,24 +329,36 @@ export async function setup(
   };
 
   // The response tool is advertised only to the agent loop of a per-turn
-  // generation session this process owns. Every other request kind and
-  // session, retention sessions included, loses it.
+  // generation session this process owns, and the session summary tool only
+  // to a structured session summary it owns. Every other request kind and
+  // session loses both. In an owned session whose request the OpenAI
+  // Responses serializer sends, another model's plain reasoning becomes
+  // readable text in the request (`projectReadableReasoning`); stored records
+  // never change.
   await ctx.session.hook("context", async event => {
     owned.admitRequest(event.sessionID);
     if (!owned.allowsResponseTool(event.sessionID)) {
       delete event.tools[V2_RESPONSE_TOOL];
     }
+    if (!owned.allowsSummaryTool(event.sessionID)) {
+      delete event.tools[V2_SUMMARY_TOOL];
+    }
     await projectMedia(event);
+    if (owned.projectsReadableReasoning(event.sessionID)) {
+      event.messages = projectReadableReasoning(event.messages);
+    }
   });
   // An owned session must never be compacted natively: that would send
   // another model request and replace the history being summarized.
   await ctx.session.hook("compaction", async event => {
     owned.rejectCompaction(event.sessionID);
     delete event.tools[V2_RESPONSE_TOOL];
+    delete event.tools[V2_SUMMARY_TOOL];
     await projectMedia(event);
   });
   await ctx.session.hook("generate", async event => {
     delete event.tools[V2_RESPONSE_TOOL];
+    delete event.tools[V2_SUMMARY_TOOL];
     await projectMedia(event);
   });
   await ctx.session.hook("title", async event => {

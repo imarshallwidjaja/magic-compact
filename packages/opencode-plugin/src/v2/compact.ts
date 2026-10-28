@@ -36,6 +36,7 @@ import { planOmission, type PlannedOmission } from "../storage/omission";
 import { isRecord } from "../util";
 import {
   trimV2Tool,
+  v2ModelVisibleHistory,
   v2RetentionCalls,
   v2ToolCalls,
   v2RetentionTurns,
@@ -63,6 +64,13 @@ import {
   type V2Successor,
 } from "./session";
 import { PluginMessageError } from "../policy/feedback";
+import {
+  NO_REPLAY,
+  reasoningFeedback,
+  replayFeedback,
+  type ReasoningReports,
+} from "../policy/reasoning";
+import { v2ReplayEstimate } from "./reasoning";
 
 const COMMAND = "Magic Compact";
 
@@ -248,7 +256,13 @@ export async function executeV2Compact(
   owned: OwnedSessions,
   sessionID: string,
   keepTurns: number,
-  options: { retention: RetentionPolicy; controlTimeoutMs: number },
+  options: {
+    retention: RetentionPolicy;
+    // `--match-model`: run each summary on the model that wrote the
+    // protected reasoning it covers, where the route is verified.
+    matchModel?: boolean;
+    controlTimeoutMs: number;
+  },
 ): Promise<{ successor: V2Successor | null; outcome: string }> {
   const { controlTimeoutMs } = options;
   return withExclusiveSource(COMMAND, sessionID, async () => {
@@ -276,6 +290,10 @@ export async function executeV2Compact(
       source,
       controlTimeoutMs,
     );
+    const reasoning: ReasoningReports = {
+      matchModel: options.matchModel === true,
+      reports: [],
+    };
     let retention: RetentionPlan = HEURISTIC_RETENTION;
     if (options.retention.mode === "task-aware") {
       const policy = options.retention;
@@ -301,6 +319,7 @@ export async function executeV2Compact(
             source,
             model,
             controlTimeoutMs,
+            reasoning,
           ),
       );
     }
@@ -329,7 +348,7 @@ export async function executeV2Compact(
           ),
         })),
       ),
-      { controlTimeoutMs },
+      { controlTimeoutMs, reasoning },
     );
 
     // A turn is replaced only when its model-facing projection, with the
@@ -398,6 +417,21 @@ export async function executeV2Compact(
     }
 
     const compactionCount = getCompactionCount(source.session) + 1;
+    const reasoningLine = reasoningFeedback(
+      reasoning.reports,
+      reasoning.matchModel,
+    );
+    const primary = source.session.model
+      ? {
+          providerID: source.session.model.providerID,
+          modelID: source.session.model.id,
+        }
+      : undefined;
+    // OpenCode 2 attributes no replay cost, so nothing is reported removed.
+    const replayLine = replayFeedback(
+      v2ReplayEstimate(v2ModelVisibleHistory(source.messages), primary),
+      NO_REPLAY,
+    );
     const outcome = statsMessage(
       compactionCount,
       before.tokens,
@@ -405,6 +439,14 @@ export async function executeV2Compact(
       selected.length,
       preserved,
       formatRetentionFeedback(retention, v2RetentionCalls(source.messages)),
+      [
+        ...(reasoningLine === undefined
+          ? []
+          : [`Reasoning | ${reasoningLine}`]),
+        ...(replayLine === undefined
+          ? []
+          : [`Reasoning replay (estimate) | ${replayLine}`]),
+      ],
     );
     const successor = await createV2Successor(host, {
       command: COMMAND,

@@ -7,7 +7,6 @@ import {
   NATIVE_BATCH_MEDIA_TOKEN_CHARGE,
   NATIVE_BATCH_PLANNING_NONCE,
   planNativeGenerationBatches,
-  type NativeBatchBudget,
 } from "../compact/batch";
 import { MAGIC_COMPACT_SUMMARIZER_AGENT } from "../compact/constants";
 import {
@@ -25,6 +24,7 @@ import {
   type GenerationTarget,
 } from "../policy/generation";
 import {
+  hasPluginMessage,
   MAX_REASONS,
   PluginMessageError,
   undeletedSessionIDs,
@@ -35,11 +35,32 @@ import { attemptWithinDeadline } from "../util";
 import type { V2Host } from "./host";
 import {
   planV2MediaProjection,
+  v2HistoryShowsImages,
   v2MediaManifest,
   v2UnprojectedImages,
   type V2MediaManifest,
 } from "./media";
-import { removeOwnedSession, type OwnedSessions } from "./owned";
+import {
+  matchedV2Model,
+  removeOwnedSession,
+  v2Configured,
+  v2MatchPreflight,
+  v2Qualifies,
+  v2SummarizerRoute,
+  type OwnedSessions,
+} from "./owned";
+import {
+  readableReasoningHeaderTokens,
+  v2ReasoningUnits,
+  v2ReplayEstimate,
+} from "./reasoning";
+import {
+  chooseStage,
+  matchCandidate,
+  stageReport,
+  type ReasoningReports,
+  type StageChoice,
+} from "../policy/reasoning";
 import {
   mintV2ID,
   readV2History,
@@ -72,7 +93,15 @@ export type V2GeneratedSummary = {
 
 export type V2SummarizerModel = {
   ref: ModelRef;
-  info: Pick<ModelInfo, "limit" | "capabilities" | "providerID" | "canonical">;
+  info: Pick<ModelInfo, "limit" | "capabilities" | "providerID" | "canonical">
+    & Partial<
+      Pick<ModelInfo, "variants" | "compatibility" | "modelID" | "package">
+    >;
+  // Every model the host lists, which `--match-model` chooses from, and
+  // whether the summarizer agent carries operator request options written for
+  // its own model.
+  others?: readonly ModelInfo[];
+  optionsConflict?: boolean;
 };
 
 type Candidate = GenerationTarget & {
@@ -88,6 +117,8 @@ type Batch = {
   nonce: string;
   target: GenerationTarget;
   prompt: string;
+  // The model this request runs on.
+  summarizer: V2SummarizerModel;
 };
 
 export class V2GenerationError
@@ -228,25 +259,39 @@ export function estimateV2HistoryTokens(messages: readonly V2Message[]): {
   return { tokens, textTokens, mediaCount };
 }
 
-// Plans every target before any session is created: budgets, the single
-// target per request, the optional preceding turn within the halo limit, and
-// the real nonce and prompt, checked against the planning estimate.
+// Plans every target before any session is created: the summary model, its
+// budgets, the single target per request, the optional preceding turn within
+// the halo limit, and the real nonce and prompt, checked against the
+// planning estimate. Under `--match-model` a target whose own protected
+// reasoning comes from one verified model runs on that model, unless the
+// preflight or that model's capacity sends it back to the configured one.
 function planBatches(
   turns: V2GenerationTurn[],
   model: V2SummarizerModel,
   globalIndexPrompt: string,
   nonceFactory: () => string,
-): { budget: NativeBatchBudget; batches: Batch[] } {
-  const budget = computeNativeBatchBudget(model.info.limit);
-  const candidates: Candidate[] = turns.map((turn, index) => {
+  reasoning: ReasoningReports | undefined,
+): Batch[] {
+  const nonces = new Set<string>();
+  const matchModel = reasoning?.matchModel === true;
+  const qualifies = v2Qualifies(model);
+  const planOne = (
+    turn: V2GenerationTurn,
+    index: number,
+    summarizer: V2SummarizerModel,
+    nonce: string,
+  ): Batch => {
+    const budget = computeNativeBatchBudget(summarizer.info.limit);
+    const destination = v2SummarizerRoute(summarizer);
     const estimate = estimateV2HistoryTokens(turn.span);
     const mediaManifest = v2MediaManifest(turn.span);
     const ordinal = index + 1;
-    return {
+    const candidate: Candidate = {
       ordinal,
       marker: generationTurnMarker(NATIVE_BATCH_PLANNING_NONCE, ordinal),
       expectedInlineImages: mediaManifest?.images.length ?? 0,
-      inputTokens: estimate.tokens,
+      inputTokens:
+        estimate.tokens + readableReasoningHeaderTokens(turn.span, destination),
       outputTokens: estimateTurnOutputTokens(
         estimate.textTokens,
         estimate.mediaCount,
@@ -254,27 +299,19 @@ function planBatches(
       turn,
       ...(mediaManifest ? { mediaManifest } : {}),
     };
-  });
-  const planned = planNativeGenerationBatches(candidates, budget, {
-    explicitRequestTokens: targets =>
-      estimateGenerationExplicitRequestTokens(targets, globalIndexPrompt),
-    responseProtocolTokens: estimateGenerationResponseProtocolTokens,
-  });
-  const nonces = new Set<string>();
-  const batches = planned.map(batch => {
-    const candidate = batch.candidates[0]!;
+    const [batch] = planNativeGenerationBatches([candidate], budget, {
+      explicitRequestTokens: targets =>
+        estimateGenerationExplicitRequestTokens(targets, globalIndexPrompt),
+      responseProtocolTokens: estimateGenerationResponseProtocolTokens,
+    });
     const previous =
-      candidate.turn.previous
-      && batch.estimatedInputTokens
-        + estimateV2HistoryTokens(candidate.turn.previous).tokens
+      turn.previous
+      && batch!.estimatedInputTokens
+        + estimateV2HistoryTokens(turn.previous).tokens
+        + readableReasoningHeaderTokens(turn.previous, destination)
         <= budget.haloInputLimit
-        ? candidate.turn.previous
+        ? turn.previous
         : undefined;
-    const nonce = selectGenerationNonce(
-      [[...(previous ?? []), ...candidate.turn.span]],
-      nonceFactory,
-      nonces,
-    );
     const target: GenerationTarget = {
       ordinal: candidate.ordinal,
       marker: generationTurnMarker(nonce, candidate.ordinal),
@@ -282,7 +319,7 @@ function planBatches(
     };
     if (
       estimateGenerationExplicitRequestTokens([target], globalIndexPrompt)
-        > batch.estimatedExplicitRequestTokens
+        > batch!.estimatedExplicitRequestTokens
       || estimateGenerationResponseProtocolTokens([target])
         > estimateGenerationResponseProtocolTokens([candidate])
     ) {
@@ -290,10 +327,8 @@ function planBatches(
         "Compaction generation request exceeded its planned size.",
       );
     }
-    const firstUser = candidate.turn.span.findIndex(
-      message => message.type === "user",
-    );
-    const user = candidate.turn.span[firstUser]!;
+    const firstUser = turn.span.findIndex(message => message.type === "user");
+    const user = turn.span[firstUser]!;
     const marker = {
       id: user.id,
       type: "synthetic",
@@ -302,20 +337,77 @@ function planBatches(
     } as V2Message;
     const history = [
       ...(previous ?? []),
-      ...candidate.turn.span.slice(0, firstUser),
+      ...turn.span.slice(0, firstUser),
       marker,
-      ...candidate.turn.span.slice(firstUser),
+      ...turn.span.slice(firstUser),
     ];
-    return {
+    const planned = {
       candidate,
       history,
       nonce,
       target,
       prompt: buildGenerationPrompt([target], globalIndexPrompt),
+      summarizer,
     };
+    assertImagesReachModel(planned, summarizer);
+    return planned;
+  };
+  return turns.map((turn, index) => {
+    // One nonce per target, absent from every history its request may send,
+    // shared by the matched model's fit check and the request that runs.
+    const nonce = selectGenerationNonce(
+      [[...(turn.previous ?? []), ...turn.span]],
+      nonceFactory,
+      nonces,
+    );
+    // The target's own reasoning decides the match, never the halo's; the
+    // image check covers the turn that may join it.
+    const match = matchCandidate(v2ReasoningUnits(turn.span), qualifies);
+    let choice: StageChoice = chooseStage(
+      match,
+      v2Configured(model),
+      candidate =>
+        v2MatchPreflight(
+          model,
+          candidate,
+          v2HistoryShowsImages([...(turn.previous ?? []), ...turn.span]),
+        ),
+    );
+    let batch: Batch | undefined;
+    if (choice.kind === "match") {
+      try {
+        const matched = planOne(
+          turn,
+          index,
+          matchedV2Model(model, choice.model, choice.variant),
+          nonce,
+        );
+        if (matchModel) batch = matched;
+      } catch (error) {
+        if (!hasPluginMessage(error)) throw error;
+        choice = { kind: "fallback", reason: "capacity" };
+      }
+    }
+    batch ??= planOne(turn, index, model, nonce);
+    // OpenCode 2 replay cost is never estimated, so the request's own
+    // protected units are reported as left out of its input estimate.
+    const requestModel = {
+      providerID: batch.summarizer.ref.providerID,
+      modelID: batch.summarizer.ref.id,
+    };
+    reasoning?.reports.push(
+      stageReport({
+        stage: "turn",
+        candidate: match,
+        choice,
+        model: requestModel,
+        units: v2ReasoningUnits(batch.history),
+        qualifies,
+        replayUnknown: v2ReplayEstimate(batch.history, requestModel).unknown,
+      }),
+    );
+    return batch;
   });
-  for (const batch of batches) assertImagesReachModel(batch, model);
-  return { budget, batches };
 }
 
 // Generates one validated summary per target turn, in order. Every request
@@ -330,14 +422,19 @@ export async function generateV2Summaries(
   model: V2SummarizerModel,
   turns: V2GenerationTurn[],
   globalIndexPrompt: string,
-  options: { controlTimeoutMs: number; nonceFactory?: () => string },
+  options: {
+    controlTimeoutMs: number;
+    nonceFactory?: () => string;
+    reasoning?: ReasoningReports;
+  },
 ): Promise<V2GeneratedSummary[]> {
   if (turns.length === 0) return [];
-  const { batches } = planBatches(
+  const batches = planBatches(
     turns,
     model,
     globalIndexPrompt,
     options.nonceFactory ?? createGenerationNonce,
+    options.reasoning,
   );
   const results: V2GeneratedSummary[] = [];
   const failures: Array<{ index: number; error: V2GenerationError }> = [];
@@ -350,7 +447,7 @@ export async function generateV2Summaries(
           host,
           owned,
           source,
-          model.ref,
+          batches[index]!.summarizer.ref,
           batches[index]!,
           options.controlTimeoutMs,
         );
@@ -429,7 +526,11 @@ async function runBatch(
   delete info["fork"];
   delete info["revert"];
 
-  owned.register(sessionID, "generation");
+  owned.register(
+    sessionID,
+    "generation",
+    v2SummarizerRoute(batch.summarizer).responses,
+  );
   let result: V2GeneratedSummary | undefined;
   let failure: V2GenerationError | undefined;
   try {

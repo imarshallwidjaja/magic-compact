@@ -1,6 +1,7 @@
 // V1 host adapter for the shared task-aware retention policy.
 import type { Session } from "@opencode-ai/sdk/v2";
 import type { V2Client } from "../api";
+import type { SummaryReasoningOptions } from "../compact/compact";
 import { buildTurns, type MessageWithParts, type Turn } from "../compact/plan";
 import { toolCallView } from "../compact/prune";
 import {
@@ -43,11 +44,12 @@ export async function decideRetention(
   messages: MessageWithParts[],
   found: RetentionCandidates,
   policy: Extract<RetentionPolicy, { mode: "task-aware" }>,
-  options: { controlTimeoutMs: number },
+  options: { controlTimeoutMs: number; reasoning?: SummaryReasoningOptions },
 ): Promise<RetentionPlan> {
   return decideRetentionWith(found, policy, () =>
     generateSessionSummary(v2, session, messages, {
       controlTimeoutMs: options.controlTimeoutMs,
+      ...(options.reasoning ? { reasoning: options.reasoning } : {}),
     }),
   );
 }

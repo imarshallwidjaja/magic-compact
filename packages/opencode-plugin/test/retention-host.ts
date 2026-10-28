@@ -231,7 +231,12 @@ export function persistedForkHistory(
 // for a successful summary request, and returns the prompt response body.
 export function summaryReply(
   fork: MessageWithParts[],
-  request: { messageID?: string; agent?: string; parts?: Part[] },
+  request: {
+    messageID?: string;
+    agent?: string;
+    parts?: Part[];
+    format?: Record<string, unknown>;
+  },
   forkID: string,
   text = SESSION_SUMMARY_TEXT,
 ) {
@@ -242,6 +247,10 @@ export function summaryReply(
       sessionID: forkID,
       role: "user",
       agent: request.agent,
+      // The host stores a prompt's format with its default retry count.
+      ...(request.format
+        ? { format: { ...request.format, retryCount: 2 } }
+        : {}),
     } as Message,
     parts: (request.parts ?? []).map((part, index) => ({
       ...part,
@@ -259,6 +268,7 @@ export function summaryReply(
     agent: "magic-compact-summarizer",
     mode: "magic-compact-summarizer",
     finish: "stop",
+    time: { created: 1, completed: 2 },
   } as Message;
   const parts = [
     { id: `${replyID}-start`, type: "step-start" },

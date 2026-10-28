@@ -36,11 +36,14 @@ import {
   type V2Successor,
 } from "./session";
 import { PluginMessageError } from "../policy/feedback";
+import { reasoningFeedback, type ReasoningReports } from "../policy/reasoning";
 
 const COMMAND = "Magic Trim";
 
 export type V2TrimOptions = {
   retention: RetentionPolicy;
+  // `--match-model` for the retention session summary.
+  matchModel?: boolean;
   controlTimeoutMs?: number;
 };
 
@@ -73,6 +76,10 @@ export async function executeV2Trim(
         ),
       ),
     );
+    const reasoning: ReasoningReports = {
+      matchModel: options.matchModel === true,
+      reports: [],
+    };
     let retention: RetentionPlan = HEURISTIC_RETENTION;
     if (options.retention.mode === "task-aware") {
       const policy = options.retention;
@@ -89,12 +96,17 @@ export async function executeV2Trim(
             source,
             await resolveV2SummarizerModel(host, source, controlTimeoutMs),
             controlTimeoutMs,
+            reasoning,
           ),
       );
     }
     const retentionLine = formatRetentionFeedback(
       retention,
       v2RetentionCalls(source.messages),
+    );
+    const reasoningLine = reasoningFeedback(
+      reasoning.reports,
+      reasoning.matchModel,
     );
 
     const omissions: PlannedOmission[] = [];
@@ -122,7 +134,10 @@ export async function executeV2Trim(
       edited.push({ ...message, content });
     }
     if (trimmedCalls === 0) {
-      return { successor: null, outcome: retentionLine };
+      return {
+        successor: null,
+        outcome: `${retentionLine}${reasoningLine === undefined ? "" : ` ${reasoningLine}`}`,
+      };
     }
 
     // Trim changes no image, so existing manifests project the same images
@@ -136,6 +151,7 @@ export async function executeV2Trim(
       after.tokens,
       trimmedCalls,
       retentionLine,
+      reasoningLine === undefined ? [] : [`Reasoning | ${reasoningLine}`],
     );
     const successor = await createV2Successor(host, {
       command: COMMAND,

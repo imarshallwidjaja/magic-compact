@@ -29,6 +29,9 @@ export type CompactionPlan = {
   effectiveSourceTurnStartIndex: number;
   effectiveSourceTurnEndIndex: number;
   sourceSnapshot: SourceSnapshot;
+  // The complete source records the plan was made from, which hold the step
+  // counters the snapshot drops.
+  sourceMessages: MessageWithParts[];
 };
 
 export type SourceSnapshot = Array<{ info: unknown; parts: unknown[] }>;
@@ -99,6 +102,7 @@ export function planCompaction(
     effectiveSourceTurnStartIndex,
     effectiveSourceTurnEndIndex,
     sourceSnapshot: captureSourceSnapshot(messages),
+    sourceMessages: messages,
   };
 }
 

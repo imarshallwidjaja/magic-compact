@@ -19,9 +19,9 @@ export const RECOVER_COMMAND = "magic-recover" as const;
 
 export const COMMAND_DESCRIPTIONS = {
   [COMPACT_COMMAND]:
-    "Lossless context compression ([N] [--backend jev|openai-decisions] [--threshold P] [--truncate], or [N] --heuristic to skip task-aware retention; turns are still summarized)",
+    "Lossless context compression ([N] [--backend jev|openai-decisions] [--threshold P] [--truncate] [--match-model], or [N] --heuristic [--match-model] to skip task-aware retention; turns are still summarized)",
   [TRIM_COMMAND]:
-    "Trim historical tool inputs and outputs ([N] [--backend jev|openai-decisions] [--threshold P] [--truncate], or [N] --heuristic to skip task-aware retention)",
+    "Trim historical tool inputs and outputs ([N] [--backend jev|openai-decisions] [--threshold P] [--truncate] [--match-model], or [N] --heuristic to skip task-aware retention)",
   [STATS_COMMAND]: "Show Magic Compact token and cost savings stats",
   [RECOVER_COMMAND]:
     "Continue in a copy that closes abandoned unfinished records as interrupted (stops no work)",
@@ -31,9 +31,13 @@ export const COMPACT_NOOP = "No assistant turns are old enough to compact.";
 export const TRIM_NOOP = "No eligible tool calls need trimming.";
 export const RECOVER_NOOP =
   "No unfinished records or undelivered background results need recovery; no successor was created.";
-// Fixed per command and never built from a token the person typed.
+// Fixed per command and never built from a token the person typed. Only
+// /magic-compact summarizes under --heuristic, so only it accepts
+// --match-model there.
 const retentionArgumentsError = (command: string) =>
-  `/${command} accepts an optional non-negative integer N plus either --heuristic or any of --backend jev|openai-decisions, --threshold P and --truncate, each at most once and in any order.`;
+  command === COMPACT_COMMAND
+    ? `/${command} accepts an optional non-negative integer N plus either --heuristic or any of --backend jev|openai-decisions, --threshold P and --truncate, with optional --match-model, each at most once and in any order.`
+    : `/${command} accepts an optional non-negative integer N plus either --heuristic or any of --backend jev|openai-decisions, --threshold P, --truncate and --match-model, each at most once and in any order.`;
 const retentionThresholdError = (command: string) =>
   `/${command} --threshold needs a plain decimal percent from 0 to 100 after a space, such as --threshold 70 or --threshold 60.5.`;
 const retentionBackendError = (command: string) =>
@@ -91,12 +95,14 @@ export function commandFailureMessage(
 }
 
 // `/magic-compact` and `/magic-trim` share one grammar and differ only in the
-// fixed error text.
+// fixed error text and in `--match-model` under `--heuristic`: /magic-trim
+// `--heuristic` makes no summary request, so the flag would change nothing.
 export function parseMagicCompactArguments(raw: string): RetentionArguments {
   return parseRetentionArguments(raw, {
     arguments: COMPACT_ARGUMENTS_ERROR,
     threshold: COMPACT_THRESHOLD_ERROR,
     backend: COMPACT_BACKEND_ERROR,
+    summarizesWhenHeuristic: true,
   });
 }
 
@@ -105,6 +111,7 @@ export function parseMagicTrimArguments(raw: string): RetentionArguments {
     arguments: TRIM_ARGUMENTS_ERROR,
     threshold: TRIM_THRESHOLD_ERROR,
     backend: TRIM_BACKEND_ERROR,
+    summarizesWhenHeuristic: false,
   });
 }
 
@@ -112,11 +119,17 @@ export function parseMagicTrimArguments(raw: string): RetentionArguments {
 // or contacts the host for a malformed command. Errors never echo a token.
 function parseRetentionArguments(
   raw: string,
-  errors: { arguments: string; threshold: string; backend: string },
+  errors: {
+    arguments: string;
+    threshold: string;
+    backend: string;
+    summarizesWhenHeuristic: boolean;
+  },
 ): RetentionArguments {
   let keepTurns: number | undefined;
   let heuristic = false;
   let truncate = false;
+  let matchModel = false;
   let keepThreshold: number | undefined;
   let backend: RetentionBackendID | undefined;
   const tokens = raw.trim().split(/\s+/u).filter(Boolean);
@@ -126,6 +139,8 @@ function parseRetentionArguments(
       heuristic = true;
     } else if (token === "--truncate" && !truncate) {
       truncate = true;
+    } else if (token === "--match-model" && !matchModel) {
+      matchModel = true;
     } else if (token === "--threshold" && keepThreshold === undefined) {
       index += 1;
       const value = tokens[index];
@@ -151,10 +166,15 @@ function parseRetentionArguments(
     }
   }
   if (heuristic) {
-    if (truncate || keepThreshold !== undefined || backend !== undefined) {
+    if (
+      truncate
+      || keepThreshold !== undefined
+      || backend !== undefined
+      || (matchModel && !errors.summarizesWhenHeuristic)
+    ) {
       throw new PluginMessageError(errors.arguments);
     }
-    return { keepTurns: keepTurns ?? 0, heuristic: true };
+    return { keepTurns: keepTurns ?? 0, heuristic: true, matchModel };
   }
   return {
     keepTurns: keepTurns ?? 0,
@@ -162,5 +182,6 @@ function parseRetentionArguments(
     ...(backend === undefined ? {} : { backend }),
     ...(keepThreshold === undefined ? {} : { keepThreshold }),
     truncate,
+    matchModel,
   };
 }

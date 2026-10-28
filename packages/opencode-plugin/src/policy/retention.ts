@@ -43,17 +43,19 @@ export type RetentionPolicy =
       fetch?: RetentionFetch;
     };
 
-// The retention arguments /magic-compact and /magic-trim share, after
-// parsing. `backend` and `keepThreshold` are the explicit `--backend` and
-// `--threshold` values, absent when they were not given.
+// The arguments /magic-compact and /magic-trim share, after parsing.
+// `backend` and `keepThreshold` are the explicit `--backend` and
+// `--threshold` values, absent when they were not given. `matchModel` is
+// `--match-model`, which chooses summary models rather than retention.
 export type RetentionArguments =
-  | { keepTurns: number; heuristic: true }
+  | { keepTurns: number; heuristic: true; matchModel: boolean }
   | {
       keepTurns: number;
       heuristic: false;
       backend?: RetentionBackendID;
       keepThreshold?: number;
       truncate: boolean;
+      matchModel: boolean;
     };
 
 const PERCENT_TEXT = /^(\d+)(?:\.(\d+))?$/;
@@ -138,13 +140,14 @@ export function commandRetentionPolicy(
   env: Readonly<Record<string, string | undefined>>,
 ): RetentionPolicy {
   if (args.heuristic) return { mode: "heuristic" };
-  const { keepTurns, backend, keepThreshold, truncate } = args;
+  const { keepTurns, backend, keepThreshold, truncate, matchModel } = args;
   return taskAwareRetentionPolicy(env, {
     command,
     keepTurns,
     ...(backend === undefined ? {} : { backend }),
     ...(keepThreshold === undefined ? {} : { keepThreshold }),
     truncate,
+    ...(matchModel ? { matchModel } : {}),
   });
 }
 
@@ -395,6 +398,18 @@ export function formatRetentionFeedback(
       ? ""
       : ` ${plan.truncated} decision(s) used a shortened session summary after a token-limit refusal (--truncate) and could have missed useful context.`;
   return `${retention} kept ${plan.keep.size} of ${plan.evaluated} evaluated tool call(s) whole${breakdown.length > 0 ? ` (${breakdown.join(", ")})` : ""}.${truncated}`;
+}
+
+// The summary a structured whole-session response submitted: exactly one
+// nonempty `summary` string, or undefined for any other shape.
+export function structuredSessionSummary(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const keys = Object.keys(value);
+  const summary = (value as Record<string, unknown>)["summary"];
+  if (keys.length !== 1 || typeof summary !== "string") return undefined;
+  return summary.trim() || undefined;
 }
 
 export type SessionSummaryStage =

@@ -116,13 +116,15 @@ export type RetentionDecision = {
 // arguments that shape what a failure suggests running again: the turn count
 // always, the keep threshold only when `--threshold` gave it explicitly, and
 // the backend when `--backend` or the server environment chose it, so a
-// suggested retry never silently selects the other provider.
+// suggested retry never silently selects the other provider. `matchModel`
+// repeats `--match-model` wherever the suggested command still summarizes.
 export type RetentionInvocation = {
   command: "compact" | "trim";
   keepTurns: number;
   backend?: RetentionBackendID;
   keepThreshold?: number;
   truncate: boolean;
+  matchModel?: boolean;
 };
 
 export type RetentionRequest = {
@@ -237,7 +239,7 @@ export function retentionFailureGuidance(
   invocation?: RetentionInvocation,
 ): string {
   const compact = invocation?.command === "compact";
-  const command = invocationCommand(invocation);
+  const command = heuristicCommand(invocation);
   return compact
     ? `No tool content was changed. Run ${command} --heuristic to compact without classification (turn summaries are still generated).`
     : `No tool content was changed. Run ${command} --heuristic to trim without classification.`;
@@ -245,11 +247,22 @@ export function retentionFailureGuidance(
 
 export const RETENTION_FAILURE_GUIDANCE = retentionFailureGuidance();
 
-// The command a person ran, with its turn count when not 0.
+// The command a person ran, with its turn count when not 0 and
+// `--match-model` when they gave it.
 function invocationCommand(invocation: RetentionInvocation | undefined) {
   const turns =
     invocation && invocation.keepTurns > 0 ? ` ${invocation.keepTurns}` : "";
-  return `/magic-${invocation?.command === "compact" ? "compact" : "trim"}${turns}`;
+  return `/magic-${invocation?.command === "compact" ? "compact" : "trim"}${turns}${invocation?.matchModel ? " --match-model" : ""}`;
+}
+
+// The command a `--heuristic` suggestion starts with. /magic-trim
+// `--heuristic` makes no summary request, so it drops `--match-model`.
+function heuristicCommand(invocation: RetentionInvocation | undefined) {
+  return invocationCommand(
+    invocation?.command === "trim"
+      ? { ...invocation, matchModel: false }
+      : invocation,
+  );
 }
 
 const UNCHANGED =
@@ -308,13 +321,14 @@ function retentionFailureText(
 ): string {
   const compact = invocation?.command === "compact";
   const command = invocationCommand(invocation);
+  const plain = heuristicCommand(invocation);
   const backend =
     diagnostics?.backend === undefined
       ? undefined
       : RETENTION_BACKENDS[diagnostics.backend];
   const heuristic = compact
-    ? `Run ${command} --heuristic to compact without task-aware keep protection (turn summaries are still generated).`
-    : `Run ${command} --heuristic to trim without task-aware keep protection.`;
+    ? `Run ${plain} --heuristic to compact without task-aware keep protection (turn summaries are still generated).`
+    : `Run ${plain} --heuristic to trim without task-aware keep protection.`;
   if (kind === "token-limit") {
     const name = (backend ?? RETENTION_BACKENDS[DEFAULT_RETENTION_BACKEND])
       .name;
@@ -332,12 +346,12 @@ function retentionFailureText(
         ? ""
         : ` --threshold ${formatKeepThresholdPercent(invocation.keepThreshold)}`
     } --truncate`;
-    const full = `${refused} ${UNCHANGED} Run ${retry} to retry each refused call once with a shorter session summary, which can omit useful context, or ${command} --heuristic to ${compact ? "compact" : "trim"} without task-aware keep protection${compact ? " (turn summaries are still generated)" : ""}. --threshold does not reduce the request size.`;
+    const full = `${refused} ${UNCHANGED} Run ${retry} to retry each refused call once with a shorter session summary, which can omit useful context, or ${plain} --heuristic to ${compact ? "compact" : "trim"} without task-aware keep protection${compact ? " (turn summaries are still generated)" : ""}. --threshold does not reduce the request size.`;
     // A threshold of hundreds of digits would push the --heuristic command
     // out of the toast, so the same guidance is then worded more briefly.
     return full.length < MESSAGE_CHARACTER_LIMIT
       ? full
-      : `${name} refused a retention request as over its token limit; nothing was changed. Run ${retry} (a shorter summary can omit context) or ${command} --heuristic${compact ? " (turns are still summarized)" : ""}. --threshold does not shrink it.`;
+      : `${name} refused a retention request as over its token limit; nothing was changed. Run ${retry} (a shorter summary can omit context) or ${plain} --heuristic${compact ? " (turns are still summarized)" : ""}. --threshold does not shrink it.`;
   }
   if (kind === "budget") {
     return `A task-aware retention request is larger than TypeSafe's 32 MiB request body limit and was not sent; --truncate does not apply to this limit. ${UNCHANGED} ${heuristic}`;

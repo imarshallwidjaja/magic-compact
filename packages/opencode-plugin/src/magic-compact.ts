@@ -3,9 +3,18 @@ import { COMPACT_NOOP } from "./commands";
 import {
   generateCompactionSummaries,
   type GeneratedSummary,
+  type SummaryReasoningOptions,
 } from "./compact/compact";
+import { estimateReplay, indexReplay } from "./compact/reasoning";
+import {
+  continuationTokens,
+  reasoningFeedback,
+  replayFeedback,
+  type ReplayEstimate,
+} from "./policy/reasoning";
 import { getCompactionCount } from "./compact/session";
 import {
+  nativeModelVisibleMessages,
   planCompaction,
   type CompactionPlan,
   type MessageWithParts,
@@ -77,6 +86,9 @@ export type MagicCompactExecutionOptions = {
   // Heuristic skips only the retention step; turn summaries are generated
   // either way.
   retention: RetentionPolicy;
+  // `--match-model`: run each summary on the model that wrote the protected
+  // reasoning it covers, where the route is verified.
+  matchModel?: boolean;
   controlTimeoutMs?: number;
 };
 
@@ -104,6 +116,7 @@ export async function executeMagicCompact(
   let summarizedTurnCount: number;
   let preserved: PreservedTurns;
   let retentionLine: string;
+  let reasoningLine: string | undefined;
 
   try {
     const outcome = await withExclusiveSource(COMMAND, sessionID, async () => {
@@ -126,6 +139,10 @@ export async function executeMagicCompact(
       }
 
       const before = countModelFacingContentTokens(source.messages);
+      const reasoning: SummaryReasoningOptions = {
+        matchModel: options.matchModel === true,
+        reports: [],
+      };
       // Opaque summary-bearing turns are never pruned, so they hold no
       // candidates. Retention runs before per-turn generation.
       const retention =
@@ -141,7 +158,7 @@ export async function executeMagicCompact(
                 ),
               ),
               options.retention,
-              { controlTimeoutMs },
+              { controlTimeoutMs, reasoning },
             )
           : HEURISTIC_RETENTION;
       retentionLine = retentionFeedback(retention, source.messages);
@@ -149,13 +166,34 @@ export async function executeMagicCompact(
         v2,
         source.session,
         plan,
-        { controlTimeoutMs },
+        { controlTimeoutMs, reasoning },
       );
+      reasoningLine = reasoningFeedback(
+        reasoning.reports,
+        reasoning.matchModel,
+      );
+      // Profitability and the savings gate measure what the continuing model
+      // is sent: visible content plus the estimated replay cost of protected
+      // reasoning that can be attributed. Unattributed reasoning adds nothing
+      // and is reported as not counted. Both sides of every comparison use
+      // the source's one attribution, so only the selected turns' own
+      // reasoning, which compaction removes whole, can change a result.
+      const sourceReplay = indexReplay(
+        nativeModelVisibleMessages(source.messages),
+      );
+      const replayOf = (turns: Turn[]) =>
+        sourceReplay.estimate(
+          reasoning.replay,
+          new Set(
+            turns.flatMap(turn => turnMessages(turn).map(m => m.info.id)),
+          ),
+        );
       const selection = await selectProfitableTurns(
         plan,
         summaries,
         sessionID,
         retention.keep,
+        replayOf,
       );
       if (selection.turns.length === 0) {
         if (summaries.every(summary => summary === null)) return null;
@@ -167,10 +205,23 @@ export async function executeMagicCompact(
         compactionEdits(source, plan, selection),
       );
       const after = countModelFacingContentTokens(compacted);
-      const eligibleTokens = countModelFacingContentTokens(
-        selection.turns.flatMap(turn => turn.assistants),
-      ).tokens;
-      if (!hasUsefulSavings(before.tokens - after.tokens, eligibleTokens)) {
+      const sourceEstimate = sourceReplay.estimate(reasoning.replay);
+      const removedReplay = replayOf(selection.turns);
+      const eligibleTokens = continuationTokens(
+        countModelFacingContentTokens(
+          selection.turns.flatMap(turn => turn.assistants),
+        ).tokens,
+        removedReplay,
+      );
+      if (
+        !hasUsefulSavings(
+          before.tokens
+            - after.tokens
+            - removedReplay.visibleTokens
+            + removedReplay.tokens,
+          eligibleTokens,
+        )
+      ) {
         throw new PluginMessageError(COMPACT_INSUFFICIENT_SAVINGS);
       }
       if (after.projectedMediaTokens < before.projectedMediaTokens) {
@@ -180,6 +231,7 @@ export async function executeMagicCompact(
       }
 
       const compactionCount = getCompactionCount(source.session) + 1;
+      const replayLine = replayFeedback(sourceEstimate, removedReplay);
       // The ignored notice is excluded from canonical counts, so it does not
       // change the `after` it reports.
       const history = applySuccessorEdits(compacted, [
@@ -195,6 +247,14 @@ export async function executeMagicCompact(
                 selection.turns.length,
                 preserved,
                 retentionLine,
+                [
+                  ...(reasoningLine === undefined
+                    ? []
+                    : [`Reasoning | ${reasoningLine}`]),
+                  ...(replayLine === undefined
+                    ? []
+                    : [`Reasoning replay (estimate) | ${replayLine}`]),
+                ],
               ),
               ignored: true,
               metadata: STATS_METADATA,
@@ -225,9 +285,19 @@ export async function executeMagicCompact(
         controlTimeoutMs,
       });
       const actual = countModelFacingContentTokens(created.messages);
+      // The persisted successor, under its new IDs, must estimate exactly as
+      // the projection did.
+      const replay = (messages: MessageWithParts[]) =>
+        estimateReplay(nativeModelVisibleMessages(messages), reasoning.replay);
+      const afterReplay = replay(compacted);
+      const actualReplay = replay(created.messages);
       if (
         actual.tokens !== after.tokens
         || actual.projectedMediaTokens !== after.projectedMediaTokens
+        || actualReplay.tokens !== afterReplay.tokens
+        || actualReplay.visibleTokens !== afterReplay.visibleTokens
+        || actualReplay.units !== afterReplay.units
+        || actualReplay.unknown !== afterReplay.unknown
       ) {
         throw new PluginMessageError(
           `Compaction token projection mismatch in successor session ${created.session.id}.`,
@@ -239,7 +309,7 @@ export async function executeMagicCompact(
     if (outcome === null) {
       await toastFeedback.showTerminal({
         title: COMMAND,
-        message: `${noopFeedback(preserved!)} ${retentionLine!}`,
+        message: `${noopFeedback(preserved!)} ${retentionLine!}${reasoningLine === undefined ? "" : ` ${reasoningLine}`}`,
         variant: "info",
         duration: 5000,
       });
@@ -253,7 +323,7 @@ export async function executeMagicCompact(
 
   await toastFeedback.showTerminal({
     title: COMMAND,
-    message: `Compacted ${summarizedTurnCount!} request turn(s) into successor session ${successor.session.id}. ${preservedTurnsFeedback(preserved!)} ${retentionLine!}`,
+    message: `Compacted ${summarizedTurnCount!} request turn(s) into successor session ${successor.session.id}. ${preservedTurnsFeedback(preserved!)} ${retentionLine!}${reasoningLine === undefined ? "" : ` ${reasoningLine}`}`,
     variant: "info",
     duration: 5000,
   });
@@ -331,11 +401,18 @@ function compactionEdits(
   return edits;
 }
 
+// A turn is replaced only when the continuing model would be sent strictly
+// less: its visible content with the summary injected and the planned pruning
+// applied, against the source turn's visible content with the estimated
+// replay cost of its attributable protected reasoning. Pruning deletes every
+// reasoning part of a summarized turn, so the projected turn replays none.
+// Reasoning whose cost cannot be attributed counts only by its visible text.
 async function selectProfitableTurns(
   plan: CompactionPlan,
   summaries: GeneratedSummary[],
   sessionID: string,
   keep: ReadonlySet<string>,
+  replayOf: (turns: Turn[]) => ReplayEstimate,
 ): Promise<CompactionSelection> {
   const selectedTurns: Turn[] = [];
   const selectedSummaries: Exclude<GeneratedSummary, null>[] = [];
@@ -350,9 +427,17 @@ async function selectProfitableTurns(
     const pruning = await createPruneProjection(candidates, sessionID, keep);
     const projectedTurn = pruning.turns[0]!;
     if (
-      countTurnModelFacingTokens(projectedTurn)
-      < countTurnModelFacingTokens(turn)
+      turnMessages(projectedTurn).some(message =>
+        message.parts.some(part => part.type === "reasoning"),
+      )
     ) {
+      throw new Error("Magic Compact pruning kept a reasoning part.");
+    }
+    const sourceCost = continuationTokens(
+      countTurnModelFacingTokens(turn),
+      replayOf([turn]),
+    );
+    if (countTurnModelFacingTokens(projectedTurn) < sourceCost) {
       selectedTurns.push(turn);
       selectedSummaries.push(summary);
       projectedTurns.push(projectedTurn);
@@ -364,6 +449,10 @@ async function selectProfitableTurns(
     summaries: selectedSummaries,
     pruning: { turns: projectedTurns, mutations },
   };
+}
+
+function turnMessages(turn: Turn): MessageWithParts[] {
+  return [...turn.user, ...turn.assistants] as MessageWithParts[];
 }
 
 function injectProjectedSummary(

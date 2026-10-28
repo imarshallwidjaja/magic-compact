@@ -30,8 +30,8 @@ Magic Compact performs per-turn conversation compaction while preserving the con
 
 ### Runtime Surfaces
 
-- `/magic-compact [N] [--backend jev|openai-decisions] [--threshold P] [--truncate]` or `/magic-compact [N] --heuristic` slash command.
-- `/magic-trim [N] [--backend jev|openai-decisions] [--threshold P] [--truncate]` or `/magic-trim [N] --heuristic` slash command.
+- `/magic-compact [N] [--backend jev|openai-decisions] [--threshold P] [--truncate] [--match-model]` or `/magic-compact [N] --heuristic [--match-model]` slash command.
+- `/magic-trim [N] [--backend jev|openai-decisions] [--threshold P] [--truncate] [--match-model]` or `/magic-trim [N] --heuristic` slash command.
 - `/magic-recover` slash command.
 - `/magic-stats` slash command.
 - `read_omitted_content` tool.
@@ -41,6 +41,7 @@ Magic Compact performs per-turn conversation compaction while preserving the con
 - Preserve the current conversation structure while reducing context size.
 - Preserve user messages exactly.
 - Replace old assistant turns with validated per-turn continuation summaries.
+- Keep protected reasoning on the host's native path. Only owned summarization requests may project readable reasoning as historical text; never serialize protected payloads into prompts or indexes. Match summary models only with `--match-model`, using preflight fallback; keep replay-cost estimates separate from stored-content and cached-read statistics. See `docs/OpenCode.md` for qualified paths.
 - Keep useful tool calls visible while removing bulky tool I/O. Task-aware retention (TypeSafe Jev by default, or OpenAI Decisions, with the selected backend's key in the OpenCode server environment) can keep a call whole; `--heuristic` skips it (on `/magic-compact` it skips retention only, and turns are still summarized).
 - Store omitted tool I/O outside context but make it retrievable.
 - Write compact, trim and recover results to a verified successor session; never mutate or delete the original session or its child sessions.
