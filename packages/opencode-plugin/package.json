@@ -1,6 +1,6 @@
 {
   "name": "arkive-compact",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Lossless context compression plugin for OpenCode.",
   "type": "module",
   "module": "src/index.ts",
