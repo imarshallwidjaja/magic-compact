@@ -6,6 +6,7 @@ import { countTokens, encodeGenerator, setMergeCacheSize } from "gpt-tokenizer";
 import { unwrap, type V2Client } from "../api";
 import { projectManifestCoveredMedia } from "../compact/media";
 import type { MessageWithParts } from "../compact/plan";
+import type { StoredHistoryCount } from "./constants";
 
 const PINNED_GPT_TOKENIZER_VERSION = "3.4.0";
 const PINNED_O200K_MAX_TOKEN_BYTES = 128;
@@ -159,35 +160,62 @@ export async function countSessionTokenProjection(
   return countModelFacingContentTokens(messages);
 }
 
-export type ModelFacingTokenCount = {
-  tokens: number;
+export type ModelFacingTokenCount = StoredHistoryCount & {
   projectedMediaTokens: number;
 };
 
+// The inline files are those of the stored messages, so an image the
+// projection replaces with its placeholder still counts as a stored file,
+// while its placeholder counts as ordinary text.
 export async function countModelFacingContentTokens(
   messages: MessageWithParts[],
 ): Promise<ModelFacingTokenCount> {
-  const projectedMessages = projectManifestCoveredMedia(messages);
-  const persistedTokens = await countCanonicalContentTokens(messages);
-  const tokens = await countCanonicalContentTokens(projectedMessages);
+  const persisted = await countCanonicalContent(messages);
+  const projected = await countCanonicalContent(
+    projectManifestCoveredMedia(messages),
+  );
   return {
-    tokens,
-    projectedMediaTokens: persistedTokens - tokens,
+    tokens: projected.tokens,
+    projectedMediaTokens: persisted.tokens - projected.tokens,
+    inlineFileTokens: projected.inlineFileTokens,
+    inlineFiles: persisted.inlineFiles,
   };
 }
 
 export async function countCanonicalContentTokens(
   messages: MessageWithParts[],
 ): Promise<number> {
-  let total = 0;
+  return (await countCanonicalContent(messages)).tokens;
+}
+
+// A file part whose URL carries its data inline. Canonical accounting counts
+// the whole URL as text; any other URL stays an ordinary short string.
+function isInlineFile(part: Part): part is Extract<Part, { type: "file" }> {
+  return part.type === "file" && part.url.startsWith("data:");
+}
+
+// One counting pass over `messages`: the canonical total, the part of it
+// inline file URLs contribute, and the inline files themselves.
+async function countCanonicalContent(
+  messages: MessageWithParts[],
+): Promise<StoredHistoryCount> {
+  let tokens = 0;
+  let inlineFileTokens = 0;
+  const inlineFiles = { count: 0, encodedBytes: 0 };
   for (const message of messages) {
     for (const part of message.parts) {
       const text = extractPartTexts(part, message.info.role).join("\n\n");
-      total +=
+      const count =
         text.length > LARGE_PART_TEXT_CHARS
           ? await countLargeTextTokens(text)
           : countGptTokens(text);
+      tokens += count;
+      if (isInlineFile(part)) {
+        inlineFileTokens += count;
+        inlineFiles.count += 1;
+        inlineFiles.encodedBytes += Buffer.byteLength(part.url);
+      }
     }
   }
-  return total;
+  return { tokens, inlineFileTokens, inlineFiles };
 }

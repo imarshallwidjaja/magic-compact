@@ -434,8 +434,8 @@ export async function executeV2Compact(
     );
     const outcome = statsMessage(
       compactionCount,
-      before.tokens,
-      after.tokens,
+      before,
+      after,
       selected.length,
       preserved,
       formatRetentionFeedback(retention, v2RetentionCalls(source.messages)),

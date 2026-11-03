@@ -9,6 +9,7 @@ import {
   type ToolRuleCategory,
 } from "../policy/tool-rules";
 import { groupTurns, type PolicyTurn } from "../policy/turns";
+import type { StoredHistoryCount } from "../stats/constants";
 import { countGptTokens } from "../stats/tokenize";
 import { isRecord } from "../util";
 import type { V2MediaProjection } from "./media";
@@ -208,15 +209,29 @@ export function countV2PayloadTokens(payload: string): number {
 // record, tokenized locally one content item at a time, file payloads by
 // `countV2PayloadTokens`. It is a stable before/after measure for reporting
 // and verification, not provider usage. With a media projection, a projected
-// image counts as its placeholder.
-export function countV2ContentTokens(
+// image counts as its placeholder. Inline file data is a user file's stored
+// base64 data, whatever its MIME (the host decodes `text/plain` later), and a
+// tool file whose URI is a `data:` URL; `inlineFileTokens` is the part of
+// `tokens` it contributes and `inlineFiles` lists every such file stored,
+// projected or not.
+export function countV2Content(
   messages: readonly V2Message[],
   projection?: V2MediaProjection,
-): number {
+): StoredHistoryCount {
   let total = 0;
+  let inlineFileTokens = 0;
+  const inlineFiles = { count: 0, encodedBytes: 0 };
   const add = (...texts: Array<string | undefined>) => {
     const text = texts.filter(value => value !== undefined).join("\n\n");
     if (text) total += countGptTokens(text);
+  };
+  const addInlineFile = (payload: string, counted: boolean) => {
+    inlineFiles.count += 1;
+    inlineFiles.encodedBytes += Buffer.byteLength(payload);
+    if (!counted) return;
+    const tokens = countV2PayloadTokens(payload);
+    total += tokens;
+    inlineFileTokens += tokens;
   };
   for (const message of messages) {
     switch (message.type) {
@@ -224,11 +239,12 @@ export function countV2ContentTokens(
         add(message.text);
         const covered = projection?.get(message.id) ?? [];
         for (const [index, file] of (message.files ?? []).entries()) {
+          if (!file.data) continue;
           const placeholder = covered.find(
             image => image.index === index,
           )?.placeholder;
           if (placeholder !== undefined) add(placeholder);
-          else if (file.data) total += countV2PayloadTokens(file.data);
+          addInlineFile(file.data, placeholder === undefined);
         }
         break;
       }
@@ -259,7 +275,11 @@ export function countV2ContentTokens(
           if (state.status === "completed" || state.status === "error") {
             for (const content of state.content ?? []) {
               if (content.type === "text") add(content.text);
-              else if (content.uri) total += countV2PayloadTokens(content.uri);
+              else if (content.uri.startsWith("data:")) {
+                addInlineFile(content.uri, true);
+              } else if (content.uri) {
+                total += countV2PayloadTokens(content.uri);
+              }
             }
           }
           if (state.status === "error") add(state.error.message);
@@ -269,5 +289,5 @@ export function countV2ContentTokens(
         break;
     }
   }
-  return total;
+  return { tokens: total, inlineFileTokens, inlineFiles };
 }

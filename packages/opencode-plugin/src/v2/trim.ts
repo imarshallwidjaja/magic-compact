@@ -147,8 +147,8 @@ export async function executeV2Trim(
       edited.filter(message => !isInstructionNotice(message)),
     );
     const outcome = trimStatsMessage(
-      before.tokens,
-      after.tokens,
+      before,
+      after,
       trimmedCalls,
       retentionLine,
       reasoningLine === undefined ? [] : [`Reasoning | ${reasoningLine}`],

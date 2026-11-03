@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { Message, Part } from "@opencode-ai/sdk/v2";
 import * as gptTokenizer from "gpt-tokenizer";
 import type { V2Client } from "../src/api";
@@ -241,6 +241,99 @@ describe("canonical token counting", () => {
     }
   });
 
+  // The canonical total still counts every file URL as text; reporting takes
+  // the share of `data:` URLs out of it without changing it.
+  test("partitions inline file data out of an unchanged canonical total", async () => {
+    const pdf = `data:application/pdf;base64,${randomBytes(3_000).toString("base64")}`;
+    const notes = `data:text/plain;base64,${Buffer.from("meeting notes").toString("base64")}`;
+    const remote = "https://example.com/report.pdf";
+    const chart = `data:image/png;base64,${randomBytes(600).toString("base64")}`;
+    const messages = [
+      {
+        ...message("usr_files", "user"),
+        parts: [
+          textPart("usr_files", "Compare the attachments."),
+          filePart(pdf),
+          filePart(notes, "text/plain"),
+          filePart(remote),
+        ],
+      },
+      {
+        ...message("ast_files", "assistant"),
+        parts: [
+          textPart("ast_files", "Chart attached."),
+          filePart(chart, "image/png"),
+        ],
+      },
+    ];
+    const tokens = (texts: string[]) =>
+      texts.reduce((total, text) => total + countGptTokens(text), 0);
+    const inline = [pdf, notes, chart];
+
+    const counted = await countModelFacingContentTokens(messages);
+
+    expect(counted).toEqual({
+      tokens: tokens([
+        "Compare the attachments.",
+        pdf,
+        notes,
+        remote,
+        "Chart attached.",
+        chart,
+      ]),
+      projectedMediaTokens: 0,
+      inlineFileTokens: tokens(inline),
+      inlineFiles: {
+        count: 3,
+        encodedBytes: inline.reduce((total, url) => total + url.length, 0),
+      },
+    });
+    expect(await countCanonicalContentTokens(messages)).toBe(counted.tokens);
+  });
+
+  test("keeps a projected image in the stored inventory and counts its placeholder as text", async () => {
+    const url = `data:image/png;base64,${"A".repeat(4_096)}`;
+    const summary = {
+      ...textPart("ast_image", "Described the image."),
+      metadata: {
+        magicCompact: {
+          summary: true,
+          capsule: true,
+          agentic: true,
+          version: 3,
+          mediaManifest: {
+            version: 1,
+            images: [
+              {
+                ordinal: 1,
+                mime: "image/png",
+                urlSha256: createHash("sha256").update(url).digest("hex"),
+              },
+            ],
+          },
+        },
+      },
+    } as Part;
+    const messages = [
+      {
+        ...message("usr_image", "user"),
+        parts: [textPart("usr_image", "Look."), filePart(url, "image/png")],
+      },
+      { ...message("ast_image", "assistant"), parts: [summary] },
+    ];
+    const placeholder = mediaPlaceholderText(1, "image/png");
+
+    expect(await countModelFacingContentTokens(messages)).toEqual({
+      tokens:
+        countGptTokens("Look.")
+        + countGptTokens(placeholder)
+        + countGptTokens("Described the image."),
+      projectedMediaTokens: countGptTokens(url) - countGptTokens(placeholder),
+      inlineFileTokens: 0,
+      inlineFiles: { count: 1, encodedBytes: url.length },
+    });
+  });
+
   // A trim counted an unchanged 19 MB PDF data URL whole, four times before
   // creating its successor, without returning to the event loop.
   test("counts a large part text exactly, yields to the event loop, and reuses the count for identical text", async () => {
@@ -265,6 +358,8 @@ describe("canonical token counting", () => {
       expect(await countModelFacingContentTokens(messages)).toEqual({
         tokens: exact,
         projectedMediaTokens: 0,
+        inlineFileTokens: exact,
+        inlineFiles: { count: 1, encodedBytes: url.length },
       });
       expect(encodeSpy).toHaveBeenCalledTimes(1);
     } finally {
@@ -317,14 +412,24 @@ describe("canonical token counting", () => {
   });
 });
 
-function filePart(url: string): Part {
+function filePart(url: string, mime = "application/pdf"): Part {
   return {
     id: "prt_file",
     sessionID: "session",
     messageID: "usr_file",
     type: "file",
-    mime: "application/pdf",
+    mime,
     url,
+  } as Part;
+}
+
+function textPart(messageID: string, text: string): Part {
+  return {
+    id: `${messageID}_text`,
+    sessionID: "session",
+    messageID,
+    type: "text",
+    text,
   } as Part;
 }
 

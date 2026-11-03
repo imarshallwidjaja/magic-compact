@@ -132,8 +132,8 @@ export async function executeMagicTrim(
             {
               type: "text",
               text: trimStatsMessage(
-                before.tokens,
-                after.tokens,
+                before,
+                after,
                 trim.replacements.length,
                 retentionLine,
                 reasoningLine === undefined

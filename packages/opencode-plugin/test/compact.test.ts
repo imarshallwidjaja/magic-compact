@@ -75,6 +75,7 @@ import { preservedTurnsFeedback, statsMessage } from "../src/stats/constants";
 import {
   countCanonicalContentTokens,
   countGptTokens,
+  countModelFacingContentTokens,
 } from "../src/stats/tokenize";
 import {
   COMPACT_INSUFFICIENT_SAVINGS,
@@ -4829,12 +4830,35 @@ describe("compaction orchestration", () => {
         return metadata?.["stats"] === true;
       }) as TextPart | undefined;
     expect(statsNotice).toBeDefined();
-    expect(statsNotice!.text).toContain("Magic Compaction #1");
-    expect(statsNotice!.text).toContain("Stored history (estimate) | ");
-    expect(statsNotice!.text).toContain("% trimmed (");
-    expect(statsNotice!.text).toContain(
-      "Changes | Request turns summarized: 1",
+    // The summarized image stays stored and is projected out of requests: it
+    // remains in the inline file inventory, its placeholder counts as text,
+    // and stats keep the canonical totals with its data included.
+    const before = await countModelFacingContentTokens(original);
+    const after = await countModelFacingContentTokens(successor);
+    expect(before.inlineFileTokens).toBe(countGptTokens(assistantImage.url));
+    expect(after.inlineFileTokens).toBe(0);
+    expect(stats?.totalTokensPruned).toBe(
+      (await countCanonicalContentTokens(original))
+        - (await countCanonicalContentTokens(successor)),
     );
+    expect(statsNotice!.text).toBe(
+      statsMessage(
+        1,
+        before,
+        after,
+        1,
+        { requested: 0, preserved: 0 },
+        HEURISTIC_FEEDBACK,
+      ),
+    );
+    expect(statsNotice!.text.split("\n").slice(0, 4)).toEqual([
+      "Magic Compaction #1",
+      expect.stringMatching(
+        /^Stored history \(estimate\) \| \S+ → \S+ text tokens, excluding inline file data \| \d+% trimmed \(/u,
+      ),
+      "Inline files | 1 file(s), 4.0 KiB encoded data in stored history before and after. Provider token cost for these files is not estimated; the text tokens above count stored text, not the model request.",
+      "Changes | Request turns summarized: 1",
+    ]);
     expect(statsNotice!.text).not.toContain("Cache Savings");
     expect(statsNotice!.text).not.toContain("Cost Savings");
     expect(statsNotice!.text).not.toContain("Inline image tokens projected");
@@ -4879,8 +4903,8 @@ describe("compaction orchestration", () => {
     expect(notice?.text).toBe(
       statsMessage(
         1,
-        storedBefore,
-        storedAfter,
+        await countModelFacingContentTokens(original),
+        await countModelFacingContentTokens(successor),
         1,
         preserved,
         HEURISTIC_FEEDBACK,
@@ -4952,8 +4976,8 @@ describe("compaction orchestration", () => {
     expect(notice?.text).toBe(
       statsMessage(
         1,
-        await countCanonicalContentTokens(original),
-        await countCanonicalContentTokens(successor),
+        await countModelFacingContentTokens(original),
+        await countModelFacingContentTokens(successor),
         2,
         { requested: 0, preserved: 0 },
         HEURISTIC_FEEDBACK,
@@ -6893,6 +6917,8 @@ describe("compaction orchestration", () => {
     expect(notice).toContain("Tokens physically pruned");
     expect(notice).toContain("Inline image tokens projected: ~0");
     expect(notice).toContain("Projected-media cache reads saved: ~0 tokens");
+    expect(notice).toContain("inline file data counted as text");
+    expect(notice).toContain("not provider usage or media billing");
   });
 
   test("keeps prior summary turns opaque and carries cache/stat lineage into the successor", async () => {

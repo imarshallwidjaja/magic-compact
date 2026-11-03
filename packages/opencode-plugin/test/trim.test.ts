@@ -66,10 +66,15 @@ import {
 } from "../src/storage/stats";
 import { SourceNotAtRestError } from "../src/policy/successor";
 import { planToolTrim, type ToolRuleCategory } from "../src/policy/tool-rules";
-import { trimStatsMessage } from "../src/stats/constants";
+import {
+  statsMessage,
+  trimStatsMessage,
+  type StoredHistoryCount,
+} from "../src/stats/constants";
 import {
   countCanonicalContentTokens,
   countGptTokens,
+  countModelFacingContentTokens,
 } from "../src/stats/tokenize";
 
 const HEURISTIC_OPTIONS = { retention: { mode: "heuristic" } } as const;
@@ -526,6 +531,102 @@ describe("magic trim", () => {
     expect(await readCache(sessionID)).toBeNull();
   });
 
+  // Inline file data tokenized as text can dwarf the conversation, so with an
+  // inline file on either side the headline counts stored text only and the
+  // files are reported by encoded size; without one the notice is unchanged.
+  test("reports stored text apart from inline file data and keeps the notice unchanged without files", () => {
+    const count = (
+      tokens: number,
+      inlineFileTokens = 0,
+      files = 0,
+      encodedBytes = 0,
+    ): StoredHistoryCount => ({
+      tokens,
+      inlineFileTokens,
+      inlineFiles: { count: files, encodedBytes },
+    });
+
+    expect(trimStatsMessage(count(1_500), count(999), 3, "R")).toBe(
+      [
+        "Magic Trim",
+        "Stored history (estimate) | 1.5K → 999 tokens | 33% trimmed (~501 removed)",
+        "Changes | Tool calls trimmed: 3",
+        "Retention | R",
+      ].join("\n"),
+    );
+    for (const [after, headline] of [
+      [25, "0 → 25 text tokens, excluding inline file data | ~25 added"],
+      [
+        0,
+        "0 → 0 text tokens, excluding inline file data | 0% trimmed (~0 removed)",
+      ],
+    ] as const) {
+      expect(
+        trimStatsMessage(
+          count(100, 100, 1, 400),
+          count(100 + after, 100, 1, 400),
+          1,
+          "R",
+        ),
+      ).toBe(
+        [
+          "Magic Trim",
+          `Stored history (estimate) | ${headline}`,
+          "Inline files | 1 file(s), 400 B encoded data in stored history before and after. Provider token cost for these files is not estimated; the text tokens above count stored text, not the model request.",
+          "Changes | Tool calls trimmed: 1",
+          "Retention | R",
+        ].join("\n"),
+      );
+    }
+    expect(trimStatsMessage(count(0), count(25), 1, "R")).toBe(
+      [
+        "Magic Trim",
+        "Stored history (estimate) | 0 → 25 tokens | 0% grown (~25 added)",
+        "Changes | Tool calls trimmed: 1",
+        "Retention | R",
+      ].join("\n"),
+    );
+    expect(
+      trimStatsMessage(
+        count(520_000, 400_000, 2, 1_572_864),
+        count(450_000, 400_000, 2, 1_572_864),
+        3,
+        "R",
+        ["Reasoning | X"],
+      ),
+    ).toBe(
+      [
+        "Magic Trim",
+        "Stored history (estimate) | 120K → 50K text tokens, excluding inline file data | 58% trimmed (~70K removed)",
+        "Inline files | 2 file(s), 1.5 MiB encoded data in stored history before and after. Provider token cost for these files is not estimated; the text tokens above count stored text, not the model request.",
+        "Changes | Tool calls trimmed: 3",
+        "Retention | R",
+        "Reasoning | X",
+      ].join("\n"),
+    );
+    // A projected image keeps its stored file, so only a changed inventory
+    // reports a before and after.
+    expect(
+      statsMessage(
+        2,
+        count(30_000, 20_000, 2, 1_048_576),
+        count(4_000, 600, 1, 800),
+        1,
+        { requested: 0, preserved: 0 },
+        "R",
+      ),
+    ).toBe(
+      [
+        "Magic Compaction #2",
+        "Stored history (estimate) | 10K → 3.4K text tokens, excluding inline file data | 66% trimmed (~6.6K removed)",
+        "Inline files | 2 → 1 file(s), 1.0 MiB → 800 B encoded data in stored history. Provider token cost for these files is not estimated; the text tokens above count stored text, not the model request.",
+        "Changes | Request turns summarized: 1",
+        "Preserved | N=0 preserved no request turns.",
+        "Retention | R",
+      ].join("\n"),
+    );
+  });
+
   test("reports trim stats on a cycle-free active basis across the 999-to-1K boundary", async () => {
     const sessionID = `ses_trim_accounting_${randomUUID().replaceAll("-", "")}`;
     const tool = readTool("tool_accounting", "historical output ".repeat(70));
@@ -546,7 +647,7 @@ describe("magic trim", () => {
         processedAssistantMessageIds: [],
       };
       await writeStats(sessionID, sourceStats);
-      const beforeTokens = await countCanonicalContentTokens(messages);
+      const before = await countModelFacingContentTokens(messages);
 
       await expect(
         executeMagicTrim(harness.v2, sessionID, 0, HEURISTIC_OPTIONS),
@@ -556,7 +657,7 @@ describe("magic trim", () => {
       expect(harness.sourceWrites).toEqual([]);
       expect(await readStats(sessionID)).toEqual(sourceStats);
       const successor = harness.successorMessages();
-      const afterTokens = await countCanonicalContentTokens(successor);
+      const after = await countModelFacingContentTokens(successor);
       const stats = await readStats(harness.successorID);
       const notice = successor
         .at(-1)!
@@ -565,12 +666,12 @@ describe("magic trim", () => {
       expect(stats).toMatchObject({
         sourceSessionId: sessionID,
         rootSessionId: "root-session",
-        totalTokensPruned: 999 + beforeTokens - afterTokens,
+        totalTokensPruned: 999 + before.tokens - after.tokens,
         cachedTokensSaved: 11,
         processedAssistantMessageIds: [successor[1]!.info.id],
       });
       expect(notice.text).toBe(
-        trimStatsMessage(beforeTokens, afterTokens, 1, HEURISTIC_FEEDBACK),
+        trimStatsMessage(before, after, 1, HEURISTIC_FEEDBACK),
       );
       expect(notice.ignored).toBeTrue();
       expect(notice.text).toContain(`Retention | ${HEURISTIC_FEEDBACK}`);
@@ -1364,13 +1465,26 @@ describe("magic trim task-aware retention", () => {
       const notice = successor
         .at(-1)!
         .parts.find((part): part is TextPart => part.type === "text")!;
+      const before = await countModelFacingContentTokens(original);
+      const after = await countModelFacingContentTokens(successor);
+      const fileTokens = gptTokenizer.countTokens(url);
+      expect([before.inlineFileTokens, after.inlineFileTokens]).toEqual([
+        fileTokens,
+        fileTokens,
+      ]);
       expect(notice.text).toBe(
-        trimStatsMessage(
-          await countCanonicalContentTokens(original),
-          await countCanonicalContentTokens(successor),
-          1,
-          HEURISTIC_FEEDBACK,
+        trimStatsMessage(before, after, 1, HEURISTIC_FEEDBACK),
+      );
+      expect(notice.text.split("\n").slice(1, 3)).toEqual([
+        expect.stringMatching(
+          /^Stored history \(estimate\) \| \S+ → \S+ text tokens, excluding inline file data \| \d+% trimmed/u,
         ),
+        `Inline files | 1 file(s), 128.0 KiB encoded data in stored history before and after. Provider token cost for these files is not estimated; the text tokens above count stored text, not the model request.`,
+      ]);
+      // Stats keep the canonical totals, file data included.
+      expect((await readStats(harness.successorID))?.totalTokensPruned).toBe(
+        (await countCanonicalContentTokens(original))
+          - (await countCanonicalContentTokens(successor)),
       );
     } finally {
       encodeSpy.mockRestore();
@@ -1444,7 +1558,12 @@ describe("magic trim task-aware retention", () => {
       const storedAfter = await countCanonicalContentTokens(successor);
       expect(storedAfter).toBeLessThan(storedBefore);
       expect(notice.text).toBe(
-        trimStatsMessage(storedBefore, storedAfter, 2, HEURISTIC_FEEDBACK),
+        trimStatsMessage(
+          await countModelFacingContentTokens(messages),
+          await countModelFacingContentTokens(successor),
+          2,
+          HEURISTIC_FEEDBACK,
+        ),
       );
       expect((await readStats(harness.successorID))?.totalTokensPruned).toBe(
         storedBefore - storedAfter,

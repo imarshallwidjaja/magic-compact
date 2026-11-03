@@ -244,8 +244,8 @@ export async function executeMagicCompact(
               type: "text",
               text: statsMessage(
                 compactionCount,
-                before.tokens,
-                after.tokens,
+                before,
+                after,
                 selection.turns.length,
                 preserved,
                 retentionLine,

@@ -37,7 +37,12 @@ import {
   planV2Compaction,
 } from "../src/v2/compact";
 import { generateV2Summaries, V2GenerationError } from "../src/v2/generation";
-import { trimV2Tool, v2ToolCallView, v2ToolCalls } from "../src/v2/history";
+import {
+  countV2PayloadTokens,
+  trimV2Tool,
+  v2ToolCallView,
+  v2ToolCalls,
+} from "../src/v2/history";
 import { connectV2Host, V2_ENDPOINT_REQUIRED } from "../src/v2/host";
 import {
   countV2ModelFacingTokens,
@@ -65,6 +70,7 @@ import {
   SourceNotAtRestError,
   SuccessorFailure,
 } from "../src/policy/successor";
+import { mediaPlaceholderText } from "../src/policy/media";
 import { countGptTokens } from "../src/stats/tokenize";
 import {
   readV2SourceAtRest,
@@ -1001,6 +1007,65 @@ describe("OpenCode 2 trim successors", () => {
         .map(message => message.id),
     );
     expect(await readStats("ses_src")).toBeNull();
+  });
+
+  test("reports inline files apart from the stored text and copies them unchanged", async () => {
+    const pdf = randomBytes(6_000).toString("base64");
+    const toolImage = `data:image/png;base64,${randomBytes(1_500).toString("base64")}`;
+    const state = fakeV2State();
+    sourceSession(state, "ses_src", [
+      userMessage("msg_u1", "Read the report", {
+        files: [
+          { data: pdf, mime: "application/pdf", source: { type: "inline" } },
+        ],
+      }),
+      assistantMessage("msg_a1", [
+        toolItem("call_r", "read", { path: "/report.txt" }, [
+          { type: "text", text: words("R", 400) },
+          { type: "file", uri: toolImage, mime: "image/png" },
+        ]),
+      ]),
+      idleMessage("msg_i1"),
+    ]);
+    const source = structuredClone(state.messages.get("ses_src")!);
+
+    const { successor, outcome } = await executeV2Trim(
+      fakeV2Host(state, new OwnedSessions()),
+      new OwnedSessions(),
+      "ses_src",
+      0,
+      { retention: { mode: "heuristic" }, controlTimeoutMs: 1_000 },
+    );
+
+    expect(state.messages.get("ses_src")).toEqual(source);
+    const stored = state.messages.get(successor!.session.id)!;
+    expect((stored[0] as Extract<V2Message, { type: "user" }>).files).toEqual(
+      (source[0] as Extract<V2Message, { type: "user" }>).files,
+    );
+    expect(
+      (v2ToolCalls(stored[1]!)[0]!.tool.state as { content: unknown[] })
+        .content[1],
+    ).toEqual({ type: "file", uri: toolImage, mime: "image/png" });
+    const before = countV2ModelFacingTokens(source);
+    const after = countV2ModelFacingTokens(stored);
+    const fileTokens =
+      countV2PayloadTokens(pdf) + countV2PayloadTokens(toolImage);
+    expect([before.inlineFileTokens, after.inlineFileTokens]).toEqual([
+      fileTokens,
+      fileTokens,
+    ]);
+    // Stats keep the canonical totals, file data included.
+    expect(
+      (await readStats(v2StorageKey(successor!.session.id)))?.totalTokensPruned,
+    ).toBe(before.tokens - after.tokens);
+    expect(outcome.split("\n").slice(0, 4)).toEqual([
+      "Magic Trim",
+      expect.stringMatching(
+        /^Stored history \(estimate\) \| \S+ → \S+ text tokens, excluding inline file data \| \d+% trimmed \(/u,
+      ),
+      "Inline files | 2 file(s), 9.8 KiB encoded data in stored history before and after. Provider token cost for these files is not estimated; the text tokens above count stored text, not the model request.",
+      "Changes | Tool calls trimmed: 1",
+    ]);
   });
 
   test("discards an unmodified candidate when the source changes before handoff", async () => {
@@ -2665,6 +2730,25 @@ describe("OpenCode 2 media projection", () => {
     const stats = await readStats(v2StorageKey(successor!.session.id));
     expect(stats?.mediaTokensProjected).toBe(facing.projectedMediaTokens);
     expect(outcome).toContain("Request turns summarized: 1");
+    // Both images stay stored; only the projected one leaves the inline file
+    // tokens, and stats keep the canonical totals with the data included.
+    const original = countV2ModelFacingTokens(source);
+    expect(original.inlineFileTokens).toBe(
+      countV2PayloadTokens(largeImage) + countV2PayloadTokens(smallImage),
+    );
+    expect(facing.inlineFileTokens).toBe(countV2PayloadTokens(smallImage));
+    expect(stats?.totalTokensPruned).toBe(
+      original.tokens
+        + original.projectedMediaTokens
+        - (facing.tokens + facing.projectedMediaTokens),
+    );
+    expect(outcome.split("\n").slice(1, 4)).toEqual([
+      expect.stringMatching(
+        /^Stored history \(estimate\) \| \S+ → \S+ text tokens, excluding inline file data \| \d+% trimmed \(/u,
+      ),
+      "Inline files | 2 file(s), 3.9 KiB encoded data in stored history before and after. Provider token cost for these files is not estimated; the text tokens above count stored text, not the model request.",
+      "Changes | Request turns summarized: 1",
+    ]);
 
     const request = requestMessages(stored);
     const before = JSON.stringify(request);
@@ -2693,6 +2777,93 @@ describe("OpenCode 2 media projection", () => {
     expect(projectV2RequestMessages(request, stored)).toEqual(request);
     const stats = await readStats(v2StorageKey(successor!.session.id));
     expect(stats?.mediaTokensProjected).toBe(0);
+  });
+
+  // User file data of any MIME and `data:` tool file URIs are inline file
+  // data; the canonical total still counts them, a projected image counts as
+  // its placeholder, and every stored inline file stays in the inventory.
+  test("partitions inline file data out of an unchanged stored-history count", () => {
+    const pdf = randomBytes(3_000).toString("base64");
+    const notes = Buffer.from("meeting notes").toString("base64");
+    const toolImage = `data:image/png;base64,${smallImage}`;
+    const remote = "file:///tmp/out.png";
+    const input = { path: "/out.png" };
+    const records = [
+      userMessage("msg_u1", "Read these", {
+        files: [
+          imageFile(largeImage),
+          { data: pdf, mime: "application/pdf", source: { type: "inline" } },
+          {
+            data: notes,
+            mime: "text/plain",
+            source: { type: "uri", uri: "file:///notes.txt" },
+          },
+          {
+            data: "",
+            mime: "application/x-directory",
+            source: { type: "uri", uri: "file:///src" },
+          },
+        ],
+      }),
+      assistantMessage(
+        "msg_a1",
+        [
+          { type: "text", text: "Summary." },
+          toolItem("call_r", "read", input, [
+            { type: "text", text: "ok" },
+            { type: "file", uri: toolImage, mime: "image/png" },
+            { type: "file", uri: remote, mime: "image/png" },
+          ]),
+        ],
+        {
+          metadata: {
+            magicCompact: {
+              summary: true,
+              capsule: true,
+              agentic: true,
+              version: 3,
+              mediaManifest: {
+                version: 1,
+                images: [
+                  {
+                    ordinal: 1,
+                    mime: "image/png",
+                    dataSha256: createHash("sha256")
+                      .update(largeImage)
+                      .digest("hex"),
+                  },
+                ],
+              },
+            },
+          },
+        },
+      ),
+    ];
+    const placeholder = mediaPlaceholderText(1, "image/png");
+    const payloads = (values: string[]) =>
+      values.reduce((total, value) => total + countV2PayloadTokens(value), 0);
+    const stored =
+      countGptTokens("Read these")
+      + payloads([largeImage, pdf, notes])
+      + countGptTokens("Summary.")
+      + countGptTokens(JSON.stringify(input))
+      + countGptTokens("ok")
+      + payloads([toolImage, remote]);
+    const projectedMedia =
+      countV2PayloadTokens(largeImage) - countGptTokens(placeholder);
+
+    expect(countV2ModelFacingTokens(records)).toEqual({
+      tokens: stored - projectedMedia,
+      projectedMediaTokens: projectedMedia,
+      inlineFileTokens: payloads([pdf, notes, toolImage]),
+      inlineFiles: {
+        count: 4,
+        encodedBytes: [largeImage, pdf, notes, toolImage].reduce(
+          (total, value) => total + value.length,
+          0,
+        ),
+      },
+    });
   });
 
   test("a changed, added, missing or reordered image fails before any request is projected", async () => {
