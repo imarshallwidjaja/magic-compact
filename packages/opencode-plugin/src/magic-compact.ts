@@ -138,7 +138,7 @@ export async function executeMagicCompact(
         return null;
       }
 
-      const before = countModelFacingContentTokens(source.messages);
+      const before = await countModelFacingContentTokens(source.messages);
       const reasoning: SummaryReasoningOptions = {
         matchModel: options.matchModel === true,
         reports: [],
@@ -204,12 +204,14 @@ export async function executeMagicCompact(
         source.messages,
         compactionEdits(source, plan, selection),
       );
-      const after = countModelFacingContentTokens(compacted);
+      const after = await countModelFacingContentTokens(compacted);
       const sourceEstimate = sourceReplay.estimate(reasoning.replay);
       const removedReplay = replayOf(selection.turns);
       const eligibleTokens = continuationTokens(
-        countModelFacingContentTokens(
-          selection.turns.flatMap(turn => turn.assistants),
+        (
+          await countModelFacingContentTokens(
+            selection.turns.flatMap(turn => turn.assistants),
+          )
         ).tokens,
         removedReplay,
       );
@@ -284,7 +286,7 @@ export async function executeMagicCompact(
           ),
         controlTimeoutMs,
       });
-      const actual = countModelFacingContentTokens(created.messages);
+      const actual = await countModelFacingContentTokens(created.messages);
       // The persisted successor, under its new IDs, must estimate exactly as
       // the projection did.
       const replay = (messages: MessageWithParts[]) =>
@@ -434,10 +436,10 @@ async function selectProfitableTurns(
       throw new Error("Magic Compact pruning kept a reasoning part.");
     }
     const sourceCost = continuationTokens(
-      countTurnModelFacingTokens(turn),
+      await countTurnModelFacingTokens(turn),
       replayOf([turn]),
     );
-    if (countTurnModelFacingTokens(projectedTurn) < sourceCost) {
+    if ((await countTurnModelFacingTokens(projectedTurn)) < sourceCost) {
       selectedTurns.push(turn);
       selectedSummaries.push(summary);
       projectedTurns.push(projectedTurn);
@@ -474,9 +476,11 @@ function injectProjectedSummary(
   return projected;
 }
 
-function countTurnModelFacingTokens(turn: Turn): number {
-  return countModelFacingContentTokens([
-    ...turn.user,
-    ...turn.assistants,
-  ] as MessageWithParts[]).tokens;
+async function countTurnModelFacingTokens(turn: Turn): Promise<number> {
+  return (
+    await countModelFacingContentTokens([
+      ...turn.user,
+      ...turn.assistants,
+    ] as MessageWithParts[])
+  ).tokens;
 }

@@ -1,5 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import type { Message } from "@opencode-ai/sdk/v2";
+import { randomBytes } from "node:crypto";
+import type { Message, Part } from "@opencode-ai/sdk/v2";
 import * as gptTokenizer from "gpt-tokenizer";
 import type { V2Client } from "../src/api";
 import type { MessageWithParts } from "../src/compact/plan";
@@ -9,6 +10,7 @@ import {
   countCanonicalContentTokens,
   countGptTokens,
   countGptTokensWithinLimit,
+  countModelFacingContentTokens,
   countSessionTokens,
 } from "../src/stats/tokenize";
 
@@ -41,12 +43,12 @@ describe("canonical token counting", () => {
     } as unknown as V2Client;
 
     expect(await countSessionTokens(v2, "session")).toBe(
-      countCanonicalContentTokens(messages),
+      await countCanonicalContentTokens(messages),
     );
     expect(await countSessionTokens(v2, "session")).toBeLessThan(100);
   });
 
-  test("excludes ignored reports while retaining synthetic active context", () => {
+  test("excludes ignored reports while retaining synthetic active context", async () => {
     const messages: MessageWithParts[] = [
       {
         ...message("usr_context", "user"),
@@ -78,13 +80,13 @@ describe("canonical token counting", () => {
       },
     ];
 
-    expect(countCanonicalContentTokens(messages)).toBe(
+    expect(await countCanonicalContentTokens(messages)).toBe(
       countGptTokens("Active user content")
         + countGptTokens("Synthetic model-facing boundary"),
     );
   });
 
-  test("includes ignored assistant text while still excluding ignored user notices", () => {
+  test("includes ignored assistant text while still excluding ignored user notices", async () => {
     const messages: MessageWithParts[] = [
       {
         ...message("usr_notice", "user"),
@@ -121,7 +123,7 @@ describe("canonical token counting", () => {
       },
     ];
 
-    expect(countCanonicalContentTokens(messages)).toBe(
+    expect(await countCanonicalContentTokens(messages)).toBe(
       countGptTokens("Visible assistant history")
         + countGptTokens("Ignored assistant continuation"),
     );
@@ -239,6 +241,63 @@ describe("canonical token counting", () => {
     }
   });
 
+  // A trim counted an unchanged 19 MB PDF data URL whole, four times before
+  // creating its successor, without returning to the event loop.
+  test("counts a large part text exactly, yields to the event loop, and reuses the count for identical text", async () => {
+    const url = `data:application/pdf;base64,${randomBytes(393_216).toString("base64")}`;
+    const messages = [
+      { ...message("usr_pdf", "user"), parts: [filePart(url)] },
+    ];
+    const exact = gptTokenizer.countTokens(url);
+    const encodeSpy = spyOn(gptTokenizer, "encodeGenerator");
+    try {
+      const order: string[] = [];
+      setImmediate(() => order.push("immediate"));
+      const counted = await countCanonicalContentTokens(messages).then(
+        count => {
+          order.push("count");
+          return count;
+        },
+      );
+
+      expect(counted).toBe(exact);
+      expect(order).toEqual(["immediate", "count"]);
+      expect(await countModelFacingContentTokens(messages)).toEqual({
+        tokens: exact,
+        projectedMediaTokens: 0,
+      });
+      expect(encodeSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      encodeSpy.mockRestore();
+    }
+  });
+
+  test("keeps the tokenizer's special-token refusal for a large part text", async () => {
+    const messages = [
+      {
+        ...message("usr_special", "user"),
+        parts: [
+          filePart(`data:text/x-log;base64,${"A".repeat(70_000)}<|endoftext|>`),
+        ],
+      },
+    ];
+
+    await expect(countCanonicalContentTokens(messages)).rejects.toThrow(
+      "Disallowed special token found: <|endoftext|>",
+    );
+  });
+
+  // gpt-tokenizer 3.4.0 internals; the version is pinned below. Its merge
+  // cache evicts superlinearly once one input exceeds its 100,000 entries.
+  test("disables the tokenizer's merge cache", () => {
+    const core = (
+      gptTokenizer.default as unknown as {
+        bytePairEncodingCoreProcessor: { mergeCache?: unknown };
+      }
+    ).bytePairEncodingCoreProcessor;
+    expect(core.mergeCache).toBeUndefined();
+  });
+
   test("pins gpt-tokenizer to the measured 3.4.0 o200k bound", async () => {
     const pluginPackage = await import("../package.json");
     const tokenizerPackage = await import("gpt-tokenizer/package.json");
@@ -257,6 +316,17 @@ describe("canonical token counting", () => {
     }
   });
 });
+
+function filePart(url: string): Part {
+  return {
+    id: "prt_file",
+    sessionID: "session",
+    messageID: "usr_file",
+    type: "file",
+    mime: "application/pdf",
+    url,
+  } as Part;
+}
 
 function message(
   id: string,

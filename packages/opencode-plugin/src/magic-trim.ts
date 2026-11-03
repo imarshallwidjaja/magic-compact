@@ -123,8 +123,8 @@ export async function executeMagicTrim(
           part,
         })),
       );
-      const before = countModelFacingContentTokens(source.messages);
-      const after = countModelFacingContentTokens(trimmed);
+      const before = await countModelFacingContentTokens(source.messages);
+      const after = await countModelFacingContentTokens(trimmed);
       const history = applySuccessorEdits(trimmed, [
         {
           type: "append-message",
@@ -163,7 +163,8 @@ export async function executeMagicTrim(
           ),
         controlTimeoutMs,
       });
-      const actual = countModelFacingContentTokens(successor.messages).tokens;
+      const actual = (await countModelFacingContentTokens(successor.messages))
+        .tokens;
       if (actual !== after.tokens) {
         throw new PluginMessageError(
           `Trim final canonical active token count did not match its projection in successor session ${successor.session.id} (projected ${after.tokens}, actual ${actual}).`,

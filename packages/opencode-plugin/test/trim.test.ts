@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test";
-import { createHash, randomUUID } from "node:crypto";
+import { describe, expect, spyOn, test } from "bun:test";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import type { Message, Part, TextPart, ToolPart } from "@opencode-ai/sdk/v2";
+import * as gptTokenizer from "gpt-tokenizer";
 import type { V2Client } from "../src/api";
 import {
   createCompactionPlan,
@@ -545,7 +546,7 @@ describe("magic trim", () => {
         processedAssistantMessageIds: [],
       };
       await writeStats(sessionID, sourceStats);
-      const beforeTokens = countCanonicalContentTokens(messages);
+      const beforeTokens = await countCanonicalContentTokens(messages);
 
       await expect(
         executeMagicTrim(harness.v2, sessionID, 0, HEURISTIC_OPTIONS),
@@ -555,7 +556,7 @@ describe("magic trim", () => {
       expect(harness.sourceWrites).toEqual([]);
       expect(await readStats(sessionID)).toEqual(sourceStats);
       const successor = harness.successorMessages();
-      const afterTokens = countCanonicalContentTokens(successor);
+      const afterTokens = await countCanonicalContentTokens(successor);
       const stats = await readStats(harness.successorID);
       const notice = successor
         .at(-1)!
@@ -1319,6 +1320,64 @@ describe("magic trim task-aware retention", () => {
     }
   });
 
+  // Accounting runs before and after the edit and again on the successor; an
+  // unchanged large file is tokenized only on the first of those counts.
+  test("tokenizes an unchanged large file once and copies it unchanged", async () => {
+    const sessionID = `ses_trim_large_file_${randomUUID().replaceAll("-", "")}`;
+    const url = `data:application/pdf;base64,${randomBytes(98_304).toString("base64")}`;
+    const messages = [
+      message("usr_pdf", "user", [
+        userText("usr_pdf", "review the attached report"),
+        {
+          id: "prt_pdf",
+          sessionID: "session",
+          messageID: "usr_pdf",
+          type: "file",
+          mime: "application/pdf",
+          filename: "report.pdf",
+          url,
+        } as Part,
+      ]),
+      message("ast_pdf", "assistant", [
+        readTool("tool_read", "large output ".repeat(100)),
+      ]),
+    ];
+    const harness = v1CommandHarness(sessionID, messages);
+    const original = structuredClone(messages);
+    const encodeSpy = spyOn(gptTokenizer, "encodeGenerator");
+
+    try {
+      expect(
+        await executeMagicTrim(harness.v2, sessionID, 0, HEURISTIC_OPTIONS),
+      ).not.toBeNull();
+      expect(
+        encodeSpy.mock.calls.filter(([text]) => text === url),
+      ).toHaveLength(1);
+
+      expect(messages).toEqual(original);
+      const successor = harness.successorMessages();
+      expect(successor[0]!.parts[1]).toMatchObject({
+        type: "file",
+        mime: "application/pdf",
+        url,
+      });
+      const notice = successor
+        .at(-1)!
+        .parts.find((part): part is TextPart => part.type === "text")!;
+      expect(notice.text).toBe(
+        trimStatsMessage(
+          await countCanonicalContentTokens(original),
+          await countCanonicalContentTokens(successor),
+          1,
+          HEURISTIC_FEEDBACK,
+        ),
+      );
+    } finally {
+      encodeSpy.mockRestore();
+      await cleanupSessions(sessionID, ...harness.created);
+    }
+  });
+
   // A native checkpoint can retain a tail that starts at the assistant carrying
   // a media capsule while its images stay in the hidden prefix. The stored
   // history is valid and trim counts stored history, so it must succeed and
@@ -1371,7 +1430,7 @@ describe("magic trim task-aware retention", () => {
     (marker.parts[0] as unknown as { tail_start_id: string }).tail_start_id =
       "ast_media";
     const harness = v1CommandHarness(sessionID, messages);
-    const storedBefore = countCanonicalContentTokens(messages);
+    const storedBefore = await countCanonicalContentTokens(messages);
 
     try {
       expect(
@@ -1382,7 +1441,7 @@ describe("magic trim task-aware retention", () => {
       const notice = successor
         .at(-1)!
         .parts.find((part): part is TextPart => part.type === "text")!;
-      const storedAfter = countCanonicalContentTokens(successor);
+      const storedAfter = await countCanonicalContentTokens(successor);
       expect(storedAfter).toBeLessThan(storedBefore);
       expect(notice.text).toBe(
         trimStatsMessage(storedBefore, storedAfter, 2, HEURISTIC_FEEDBACK),

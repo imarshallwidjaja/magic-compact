@@ -4865,8 +4865,8 @@ describe("compaction orchestration", () => {
 
     expect(messages).toEqual(original);
     const successor = harness.successorMessages();
-    const storedBefore = countCanonicalContentTokens(original);
-    const storedAfter = countCanonicalContentTokens(successor);
+    const storedBefore = await countCanonicalContentTokens(original);
+    const storedAfter = await countCanonicalContentTokens(successor);
     const preserved = { requested: 1, preserved: 1 };
     const notice = successor
       .flatMap(item => item.parts)
@@ -4952,8 +4952,8 @@ describe("compaction orchestration", () => {
     expect(notice?.text).toBe(
       statsMessage(
         1,
-        countCanonicalContentTokens(original),
-        countCanonicalContentTokens(successor),
+        await countCanonicalContentTokens(original),
+        await countCanonicalContentTokens(successor),
         2,
         { requested: 0, preserved: 0 },
         HEURISTIC_FEEDBACK,
@@ -5017,7 +5017,7 @@ describe("compaction orchestration", () => {
     );
     messages[1]!.parts.push(task);
     const original = structuredClone(messages);
-    const beforeTokens = countCanonicalContentTokens(messages);
+    const beforeTokens = await countCanonicalContentTokens(messages);
     const harness = commandHarness(messages, {
       generationResponse: {
         turns: [result(1, "Completed the delegated work.")],
@@ -5059,7 +5059,7 @@ describe("compaction orchestration", () => {
       Object.values(cache!.entries).filter(entry => entry.content === prompt),
     ).toHaveLength(1);
     expect((await readStats("successor"))?.totalTokensPruned).toBe(
-      beforeTokens - countCanonicalContentTokens(successor),
+      beforeTokens - (await countCanonicalContentTokens(successor)),
     );
   });
 
