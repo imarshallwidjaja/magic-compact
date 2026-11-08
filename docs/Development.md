@@ -95,7 +95,7 @@ CI and release workflows install with `bun install --frozen-lockfile`. Run the s
 ### `docs/`
 
 - `docs/Development.md` - contributor setup and repository map.
-- `docs/Architecture.md` - architecture state-machine inventory and refactor decision log, including the baseline and current candidate.
+- `docs/Architecture.md` - current architecture and state-machine inventory, with lifecycle diagrams.
 - `docs/Core.md` - core behavior and safety guarantees.
 - `docs/OpenCode.md` - OpenCode runtime behavior specification.
 - `docs/RetentionEvaluation.md` - task-aware retention classifier contract, evaluation protocol, and measured results.
