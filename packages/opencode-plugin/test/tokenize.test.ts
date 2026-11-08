@@ -11,6 +11,20 @@ import {
   countGptTokensWithinLimit,
 } from "../src/stats/tokenize";
 
+// Every special-token spelling of o200k_base in gpt-tokenizer 3.4.0, and the
+// option under which that tokenizer reads them as ordinary text.
+const O200K_SPECIAL_TOKENS = [
+  "<|endoftext|>",
+  "<|fim_prefix|>",
+  "<|fim_middle|>",
+  "<|fim_suffix|>",
+  "<|im_start|>",
+  "<|im_end|>",
+  "<|im_sep|>",
+  "<|endofprompt|>",
+];
+const LITERAL = { disallowedSpecial: new Set<string>() };
+
 describe("canonical token counting", () => {
   test("counts canonical content locally regardless of provider usage", async () => {
     const messages: MessageWithParts[] = [
@@ -136,6 +150,43 @@ describe("canonical token counting", () => {
     expect(countGptTokensWithinLimit(text, exact)).toBe(exact);
     expect(countGptTokensWithinLimit(text, exact - 1)).toBeNull();
   });
+
+  // Session text is never a tokenizer control sequence: `<|endoftext|>` in a
+  // tool output is the seven ordinary pieces <, |, end, of, text, |, >.
+  test("counts a special-token spelling as the ordinary text it is", () => {
+    const pieces = gptTokenizer.encode("<|endoftext|>", LITERAL);
+    expect(pieces.map(piece => gptTokenizer.decode([piece]))).toEqual([
+      "<",
+      "|",
+      "end",
+      "of",
+      "text",
+      "|",
+      ">",
+    ]);
+    expect(countGptTokens("<|endoftext|>")).toBe(7);
+  });
+
+  test.each(O200K_SPECIAL_TOKENS)(
+    "counts %s exactly wherever it appears in a text",
+    special => {
+      const texts = [
+        `${special} leading`,
+        `trailing ${special}`,
+        `${special}${special}`,
+        // Over the 4,096-byte memo key limit, so counted uncached.
+        `${special}${"plain words ".repeat(400)}${special}`,
+      ];
+      for (const text of texts) {
+        const exact = countGptTokens(text);
+
+        expect(exact).toBe(gptTokenizer.countTokens(text, LITERAL));
+        expect(countGptTokens(text)).toBe(exact);
+        expect(countGptTokensWithinLimit(text, exact)).toBe(exact);
+        expect(countGptTokensWithinLimit(text, exact - 1)).toBeNull();
+      }
+    },
+  );
 
   test("evicts the previous exact token-count memo entry", () => {
     const first = `memo-first-${"a".repeat(257)}`;
@@ -315,13 +366,15 @@ describe("canonical token counting", () => {
   });
 
   // A trim counted an unchanged 19 MB PDF data URL whole, four times before
-  // creating its successor, without returning to the event loop.
+  // creating its successor, without returning to the event loop. Special-token
+  // spellings in the payload count as ordinary text.
   test("counts a large part text exactly, yields to the event loop, and reuses the count for identical text", async () => {
-    const url = `data:application/pdf;base64,${randomBytes(393_216).toString("base64")}`;
+    const url = `data:application/pdf;base64,${O200K_SPECIAL_TOKENS.join("")}${randomBytes(393_216).toString("base64")}${O200K_SPECIAL_TOKENS.join(" ")}`;
     const messages = [
       { ...message("usr_pdf", "user"), parts: [filePart(url)] },
     ];
-    const exact = gptTokenizer.countTokens(url);
+    expect(url.length).toBeGreaterThan(65_536);
+    const exact = gptTokenizer.countTokens(url, LITERAL);
     const encodeSpy = spyOn(gptTokenizer, "encodeGenerator");
     try {
       const order: string[] = [];
@@ -345,21 +398,6 @@ describe("canonical token counting", () => {
     } finally {
       encodeSpy.mockRestore();
     }
-  });
-
-  test("keeps the tokenizer's special-token refusal for a large part text", async () => {
-    const messages = [
-      {
-        ...message("usr_special", "user"),
-        parts: [
-          filePart(`data:text/x-log;base64,${"A".repeat(70_000)}<|endoftext|>`),
-        ],
-      },
-    ];
-
-    await expect(countModelFacingContentTokens(messages)).rejects.toThrow(
-      "Disallowed special token found: <|endoftext|>",
-    );
   });
 
   // gpt-tokenizer 3.4.0 internals; the version is pinned below. Its merge

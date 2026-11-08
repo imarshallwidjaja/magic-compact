@@ -94,6 +94,7 @@ import {
   privateHostError,
   reachableStrings,
   sourceSession,
+  SPECIAL_TOKEN,
   toolItem,
   userMessage,
   type ContextEvent,
@@ -943,7 +944,10 @@ describe("OpenCode 2 endpoint qualification", () => {
 describe("OpenCode 2 trim successors", () => {
   test("imports a verified successor with fresh IDs, current instructions, caches and stats", async () => {
     const state = fakeV2State();
-    const source = sourceSession(state, "ses_src", toolHistory());
+    const history = toolHistory();
+    // A special-token spelling in a user message is ordinary text.
+    Object.assign(history[4]!, { text: `Read it ${SPECIAL_TOKEN}` });
+    const source = sourceSession(state, "ses_src", history);
     state.instructions.set("ses_src", [{ key: "a", value: "ALPHA-v2" }]);
     const before = structuredClone(state.messages.get("ses_src"));
     const host = fakeV2Host(state, new OwnedSessions());
@@ -2726,6 +2730,10 @@ describe("OpenCode 2 compaction", () => {
   test("summarizes each target into its first assistant message and leads the next turn with a boundary", async () => {
     const state = fakeV2State();
     const messages = [...turn(1), ...turn(2), ...turn(3)];
+    // Special-token spellings in a summarized turn and in a kept user message
+    // are ordinary text.
+    Object.assign(messages[0]!, { text: `Request 1 ${SPECIAL_TOKEN}` });
+    Object.assign(messages[6]!, { text: `Request 3 <|im_end|><|im_sep|>` });
     sourceSession(state, "ses_src", messages);
     const owned = new OwnedSessions();
     const host = fakeV2Host(state, owned, echoGeneration());

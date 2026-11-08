@@ -809,15 +809,18 @@ describe("magic trim", () => {
 describe("magic trim task-aware retention", () => {
   test("trims timestamp-disagreeing history twice into faithful successors with unchanged users", async () => {
     const sessionID = `ses_trim_chronology_${randomUUID().replaceAll("-", "")}`;
+    // Tokenizer special-token spellings in stored text are ordinary text.
     const source = [
       message("usr_first", "user", [
-        userText("usr_first", "Keep the exact user request."),
+        userText("usr_first", "Keep the exact user request: <|im_start|>."),
       ]),
       ...Array.from({ length: 6 }, (_, index) =>
         message(
           `ast_${index}`,
           "assistant",
-          index === 5 ? [readTool("read_old", "obsolete listing")] : [],
+          index === 5
+            ? [readTool("read_old", "obsolete <|endoftext|> listing")]
+            : [],
         ),
       ),
     ];
@@ -856,7 +859,7 @@ describe("magic trim task-aware retention", () => {
       expect(successor[0]!.info.time).toEqual(originalUser!.info.time);
       expect(successor[0]!.parts[0]).toMatchObject({
         type: "text",
-        text: "Keep the exact user request.",
+        text: "Keep the exact user request: <|im_start|>.",
       });
       expect((successor[6]!.info as { parentID: string }).parentID).toBe(
         successor[0]!.info.id,

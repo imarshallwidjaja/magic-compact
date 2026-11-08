@@ -5,10 +5,10 @@
 // registry's one-request rule directly, or by the plugin's real `context`
 // hook when a test supplies it.
 import type { SessionInfo } from "@opencode/client";
+import { countTokens } from "gpt-tokenizer";
 import type { V2Host } from "../src/v2/host";
 import type { OwnedSessions } from "../src/v2/owned";
 import type { V2Message } from "../src/v2/session";
-import { countGptTokens } from "../src/stats/tokenize";
 
 export type FakeReply =
   | { text: string }
@@ -150,13 +150,14 @@ export function reachableStrings(value: unknown): string[] {
 // message, a spoofed plugin error name, an uppercase code, an out-of-range
 // status, a response body, custom data, and a nested cause.
 export const PRIVATE_SENTINEL = "PRIVATE_SENTINEL_7F3A";
-// What the tokenizer dependency (gpt-tokenizer 3.4.0) throws for a literal
-// special token: a plain `Error` with no code or other field, so only a mark
-// tells it from an error this plugin raised.
+// A real dependency failure: gpt-tokenizer 3.4.0, called with its default
+// options, refuses a special-token spelling with a plain `Error` that has no
+// code or other field, so only a mark tells it from an error this plugin
+// raised. The plugin itself counts that spelling as ordinary text.
 export const SPECIAL_TOKEN = "<|endoftext|>";
 export function dependencyError(): unknown {
   try {
-    countGptTokens(SPECIAL_TOKEN);
+    countTokens(SPECIAL_TOKEN);
   } catch (error) {
     return error;
   }

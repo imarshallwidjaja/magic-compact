@@ -15,6 +15,7 @@ import { dirname, join } from "node:path";
 import type { Config, PluginInput } from "@opencode-ai/plugin";
 import type { AssistantMessage, Event } from "@opencode-ai/sdk";
 import type { Message, Part, Session, TextPart } from "@opencode-ai/sdk/v2";
+import * as gptTokenizer from "gpt-tokenizer";
 import {
   connectListener,
   createListenerIdentity,
@@ -4730,8 +4731,11 @@ describe("compaction orchestration", () => {
   });
 
   test("prunes exactly, persists retrievable omissions and stats, and verifies final projection", async () => {
-    const output = "large tool output ".repeat(1_000);
+    // Special-token spellings in the request and the output are ordinary text.
+    const output = `${SPECIAL_TOKEN} ${"large tool output ".repeat(1_000)}<|im_start|>`;
     const messages = compactableCommandMessages("success", output);
+    const request = `Explain ${SPECIAL_TOKEN}<|endofprompt|> in this log.`;
+    (messages[0]!.parts[0] as TextPart).text = request;
     const assistantImage = imagePart(
       "success-assistant-image",
       "success-assistant",
@@ -4763,6 +4767,7 @@ describe("compaction orchestration", () => {
     expect(harness.sourceWrites).toEqual([]);
     expect(messages).toEqual(original);
     const successor = harness.successorMessages();
+    expect((successor[0]!.parts[0] as TextPart).text).toBe(request);
     expect(harness.successorInfo()).toMatchObject({
       title: "Source",
       metadata: {
@@ -5710,24 +5715,32 @@ describe("compaction orchestration", () => {
   });
 
   test("never shows a dependency's own error text for a failure inside the command", async () => {
-    // The tokenizer refuses a literal special token in the session's tool
-    // output with a plain Error (gpt-tokenizer 3.4.0), before any session work.
+    // The tokenizer fails with its own plain Error before any session work.
+    const failure = dependencyError();
     const messages = compactableCommandMessages(
-      "special-token",
-      `${SPECIAL_TOKEN} ${"large output ".repeat(1_000)}`,
+      "dependency-error",
+      "large output ".repeat(1_000),
     );
     const before = structuredClone(messages);
     const harness = commandHarness(messages, {
       generationResponse: { turns: [result(1, "Completed.")] },
     });
+    const countSpy = spyOn(gptTokenizer, "countTokens").mockImplementation(
+      () => {
+        throw failure;
+      },
+    );
 
     const error = await executeMagicCompact(
       harness.v2,
       "source",
       0,
       HEURISTIC_OPTIONS,
-    ).catch((caught: unknown) => caught);
+    )
+      .catch((caught: unknown) => caught)
+      .finally(() => countSpy.mockRestore());
 
+    expect(error).toBe(failure);
     expect(String(error)).toContain("Disallowed special token");
     expect(harness.toasts.at(-1)).toMatchObject({
       title: "Magic Compact Failed",

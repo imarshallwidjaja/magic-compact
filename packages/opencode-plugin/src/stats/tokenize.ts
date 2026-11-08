@@ -17,17 +17,21 @@ const installedTokenizerVersion = (
 // 31 s with the cache and 1.7 s without, and three counts of the same 1 MiB
 // took 0.9, 3.6 and 8.3 s. Counts are the same either way.
 setMergeCacheSize(0);
+// Session text is counted as the text it is. Without this option the
+// tokenizer throws on a special-token spelling such as `<|endoftext|>`,
+// which any tool output or user message can contain.
+const LITERAL_TEXT = { disallowedSpecial: new Set<string>() };
 const MAX_EXACT_TOKEN_COUNT_ENTRIES = 1;
 const MAX_EXACT_TOKEN_COUNT_KEY_BYTES = 4_096;
 const exactTokenCounts = new Map<string, number>();
 
 function exactTokenCount(text: string): number {
   if (Buffer.byteLength(text) > MAX_EXACT_TOKEN_COUNT_KEY_BYTES) {
-    return countTokens(text);
+    return countTokens(text, LITERAL_TEXT);
   }
   const cached = exactTokenCounts.get(text);
   if (cached !== undefined) return cached;
-  const count = countTokens(text);
+  const count = countTokens(text, LITERAL_TEXT);
   if (exactTokenCounts.size >= MAX_EXACT_TOKEN_COUNT_ENTRIES) {
     const oldest = exactTokenCounts.keys().next().value;
     if (oldest !== undefined) exactTokenCounts.delete(oldest);
@@ -72,8 +76,8 @@ export async function countGptTokensYielding(text: string): Promise<number> {
   let count = 0;
   let pieces = 0;
   let sliceStart = performance.now();
-  // The same pieces, special-token check and count as `countTokens`.
-  for (const tokens of encodeGenerator(text)) {
+  // The same pieces and count as `countTokens`.
+  for (const tokens of encodeGenerator(text, LITERAL_TEXT)) {
     count += tokens.length;
     if (
       ++pieces % 256 === 0
