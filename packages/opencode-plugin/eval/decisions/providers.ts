@@ -16,6 +16,7 @@ import {
   renderPredicateInstructions,
   RETENTION_BACKENDS,
   RETENTION_ENDPOINT,
+  RETENTION_MODEL,
   type BackendAnswers,
 } from "../../src/retention/backends";
 import {
@@ -33,31 +34,41 @@ import {
 export const PROVIDER_IDS = ["jev", "openai-decisions"] as const;
 export type ProviderID = (typeof PROVIDER_IDS)[number];
 
-export { OPENAI_DECISIONS_ENDPOINT, renderPredicateInstructions };
-
 export const DEFAULT_TIMEOUT_MS = RETENTION_REQUEST_TIMEOUT_MS;
 // OpenAI documents gpt-6-luna as the only Decisions model. Selecting another
 // is refused up front rather than sent to be rejected one case at a time.
-export const OPENAI_DECISIONS_MODELS = [OPENAI_DECISIONS_MODEL] as const;
+const OPENAI_DECISIONS_MODELS = [OPENAI_DECISIONS_MODEL] as const;
 export const OPENAI_TRANSLATION_VERSION = "openai-predicate-1";
 
 export type Usage = { inputTokens?: number; outputTokens?: number };
 
-export type FailureCategory =
-  | "auth"
-  | "rate-limit"
-  | "http"
-  | "timeout"
-  | "network"
-  | "invalid-response"
-  | "model-mismatch";
-
-// A rejected key or an exhausted rate limit affects every remaining request,
-// so the runner stops admitting new ones after either.
-export const FATAL_CATEGORIES: ReadonlySet<FailureCategory> = new Set([
+// Every category a failed request is recorded with; the run record schema
+// derives from this list.
+export const FAILURE_CATEGORIES = [
   "auth",
   "rate-limit",
-]);
+  "http",
+  "timeout",
+  "network",
+  "invalid-response",
+  "model-mismatch",
+] as const;
+export type FailureCategory = (typeof FAILURE_CATEGORIES)[number];
+
+// A rejected key or an exhausted rate limit affects every remaining request,
+// so the runner stops admitting new ones after either and records each
+// unadmitted request as not attempted because of it.
+export const FATAL_CATEGORIES = [
+  "auth",
+  "rate-limit",
+] as const satisfies readonly FailureCategory[];
+export type FatalCategory = (typeof FATAL_CATEGORIES)[number];
+
+export function isFatalCategory(
+  category: FailureCategory,
+): category is FatalCategory {
+  return (FATAL_CATEGORIES as readonly string[]).includes(category);
+}
 
 export type Transport =
   | {
@@ -97,6 +108,13 @@ export type ProviderAdapter = {
   endpoint: string;
   // The only environment variable the CLI reads for this provider.
   keyEnv: string;
+  // The model a run uses without --model, and how --help describes the
+  // models `checkModel` accepts.
+  defaultModel: string;
+  modelHelp: string;
+  // The production backend's cap on the exact wire body, or null where the
+  // provider documents none.
+  bodyByteLimit: number | null;
   // Null when the wire body is the production body with only `model` replaced.
   translation(): { version: string; sha256: string } | null;
   checkModel(model: string): void;
@@ -178,6 +196,9 @@ const jev: ProviderAdapter = {
   id: "jev",
   endpoint: RETENTION_ENDPOINT,
   keyEnv: RETENTION_BACKENDS.jev.keyEnv,
+  defaultModel: RETENTION_MODEL,
+  modelHelp: `a versioned ID (default ${RETENTION_MODEL}); aliases are refused.`,
+  bodyByteLimit: RETENTION_BACKENDS.jev.bodyByteLimit,
   translation: () => null,
   checkModel(model) {
     if (!JEV_VERSION.test(model)) {
@@ -199,6 +220,9 @@ const openaiDecisions: ProviderAdapter = {
   id: "openai-decisions",
   endpoint: OPENAI_DECISIONS_ENDPOINT,
   keyEnv: RETENTION_BACKENDS["openai-decisions"].keyEnv,
+  defaultModel: OPENAI_DECISIONS_MODEL,
+  modelHelp: `${OPENAI_DECISIONS_MODELS.join(", ")} (the only model OpenAI offers).`,
+  bodyByteLimit: RETENTION_BACKENDS["openai-decisions"].bodyByteLimit,
   translation: () => ({
     version: OPENAI_TRANSLATION_VERSION,
     sha256: sha256(

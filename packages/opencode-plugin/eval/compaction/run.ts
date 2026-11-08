@@ -6,25 +6,22 @@
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
-  closeSync,
   existsSync,
-  fsyncSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
-  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
-  writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { COMPACT_COMMAND, COMMAND_DESCRIPTIONS } from "../../src/commands";
+import { MAGIC_COMPACT_SUMMARIZER_AGENT } from "../../src/policy/protocol";
 import {
   defaultCacheRoot,
   PACKAGE_DIR,
@@ -34,13 +31,16 @@ import {
 } from "./artifact";
 import {
   checkCompactionPlans,
+  isRunnablePlan,
   loadCorpus,
+  Sha256Hex,
   type Corpus,
   type CorpusCase,
 } from "./corpus";
 import {
   JUDGE_SYSTEM,
   GRADES_FORMAT,
+  gradedAttempts,
   judgePrompt,
   judgmentProblem,
   outputSha256,
@@ -50,6 +50,7 @@ import {
 import {
   EvalError,
   identifyServer,
+  JUDGE_AGENT,
   readChannel,
   type ChannelLine,
   type EffectiveSetup,
@@ -60,13 +61,24 @@ import {
   type ModelSelector,
   type ServerAuth,
   type ServerIdentity,
-  type SessionLedger,
   type SessionState,
   type Witness,
 } from "./host";
 import { v1Host } from "./host-v1";
 import { v2Host } from "./host-v2";
 import { classifyOutcome, type CommandOutcome } from "./inspect";
+import {
+  isClear,
+  Ledger,
+  outstanding,
+  receiptFor,
+  receiptRequestIds,
+  recordsRun,
+  residue,
+  storageRecord,
+  unresolvedOwnership,
+  type LedgerEntry,
+} from "./ledger";
 import {
   createLocation,
   createRoot,
@@ -76,111 +88,15 @@ import {
   type LocationRole,
   type Owner,
 } from "./scratch";
+import { CONTROL } from "./wrapper/core";
 
 export const RUN_FORMAT = "arkive-compaction-eval-run/1";
-const CONTROL_COMMAND = "arkive-eval-control";
-const SUMMARIZER = "magic-compact-summarizer";
-const JUDGE_AGENT = "arkive-eval-judge";
 const CHANNEL_WAIT_MS = 15_000;
 
 // Bun's fetch may time out a long command request; the eval waits for the
 // command's own outcome instead.
 export const untimedFetch: FetchLike = (input, init) =>
   fetch(input, { ...init, timeout: false } as RequestInit);
-
-export type LedgerEntry = {
-  seq: number;
-  at: string;
-  kind: string;
-  [key: string]: unknown;
-};
-
-// Append-only and flushed per entry, so a crash leaves every intent and
-// returned ID on disk.
-export class Ledger {
-  private seq: number;
-  constructor(readonly path: string) {
-    this.seq = existsSync(path) ? Ledger.read(path).length : 0;
-  }
-  static read(path: string): LedgerEntry[] {
-    return readFileSync(path, "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .map(line => JSON.parse(line) as LedgerEntry);
-  }
-  append(kind: string, fields: Record<string, unknown> = {}): number {
-    const entry = {
-      seq: ++this.seq,
-      at: new Date().toISOString(),
-      kind,
-      ...fields,
-    };
-    const fd = openSync(this.path, "a");
-    try {
-      writeSync(fd, `${JSON.stringify(entry)}\n`);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    return entry.seq;
-  }
-  // Each creation names the intent it fulfils, so a later creation never
-  // settles an earlier intent whose request failed.
-  sessions(attemptId: string | null): SessionLedger {
-    const intents = new Map<string, number>();
-    return {
-      intent: (role, plannedID, title) =>
-        intents.set(
-          role,
-          this.append("session-intent", { attemptId, role, plannedID, title }),
-        ),
-      created: (role, id) =>
-        this.append("session-created", {
-          attemptId,
-          role,
-          id,
-          intentSeq: intents.get(role) ?? null,
-        }),
-      removed: id => this.append("session-removed", { attemptId, id }),
-    };
-  }
-}
-
-// What the ledger leaves open: sessions created and not removed or found
-// absent; session intents with no creation or resolution recorded, whether
-// or not their ID was chosen in advance; and attempts whose command started
-// without a settled outcome, including after a crash that wrote nothing more.
-export function outstanding(entries: LedgerEntry[]) {
-  const gone = new Set(
-    entries
-      .filter(e => e.kind === "session-removed" || e.kind === "session-absent")
-      .map(e => String(e["id"])),
-  );
-  const sessions = entries.filter(
-    e => e.kind === "session-created" && !gone.has(String(e["id"])),
-  );
-  const resolved = new Set(
-    entries
-      .filter(
-        e =>
-          (e.kind === "session-created" && e["intentSeq"] != null)
-          || e.kind === "session-intent-resolved",
-      )
-      .map(e => Number(e["intentSeq"])),
-  );
-  const intents = entries.filter(
-    e => e.kind === "session-intent" && !resolved.has(e.seq),
-  );
-  const settled = new Set(
-    entries
-      .filter(e => e.kind === "attempt-settled")
-      .map(e => String(e["attemptId"])),
-  );
-  const attempts = entries.filter(
-    e => e.kind === "command-start" && !settled.has(String(e["attemptId"])),
-  );
-  return { sessions, intents, attempts };
-}
 
 export type RunOptions = {
   server: string;
@@ -210,13 +126,15 @@ export const ATTEMPT_STATUSES = [
   "delivered",
   "delivered-invalid",
 ] as const;
+export type AttemptStatus = (typeof ATTEMPT_STATUSES)[number];
 
 export type CleanupResult = {
   id: string;
   action: "removed" | "retained" | "absent";
   reason?: string;
-  // For a removed successor: whether the wrapper removed its storage after
-  // the host reported the deletion, and where it was when it did not.
+  // For a successor removed or found gone after its receipt: whether the
+  // wrapper removed its storage after the host reported the deletion, and
+  // where it was when it did not.
   storage?: "removed" | { orphaned: { cache: string; stats: string } | null };
 };
 
@@ -228,7 +146,7 @@ export type AttemptRecord = {
   attemptId: string;
   caseId: string;
   repeat: number;
-  status: (typeof ATTEMPT_STATUSES)[number];
+  status: AttemptStatus;
   skipReason: string | null;
   sourceID: string | null;
   successorID: string | null;
@@ -303,7 +221,7 @@ function usageBetween(
       line.kind === "usage"
       && line.at >= from
       && line.at <= to
-      && (kind === "v2" || line["agent"] === SUMMARIZER)
+      && (kind === "v2" || line["agent"] === MAGIC_COMPACT_SUMMARIZER_AGENT)
     )
       byMessage.set(String(line["messageID"]), line);
   const totals: UsageTotals = {
@@ -444,11 +362,17 @@ function retain(
   return { id, action: "retained", reason };
 }
 
-const controlLine = (ctx: RunContext, requestId: string, phases: string[]) =>
+const controlLine = (
+  ctx: RunContext,
+  requestId: string,
+  phases: string[],
+  sessionID: string,
+) =>
   readChannel(ctx.channel, ctx.runNonce).find(
     l =>
       l.kind === "control"
       && l["requestId"] === requestId
+      && l["sessionID"] === sessionID
       && phases.includes(String(l["phase"])),
   );
 
@@ -457,7 +381,9 @@ const controlLine = (ctx: RunContext, requestId: string, phases: string[]) =>
 // session is removed under the same checks as any other, and the wrapper
 // removes the storage only once the host reports the deletion. A successor
 // the run keeps keeps its storage; a deletion whose storage removal is not
-// confirmed reports the storage paths left behind.
+// confirmed reports the storage paths left behind. A successor found gone
+// after its receipt, deleted by another writer, is settled the same way:
+// the wrapper removes the storage for that deletion too.
 export async function removeSuccessor(
   ctx: RunContext,
   id: string,
@@ -465,6 +391,18 @@ export async function removeSuccessor(
   expected: ExpectedState | null,
   attemptId: string | null,
 ): Promise<CleanupResult> {
+  let exists: boolean;
+  try {
+    exists = (await ctx.host.pending(ctx.project, id)).exists;
+  } catch (error) {
+    return retain(
+      ctx,
+      id,
+      attemptId,
+      `ownership check failed: ${message(error)}`,
+    );
+  }
+  if (!exists) return settleGoneSuccessor(ctx, id, attemptId);
   if (!expected)
     return retain(ctx, id, attemptId, "no recorded state to compare");
   const requestId = randomBytes(12).toString("hex");
@@ -476,13 +414,14 @@ export async function removeSuccessor(
   await ctx.host.runCommand(
     ctx.project,
     id,
-    CONTROL_COMMAND,
+    CONTROL,
     JSON.stringify({ runNonce: ctx.runNonce, requestId, sourceID }),
   );
   const receipt = await waitFor(
-    () => controlLine(ctx, requestId, ["prepared", "refused"]),
+    () => controlLine(ctx, requestId, ["prepared", "refused"], id),
     CHANNEL_WAIT_MS,
   );
+  if (receipt) recordReceipt(ctx, attemptId, id, receipt);
   if (receipt?.["phase"] !== "prepared")
     return retain(
       ctx,
@@ -491,21 +430,80 @@ export async function removeSuccessor(
       `the wrapper did not confirm the successor is this run's${receipt ? ` (${String(receipt["reason"])})` : ""}`,
     );
   const result = await removeOwned(ctx, ctx.project, id, expected, attemptId);
-  if (result.action !== "removed") return result;
+  if (result.action === "retained") return result;
   const storage = await waitFor(
-    () => controlLine(ctx, requestId, ["storage"]),
+    () => controlLine(ctx, requestId, ["storage"], id),
     CHANNEL_WAIT_MS,
   );
   if (storage?.["removed"] === true) {
     ctx.ledger.append("storage-removed", { attemptId, id, requestId });
     return { ...result, storage: "removed" };
   }
-  const paths = (receipt["paths"] ?? null) as {
-    cache: string;
-    stats: string;
-  } | null;
+  const paths = receiptPaths(receipt);
   ctx.ledger.append("storage-orphaned", { attemptId, id, requestId, paths });
   return { ...result, storage: { orphaned: paths } };
+}
+
+const receiptPaths = (line: ChannelLine) =>
+  (line["paths"] ?? null) as { cache: string; stats: string } | null;
+
+// The wrapper's answer to one receipt request, as the channel shows it.
+function recordReceipt(
+  ctx: RunContext,
+  attemptId: string | null,
+  id: string,
+  line: ChannelLine,
+  reconciled?: true,
+) {
+  ctx.ledger.append("storage-receipt", {
+    attemptId,
+    id,
+    requestId: line["requestId"],
+    phase: line["phase"],
+    ...(line["phase"] === "prepared"
+      ? { paths: receiptPaths(line) }
+      : { reason: line["reason"] ?? null }),
+    ...(reconciled ? { reconciled } : {}),
+  });
+}
+
+// A successor that is already gone takes no new receipt request, because no
+// command can run inside it; this is how a removal that succeeded but could
+// not be recorded is settled later. Its absence counts only while the server
+// process that created it answers, and is recorded only from a receipt the
+// wrapper prepared for it earlier, which says which storage the deletion
+// released. Without one, nothing can confirm or remove its storage, so the
+// successor stays the run's and is reported.
+async function settleGoneSuccessor(
+  ctx: RunContext,
+  id: string,
+  attemptId: string | null,
+): Promise<CleanupResult> {
+  const problem = await serverProblem(ctx);
+  if (problem)
+    return retain(ctx, id, attemptId, `absence not proven: ${problem}`);
+  importChannel(ctx);
+  const receipt = receiptFor(Ledger.read(ctx.ledger.path), id);
+  if (!receipt?.prepared)
+    return retain(
+      ctx,
+      id,
+      attemptId,
+      "the successor is gone, but the wrapper prepared no receipt for its storage, so nothing can confirm that storage was removed",
+    );
+  ctx.ledger.append("session-absent", { attemptId, id });
+  importChannel(ctx);
+  const entries = Ledger.read(ctx.ledger.path);
+  if (storageRecord(entries, id, receipt, "storage-removed"))
+    return { id, action: "absent", storage: "removed" };
+  if (!storageRecord(entries, id, receipt, "storage-orphaned"))
+    ctx.ledger.append("storage-orphaned", {
+      attemptId,
+      id,
+      requestId: receipt.requestId,
+      paths: receipt.paths,
+    });
+  return { id, action: "absent", storage: { orphaned: receipt.paths } };
 }
 
 // A successor's state can authorize its removal only when the same read
@@ -539,10 +537,30 @@ function recordVerifiedSuccessor(
   });
 }
 
-// A kept successor can later be verified, and its storage removed, only
-// against its source, so the source stays with it.
+// An attempt's source goes only once its successor, if it has one, is no
+// longer the run's: a kept successor can later be verified, and its storage
+// removed, only against that source. Both a run and `cleanup` therefore
+// settle an attempt's successor before its source.
 const SOURCE_OF_KEPT_SUCCESSOR =
   "its successor is kept, and only this source can verify it later";
+async function removeSource(
+  ctx: RunContext,
+  directory: string,
+  id: string,
+  expected: ExpectedState | null,
+  attemptId: string | null,
+): Promise<CleanupResult> {
+  const successorKept = outstanding(Ledger.read(ctx.ledger.path)).sessions.some(
+    e => e["role"] === "successor" && e["attemptId"] === attemptId,
+  );
+  return successorKept
+    ? retain(ctx, id, attemptId, SOURCE_OF_KEPT_SUCCESSOR)
+    : removeOwned(ctx, directory, id, expected, attemptId);
+}
+
+const attemptIdOf = (repeat: number, caseId: string) => `r${repeat}-${caseId}`;
+const caseOfAttempt = (attemptId: string) =>
+  /^r\d+-(.+)$/u.exec(attemptId)?.[1];
 
 const sourceTitle = (runNonce: string, attemptId: string) =>
   `arkive compaction eval ${runNonce} ${attemptId}`;
@@ -554,7 +572,7 @@ export async function runAttempt(
   model: ModelSelector,
   descriptor: ModelDescriptor,
 ): Promise<AttemptRecord> {
-  const attemptId = `r${repeat}-${corpusCase.id}`;
+  const attemptId = attemptIdOf(repeat, corpusCase.id);
   const record: AttemptRecord = {
     runNonce: ctx.runNonce,
     model: model.selector,
@@ -706,7 +724,6 @@ export async function runAttempt(
     record.error = `source reread failed: ${message(error)}`;
   }
 
-  let successorKept = false;
   if (record.successorID) {
     let verified: SessionState | null = null;
     try {
@@ -732,21 +749,20 @@ export async function runAttempt(
         sourceState: before,
         outputSha256: record.outputSha256,
       });
-      const removal = await removeSuccessor(
-        ctx,
-        record.successorID,
-        sourceID,
-        verified,
-        attemptId,
+      record.cleanup.push(
+        await removeSuccessor(
+          ctx,
+          record.successorID,
+          sourceID,
+          verified,
+          attemptId,
+        ),
       );
-      record.cleanup.push(removal);
-      successorKept = removal.action === "retained";
     } else {
       // What was read is not known to be only the product's output, so it
       // never becomes a removal baseline: the successor, its storage and
       // the location stay.
       record.status = "delivered-invalid";
-      successorKept = true;
       record.cleanup.push(
         retain(
           ctx,
@@ -758,9 +774,7 @@ export async function runAttempt(
     }
   }
   record.cleanup.push(
-    successorKept
-      ? retain(ctx, sourceID, attemptId, SOURCE_OF_KEPT_SUCCESSOR)
-      : await removeOwned(ctx, ctx.project, sourceID, before, attemptId),
+    await removeSource(ctx, ctx.project, sourceID, before, attemptId),
   );
   return record;
 }
@@ -807,7 +821,7 @@ export function preflightProblems(input: {
     problems.push(
       `expected exactly one Arkive plugin in the eval project, found ${arkivePlugins.length}: ${arkivePlugins.join(", ")}`,
     );
-  for (const name of [...Object.keys(COMMAND_DESCRIPTIONS), CONTROL_COMMAND])
+  for (const name of [...Object.keys(COMMAND_DESCRIPTIONS), CONTROL])
     if (!setup.commands.includes(name))
       problems.push(`command ${name} is missing`);
   const wanted = `${model.providerID}/${model.modelID}`;
@@ -874,17 +888,9 @@ export async function runEval(options: RunOptions): Promise<RunResult> {
   if (!existsSync(dirname(requestedOut)))
     throw new EvalError(`The parent of --out ${requestedOut} does not exist.`);
   const corpus = loadCorpus();
-  const plans = await checkCompactionPlans(corpus);
-  if (
-    plans.some(
-      p =>
-        p.v1.targets !== 1
-        || p.v2.targets !== 1
-        || p.v1.candidates + p.v2.candidates > 0,
-    )
-  )
+  if (!(await checkCompactionPlans(corpus)).every(isRunnablePlan))
     throw new EvalError(
-      "The corpus no longer plans one retention-free target per case; run `check`.",
+      "The corpus no longer plans one retention-free target and one preserved turn per case; run `check`.",
     );
   const selected = options.cases
     ? options.cases.map(id => {
@@ -1088,7 +1094,7 @@ export async function runEval(options: RunOptions): Promise<RunResult> {
       for (let repeat = 1; repeat <= options.repeat && !stopping; repeat++) {
         for (const corpusCase of selected) {
           if (stopping) break;
-          log(`attempt r${repeat}-${corpusCase.id} ...`);
+          log(`attempt ${attemptIdOf(repeat, corpusCase.id)} ...`);
           const record = await runAttempt(
             ctx,
             corpusCase,
@@ -1132,11 +1138,71 @@ export async function runEval(options: RunOptions): Promise<RunResult> {
   return { out, attempts, status };
 }
 
+// Records what the wrapper wrote to this run's channel about the ledger's
+// own receipt requests after the run stopped waiting or could not record it:
+// the answer to each request with none recorded, and each storage removal it
+// confirmed for unconfirmed storage. Only a line for the exact session and
+// one of the requests its receipt may be held under counts. Storage is never
+// removed here; once the session is gone only the wrapper's own receipt can
+// remove it.
+function importChannel(ctx: RunContext) {
+  const entries = Ledger.read(ctx.ledger.path);
+  const answered = new Set(
+    entries
+      .filter(e => e.kind === "storage-receipt")
+      .map(e => String(e["requestId"])),
+  );
+  const unanswered = entries.filter(
+    e =>
+      e.kind === "storage-receipt-request"
+      && !answered.has(String(e["requestId"])),
+  );
+  const unconfirmed = outstanding(entries).storage;
+  if (!unanswered.length && !unconfirmed.length) return;
+  const lines = readChannel(ctx.channel, ctx.runNonce).filter(
+    l => l.kind === "control",
+  );
+  for (const request of unanswered) {
+    const line = lines.find(
+      l =>
+        l["requestId"] === request["requestId"]
+        && l["sessionID"] === request["id"]
+        && (l["phase"] === "prepared" || l["phase"] === "refused"),
+    );
+    if (line)
+      recordReceipt(
+        ctx,
+        request["attemptId"] == null ? null : String(request["attemptId"]),
+        String(request["id"]),
+        line,
+        true,
+      );
+  }
+  for (const storage of outstanding(Ledger.read(ctx.ledger.path)).storage) {
+    const requests = receiptRequestIds(storage);
+    const line = lines.find(
+      l =>
+        l["phase"] === "storage"
+        && requests.includes(String(l["requestId"]))
+        && l["sessionID"] === storage.id
+        && l["removed"] === true,
+    );
+    if (line)
+      ctx.ledger.append("storage-removed", {
+        attemptId: storage.attemptId,
+        id: storage.id,
+        requestId: line["requestId"],
+        reconciled: true,
+      });
+  }
+}
+
 // Disposes each owned location and deletes the scratch tree, only when the
-// ledger leaves nothing open, the root and every location prove ownership by
-// their markers, and the host lists no session at any of them. Otherwise
-// nothing is disposed or deleted, so retained or unknown sessions keep their
-// location, config and wrapper for a later `cleanup`.
+// whole ledger leaves nothing open, the root and every location prove
+// ownership by their markers, and the host lists no session at any of them.
+// Otherwise nothing is disposed or deleted, so retained or unknown sessions
+// keep their location, config and wrapper for a later `cleanup`, and the
+// wrapper that holds a receipt for unconfirmed storage stays loaded.
 async function disposeLocations(
   ctx: RunContext,
   owner: Owner,
@@ -1147,10 +1213,10 @@ async function disposeLocations(
     ctx.ledger.append("scratch-kept", { directory: root, reason, ...extra });
     return { scratchRemoved: false, reason, locations: [] };
   };
-  const open = outstanding(Ledger.read(ctx.ledger.path));
-  if (open.sessions.length + open.intents.length + open.attempts.length > 0)
+  importChannel(ctx);
+  if (!isClear(residue(Ledger.read(ctx.ledger.path))))
     return keep(
-      "the run still owns sessions, unresolved session intents or attempts with an unknown outcome",
+      "the run still owns sessions, unresolved session intents, attempts with an unknown outcome or successor storage whose removal is not confirmed",
     );
   const problem =
     rootProblem(root, owner)
@@ -1217,13 +1283,7 @@ async function gradeWithJudge(
 ) {
   const items: GradesFile["items"] = [];
   const results: Array<Record<string, unknown>> = [];
-  for (const attempt of attempts) {
-    if (
-      !attempt.capsule
-      || !attempt.outputSha256
-      || attempt.status !== "delivered"
-    )
-      continue;
+  for (const attempt of gradedAttempts(attempts)) {
     const corpusCase = ctx.corpus.cases.find(c => c.id === attempt.caseId)!;
     const blindID = randomBytes(8).toString("hex");
     ctx.log(`judge ${blindID} ...`);
@@ -1318,7 +1378,6 @@ async function gradeWithJudge(
 
 // --- saved runs ------------------------------------------------------------
 
-const Hex = z.string().regex(/^[0-9a-f]{64}$/u);
 const RunHeaderSchema = z.looseObject({
   format: z.literal(RUN_FORMAT),
   runNonce: z.string().regex(/^[0-9a-f]{32}$/u),
@@ -1331,9 +1390,9 @@ const RunHeaderSchema = z.looseObject({
   }),
   corpus: z.strictObject({
     id: z.string(),
-    sha256: Hex,
+    sha256: Sha256Hex,
     rubricId: z.string(),
-    rubricSha256: Hex,
+    rubricSha256: Sha256Hex,
   }),
   requested: z.looseObject({
     model: z.string(),
@@ -1357,7 +1416,7 @@ const AttemptSchema = z.looseObject({
   successorChecks: Checks,
   sourceUnchanged: z.boolean().nullable(),
   capsule: z.string().nullable(),
-  outputSha256: Hex.nullable(),
+  outputSha256: Sha256Hex.nullable(),
   cleanup: z.array(z.looseObject({ id: z.string() })),
 });
 
@@ -1408,11 +1467,12 @@ export function readRun(dir: string, corpus: Corpus = loadCorpus()) {
   const attemptFiles = existsSync(attemptsDir)
     ? readdirSync(attemptsDir).sort()
     : [];
+  // Without a ledger no attempt may name a session, and `ledger` is null:
+  // what such a run owns is unknown, since a creation that failed before its
+  // ID returned can still have left a session. A ledger that is not intact
+  // refuses the run.
   const ledgerPath = join(dir, "ledger.jsonl");
-  const ledger =
-    attemptFiles.length && existsSync(ledgerPath)
-      ? Ledger.read(ledgerPath)
-      : [];
+  const ledger = existsSync(ledgerPath) ? Ledger.read(ledgerPath) : null;
   const attempts: AttemptRecord[] = [];
   for (const name of attemptFiles) {
     const parsed = AttemptSchema.safeParse(
@@ -1425,7 +1485,7 @@ export function readRun(dir: string, corpus: Corpus = loadCorpus()) {
     const a = parsed.data!;
     if (
       name !== `${a.attemptId}.json`
-      || a.attemptId !== `r${a.repeat}-${a.caseId}`
+      || a.attemptId !== attemptIdOf(a.repeat, a.caseId)
     )
       fail(`attempts/${name} names another attempt`);
     if (a.runNonce !== run.runNonce || a.model !== run.requested.model)
@@ -1438,7 +1498,7 @@ export function readRun(dir: string, corpus: Corpus = loadCorpus()) {
     ] as const)
       if (
         id !== null
-        && !ledger.some(
+        && !ledger?.some(
           e =>
             e.kind === "session-created"
             && e["id"] === id
@@ -1471,6 +1531,7 @@ export function readRun(dir: string, corpus: Corpus = loadCorpus()) {
     preflight: read("preflight.json"),
     results: read("results.json"),
     attempts,
+    ledger,
   };
 }
 
@@ -1520,10 +1581,21 @@ export async function gradeRunWithJudge(options: {
   const log = options.log ?? (line => console.error(line));
   const corpus = loadCorpus();
   const { run, attempts } = readRun(options.dir, corpus);
+  // The judge's root and sessions join what the run owns, so they are
+  // recorded only in the ledger the run wrote. Read before the check, so a
+  // ledger replaced after it fails the append check.
+  const ledgerPath = join(options.dir, "ledger.jsonl");
+  const ledger = new Ledger(ledgerPath);
+  if (
+    !existsSync(ledgerPath)
+    || !recordsRun(Ledger.read(ledgerPath), run.runNonce)
+  )
+    throw new EvalError(
+      `${options.dir} has no ledger written by its run, so what the run owns is unknown and a judge's sessions could not be recorded with it. Nothing was changed; grades can still be imported with --import.`,
+    );
   const fetchImpl = options.fetch ?? untimedFetch;
   const identity = await sameServer(run, options, fetchImpl);
   const host = makeHost(identity, { ...options, fetch: fetchImpl });
-  const ledger = new Ledger(join(options.dir, "ledger.jsonl"));
   const owner = ownerOf(options.dir, run);
   const root = createRoot(owner, "judge");
   ledger.append("scratch-root", { directory: root });
@@ -1601,7 +1673,7 @@ function entryExists(path: string): boolean {
 // location's session list shows exactly one session with its title, or
 // none. A successor registered this way is removable only when it passes
 // every mechanical check against its unchanged source, which pins down its
-// whole content.
+// whole content. A storage removal the wrapper confirmed late is recorded.
 export async function cleanupRun(options: {
   dir: string;
   server: string;
@@ -1613,13 +1685,18 @@ export async function cleanupRun(options: {
 }) {
   const log = options.log ?? (line => console.error(line));
   const run = readRunHeader(options.dir);
+  const ledgerPath = join(options.dir, "ledger.jsonl");
+  // A ledger that is missing or not intact refuses before anything is sent.
+  const ledger = new Ledger(ledgerPath);
+  if (!existsSync(ledgerPath))
+    throw new EvalError(
+      `${options.dir} has no ledger, so what the run owns is unknown and nothing can be reconciled. Nothing was changed; review the host's sessions by hand.`,
+    );
   const fetchImpl = options.fetch ?? untimedFetch;
   const identity = await sameServer(run, options, fetchImpl);
   const host =
     options.host ?? makeHost(identity, { ...options, fetch: fetchImpl });
   const owner = ownerOf(options.dir, run);
-  const ledgerPath = join(options.dir, "ledger.jsonl");
-  const ledger = new Ledger(ledgerPath);
   const channel = join(options.dir, "channel");
   const corpus = loadCorpus();
   const first = Ledger.read(ledgerPath);
@@ -1795,16 +1872,14 @@ export async function cleanupRun(options: {
     }
   }
 
-  let all = Ledger.read(ledgerPath);
+  const all = Ledger.read(ledgerPath);
   // A successor's removal baseline is only a state recorded as verified;
   // any other session's is the state recorded when the run validated it.
   const snapshotOf = (
     id: string,
     kinds: string[] = ["source-snapshot", "judge-snapshot"],
   ): ExpectedState | null => {
-    const entry = [...all]
-      .reverse()
-      .find(e => kinds.includes(e.kind) && e["id"] === id);
+    const entry = all.findLast(e => kinds.includes(e.kind) && e["id"] === id);
     return entry
       ? {
           headerSha256: String(entry["headerSha256"]),
@@ -1817,88 +1892,77 @@ export async function cleanupRun(options: {
   );
   const sourceOf = (attemptId: string) =>
     all.find(e => e.kind === "command-start" && e["attemptId"] === attemptId);
-
-  const results: CleanupResult[] = [];
-  // Attempts whose successor stays; their source stays with it.
-  const keptSuccessor = new Set<string>();
-  // Successors first: their storage removal runs through the wrapper, which
-  // the project location loads, and their removal needs the source.
-  const created = outstanding(all).sessions.sort(
-    (a, b) =>
-      Number(b["role"] === "successor") - Number(a["role"] === "successor"),
-  );
-  for (const entry of created) {
+  // A session is read for removal only at a location that proves ownership,
+  // while the server process that created it answers, and once its
+  // attempt's outcome is known.
+  const settle = async (
+    entry: LedgerEntry,
+    attemptId: string | null,
+  ): Promise<CleanupResult> => {
     const id = String(entry["id"]);
-    const attemptId =
-      entry["attemptId"] == null ? null : String(entry["attemptId"]);
     const directory = locationOf(all, entry);
-    if (!directory) {
-      results.push(
-        retain(
-          ctx,
-          id,
-          attemptId,
-          "its eval location does not prove ownership",
-        ),
+    if (!directory)
+      return retain(
+        ctx,
+        id,
+        attemptId,
+        "its eval location does not prove ownership",
       );
-      continue;
-    }
     const notProven = unproven(dirname(directory));
-    if (notProven) {
-      results.push(
-        retain(ctx, id, attemptId, `server identity not proven: ${notProven}`),
+    if (notProven)
+      return retain(
+        ctx,
+        id,
+        attemptId,
+        `server identity not proven: ${notProven}`,
       );
-      continue;
-    }
-    if (attemptId && unsettled.has(attemptId)) {
-      results.push(
-        retain(ctx, id, attemptId, "its attempt's outcome is unknown"),
-      );
-      continue;
-    }
+    if (attemptId && unsettled.has(attemptId))
+      return retain(ctx, id, attemptId, "its attempt's outcome is unknown");
     const bound = rootCtx(dirname(directory));
-    if (
-      entry["role"] === "source"
-      && attemptId
-      && keptSuccessor.has(attemptId)
-    ) {
-      results.push(retain(ctx, id, attemptId, SOURCE_OF_KEPT_SUCCESSOR));
-      continue;
-    }
-    if (entry["role"] !== "successor") {
-      results.push(
-        await removeOwned(bound, directory, id, snapshotOf(id), attemptId),
-      );
-      continue;
-    }
+    if (entry["role"] === "source")
+      return removeSource(bound, directory, id, snapshotOf(id), attemptId);
+    if (entry["role"] !== "successor")
+      return removeOwned(bound, directory, id, snapshotOf(id), attemptId);
     const sourceID = String(sourceOf(attemptId ?? "")?.["sourceID"] ?? "");
-    let expected = snapshotOf(id, ["successor-verified"]);
-    if (!expected)
-      expected = await reconciledSuccessor(bound, directory, id, sourceID, {
+    const expected =
+      snapshotOf(id, ["successor-verified"])
+      ?? (await reconciledSuccessor(bound, directory, id, sourceID, {
         attemptId,
         sourceSnapshot: snapshotOf(sourceID, ["source-snapshot"]),
-      });
-    const removal = await removeSuccessor(
-      bound,
-      id,
-      sourceID,
-      expected,
-      attemptId,
-    );
-    results.push(removal);
-    if (removal.action === "retained" && attemptId)
-      keptSuccessor.add(attemptId);
-    all = Ledger.read(ledgerPath);
-  }
+      }));
+    return removeSuccessor(bound, id, sourceID, expected, attemptId);
+  };
 
+  const results: CleanupResult[] = [];
+  const attempts = new Map<string | null, LedgerEntry[]>();
+  for (const entry of outstanding(all).sessions) {
+    const attemptId =
+      entry["attemptId"] == null ? null : String(entry["attemptId"]);
+    attempts.set(attemptId, [...(attempts.get(attemptId) ?? []), entry]);
+  }
+  // Each attempt's successor before the rest of its sessions: the source
+  // that verifies it stays while the successor is kept.
+  for (const [attemptId, entries] of attempts)
+    for (const entry of [
+      ...entries.filter(e => e["role"] === "successor"),
+      ...entries.filter(e => e["role"] !== "successor"),
+    ])
+      results.push(await settle(entry, attemptId));
+
+  importChannel(ctx);
   const after = Ledger.read(ledgerPath);
+  const kept = new Set(unresolvedOwnership(after).map(u => u.directory));
   const disposal = [];
   for (const root of roots) {
     const problem = rootProblem(root, owner);
     if (problem) {
-      // A root that is gone was cleaned. Anything else at its path stays,
-      // untouched, and fails the cleanup.
-      if (entryExists(root)) {
+      // A root that is gone was cleaned, which resolves an earlier decision
+      // to keep it. Anything else at its path stays, untouched, and fails
+      // the cleanup.
+      if (!entryExists(root)) {
+        if (kept.has(root))
+          ctx.ledger.append("scratch-absent", { directory: root });
+      } else {
         const reason = `ownership not proven: ${problem}`;
         ctx.ledger.append("scratch-kept", { directory: root, reason });
         disposal.push({
@@ -1945,17 +2009,20 @@ export async function cleanupRun(options: {
       ...(await disposeLocations(rootCtx(root), owner, root, locations)),
     });
   }
-  const open = outstanding(Ledger.read(ledgerPath));
+  const final = Ledger.read(ledgerPath);
+  const left = residue(final);
+  // A ledger the run did not write settles what it recorded, never the run.
+  const ownershipKnown = recordsRun(final, run.runNonce);
   const summary = {
     sessions: results,
     disposal,
-    stillOwned: open.sessions.map(e => e["id"]),
-    unknownOutcomes: open.attempts.map(e => e["attemptId"]),
-    unresolvedIntents: open.intents.map(e => ({
-      attemptId: e["attemptId"],
-      role: e["role"],
-      plannedID: e["plannedID"],
-    })),
+    stillOwned: left.sessions.map(s => s.id),
+    unconfirmedStorage: left.storage,
+    unknownOutcomes: left.unknownOutcomes,
+    unresolvedIntents: left.unresolvedIntents,
+    ownershipKnown,
+    complete:
+      ownershipKnown && isClear(left) && disposal.every(d => d.scratchRemoved),
   };
   log(JSON.stringify(summary, null, 2));
   return summary;
@@ -1972,7 +2039,7 @@ async function reconciledSuccessor(
   sourceID: string,
   facts: { attemptId: string | null; sourceSnapshot: ExpectedState | null },
 ): Promise<ExpectedState | null> {
-  const caseId = facts.attemptId?.replace(/^r\d+-/u, "");
+  const caseId = facts.attemptId && caseOfAttempt(facts.attemptId);
   const corpusCase = ctx.corpus.cases.find(c => c.id === caseId);
   if (!facts.sourceSnapshot || !corpusCase) return null;
   try {

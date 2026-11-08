@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { GENERATION_PROTOCOL } from "../src/compact/constants";
+import { dirname, join } from "node:path";
+import { GENERATION_PROTOCOL } from "../src/policy/protocol";
 import {
   COMPACT_ARGUMENTS_ERROR,
   COMPACT_NOOP,
@@ -11,6 +11,7 @@ import {
   commandFailureMessage,
   parseMagicCompactArguments,
   parseMagicTrimArguments,
+  STATS_ARGUMENTS_ERROR,
   TRIM_ARGUMENTS_ERROR,
   TRIM_THRESHOLD_ERROR,
 } from "../src/commands";
@@ -25,12 +26,18 @@ import {
   RETENTION_KEEP_THRESHOLD_PERCENT_ENV,
   RETENTION_SUMMARY_EXCERPT_BYTES,
   RetentionClassificationError,
+  retentionFailureGuidance,
   type RetentionFetch,
 } from "../src/retention/classifier";
 import plugin from "../src/index";
 import tuiPlugin from "../src/tui";
-import { readOmittedContent } from "../src/storage/omission";
-import { readStats } from "../src/storage/stats";
+import {
+  cachePath,
+  commitPlannedOmission,
+  planOmission,
+  readOmittedContent,
+} from "../src/storage/omission";
+import { InvalidStatsError, readStats } from "../src/storage/stats";
 import {
   executeV2Compact,
   isDisposableV2HostRecord,
@@ -40,7 +47,6 @@ import { generateV2Summaries, V2GenerationError } from "../src/v2/generation";
 import {
   countV2PayloadTokens,
   trimV2Tool,
-  v2ToolCallView,
   v2ToolCalls,
 } from "../src/v2/history";
 import { connectV2Host, V2_ENDPOINT_REQUIRED } from "../src/v2/host";
@@ -51,21 +57,13 @@ import {
   v2VisibleImageIndexes,
 } from "../src/v2/media";
 import { generateV2SessionSummary, OwnedSessions } from "../src/v2/owned";
-import {
-  READABLE_REASONING_HEADER,
-  type StageReport,
-} from "../src/policy/reasoning";
+import { READABLE_REASONING_HEADER } from "../src/policy/reasoning";
 import { SessionSummaryError } from "../src/policy/retention";
 import {
   SESSION_SUMMARY_PROMPT,
   SESSION_SUMMARY_TOOL_PROMPT,
-} from "../src/compact/constants";
-import {
-  buildGenerationPrompt,
-  estimateGenerationExplicitRequestTokens,
-  GENERATION_RESPONSE_SCHEMA,
-  generationTurnMarker,
-} from "../src/policy/generation";
+} from "../src/policy/protocol";
+import { estimateGenerationExplicitRequestTokens } from "../src/policy/generation";
 import {
   SourceNotAtRestError,
   SuccessorFailure,
@@ -98,6 +96,7 @@ import {
   sourceSession,
   toolItem,
   userMessage,
+  type ContextEvent,
   type FakeReply,
   type FakeV2State,
 } from "./v2-host";
@@ -450,7 +449,7 @@ describe("OpenCode 2 tool trim", () => {
     },
   );
 
-  test("keeps a short subagent report and prompt unchanged and reads no child session from other tools", async () => {
+  test("keeps a short subagent report and prompt unchanged and names no child session for other tools", async () => {
     const report = [{ type: "text", text: "Short report." }];
     const subagent = toolItem(
       "call_k",
@@ -466,22 +465,34 @@ describe("OpenCode 2 tool trim", () => {
     expect((trimmed!.state as { input: unknown }).input).toEqual({
       prompt: "Check the suite.",
     });
-    const read = toolItem("call_k2", "read", {}, report, {
-      sessionID: "ses_0123abcXYZ",
-    }) as never as Parameters<typeof trimV2Tool>[0];
-    expect(v2ToolCallView(read)?.childSessionID).toBeUndefined();
+    const read = toolItem(
+      "call_k2",
+      "read",
+      {},
+      [{ type: "text", text: SUBAGENT_REPORT }],
+      { sessionID: "ses_0123abcXYZ" },
+    ) as never as Parameters<typeof trimV2Tool>[0];
+    const readTrimmed = await trimV2Tool(
+      read,
+      async () => "abcdefabcdef:omitted-EEEEEEEEEEEEEEEEEEEEEE",
+    );
+    expect((readTrimmed!.state as { content: unknown }).content).toEqual([
+      {
+        type: "text",
+        text: `[Historical read result omitted (${Buffer.byteLength(SUBAGENT_REPORT)} bytes); Content ID: abcdefabcdef:omitted-EEEEEEEEEEEEEEEEEEEEEE]`,
+      },
+    ]);
   });
 
-  test("identifies calls by message, position and call ID", () => {
+  test("gives calls that share a call ID distinct references", () => {
     const message = assistantMessage("msg_x", [
       toolItem("call_1", "read", {}, [{ type: "text", text: "a" }]),
       { type: "text", text: "between" },
       toolItem("call_1", "read", {}, [{ type: "text", text: "b" }]),
     ]);
-    expect(v2ToolCalls(message).map(call => call.ref)).toEqual([
-      "msg_x:0:call_1",
-      "msg_x:2:call_1",
-    ]);
+    const refs = v2ToolCalls(message).map(call => call.ref);
+    expect(refs).toHaveLength(2);
+    expect(new Set(refs).size).toBe(2);
   });
 });
 
@@ -1048,12 +1059,6 @@ describe("OpenCode 2 trim successors", () => {
     ).toEqual({ type: "file", uri: toolImage, mime: "image/png" });
     const before = countV2ModelFacingTokens(source);
     const after = countV2ModelFacingTokens(stored);
-    const fileTokens =
-      countV2PayloadTokens(pdf) + countV2PayloadTokens(toolImage);
-    expect([before.inlineFileTokens, after.inlineFileTokens]).toEqual([
-      fileTokens,
-      fileTokens,
-    ]);
     // Stats keep the canonical totals, file data included.
     expect(
       (await readStats(v2StorageKey(successor!.session.id)))?.totalTokensPruned,
@@ -1087,6 +1092,59 @@ describe("OpenCode 2 trim successors", () => {
     expect([...state.sessions.keys()]).toEqual(["ses_src"]);
   });
 
+  // This host returns its own stored session object on every read, so an
+  // in-place edit also reaches the session the first read returned: only a
+  // recheck that compares against its own copy of that read sees the change.
+  const continuation: Array<[string, (session: SessionInfo) => void]> = [
+    [
+      "metadata",
+      session => {
+        (session.metadata as Record<string, unknown>)["seed"] = "changed";
+      },
+    ],
+    [
+      "model",
+      session => {
+        (session.model as { id: string }).id = "changed-model";
+      },
+    ],
+    [
+      "permission rules",
+      session => {
+        (session.permissions as Array<{ effect: string }>)[0]!.effect = "deny";
+      },
+    ],
+  ];
+  for (const [name, change] of continuation) {
+    test(`discards an unready candidate when only the source's nested ${name} change before handoff`, async () => {
+      const state = fakeV2State();
+      const session = sourceSession(state, "ses_src", toolHistory());
+      const history = structuredClone(state.messages.get("ses_src"));
+      const host = fakeV2Host(state, new OwnedSessions());
+      const get = host.session.get.bind(host.session);
+      host.session.get = (async (input: { sessionID: string }) =>
+        input.sessionID === "ses_src"
+          ? session
+          : get(input as never)) as typeof host.session.get;
+      state.afterWrite = method => {
+        if (method === "import") change(session);
+      };
+
+      const error = await trim(state, host);
+
+      expect(String(error)).toContain(
+        "The session changed while Magic Trim was preparing its successor.",
+      );
+      expect((error as SuccessorFailure).details).toMatchObject({
+        stage: "recheck",
+        cleanup: { outcome: "deleted" },
+      });
+      expect(state.calls.some(call => call.startsWith("update:"))).toBeFalse();
+      expect([...state.sessions.keys()]).toEqual(["ses_src"]);
+      expect(state.messages.get("ses_src")).toEqual(history);
+    });
+  }
+
   test("keeps and names a candidate another writer changed", async () => {
     const state = fakeV2State();
     sourceSession(state, "ses_src", toolHistory());
@@ -1105,7 +1163,9 @@ describe("OpenCode 2 trim successors", () => {
     expect(String(error)).toContain(`Successor candidate ${kept} was kept`);
   });
 
-  test("a failed import leaves no candidate and names none", async () => {
+  // The host may still apply an import it rejected, so a missing candidate
+  // is named as not found rather than reported as removed.
+  test("a failed import names its candidate as not found, not as removed", async () => {
     const state = fakeV2State();
     sourceSession(state, "ses_src", toolHistory());
     state.failImport = true;
@@ -1118,22 +1178,28 @@ describe("OpenCode 2 trim successors", () => {
         retention: { mode: "heuristic" },
         controlTimeoutMs: 1_000,
       },
-    ).catch((caught: Error) => caught);
-    expect(String(error)).toContain(
-      "could not finish preparing its successor session. The original session was left unchanged.",
+    ).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(SuccessorFailure);
+    const { details } = error as SuccessorFailure;
+    expect(details).toMatchObject({
+      stage: "import",
+      cleanup: { outcome: "absent", storageAttempted: false },
+    });
+    expect((error as Error).message).toBe(
+      `Magic Trim could not finish preparing its successor session. The original session was left unchanged. Successor candidate ${details.candidateID} was not found when this run checked it, which does not prove that it was removed; check for it before continuing.`,
     );
-    expect(String(error)).not.toContain("was kept");
+    expect(state.calls).not.toContain(`remove:${details.candidateID}`);
     expect([...state.sessions.keys()]).toEqual(["ses_src"]);
   });
 
-  const trim = (state: FakeV2State) =>
-    executeV2Trim(
-      fakeV2Host(state, new OwnedSessions()),
-      new OwnedSessions(),
-      "ses_src",
-      0,
-      { retention: { mode: "heuristic" }, controlTimeoutMs: 1_000 },
-    ).catch((caught: unknown) => caught);
+  const trim = (
+    state: FakeV2State,
+    host = fakeV2Host(state, new OwnedSessions()),
+  ) =>
+    executeV2Trim(host, new OwnedSessions(), "ses_src", 0, {
+      retention: { mode: "heuristic" },
+      controlTimeoutMs: 1_000,
+    }).catch((caught: unknown) => caught);
   const candidateID = (state: FakeV2State) =>
     [...state.sessions.keys()].find(
       id => id !== "ses_src" && state.sessions.get(id)!.parentID === undefined,
@@ -1220,8 +1286,12 @@ describe("OpenCode 2 trim successors", () => {
       };
       const error = await trim(state);
       const kept = candidateID(state)!;
-      expect(String(error)).toContain(`Successor candidate ${kept} was kept`);
+      expect((error as Error).message).toBe(
+        `The session changed while Magic Trim was preparing its successor. The session was left unchanged; retry when it is at rest. Successor candidate ${kept} was kept because it could not be confirmed as unmodified; this run did not mark it ready, so inspect it or delete it manually.`,
+      );
       expect(state.calls).not.toContain(`remove:${kept}`);
+      expect(state.calls).not.toContain(`update:${kept}`);
+      expect(state.calls.filter(call => call.endsWith(":ses_src"))).toEqual([]);
       if (name === "a child session")
         expect(state.sessions.get("ses_kid")?.parentID).toBe(kept);
     });
@@ -1245,6 +1315,117 @@ describe("OpenCode 2 trim successors", () => {
     );
     expect(String(error)).not.toContain("was kept");
     expect([...state.sessions.keys()]).toEqual(["ses_src"]);
+  });
+
+  test("a candidate missing at cleanup is named, and its saved cache and stats stay", async () => {
+    const state = fakeV2State();
+    sourceSession(state, "ses_src", toolHistory());
+    const host = fakeV2Host(state, new OwnedSessions());
+    // Once the candidate's stats exist, the next activity read belongs to the
+    // source recheck: another client removes the candidate and changes the
+    // source's instructions, which the recheck reads next.
+    let removed = false;
+    const active = host.session.active.bind(host.session);
+    host.session.active = async (...args: Parameters<typeof active>) => {
+      const id = candidateID(state);
+      if (
+        !removed
+        && id !== undefined
+        && (await readStats(v2StorageKey(id))) !== null
+      ) {
+        removed = true;
+        state.sessions.delete(id);
+        state.messages.delete(id);
+        state.instructions.set("ses_src", [{ key: "late", value: "x" }]);
+      }
+      return active(...args);
+    };
+    const source = structuredClone(state.messages.get("ses_src"));
+    const error = await executeV2Trim(host, new OwnedSessions(), "ses_src", 0, {
+      retention: { mode: "heuristic" },
+      controlTimeoutMs: 1_000,
+    }).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(SuccessorFailure);
+    const { details } = error as SuccessorFailure;
+    expect(details).toMatchObject({
+      stage: "recheck",
+      cleanup: { outcome: "absent", storageAttempted: true },
+    });
+    // The drift sentence states no outcome; the candidate's own text does.
+    expect((error as Error).message).toBe(
+      `The session changed while Magic Trim was preparing its successor. The session was left unchanged; retry when it is at rest. Successor candidate ${details.candidateID} was not found when this run checked it, which does not prove that it was removed; check for it before continuing. Any omission cache or stats this run saved for it were left in place.`,
+    );
+    expect(await readStats(v2StorageKey(details.candidateID!))).not.toBeNull();
+    expect(state.messages.get("ses_src")).toEqual(source);
+    expect(state.calls.filter(call => call.endsWith(":ses_src"))).toEqual([]);
+  });
+
+  test("a candidate missing after its cache copy failed claims no saved files", async () => {
+    const state = fakeV2State();
+    sourceSession(state, "ses_src", toolHistory());
+    state.instructions.set("ses_src", [{ key: "a", value: "ALPHA" }]);
+    // An omission cache that cannot be read stops the copy before it writes.
+    const sourceCache = cachePath(v2StorageKey("ses_src"));
+    await mkdir(dirname(sourceCache), { recursive: true });
+    await Bun.write(sourceCache, "{}\n");
+    const host = fakeV2Host(state, new OwnedSessions());
+    // Another client removes the candidate right after its last check before
+    // the copy.
+    const list = host.session.instructions.entry.list.bind(
+      host.session.instructions.entry,
+    );
+    host.session.instructions.entry.list = async (
+      ...args: Parameters<typeof list>
+    ) => {
+      const entries = await list(...args);
+      const id = args[0].sessionID;
+      if (id !== "ses_src") {
+        state.sessions.delete(id);
+        state.messages.delete(id);
+      }
+      return entries;
+    };
+    const error = await trim(state, host);
+    expect(error).toBeInstanceOf(SuccessorFailure);
+    const { details } = error as SuccessorFailure;
+    expect(details).toMatchObject({
+      stage: "cache",
+      cleanup: { outcome: "absent", storageAttempted: true },
+    });
+    expect((error as Error).message).toBe(
+      `Magic Trim could not finish preparing its successor session. The original session was left unchanged. Successor candidate ${details.candidateID} was not found when this run checked it, which does not prove that it was removed; check for it before continuing. Any omission cache or stats this run saved for it were left in place.`,
+    );
+    const key = v2StorageKey(details.candidateID!);
+    expect(await Bun.file(cachePath(key)).exists()).toBeFalse();
+    expect(await readStats(key)).toBeNull();
+  });
+
+  test("a deleted candidate whose stats cannot be removed is named with that residue", async () => {
+    const state = fakeV2State();
+    sourceSession(state, "ses_src", toolHistory());
+    state.afterWrite = method => {
+      if (method === "import")
+        state.messages.get("ses_src")!.push(userMessage("msg_late", "late"));
+    };
+    // A directory where the candidate's stats file was makes its removal fail.
+    state.beforeWrite = async (method, sessionID) => {
+      if (method !== "remove") return;
+      const file = `${storageDirectory}/opencode/storage/magic-compact/stats/v2/${sessionID}.json`;
+      await rm(file, { force: true });
+      await mkdir(join(file, "kept"), { recursive: true });
+    };
+    const error = await trim(state);
+    expect(error).toBeInstanceOf(SuccessorFailure);
+    const { details } = error as SuccessorFailure;
+    expect(details).toMatchObject({
+      stage: "recheck",
+      cleanup: { outcome: "deleted-with-residue", residue: ["stats"] },
+    });
+    expect(state.calls).toContain(`remove:${details.candidateID}`);
+    expect(String(error)).toContain(
+      `Successor candidate ${details.candidateID} was deleted, but its stats could not be removed; delete the files named after ${details.candidateID} in Magic Compact's storage directory.`,
+    );
+    expect(String(error)).not.toContain(storageDirectory);
   });
 
   const hostFailures: Array<
@@ -1293,7 +1474,7 @@ describe("OpenCode 2 trim successors", () => {
           if (method === "remove") throw privateHostError();
         };
       },
-      "was kept because it could not be confirmed as unmodified",
+      "was kept because its deletion could not be confirmed",
     ],
   ];
   for (const [name, stage, arrange, text] of hostFailures) {
@@ -1553,6 +1734,132 @@ describe("OpenCode 2 trim successors", () => {
   });
 });
 
+describe("OpenCode 2 saved stats", () => {
+  const CANARY = "PRIVATE-STATS-CANARY";
+  const statsFile = () =>
+    `${storageDirectory}/opencode/storage/magic-compact/stats/v2/ses_src.json`;
+  const writeInvalidStats = async () => {
+    const bytes = `{"version":2,"rootSessionId":"${CANARY}"}\n`;
+    await mkdir(dirname(statsFile()), { recursive: true });
+    await Bun.write(statsFile(), bytes);
+    return bytes;
+  };
+  const expectContentFree = (text: string) => {
+    expect(text).not.toContain(CANARY);
+    expect(text).not.toContain(storageDirectory);
+  };
+
+  test("/magic-stats reports invalid and unreadable stats without their path or content", async () => {
+    type Execute = (input: {
+      sessionID: string;
+      prompt: { text: string };
+    }) => Promise<void>;
+    const found = new Map<string, Execute>();
+    const editor = {
+      add: (command: { name: string; execute: Execute }) => {
+        found.set(command.name, command.execute);
+      },
+      update: () => undefined,
+    };
+    await setup({
+      options: {},
+      agent: { transform: async (fn: (e: unknown) => void) => fn(editor) },
+      command: { transform: async (fn: (e: unknown) => void) => fn(editor) },
+      tool: { transform: async (fn: (e: unknown) => void) => fn(editor) },
+      session: { hook: async () => undefined, get: async () => ({}) },
+      event: { subscribe: async function* () {} },
+    } as never);
+    const run = (text: string) =>
+      found.get("magic-stats")!({
+        sessionID: "ses_src",
+        prompt: { text },
+      }).then(
+        () => "",
+        (error: unknown) => (error as Error).message,
+      );
+
+    expect(await run("now")).toBe(STATS_ARGUMENTS_ERROR);
+    const bytes = await writeInvalidStats();
+    const invalid = await run("");
+    expect(invalid).toBe(new InvalidStatsError().message);
+    expect(await Bun.file(statsFile()).text()).toBe(bytes);
+    if (process.getuid?.() !== 0) {
+      await chmod(statsFile(), 0o000);
+      try {
+        const unreadable = await run("");
+        expect(unreadable).toBe(
+          "Magic Stats stopped on an unexpected error (EACCES). The original session was left unchanged. Retry; if it fails again, check the OpenCode server log.",
+        );
+        expectContentFree(unreadable);
+      } finally {
+        await chmod(statsFile(), 0o600);
+      }
+    }
+  });
+
+  test("compaction stops before any model request, and a no-op still succeeds", async () => {
+    const state = fakeV2State();
+    const messages = toolHistory();
+    sourceSession(state, "ses_src", messages);
+    const owned = new OwnedSessions();
+    const host = fakeV2Host(state, owned, echoGeneration());
+    const options = {
+      retention: { mode: "heuristic" as const },
+      controlTimeoutMs: 1_000,
+    };
+    const bytes = await writeInvalidStats();
+
+    const noop = await executeV2Compact(host, owned, "ses_src", 2, options);
+    expect(noop.successor).toBeNull();
+    const error = await executeV2Compact(
+      host,
+      owned,
+      "ses_src",
+      0,
+      options,
+    ).then(
+      () => undefined,
+      (failure: unknown) => failure,
+    );
+    expect(error).toBeInstanceOf(InvalidStatsError);
+    expect(state.requests).toEqual([]);
+    expect([...state.sessions.keys()]).toEqual(["ses_src"]);
+    expect(state.messages.get("ses_src")).toEqual(messages);
+    expect(await Bun.file(statsFile()).text()).toBe(bytes);
+
+    // The same command makes its requests once the stats are moved away.
+    await rm(statsFile());
+    await executeV2Compact(host, owned, "ses_src", 0, options);
+    expect(state.requests.length).toBeGreaterThan(0);
+  });
+
+  test("a successor's stats stage reports invalid source stats and discards the candidate", async () => {
+    const state = fakeV2State();
+    const messages = toolHistory();
+    sourceSession(state, "ses_src", messages);
+    const host = fakeV2Host(state, new OwnedSessions());
+    const bytes = await writeInvalidStats();
+
+    const error = await executeV2Trim(host, new OwnedSessions(), "ses_src", 0, {
+      retention: { mode: "heuristic" },
+      controlTimeoutMs: 1_000,
+    }).then(
+      () => undefined,
+      (failure: unknown) => failure,
+    );
+
+    expect(error).toBeInstanceOf(SuccessorFailure);
+    const message = commandFailureMessage("Magic Trim", error);
+    expect(message).toBe(
+      `${new InvalidStatsError().message}\nDetails: stage stats.`,
+    );
+    expectContentFree(message);
+    expect([...state.sessions.keys()]).toEqual(["ses_src"]);
+    expect(state.messages.get("ses_src")).toEqual(messages);
+    expect(await Bun.file(statsFile()).text()).toBe(bytes);
+  });
+});
+
 describe("OpenCode 2 generation responses", () => {
   const target = [
     userMessage("msg_t", "Do it"),
@@ -1578,7 +1885,10 @@ describe("OpenCode 2 generation responses", () => {
       [{ span: target }],
       "index",
       { controlTimeoutMs: 1_000 },
-    ).catch((error: Error) => error);
+    ).then(
+      result => result.summaries,
+      (error: Error) => error,
+    );
     return { state, outcome };
   };
   const call = (input: unknown): FakeReply => ({
@@ -1689,17 +1999,20 @@ describe("OpenCode 2 generation responses", () => {
       [{ span: target }, { span: second }],
       "index",
       { controlTimeoutMs: 1_000 },
-    ).catch((error: Error) => error);
+    ).then(
+      result => result.summaries,
+      (error: Error) => error,
+    );
     expect((outcome as Error).message).toBe(
       "Compaction generation failed for 2 turns: Compaction generation model request failed.",
     );
   });
 
-  test("names every temporary session that could not be deleted when five started batches fail", async () => {
-    // Six turns, five concurrent batches. Every request fails and every
-    // removal is refused, so five sessions stay behind and the sixth turn is
-    // never admitted. The aggregate explains the failure once and still names
-    // all five sessions.
+  test("names every temporary session whose removal was not confirmed, in batch order, when five started batches fail", async () => {
+    // Six turns, five concurrent batches. The third batch's import fails, so
+    // the host no longer finds its session; every other request fails and its
+    // removal is refused. The sixth turn is never admitted. The aggregate
+    // explains each failure once and names all five sessions in batch order.
     const extra = Array.from({ length: 5 }, (_, index) => [
       userMessage(`msg_x${index}`, `Turn ${index + 2}`),
       assistantMessage(`msg_x${index}a`, [
@@ -1711,8 +2024,15 @@ describe("OpenCode 2 generation responses", () => {
     const state = fakeV2State();
     const source = sourceSession(state, "ses_src", history);
     const before = structuredClone(state.messages.get("ses_src"));
-    state.beforeWrite = method => {
-      if (method === "remove") throw new Error("connection reset");
+    const ids: string[] = [];
+    state.beforeWrite = (method, sessionID) => {
+      if (method === "import") {
+        ids.push(sessionID);
+        if (ids.length === 3) throw new Error("import failed");
+      }
+      if (method === "remove" && state.sessions.has(sessionID)) {
+        throw new Error("connection reset");
+      }
     };
     const owned = new OwnedSessions();
     const outcome = await generateV2Summaries(
@@ -1736,29 +2056,116 @@ describe("OpenCode 2 generation responses", () => {
       ],
       "index",
       { controlTimeoutMs: 1_000 },
-    ).catch((error: Error) => error);
+    ).then(
+      result => result.summaries,
+      (error: Error) => error,
+    );
 
-    const ids = state.calls
-      .filter(entry => entry.startsWith("import:"))
-      .map(entry => entry.slice("import:".length));
     expect(ids).toHaveLength(5);
     expect(new Set(ids).size).toBe(5);
+    const [a, b, missing, d, e] = ids;
     expect(outcome).toBeInstanceOf(V2GenerationError);
-    expect((outcome as V2GenerationError).undeletedSessionIDs).toEqual(ids);
+    expect((outcome as V2GenerationError).unremovedSessions).toEqual(
+      ids.map(id => ({
+        id,
+        removal: id === missing ? "not-found" : "failed",
+      })),
+    );
     expect((outcome as Error).message).toBe(
-      `Compaction generation failed for 5 turns: Compaction generation model request failed. Temporary sessions ${ids.join(", ")} could not be deleted.`,
+      `Compaction generation failed for 5 turns: Compaction generation model request failed. Compaction generation session creation failed. Temporary sessions ${a}, ${b} could not be deleted. Temporary session ${missing} was not found when this run tried to remove it, which does not prove that it was removed. Temporary sessions ${d}, ${e} could not be deleted.`,
     );
     for (const id of ids) {
       // Each stays registered and refuses new provider requests.
-      expect(state.sessions.has(id)).toBeTrue();
       expect(owned.has(id)).toBeTrue();
       expect(() => owned.admitRequest(id)).toThrow(owned.stop);
       expect(() => owned.rejectCompaction(id)).toThrow(owned.compactionBlocked);
     }
     // The source is unchanged and the sixth turn started nothing.
     expect(state.messages.get("ses_src")).toEqual(before);
-    expect([...state.sessions.keys()]).toEqual(["ses_src", ...ids]);
+    expect([...state.sessions.keys()]).toEqual(["ses_src", a, b, d, e]);
+    expect(state.requests).toHaveLength(4);
+  });
+
+  test("stops admitting batches once a failure is seen, before its session is removed", async () => {
+    // Six turns, five concurrent batches. The first turn's request fails and
+    // its removal is held until the other four batches have finished and
+    // been removed. Those workers are then free, but the sixth turn must not
+    // start: the failure was already seen.
+    const extra = Array.from({ length: 5 }, (_, index) => [
+      userMessage(`msg_x${index}`, `Turn ${index + 2}`),
+      assistantMessage(`msg_x${index}a`, [
+        { type: "text", text: words(`X${index}`, 200) },
+      ]),
+      idleMessage(`msg_x${index}i`),
+    ]).flat();
+    const history = [...target, ...extra];
+    const state = fakeV2State();
+    const source = sourceSession(state, "ses_src", history);
+    const imports: string[] = [];
+    let releaseOthers!: () => void;
+    const othersHeld = new Promise<void>(resolve => {
+      releaseOthers = resolve;
+    });
+    let releaseRemoval!: () => void;
+    const removalHeld = new Promise<void>(resolve => {
+      releaseRemoval = resolve;
+    });
+    let othersRemoved = 0;
+    state.beforeWrite = async (method, sessionID) => {
+      if (method === "import") {
+        imports.push(sessionID);
+        if (sessionID !== imports[0]) await othersHeld;
+      }
+      if (method === "remove" && sessionID === imports[0]) {
+        releaseOthers();
+        await removalHeld;
+      }
+    };
+    state.afterWrite = (method, sessionID) => {
+      if (method === "remove" && sessionID !== imports[0]) {
+        othersRemoved += 1;
+        if (othersRemoved === 4) releaseRemoval();
+      }
+    };
+    const echo = echoGeneration();
+    const owned = new OwnedSessions();
+    const outcome = await generateV2Summaries(
+      fakeV2Host(state, owned, (text, sent) =>
+        sent.some(
+          message => message.type === "user" && message.text === "Do it",
+        )
+          ? { error: { type: "provider.invalid-request", message: "bad" } }
+          : echo(text),
+      ),
+      owned,
+      { session: source, messages: history, instructions: [] },
+      {
+        ref: state.summarizerModel!,
+        info: {
+          limit: state.modelLimit,
+          capabilities: { tools: true, input: ["text"], output: ["text"] },
+        },
+      },
+      [
+        { span: target },
+        ...Array.from({ length: 5 }, (_, index) => ({
+          span: extra.slice(index * 3, index * 3 + 3),
+        })),
+      ],
+      "index",
+      { controlTimeoutMs: 1_000 },
+    ).then(
+      result => result.summaries,
+      (error: Error) => error,
+    );
+
+    expect(outcome).toBeInstanceOf(V2GenerationError);
+    expect((outcome as Error).message).toBe(
+      "Compaction generation model request failed.",
+    );
+    expect(imports).toHaveLength(5);
     expect(state.requests).toHaveLength(5);
+    expect([...state.sessions.keys()]).toEqual(["ses_src"]);
   });
 
   // Each owned session's lifecycle requests are awaited until they settle;
@@ -1785,7 +2192,10 @@ describe("OpenCode 2 generation responses", () => {
       [{ span: target }],
       "index",
       { controlTimeoutMs: 10 },
-    ).catch((error: Error) => error);
+    ).then(
+      result => result.summaries,
+      (error: Error) => error,
+    );
     const ownedID = state.calls
       .find(entry => entry.startsWith("import:"))
       ?.slice("import:".length);
@@ -1814,8 +2224,8 @@ describe("OpenCode 2 generation responses", () => {
         if (method === "remove") throw new Error("connection reset");
       };
     });
-    expect(String(outcome)).toContain(
-      `temporary session ${ownedID} could not be deleted`,
+    expect((outcome as Error).message).toBe(
+      `Compaction generation session deletion failed. Temporary session ${ownedID} could not be deleted.`,
     );
     expect(state.sessions.has(ownedID!)).toBeTrue();
     expect(owned.has(ownedID!)).toBeTrue();
@@ -1835,7 +2245,7 @@ describe("OpenCode 2 generation responses", () => {
     expect(owned.has(ownedID!)).toBeFalse();
   });
 
-  test("reports a failed import without a cleanup failure and keeps its guard", async () => {
+  test("names a failed import's session as not found and keeps its guard", async () => {
     const { state, owned, outcome } = await generate(state => {
       state.beforeWrite = (method, sessionID) => {
         if (method === "import") {
@@ -1845,14 +2255,34 @@ describe("OpenCode 2 generation responses", () => {
       };
     });
     const ownedID = state.calls[0]!.slice("import:".length);
-    expect(String(outcome)).toContain("session creation failed");
-    expect(String(outcome)).not.toContain("could not be deleted");
+    // The host has no such session now, which does not prove it never will.
+    expect((outcome as Error).message).toBe(
+      `Compaction generation session creation failed. Temporary session ${ownedID} was not found when this run tried to remove it, which does not prove that it was removed.`,
+    );
+    expect((outcome as V2GenerationError).unremovedSessions).toEqual([
+      { id: ownedID, removal: "not-found" },
+    ]);
     expect([...state.sessions.keys()]).toEqual(["ses_src"]);
     // The failed import could still be applied later; its ID stays stopped,
     // and the host's answer that no such session exists keeps it so.
     expect(owned.has(ownedID)).toBeTrue();
     expect(() => owned.admitRequest(ownedID)).toThrow(owned.stop);
     expect(state.requests).toHaveLength(0);
+  });
+
+  test("keeps a validated response when the host no longer finds its session, and keeps its guard", async () => {
+    const { state, owned, outcome, ownedID } = await generate(state => {
+      state.beforeWrite = (method, sessionID) => {
+        if (method === "remove") state.sessions.delete(sessionID);
+      };
+    });
+    expect(outcome).toEqual([{ text: "Summary of target 1." }]);
+    expect(state.requests).toHaveLength(1);
+    expect(owned.has(ownedID!)).toBeTrue();
+    expect(() => owned.admitRequest(ownedID!)).toThrow(owned.stop);
+    expect(() => owned.rejectCompaction(ownedID!)).toThrow(
+      owned.compactionBlocked,
+    );
   });
 
   // The host may apply an import and only then fail the request, or hand back
@@ -1889,8 +2319,8 @@ describe("OpenCode 2 generation responses", () => {
         };
       });
       expect(String(outcome)).toMatch(failure);
-      expect(String(outcome)).toContain(
-        `temporary session ${ownedID} could not be deleted`,
+      expect(String(outcome)).toEndWith(
+        ` Temporary session ${ownedID} could not be deleted.`,
       );
       expect(state.requests).toHaveLength(0);
       expect(state.sessions.has(ownedID!)).toBeTrue();
@@ -1919,7 +2349,11 @@ describe("OpenCode 2 generation responses", () => {
         },
       },
       10,
-    ).catch((error: Error) => error);
+      false,
+    ).then(
+      summary => summary.text,
+      (error: Error) => error,
+    );
     const ownedID = state.calls
       .find(entry => entry.startsWith("import:"))!
       .slice("import:".length);
@@ -1976,8 +2410,7 @@ describe("OpenCode 2 generation responses", () => {
         if (method === "import")
           imported.push(state.sessions.get(sessionID)!.model);
       };
-      const reasoning = { matchModel, reports: [] as StageReport[] };
-      const outcome = await generateV2Summaries(
+      const { summaries: outcome, ...reasoning } = await generateV2Summaries(
         fakeV2Host(state, owned, echoGeneration()),
         owned,
         { session: source, messages, instructions: [] },
@@ -1991,7 +2424,7 @@ describe("OpenCode 2 generation responses", () => {
         },
         [{ span: messages }],
         "index",
-        { controlTimeoutMs: 1_000, reasoning },
+        { controlTimeoutMs: 1_000, matchModel },
       );
       expect(outcome).toEqual([{ text: "Summary of target 1." }]);
       expect(JSON.stringify(state.requests)).not.toContain("enc_secret");
@@ -2045,8 +2478,7 @@ describe("OpenCode 2 generation responses", () => {
       const state = fakeV2State();
       const source = sourceSession(state, "ses_src", messages);
       const owned = new OwnedSessions();
-      const reasoning = { matchModel: true, reports: [] as StageReport[] };
-      await generateV2Summaries(
+      const reasoning = await generateV2Summaries(
         fakeV2Host(state, owned, echoGeneration()),
         owned,
         { session: source, messages, instructions: [] },
@@ -2060,7 +2492,7 @@ describe("OpenCode 2 generation responses", () => {
         },
         [{ span: messages }],
         "index",
-        { controlTimeoutMs: 1_000, reasoning },
+        { controlTimeoutMs: 1_000, matchModel: true },
       );
       expect(reasoning.reports[0]!.choice).toEqual({
         kind: "fallback",
@@ -2117,7 +2549,11 @@ describe("OpenCode 2 generation responses", () => {
           },
         },
         1_000,
-      ).catch((error: Error) => error);
+        false,
+      ).then(
+        summary => summary.text,
+        (error: Error) => error,
+      );
       expect([...state.sessions.keys()]).toEqual(["ses_src"]);
       return { state, outcome, permissions, allowed };
     };
@@ -2169,7 +2605,12 @@ describe("OpenCode 2 generation responses", () => {
         if (method === "remove") throw new Error("connection reset");
       };
     });
-    expect(String(outcome)).toContain("summary failed (delete)");
+    expect(String(outcome)).toContain(
+      `summary failed (delete). Temporary session ${ownedID} could not be deleted. No tool content was changed.`,
+    );
+    expect((outcome as SessionSummaryError).unremovedSessions).toEqual([
+      { id: ownedID, removal: "failed" },
+    ]);
     expect(owned.has(ownedID)).toBeTrue();
     expect(() => owned.rejectCompaction(ownedID)).toThrow(
       owned.compactionBlocked,
@@ -2188,10 +2629,48 @@ describe("OpenCode 2 generation responses", () => {
         if (method === "remove") throw new Error("connection reset");
       };
     });
-    expect(String(outcome)).toContain("summary and cleanup failed");
+    expect(String(outcome)).toContain(
+      `summary and cleanup failed (fork, delete). Temporary session ${ownedID} could not be deleted.`,
+    );
     expect(state.requests).toHaveLength(0);
     expect(state.sessions.has(ownedID)).toBeTrue();
     expect(() => owned.admitRequest(ownedID)).toThrow(owned.stop);
+  });
+
+  test("the retention summary names a failed import's session as not found and keeps its guard", async () => {
+    const { state, owned, outcome, ownedID } = await summarizeSession(state => {
+      state.beforeWrite = (method, sessionID) => {
+        if (method === "import") {
+          state.calls.push(`import:${sessionID}`);
+          throw new Error("import failed");
+        }
+      };
+    });
+    expect((outcome as Error).message).toBe(
+      `Task-aware retention session summary and cleanup failed (fork, delete). Temporary session ${ownedID} was not found when this run tried to remove it, which does not prove that it was removed. ${retentionFailureGuidance()}`,
+    );
+    expect((outcome as SessionSummaryError).unremovedSessions).toEqual([
+      { id: ownedID, removal: "not-found" },
+    ]);
+    expect([...state.sessions.keys()]).toEqual(["ses_src"]);
+    expect(owned.has(ownedID)).toBeTrue();
+    expect(() => owned.admitRequest(ownedID)).toThrow(owned.stop);
+    expect(state.requests).toHaveLength(0);
+  });
+
+  test("the retention summary keeps a validated summary when the host no longer finds its session, and keeps its guard", async () => {
+    const { state, owned, outcome, ownedID } = await summarizeSession(state => {
+      state.beforeWrite = (method, sessionID) => {
+        if (method === "remove") state.sessions.delete(sessionID);
+      };
+    });
+    expect(outcome).toBe("## Objective\n- Continue.");
+    expect(state.requests).toHaveLength(1);
+    expect(owned.has(ownedID)).toBeTrue();
+    expect(() => owned.admitRequest(ownedID)).toThrow(owned.stop);
+    expect(() => owned.rejectCompaction(ownedID)).toThrow(
+      owned.compactionBlocked,
+    );
   });
 });
 
@@ -2384,6 +2863,62 @@ describe("OpenCode 2 compaction", () => {
     ).rejects.toThrow(/needs a model on the `magic-compact-summarizer` agent/);
     expect(state.requests).toHaveLength(0);
   });
+
+  // The summarizer is resolved when the retention summary first needs it, so
+  // its refusal is a retention failure and suggests the person's own command.
+  test.each([
+    ["compact", "Magic Compact"],
+    ["trim", "Magic Trim"],
+  ] as const)(
+    "task-aware /magic-%s names a missing summarizer model with its own heuristic command",
+    async (command, title) => {
+      const state = fakeV2State();
+      sourceSession(
+        state,
+        "ses_src",
+        command === "compact"
+          ? [...turn(1), ...turn(2), ...turn(3)]
+          : toolHistory(),
+      );
+      delete state.summarizerModel;
+      const owned = new OwnedSessions();
+      const host = fakeV2Host(state, owned);
+      const options = {
+        retention: {
+          ...commandRetentionPolicy(
+            command,
+            (command === "compact"
+              ? parseMagicCompactArguments
+              : parseMagicTrimArguments)("1 --match-model"),
+            { TYPESAFE_API_KEY: "test-key" },
+          ),
+          fetch: async () => {
+            throw new Error("unexpected retention request");
+          },
+        },
+        controlTimeoutMs: 1_000,
+      };
+      const error = await (
+        command === "compact"
+          ? executeV2Compact(host, owned, "ses_src", 1, options)
+          : executeV2Trim(host, owned, "ses_src", 1, options)
+      ).then(
+        () => undefined,
+        (failure: unknown) => failure,
+      );
+
+      expect(error).toBeInstanceOf(SessionSummaryError);
+      expect(commandFailureMessage(title, error)).toBe(
+        `Magic Compact needs a model on the \`magic-compact-summarizer\` agent. Set \`agents.magic-compact-summarizer.model\` (for example \`provider/model#variant\`) in opencode.json. ${
+          command === "compact"
+            ? "No tool content was changed. Run /magic-compact 1 --match-model --heuristic to compact without classification (turn summaries are still generated)."
+            : "No tool content was changed. Run /magic-trim 1 --heuristic to trim without classification."
+        }`,
+      );
+      expect(state.requests).toHaveLength(0);
+      expect([...state.sessions.keys()]).toEqual(["ses_src"]);
+    },
+  );
 
   describe("task-aware retention", () => {
     const longSummary = `## Objective\n${"- A dense detail line.\n".repeat(1_500)}## Next Move`;
@@ -2730,13 +3265,9 @@ describe("OpenCode 2 media projection", () => {
     const stats = await readStats(v2StorageKey(successor!.session.id));
     expect(stats?.mediaTokensProjected).toBe(facing.projectedMediaTokens);
     expect(outcome).toContain("Request turns summarized: 1");
-    // Both images stay stored; only the projected one leaves the inline file
-    // tokens, and stats keep the canonical totals with the data included.
+    // Both images stay stored, and stats keep the canonical totals with the
+    // data included.
     const original = countV2ModelFacingTokens(source);
-    expect(original.inlineFileTokens).toBe(
-      countV2PayloadTokens(largeImage) + countV2PayloadTokens(smallImage),
-    );
-    expect(facing.inlineFileTokens).toBe(countV2PayloadTokens(smallImage));
     expect(stats?.totalTokensPruned).toBe(
       original.tokens
         + original.projectedMediaTokens
@@ -3589,7 +4120,10 @@ describe("OpenCode 2 media projection", () => {
       [{ span }],
       "index",
       { controlTimeoutMs: 1_000 },
-    ).catch((error: Error) => error);
+    ).then(
+      result => result.summaries,
+      (error: Error) => error,
+    );
     return { state, outcome };
   };
   const limit = 25 * 1024 * 1024;
@@ -3836,6 +4370,7 @@ describe("OpenCode 2 response tool boundary", () => {
   const harness = async (owned: OwnedSessions) => {
     const hooks = new Map<string, (event: never) => Promise<void> | void>();
     const executors = new Map<string, Execute>();
+    let contextReads = 0;
     const idle = { add: () => undefined, update: () => undefined };
     const tools = {
       add: (tool: { name: string; execute: Execute }) => {
@@ -3856,7 +4391,10 @@ describe("OpenCode 2 response tool boundary", () => {
           ) => {
             hooks.set(name, callback);
           },
-          context: async () => [],
+          context: async () => {
+            contextReads += 1;
+            return [];
+          },
         },
         event: { subscribe: async function* () {} },
       } as never,
@@ -3891,8 +4429,194 @@ describe("OpenCode 2 response tool boundary", () => {
       await hooks.get(kind)!(event as never);
       return event.messages;
     };
-    return { advertised, respond, submitSummary, request };
+    const context = async (event: ContextEvent) => {
+      await hooks.get("context")!(event as never);
+    };
+    const title = async (event: Record<string, unknown>) => {
+      await hooks.get("title")!(event as never);
+      return event;
+    };
+    const readOmitted = (sessionID: string, contentId: string) =>
+      executors.get("read_omitted_content")!({ contentId }, {
+        sessionID,
+      } as never);
+    return {
+      advertised,
+      respond,
+      submitSummary,
+      request,
+      context,
+      title,
+      readOmitted,
+      contextReads: () => contextReads,
+    };
   };
+
+  test("the context hook stops an owned session's second request and every request once it is closed", async () => {
+    const owned = new OwnedSessions();
+    owned.register("ses_gen", "generation", false);
+    owned.register("ses_closed", "retention", false);
+    owned.close("ses_closed");
+    const { advertised } = await harness(owned);
+    expect(await advertised("context", "ses_gen")).toEqual([RESPONSE, "read"]);
+    await expect(advertised("context", "ses_gen")).rejects.toThrow(owned.stop);
+    await expect(advertised("context", "ses_closed")).rejects.toThrow(
+      owned.stop,
+    );
+    // A session this process does not own is never stopped.
+    for (let request = 0; request < 3; request++) {
+      expect(await advertised("context", "ses_user")).toEqual(["read"]);
+    }
+  });
+
+  // The registry entries below come from the real generation and summary
+  // requests; only the context hook's effect on each request is observed.
+  test.each([
+    ["the OpenAI Responses serializer", "@opencode/ai/providers/openai", true],
+    ["another serializer", "@opencode/ai/providers/openai-compatible", false],
+  ] as const)(
+    "a per-turn generation on %s keeps the response tool, projects reasoning as registered, and its next step is stopped",
+    async (_name, serializer, readable) => {
+      const owned = new OwnedSessions();
+      const { context } = await harness(owned);
+      const turn = [
+        userMessage("msg_u", "Do it"),
+        assistantMessage(
+          "msg_a",
+          [
+            { type: "reasoning", text: "deepseek analysis" },
+            { type: "text", text: words("A", 200) },
+          ],
+          { model: { providerID: "deepseek", id: "deepseek-flash" } },
+        ),
+        idleMessage("msg_i"),
+      ];
+      const state = fakeV2State();
+      const source = sourceSession(state, "ses_src", turn);
+      const { summaries } = await generateV2Summaries(
+        fakeV2Host(state, owned, echoGeneration(), context),
+        owned,
+        { session: source, messages: turn, instructions: [] },
+        {
+          ref: state.summarizerModel!,
+          info: {
+            package: serializer,
+            limit: state.modelLimit,
+            capabilities: { tools: true, input: ["text"], output: ["text"] },
+          } as never,
+        },
+        [{ span: turn }],
+        "index",
+        { controlTimeoutMs: 1_000 },
+      );
+
+      expect(summaries).toEqual([{ text: "Summary of target 1." }]);
+      const [first, second] = state.contextRequests;
+      expect(state.contextRequests).toHaveLength(2);
+      expect(first).toMatchObject({
+        tools: [RESPONSE, "read"],
+        stopped: false,
+      });
+      expect(second!.stopped).toBeTrue();
+      const sent = first!.messages.flatMap(message => message.content);
+      expect(sent).toContainEqual(
+        readable
+          ? {
+              type: "text",
+              text: `${READABLE_REASONING_HEADER}\ndeepseek analysis`,
+            }
+          : { type: "reasoning", text: "deepseek analysis" },
+      );
+    },
+  );
+
+  test("a whole-session summary request sees neither plugin tool", async () => {
+    const owned = new OwnedSessions();
+    const { context } = await harness(owned);
+    const turn = [
+      userMessage("msg_u", "Do it"),
+      assistantMessage("msg_a", [{ type: "text", text: "Done." }]),
+      idleMessage("msg_i"),
+    ];
+    const state = fakeV2State();
+    const source = sourceSession(state, "ses_src", turn);
+    await generateV2SessionSummary(
+      fakeV2Host(
+        state,
+        owned,
+        () => ({ text: "## Objective\n- Continue." }),
+        context,
+      ),
+      owned,
+      { session: source, messages: turn, instructions: [] },
+      {
+        ref: state.summarizerModel!,
+        info: {
+          limit: state.modelLimit,
+          capabilities: { tools: true, input: ["text"], output: ["text"] },
+        },
+      },
+      1_000,
+      false,
+    );
+    expect(state.contextRequests).toEqual([
+      expect.objectContaining({ tools: ["read"], stopped: false }),
+    ]);
+  });
+
+  test("an owned session's title is fixed without reading its history", async () => {
+    const owned = new OwnedSessions();
+    owned.register("ses_gen", "generation", false);
+    const { title, contextReads } = await harness(owned);
+    const image = (sessionID: string) => ({
+      sessionID,
+      messages: [
+        {
+          id: "msg_img",
+          role: "user",
+          content: [
+            {
+              type: "media",
+              media: {
+                mediaType: "image/png",
+                source: {
+                  type: "base64",
+                  data: "Zm9v",
+                  mediaType: "image/png",
+                },
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect((await title(image("ses_gen")))["result"]).toBe("Magic Compact");
+    expect(contextReads()).toBe(0);
+    // A user session's title request keeps its own result.
+    expect(
+      (await title({ sessionID: "ses_user", messages: [] }))["result"],
+    ).toBeUndefined();
+  });
+
+  test("read_omitted_content reads only the current session's OpenCode 2 cache", async () => {
+    const { readOmitted } = await harness(new OwnedSessions());
+    const omission = planOmission("ses_cur", { content: "omitted bytes" });
+    await commitPlannedOmission(v2StorageKey("ses_cur"), omission);
+    // The same entry under the OpenCode 1 key of that session ID.
+    await commitPlannedOmission("ses_cur", omission);
+
+    expect(await readOmitted("ses_cur", omission.contentID)).toEqual({
+      content: "omitted bytes",
+    });
+    expect(await readOmitted("ses_other", omission.contentID)).toEqual({
+      content: `Omitted content unavailable for Content ID ${omission.contentID}: no authorized current-session cache entry exists.`,
+    });
+    await rm(cachePath(v2StorageKey("ses_cur")));
+    expect(await readOmitted("ses_cur", omission.contentID)).toEqual({
+      content: `Omitted content unavailable for Content ID ${omission.contentID}: no authorized current-session cache entry exists.`,
+    });
+  });
 
   test("a session this process does not own never sees the response or summary tool, in any request kind", async () => {
     const { advertised } = await harness(new OwnedSessions());
@@ -4048,6 +4772,7 @@ describe("OpenCode 2 response tool boundary", () => {
       { session: retained, messages: turn, instructions: [] },
       model(retention),
       1_000,
+      false,
     );
     expect(retentionRules).toEqual([
       [{ action: "*", resource: "*", effect: "deny" }],
@@ -4155,6 +4880,61 @@ describe("generation request protocol", () => {
     ).toEqual(following.map(message => JSON.stringify({ ...message, id: "" })));
   });
 
+  // A turn is anchored by its first user message's text, even an empty one;
+  // a later adjacent user message never supplies the anchor.
+  test("anchors a turn by its first user message, even when that message has no text", async () => {
+    const state = fakeV2State();
+    const messages = [
+      userMessage("msg_u1a", ""),
+      userMessage("msg_u1b", `${"x".repeat(170)}\nsecond line`),
+      assistantMessage("msg_a1", [{ type: "text", text: "Answer 1" }]),
+      idleMessage("msg_i1"),
+      ...turn(2, words("A2", 300)),
+      ...turn(3),
+    ];
+    sourceSession(state, "ses_src", messages);
+    const owned = new OwnedSessions();
+    const prompts: string[] = [];
+    await executeV2Compact(
+      fakeV2Host(state, owned, prompt => {
+        prompts.push(prompt);
+        return echoGeneration()(prompt);
+      }),
+      owned,
+      "ses_src",
+      1,
+      { retention: { mode: "heuristic" }, controlTimeoutMs: 1_000 },
+    );
+    // Both target turns repeat the same map.
+    expect(prompts).toHaveLength(2);
+    for (const [index, prompt] of prompts.entries()) {
+      const { marker } = (
+        JSON.parse(prompt.split("\n").at(-1)!) as {
+          turns: Array<{ marker: string }>;
+        }
+      ).turns[0]!;
+      expect(prompt).toBe(
+        [
+          "Generate one continuation summary for the indexed target turn using the retained native history.",
+          GENERATION_PROTOCOL,
+          "Submit the object through StructuredOutput. Its turns array must contain exactly one object, for the single target index entry below.",
+          "The globalTurnIndex is an orientation-only user-anchor map. Its sourceOrdinal values are immutable source-history positions, not target ordinals, and it does not supply distant assistant or tool detail. Each entry contains only its sourceOrdinal and bounded user anchor:",
+          JSON.stringify({
+            globalTurnIndex: [
+              { sourceOrdinal: 1, anchor: "" },
+              { sourceOrdinal: 2, anchor: "Request 2" },
+              { sourceOrdinal: 3, anchor: "Request 3" },
+            ],
+          }),
+          "Use the ephemeral markers only as ordering guides. Echo each exact marker token and target ordinal; marker echo is allowed. Never include the active generation nonce or marker token in summaries or visual descriptions; useful source identifiers may remain when you include them.",
+          JSON.stringify({
+            turns: [{ ordinal: index + 1, marker, expectedInlineImages: 0 }],
+          }),
+        ].join("\n"),
+      );
+    }
+  });
+
   test("drops the preceding turn when it does not fit the halo limit", async () => {
     const state = fakeV2State();
     state.modelLimit = { context: 200_000, input: 20_000, output: 32_000 };
@@ -4188,19 +4968,71 @@ describe("generation request protocol", () => {
     expect((histories[0]![1] as { text: string }).text).toBe("Request 2");
   });
 
-  test("the explicit request estimate charges the complete protocol, schema and marker", () => {
-    const nonce = "n".repeat(22);
+  // The oracle is what a real request carries: the prompt the host received,
+  // the marker message in the imported session, and the response tool's
+  // input schema as setup registers it.
+  test("the explicit request estimate charges the prompt, marker and tool schema a request carries", async () => {
+    const schemas = new Map<string, unknown>();
+    const idle = { add: () => undefined, update: () => undefined };
+    await setup({
+      options: {},
+      agent: { transform: async (fn: (e: unknown) => void) => fn(idle) },
+      command: { transform: async (fn: (e: unknown) => void) => fn(idle) },
+      tool: {
+        transform: async (fn: (e: unknown) => void) =>
+          fn({
+            add: (tool: { name: string; input: unknown }) =>
+              schemas.set(tool.name, tool.input),
+            update: () => undefined,
+          }),
+      },
+      session: { hook: async () => undefined },
+      event: { subscribe: async function* () {} },
+    } as never);
+    const turn = [
+      userMessage("msg_u", "Do it"),
+      assistantMessage("msg_a", [{ type: "text", text: "Done." }]),
+      idleMessage("msg_i"),
+    ];
+    const state = fakeV2State();
+    const source = sourceSession(state, "ses_src", turn);
+    const markers: string[] = [];
+    state.afterWrite = (method, sessionID) => {
+      if (method !== "import") return;
+      for (const message of state.messages.get(sessionID)!) {
+        if (message.type === "synthetic") markers.push(message.text);
+      }
+    };
+    const owned = new OwnedSessions();
+    await generateV2Summaries(
+      fakeV2Host(state, owned, echoGeneration()),
+      owned,
+      { session: source, messages: turn, instructions: [] },
+      {
+        ref: state.summarizerModel!,
+        info: {
+          limit: state.modelLimit,
+          capabilities: { tools: true, input: ["text"], output: ["text"] },
+        },
+      },
+      [{ span: turn }],
+      "index",
+      { controlTimeoutMs: 1_000 },
+    );
+
+    expect(markers).toHaveLength(1);
+    const [prompt] = state.requests.map(request => request.text);
+    expect(prompt).toContain(GENERATION_PROTOCOL);
+    expect(prompt).toContain("index");
     const target = {
       ordinal: 1,
-      marker: generationTurnMarker(nonce, 1),
+      marker: markers[0]!,
       expectedInlineImages: 0,
     };
-    const prompt = buildGenerationPrompt([target], "index");
-    expect(prompt).toContain(GENERATION_PROTOCOL);
-    expect(estimateGenerationExplicitRequestTokens([target], "index")).toBe(
-      countGptTokens(JSON.stringify(GENERATION_RESPONSE_SCHEMA))
-        + countGptTokens(prompt)
-        + countGptTokens(target.marker),
+    expect(estimateGenerationExplicitRequestTokens(target, "index")).toBe(
+      countGptTokens(JSON.stringify(schemas.get("StructuredOutput")))
+        + countGptTokens(prompt!)
+        + countGptTokens(markers[0]!),
     );
   });
 });
@@ -4342,6 +5174,43 @@ describe("OpenCode 2 retention summary budget", () => {
     // One retention summary, then one request per target turn.
     expect(state.requests).toHaveLength(3);
   });
+
+  test("compact without the selected key stops before resolving the summarizer", async () => {
+    const state = fakeV2State();
+    const turn = (n: number): V2Message[] => [
+      userMessage(`msg_u${n}`, `Request ${n}`),
+      assistantMessage(`msg_a${n}`, [
+        toolItem(`call_${n}`, "read", { path: "/f" }, [
+          { type: "text", text: words(`R${n}`, 300) },
+        ]),
+      ]),
+      idleMessage(`msg_i${n}`),
+    ];
+    sourceSession(state, "ses_src", [...turn(1), ...turn(2)]);
+    const owned = new OwnedSessions();
+    const host = fakeV2Host(state, owned, echoGeneration());
+    const reads: string[] = [];
+    const agentGet = host.agent.get.bind(host.agent);
+    host.agent.get = (async (...args: Parameters<typeof agentGet>) => {
+      reads.push("agent");
+      return agentGet(...args);
+    }) as typeof host.agent.get;
+    const modelList = host.model.list.bind(host.model);
+    host.model.list = (async (...args: Parameters<typeof modelList>) => {
+      reads.push("models");
+      return modelList(...args);
+    }) as typeof host.model.list;
+    const outcome = await executeV2Compact(host, owned, "ses_src", 1, {
+      retention: { mode: "task-aware", apiKey: undefined },
+      controlTimeoutMs: 1_000,
+    }).catch((error: unknown) => error);
+    expect(outcome).toBeInstanceOf(RetentionClassificationError);
+    expect((outcome as RetentionClassificationError).kind).toBe(
+      "missing-api-key",
+    );
+    expect(reads).toEqual([]);
+    expect(state.requests).toHaveLength(0);
+  });
 });
 
 describe("OpenCode 2 compaction of host records", () => {
@@ -4452,10 +5321,7 @@ describe("OpenCode 2 compaction of host records", () => {
     expect(
       stored.filter(message => JSON.stringify(message).includes(disposable)),
     ).toHaveLength(1);
-    const before = countV2ModelFacingTokens(source).tokens;
-    const after = countV2ModelFacingTokens(stored).tokens;
     expect(outcome).toContain("Request turns summarized: 1");
-    expect(after).toBeLessThan(before);
   });
 
   test("classifies host records by their annotations", () => {

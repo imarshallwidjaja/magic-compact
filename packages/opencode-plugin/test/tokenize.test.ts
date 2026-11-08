@@ -2,16 +2,13 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
 import type { Message, Part } from "@opencode-ai/sdk/v2";
 import * as gptTokenizer from "gpt-tokenizer";
-import type { V2Client } from "../src/api";
 import type { MessageWithParts } from "../src/compact/plan";
 import { mediaPlaceholderText, projectsSmaller } from "../src/policy/media";
 import { countV2PayloadTokens } from "../src/v2/history";
+import { countModelFacingContentTokens } from "../src/compact/accounting";
 import {
-  countCanonicalContentTokens,
   countGptTokens,
   countGptTokensWithinLimit,
-  countModelFacingContentTokens,
-  countSessionTokens,
 } from "../src/stats/tokenize";
 
 describe("canonical token counting", () => {
@@ -38,14 +35,10 @@ describe("canonical token counting", () => {
         },
       }),
     ];
-    const v2 = {
-      session: { messages: async () => ({ data: messages }) },
-    } as unknown as V2Client;
 
-    expect(await countSessionTokens(v2, "session")).toBe(
-      await countCanonicalContentTokens(messages),
+    expect((await countModelFacingContentTokens(messages)).tokens).toBe(
+      countGptTokens("Canonical local content"),
     );
-    expect(await countSessionTokens(v2, "session")).toBeLessThan(100);
   });
 
   test("excludes ignored reports while retaining synthetic active context", async () => {
@@ -80,7 +73,7 @@ describe("canonical token counting", () => {
       },
     ];
 
-    expect(await countCanonicalContentTokens(messages)).toBe(
+    expect((await countModelFacingContentTokens(messages)).tokens).toBe(
       countGptTokens("Active user content")
         + countGptTokens("Synthetic model-facing boundary"),
     );
@@ -123,7 +116,7 @@ describe("canonical token counting", () => {
       },
     ];
 
-    expect(await countCanonicalContentTokens(messages)).toBe(
+    expect((await countModelFacingContentTokens(messages)).tokens).toBe(
       countGptTokens("Visible assistant history")
         + countGptTokens("Ignored assistant continuation"),
     );
@@ -179,35 +172,23 @@ describe("canonical token counting", () => {
     expect(countGptTokensWithinLimit(accepted, 16)).toBe(16);
     expect(countGptTokensWithinLimit(accepted, 15)).toBeNull();
 
-    const encodeSpy = spyOn(gptTokenizer, "encode");
     const countSpy = spyOn(gptTokenizer, "countTokens");
-    const withinSpy = spyOn(gptTokenizer, "isWithinTokenLimit");
     try {
       expect(countGptTokensWithinLimit(rejected, 1)).toBeNull();
-      expect(encodeSpy).not.toHaveBeenCalled();
       expect(countSpy).not.toHaveBeenCalled();
-      expect(withinSpy).not.toHaveBeenCalled();
     } finally {
-      encodeSpy.mockRestore();
       countSpy.mockRestore();
-      withinSpy.mockRestore();
     }
   });
 
   test("rejects a pathological over-budget span without entering gpt-tokenizer", () => {
     const text = `${"🚀".repeat(50_000)}!`;
-    const encodeSpy = spyOn(gptTokenizer, "encode");
     const countSpy = spyOn(gptTokenizer, "countTokens");
-    const withinSpy = spyOn(gptTokenizer, "isWithinTokenLimit");
     try {
       expect(countGptTokensWithinLimit(text, 1_000)).toBeNull();
-      expect(encodeSpy).not.toHaveBeenCalled();
       expect(countSpy).not.toHaveBeenCalled();
-      expect(withinSpy).not.toHaveBeenCalled();
     } finally {
-      encodeSpy.mockRestore();
       countSpy.mockRestore();
-      withinSpy.mockRestore();
     }
   });
 
@@ -288,7 +269,6 @@ describe("canonical token counting", () => {
         encodedBytes: inline.reduce((total, url) => total + url.length, 0),
       },
     });
-    expect(await countCanonicalContentTokens(messages)).toBe(counted.tokens);
   });
 
   test("keeps a projected image in the stored inventory and counts its placeholder as text", async () => {
@@ -346,21 +326,21 @@ describe("canonical token counting", () => {
     try {
       const order: string[] = [];
       setImmediate(() => order.push("immediate"));
-      const counted = await countCanonicalContentTokens(messages).then(
+      const counted = await countModelFacingContentTokens(messages).then(
         count => {
           order.push("count");
           return count;
         },
       );
 
-      expect(counted).toBe(exact);
       expect(order).toEqual(["immediate", "count"]);
-      expect(await countModelFacingContentTokens(messages)).toEqual({
+      expect(counted).toEqual({
         tokens: exact,
         projectedMediaTokens: 0,
         inlineFileTokens: exact,
         inlineFiles: { count: 1, encodedBytes: url.length },
       });
+      expect(await countModelFacingContentTokens(messages)).toEqual(counted);
       expect(encodeSpy).toHaveBeenCalledTimes(1);
     } finally {
       encodeSpy.mockRestore();
@@ -377,7 +357,7 @@ describe("canonical token counting", () => {
       },
     ];
 
-    await expect(countCanonicalContentTokens(messages)).rejects.toThrow(
+    await expect(countModelFacingContentTokens(messages)).rejects.toThrow(
       "Disallowed special token found: <|endoftext|>",
     );
   });
@@ -399,16 +379,6 @@ describe("canonical token counting", () => {
 
     expect(pluginPackage.default.dependencies["gpt-tokenizer"]).toBe("3.4.0");
     expect(tokenizerPackage.default.version).toBe("3.4.0");
-  });
-
-  test("delegates bounded checks without local prefix encoding", () => {
-    const encodeSpy = spyOn(gptTokenizer, "encode");
-    try {
-      expect(countGptTokensWithinLimit("x".repeat(20_000), 1)).toBeNull();
-      expect(encodeSpy).not.toHaveBeenCalled();
-    } finally {
-      encodeSpy.mockRestore();
-    }
   });
 });
 

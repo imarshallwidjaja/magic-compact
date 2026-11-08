@@ -27,22 +27,24 @@ import {
   canonicalRequestSha256,
   datasetCases,
   DATASET_SPLITS,
-  DECISION_EVALUATION_THRESHOLD,
   datasetSha256,
   DecisionEvalError,
   requestSetSha256,
   semanticQuestionSha256,
   sha256,
+  thresholdRefusal,
   type DecisionDataset,
   type EvalCase,
 } from "./dataset";
 import {
+  FAILURE_CATEGORIES,
   FATAL_CATEGORIES,
+  isFatalCategory,
   PROVIDER_IDS,
   PROVIDERS,
   returnedModelMatches,
   sendDecision,
-  type FailureCategory,
+  type FatalCategory,
   type ProviderAdapter,
   type Transport,
 } from "./providers";
@@ -129,15 +131,7 @@ const outcomeSchema = z.discriminatedUnion("status", [
   z.strictObject({
     status: z.literal("failed"),
     ...outcomeBase,
-    category: z.enum([
-      "auth",
-      "rate-limit",
-      "http",
-      "timeout",
-      "network",
-      "invalid-response",
-      "model-mismatch",
-    ]),
+    category: z.enum(FAILURE_CATEGORIES),
     httpStatus: z.number().int().min(100).max(599).optional(),
   }),
   z.strictObject({
@@ -145,7 +139,7 @@ const outcomeSchema = z.discriminatedUnion("status", [
     caseID: z.string(),
     repeat: z.number().int().min(1),
     canonicalRequestSha256: digest,
-    reason: z.enum(["stopped-after-auth", "stopped-after-rate-limit"]),
+    reason: z.templateLiteral(["stopped-after-", z.enum(FATAL_CATEGORIES)]),
   }),
 ]);
 export type Outcome = z.infer<typeof outcomeSchema>;
@@ -186,7 +180,8 @@ type PlannedCase = {
 
 // The singleton request for one case and what it is sent as, built only by the
 // production request builder and the provider adapter. Planning and result
-// loading both use it, so a stored hash is always checked against this.
+// loading both use it, so a stored hash is always checked against this. A
+// provider's documented body limit applies to these exact wire bytes.
 function planCase(
   item: EvalCase,
   adapter: ProviderAdapter,
@@ -194,6 +189,12 @@ function planCase(
 ): PlannedCase {
   const request = buildCaseRequest(item);
   const body = adapter.translate(request, model);
+  const bytes = Buffer.byteLength(body, "utf8");
+  if (adapter.bodyByteLimit !== null && bytes > adapter.bodyByteLimit) {
+    throw new DecisionEvalError(
+      `Case ${item.caseID} cannot be sent to ${adapter.id}: its ${bytes}-byte request body is above the provider's ${adapter.bodyByteLimit}-byte limit (budget).`,
+    );
+  }
   return {
     item,
     request,
@@ -229,21 +230,8 @@ function integerOption(
 // bad selection never reaches a paid request.
 export function planRun(options: RunOptions): RunPlan {
   const { dataset, adapter, model } = options;
-  if (
-    !Number.isFinite(options.threshold)
-    || options.threshold <= 0
-    || options.threshold > 1
-  ) {
-    throw new DecisionEvalError("--threshold must be above 0 and at most 1.");
-  }
-  if (
-    dataset.split === "heldout"
-    && options.threshold !== DECISION_EVALUATION_THRESHOLD
-  ) {
-    throw new DecisionEvalError(
-      `Held-out datasets are scored at the frozen threshold ${DECISION_EVALUATION_THRESHOLD}; --threshold is not available for them.`,
-    );
-  }
+  const refusal = thresholdRefusal(dataset.split, options.threshold);
+  if (refusal) throw new DecisionEvalError(`--threshold ${refusal}.`);
   integerOption("--repeat", options.repeat, 1, MAX_REPEAT);
   integerOption("--concurrency", options.concurrency, 1, MAX_CONCURRENCY);
   integerOption("--timeout-ms", options.timeoutMs, 1, 600_000);
@@ -351,7 +339,7 @@ export async function executeRun(
     deps.onOutcome?.(outcome);
   };
   let next = 0;
-  let stoppedBy: FailureCategory | undefined;
+  let stoppedBy: FatalCategory | undefined;
   const worker = async () => {
     while (stoppedBy === undefined && next < units.length) {
       const { planned, repeat } = units[next]!;
@@ -377,7 +365,7 @@ export async function executeRun(
       });
       if (
         transport.status === "failed"
-        && FATAL_CATEGORIES.has(transport.category)
+        && isFatalCategory(transport.category)
       ) {
         stoppedBy ??= transport.category;
       }
@@ -386,7 +374,7 @@ export async function executeRun(
   await Promise.all(
     Array.from({ length: Math.min(options.concurrency, units.length) }, worker),
   );
-  if (stoppedBy === "auth" || stoppedBy === "rate-limit") {
+  if (stoppedBy !== undefined) {
     for (const { planned, repeat } of units.slice(next)) {
       record({
         status: "not-attempted",
@@ -510,13 +498,9 @@ export function loadRun(dir: string, dataset: DecisionDataset): LoadedRun {
   ) {
     return reject("has a request set that does not match its plan.");
   }
-  if (
-    manifest.dataset.split === "heldout"
-    && manifest.threshold !== DECISION_EVALUATION_THRESHOLD
-  ) {
-    return reject(
-      `scored a held-out dataset at threshold ${manifest.threshold}, not the frozen ${DECISION_EVALUATION_THRESHOLD}.`,
-    );
+  const refusal = thresholdRefusal(manifest.dataset.split, manifest.threshold);
+  if (refusal) {
+    return reject(`records threshold ${manifest.threshold}, which ${refusal}.`);
   }
   const outcomes: Outcome[] = [];
   const seen = new Set<string>();

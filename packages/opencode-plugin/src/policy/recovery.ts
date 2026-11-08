@@ -7,15 +7,13 @@
 // delivery.
 import { isRecord } from "../util";
 import { PluginMessageError } from "./feedback";
-import { boundedLabel } from "./successor";
+import { boundedLabel, plural } from "./successor";
 
 export const RECOVER_COMMAND_NAME = "Magic Recover";
 
-// The error a closed assistant response carries.
 export const RECOVERED_RESPONSE_ERROR =
   "Interrupted; outcome unknown. /magic-recover closed this response after it was declared abandoned.";
 
-// The error a closed tool call carries.
 export const RECOVERED_TOOL_ERROR =
   "Tool execution interrupted; outcome unknown. /magic-recover closed this call after it was declared abandoned.";
 
@@ -49,9 +47,6 @@ export type RecoveryRecord =
   // time. OpenCode 2's import drops such a response, so the copy gets the
   // latest time the message already records and keeps its error and content.
   | { kind: "completion-time"; messageID: string };
-
-const plural = (count: number, noun: string) =>
-  `${count} ${noun}${count === 1 ? "" : "s"}`;
 
 function recordLabel(record: RecoveryRecord): string {
   switch (record.kind) {
@@ -181,9 +176,21 @@ export function recoveryContext(
   ].join("\n");
 }
 
+// What recovery stores under a tool call's `metadata.magicCompact.recovered`.
+// A background launch still owed its result names the job whose delivery was
+// abandoned: a child session ID on OpenCode 1, a shell or subagent ID on
+// OpenCode 2. A closed call records the state it was in and the value the
+// host's error state has no field for: a pending call's raw input and a
+// running call's title on OpenCode 1, a streaming call's partial input on
+// OpenCode 2.
+export type RecoveryMarker =
+  | { delivery: "abandoned"; job: string }
+  | { outcome: "unknown"; state: "pending"; raw: string }
+  | { outcome: "unknown"; state: "running"; title?: string }
+  | { outcome: "unknown"; state: "streaming"; input: string };
+
 // The job a recovery marker on a background launch names as abandoned, if the
-// launch carries one: a child session ID on OpenCode 1, a shell or subagent ID
-// on OpenCode 2. `withRecoveryMarker` writes the marker; this reads it.
+// launch carries one. `withRecoveryMarker` writes the marker; this reads it.
 export function abandonedDeliveryJob(
   metadata: Readonly<Record<string, unknown>> | undefined,
 ): string | undefined {
@@ -202,7 +209,7 @@ export function abandonedDeliveryJob(
 // `magicCompact` entry, next to any marker an earlier trim left there.
 export function withRecoveryMarker(
   metadata: Readonly<Record<string, unknown>> | undefined,
-  marker: Record<string, unknown>,
+  marker: RecoveryMarker,
 ): Record<string, unknown> {
   const magicCompact = metadata?.["magicCompact"];
   return {
@@ -214,6 +221,48 @@ export function withRecoveryMarker(
       recovered: marker,
     },
   };
+}
+
+// One stored background record, as a host adapter extracts it in stored
+// order. `job` and `mark` are in the namespace the adapter chose for its
+// jobs; `mark` is the job a recovery marker on the launch names.
+export type DeliveryRecord<Launch> =
+  | {
+      type: "launch";
+      launch: Launch;
+      job: string | undefined;
+      mark: string | undefined;
+    }
+  | { type: "delivery"; job: string };
+
+// Settles background launches against their deliveries. Every launch owes one
+// later delivery for its job: in stored order a delivery settles the oldest
+// launch of its job that is still open, and one with no open launch settles
+// nothing, so a job started twice owes two and a delivery stored before its
+// launch settles neither. A launch whose recovery marker names its own job
+// is settled by that mark alone and takes no delivery. A launch without a
+// job can never be settled. Returns every launch in stored order.
+export function settleDeliveries<Launch>(
+  records: Iterable<DeliveryRecord<Launch>>,
+): Array<{ launch: Launch; settled: boolean }> {
+  const launches: Array<{ launch: Launch; settled: boolean }> = [];
+  const open = new Map<string, Array<(typeof launches)[number]>>();
+  for (const record of records) {
+    if (record.type === "delivery") {
+      const settled = open.get(record.job)?.shift();
+      if (settled !== undefined) settled.settled = true;
+      continue;
+    }
+    const entry = {
+      launch: record.launch,
+      settled: record.job !== undefined && record.mark === record.job,
+    };
+    launches.push(entry);
+    if (record.job !== undefined && !entry.settled) {
+      open.set(record.job, [...(open.get(record.job) ?? []), entry]);
+    }
+  }
+  return launches;
 }
 
 // A record this command cannot close without guessing what the host would

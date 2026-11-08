@@ -1,5 +1,5 @@
 import type { Event } from "@opencode-ai/sdk";
-import { readStats, writeStats } from "../storage/stats";
+import { InvalidStatsError, recordAssistantCompletion } from "../storage/stats";
 
 export async function handleStatsEvent(event: Event): Promise<void> {
   if (event.type !== "message.updated") {
@@ -11,28 +11,19 @@ export async function handleStatsEvent(event: Event): Promise<void> {
     return;
   }
 
-  await recordAssistantCompletion(info.sessionID, info.id);
+  await recordCompletionEvent(info.sessionID, info.id);
 }
 
-// Adds the conversation's current savings once per completed assistant
-// message. `statsKey` names the session's stats file.
-export async function recordAssistantCompletion(
+// The host's completion event, on either host. Invalid saved stats stay as
+// they are and this completion is not counted; the commands that need those
+// totals report them. Any other failure reaches the caller.
+export async function recordCompletionEvent(
   statsKey: string,
   messageID: string,
 ): Promise<void> {
-  const stats = await readStats(statsKey);
-  if (!stats || stats.processedAssistantMessageIds.includes(messageID)) {
-    return;
+  try {
+    await recordAssistantCompletion(statsKey, messageID);
+  } catch (error) {
+    if (!(error instanceof InvalidStatsError)) throw error;
   }
-
-  await writeStats(statsKey, {
-    ...stats,
-    cachedTokensSaved: stats.cachedTokensSaved + stats.totalTokensPruned,
-    cachedMediaTokensSaved:
-      (stats.cachedMediaTokensSaved ?? 0) + (stats.mediaTokensProjected ?? 0),
-    processedAssistantMessageIds: [
-      ...stats.processedAssistantMessageIds,
-      messageID,
-    ],
-  });
 }

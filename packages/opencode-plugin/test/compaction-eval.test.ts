@@ -7,6 +7,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
+  appendFileSync,
+  chmodSync,
   cpSync,
   existsSync,
   lstatSync,
@@ -22,6 +24,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { OpenCode } from "@opencode/client";
 import { z } from "zod";
 import {
   ArtifactCacheError,
@@ -32,14 +35,13 @@ import {
   checkCompactionPlans,
   CORPUS_DIR,
   CorpusError,
+  isRunnablePlan,
   loadCorpus,
   sha256,
   v2SourceHistory,
 } from "../eval/compaction/corpus";
 import {
   GRADES_FORMAT,
-  JUDGE_SYSTEM,
-  JUDGMENT_JSON_SCHEMA,
   JudgmentSchema,
   judgePrompt,
   judgmentProblem,
@@ -59,20 +61,20 @@ import {
   type ExpectedState,
   type FetchLike,
   type SessionState,
+  WITNESS_PREFIX,
 } from "../eval/compaction/host";
 import { v1Host } from "../eval/compaction/host-v1";
-import { createdState, v2Host } from "../eval/compaction/host-v2";
+import { v2Host } from "../eval/compaction/host-v2";
 import {
   classifyOutcome,
   v1SuccessorInspection,
   v2SuccessorInspection,
 } from "../eval/compaction/inspect";
-import { summarizeRun } from "../eval/compaction/report";
+import { formatReport, summarizeRun } from "../eval/compaction/report";
+import { Ledger, outstanding } from "../eval/compaction/ledger";
 import {
   cleanupRun,
   gradeRunWithJudge,
-  Ledger,
-  outstanding,
   preflightProblems,
   readRun,
   removeOwned,
@@ -94,11 +96,13 @@ import {
 } from "../eval/compaction/scratch";
 import {
   applySummarizerVariant,
+  CONTROL,
   createControl,
   evalOptions,
   observeCommand,
   subjectStorage,
   type SessionFacts,
+  WITNESS,
 } from "../eval/compaction/wrapper/core";
 import { compactSuccess } from "../src/commands";
 import { OwnedSessions } from "../src/v2/owned";
@@ -145,15 +149,25 @@ describe("frozen corpus", () => {
       "444be5eb67688e27da659f81e0048691f4ae563472383cb35e45598501447048",
     );
     expect(corpus.corpusSha256).toBe(
-      sha256(readFileSync(join(CORPUS_DIR, "manifest.json"))),
+      "722ec924dea31a83934f019e64cd56a6d5103a3263aeae7e3e603b2a5748e92d",
     );
   });
 
-  test("every case plans one target, one preserved turn and no retention candidate on both hosts", async () => {
-    for (const plan of await checkCompactionPlans(corpus)) {
+  test("every case plans one target, one preserved turn and no retention candidate on both hosts, and any other plan is not runnable", async () => {
+    const plans = await checkCompactionPlans(corpus);
+    for (const plan of plans) {
       expect(plan.v1).toEqual({ targets: 1, preserved: 1, candidates: 0 });
       expect(plan.v2).toEqual({ targets: 1, preserved: 1, candidates: 0 });
+      expect(isRunnablePlan(plan)).toBe(true);
     }
+    const plan = plans[0]!;
+    for (const changed of [
+      { ...plan, v1: { ...plan.v1, preserved: 2 } },
+      { ...plan, v2: { ...plan.v2, preserved: 0 } },
+      { ...plan, v1: { ...plan.v1, targets: 2 } },
+      { ...plan, v2: { ...plan.v2, candidates: 1 } },
+    ])
+      expect(isRunnablePlan(changed)).toBe(false);
   });
 
   test("refuses a changed file, an unknown format and an extra field", () => {
@@ -907,6 +921,284 @@ describe("ledger", () => {
     ]);
     expect(settled.attempts).toEqual([]);
   });
+
+  test("a removed successor's storage stays open until a removal is recorded for the request that preceded its deletion", () => {
+    const successor = (seq: number, attemptId: string, id: string) =>
+      entry(seq, "session-created", {
+        attemptId,
+        role: "successor",
+        id,
+        intentSeq: null,
+      });
+    const open = outstanding([
+      successor(1, "r1-A", "ses_a"),
+      // An earlier writer recorded no answers: the first request kept the
+      // session, and the wrapper may hold the receipt under either request.
+      entry(2, "storage-receipt-request", {
+        attemptId: "r1-A",
+        id: "ses_a",
+        requestId: "r1",
+      }),
+      entry(3, "session-retained", { attemptId: "r1-A", id: "ses_a" }),
+      entry(4, "storage-receipt-request", {
+        attemptId: "r1-A",
+        id: "ses_a",
+        requestId: "r2",
+      }),
+      // Removed, then a crash before any storage outcome was recorded.
+      entry(5, "session-removed", { attemptId: "r1-A", id: "ses_a" }),
+      successor(6, "r1-C", "ses_c"),
+      entry(7, "storage-receipt-request", {
+        attemptId: "r1-C",
+        id: "ses_c",
+        requestId: "r3",
+      }),
+      entry(8, "session-removed", { attemptId: "r1-C", id: "ses_c" }),
+      entry(9, "storage-orphaned", {
+        attemptId: "r1-C",
+        id: "ses_c",
+        requestId: "r3",
+        paths: { cache: "/c", stats: "/s" },
+      }),
+      successor(10, "r2-A", "ses_b"),
+      entry(11, "storage-receipt-request", {
+        attemptId: "r2-A",
+        id: "ses_b",
+        requestId: "r4",
+      }),
+      entry(12, "session-removed", { attemptId: "r2-A", id: "ses_b" }),
+      entry(13, "storage-orphaned", {
+        attemptId: "r2-A",
+        id: "ses_b",
+        requestId: "r4",
+        paths: null,
+      }),
+      // A late confirmation closes only its own request.
+      entry(14, "storage-removed", {
+        attemptId: "r2-A",
+        id: "ses_b",
+        requestId: "r4",
+        reconciled: true,
+      }),
+    ]);
+    expect(open.sessions).toEqual([]);
+    expect(open.storage).toEqual([
+      {
+        attemptId: "r1-A",
+        id: "ses_a",
+        requestId: "r2",
+        paths: null,
+        uncertainRequestIds: ["r1"],
+      },
+      {
+        attemptId: "r1-C",
+        id: "ses_c",
+        requestId: "r3",
+        paths: { cache: "/c", stats: "/s" },
+      },
+    ]);
+  });
+
+  test("a later request with no recorded answer may hold the receipt after a prepared one; only an exact confirmation of either settles, and a refused request never does", () => {
+    const [A, B] = ["a", "b"].map(c => c.repeat(24)) as [string, string];
+    const paths = { cache: "/c", stats: "/s" };
+    const fields = { attemptId: "r1-A", id: "ses_s" };
+    const gone = (answerB: Record<string, unknown> | null) => [
+      entry(1, "session-created", {
+        ...fields,
+        role: "successor",
+        intentSeq: null,
+      }),
+      entry(2, "storage-receipt-request", { ...fields, requestId: A }),
+      entry(3, "storage-receipt", {
+        ...fields,
+        requestId: A,
+        phase: "prepared",
+        paths,
+      }),
+      entry(4, "session-retained", { ...fields, reason: "busy" }),
+      entry(5, "storage-receipt-request", { ...fields, requestId: B }),
+      ...(answerB
+        ? [entry(6, "storage-receipt", { ...fields, requestId: B, ...answerB })]
+        : []),
+      entry(7, "session-absent", fields),
+    ];
+    const removed = (requestId: string, id = "ses_s") =>
+      entry(8, "storage-removed", { attemptId: "r1-A", id, requestId });
+    const open = (entries: ReturnType<typeof gone>) =>
+      outstanding(entries).storage;
+
+    const unanswered = gone(null);
+    expect(open(unanswered)).toEqual([
+      { ...fields, requestId: A, paths, uncertainRequestIds: [B] },
+    ]);
+    expect(open([...unanswered, removed(B)])).toEqual([]);
+    expect(open([...unanswered, removed(A)])).toEqual([]);
+    for (const other of [removed(B, "ses_other"), removed("c".repeat(24))])
+      expect(open([...unanswered, other])).toHaveLength(1);
+
+    const refused = gone({ phase: "refused", reason: "not this run's" });
+    expect(open(refused)).toEqual([{ ...fields, requestId: A, paths }]);
+    expect(open([...refused, removed(B)])).toHaveLength(1);
+    expect(open([...refused, removed(A)])).toEqual([]);
+
+    // A prepared later request replaces the earlier receipt.
+    const replaced = gone({ phase: "prepared", paths });
+    expect(open(replaced)).toEqual([{ ...fields, requestId: B, paths }]);
+    expect(open([...replaced, removed(A)])).toHaveLength(1);
+  });
+
+  test("a torn tail, a broken sequence, a non-object line or a missing kind refuses the ledger and leaves its bytes", () => {
+    const line = (seq: unknown) =>
+      JSON.stringify({
+        seq,
+        at: "2026-11-08T00:00:00.000Z",
+        kind: "run-start",
+      });
+    const variants: Array<[string, string, RegExp]> = [
+      [
+        "torn tail",
+        `${line(1)}\n{"seq":2,"at":"t","ki`,
+        /line 2: .*incomplete/u,
+      ],
+      [
+        "complete entry without its newline",
+        `${line(1)}\n${line(2)}`,
+        /line 2: .*incomplete/u,
+      ],
+      ["duplicate sequence", `${line(1)}\n${line(1)}\n`, /line 2: .*seq 1/u],
+      [
+        "going back",
+        `${line(1)}\n${line(3)}\n${line(2)}\n`,
+        /line 3: .*seq 2/u,
+      ],
+      ["zero", `${line(0)}\n`, /line 1: .*seq 0/u],
+      ["fraction", `${line(1)}\n${line(2.5)}\n`, /line 2: .*seq 2\.5/u],
+      ["string", `${line(1)}\n${line("2")}\n`, /line 2: .*seq "2"/u],
+      ["unsafe", `${line(1)}\n${line(2 ** 53)}\n`, /line 2: .*seq 9007/u],
+      ["array", `${line(1)}\n[2]\n`, /line 2: .*not a JSON object/u],
+      [
+        "kind not a string",
+        `${line(1)}\n{"seq":2,"at":"t","kind":7}\n`,
+        /line 2: .*kind/u,
+      ],
+      ["blank line", `${line(1)}\n\n${line(2)}\n`, /line 2: .*not JSON/u],
+    ];
+    const dir = scratch();
+    try {
+      for (const [name, text, error] of variants) {
+        const path = join(dir, "ledger.jsonl");
+        writeFileSync(path, text);
+        expect(() => Ledger.read(path), name).toThrow(EvalError);
+        expect(() => Ledger.read(path), name).toThrow(error);
+        expect(() => new Ledger(path), name).toThrow(error);
+        expect(readFileSync(path, "utf8"), name).toBe(text);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The earlier writer numbered an entry before writing it, so an append the
+  // file system refused left a gap before the next entry it wrote.
+  test("a ledger with the gap an earlier writer's failed append left reads, reconciles and takes the next number above its last", () => {
+    const dir = scratch();
+    try {
+      const path = join(dir, "ledger.jsonl");
+      const legacy = [
+        entry(1, "run-start", {}),
+        // seq 2 was refused by the file system.
+        entry(3, "session-intent", {
+          attemptId: "r1-A",
+          role: "source",
+          plannedID: null,
+          title: "t",
+        }),
+        entry(4, "session-created", {
+          attemptId: "r1-A",
+          role: "source",
+          id: "ses_s",
+          intentSeq: 3,
+        }),
+        // seq 5 and 6 were refused.
+        entry(7, "session-intent", {
+          attemptId: "r1-B",
+          role: "source",
+          plannedID: null,
+          title: "u",
+        }),
+      ];
+      const text = legacy.map(e => `${JSON.stringify(e)}\n`).join("");
+      writeFileSync(path, text);
+      const open = outstanding(Ledger.read(path));
+      expect(open.sessions.map(e => e["id"])).toEqual(["ses_s"]);
+      expect(open.intents.map(e => e.seq)).toEqual([7]);
+      const ledger = new Ledger(path);
+      expect(ledger.append("session-intent-resolved", { intentSeq: 7 })).toBe(
+        8,
+      );
+      expect(readFileSync(path, "utf8").startsWith(text)).toBe(true);
+      expect(Ledger.read(path).map(e => e.seq)).toEqual([1, 3, 4, 7, 8]);
+      expect(outstanding(Ledger.read(path)).intents).toEqual([]);
+
+      // The last safe number reads, and nothing more is appended after it.
+      const full = `${JSON.stringify(entry(Number.MAX_SAFE_INTEGER, "run-start", {}))}\n`;
+      writeFileSync(path, full);
+      expect(Ledger.read(path)).toHaveLength(1);
+      expect(() => new Ledger(path).append("scratch-kept")).toThrow(
+        /no sequence number left/u,
+      );
+      expect(readFileSync(path, "utf8")).toBe(full);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an append the file system refuses takes no number, so the next one continues without a gap", () => {
+    const dir = scratch();
+    try {
+      const path = join(dir, "ledger.jsonl");
+      const ledger = new Ledger(path);
+      ledger.append("run-start");
+      chmodSync(path, 0o444);
+      try {
+        expect(() => ledger.append("scratch-root")).toThrow(/EACCES/u);
+      } finally {
+        chmodSync(path, 0o644);
+      }
+      ledger.append("scratch-root");
+      expect(Ledger.read(path).map(e => [e.seq, e.kind])).toEqual([
+        [1, "run-start"],
+        [2, "scratch-root"],
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an append refuses a ledger another writer changed since this one last read or wrote it", () => {
+    const dir = scratch();
+    try {
+      const path = join(dir, "ledger.jsonl");
+      const first = new Ledger(path);
+      first.append("run-start");
+      const second = new Ledger(path);
+      second.append("scratch-root", { directory: "/tmp/x" });
+      const before = readFileSync(path, "utf8");
+      expect(() => first.append("scratch-kept")).toThrow(
+        /changed since this command last read or wrote it/u,
+      );
+      expect(readFileSync(path, "utf8")).toBe(before);
+      expect(Ledger.read(path).map(e => [e.seq, e.kind])).toEqual([
+        [1, "run-start"],
+        [2, "scratch-root"],
+      ]);
+      second.append("scratch-kept");
+      expect(Ledger.read(path).map(e => e.seq)).toEqual([1, 2, 3]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // --- removal ------------------------------------------------------------------
@@ -1088,6 +1380,10 @@ describe("removal", () => {
     change?: (state: SessionState) => SessionState;
     pending?: Pending;
     failStorage?: boolean;
+    // Another writer deletes the successor right after the wrapper prepared
+    // its receipt; the host reports that deletion to the wrapper, whose
+    // stats removal fails when `failStats` is set.
+    vanish?: { failStats: boolean };
   }) {
     const recorded = stateAt("/eval/project");
     const storage = await subjectStorage("v1", PACKAGE_DIR);
@@ -1097,13 +1393,21 @@ describe("removal", () => {
     writeFileSync(stats, "{}");
     const removed: string[] = [];
     const wrapper: { control?: ReturnType<typeof createControl> } = {};
+    let vanished = false;
     const { dir, ctx } = stubContext(
       stubHost({
         runCommand: async (_, id, __, args) => {
           await wrapper.control!.prepare(id, args);
+          if (options.vanish) {
+            vanished = true;
+            await wrapper.control!.deleted(id);
+          }
           return { kind: "returned", status: 500, message: null, ms: 1 };
         },
-        pending: async () => options.pending ?? { exists: true, reasons: [] },
+        pending: async () =>
+          vanished
+            ? { exists: false }
+            : (options.pending ?? { exists: true, reasons: [] }),
         read: async () => (options.change ?? (s => s))(recorded),
         remove: async (_, id) => {
           removed.push(id);
@@ -1132,7 +1436,15 @@ describe("removal", () => {
               title: `arkive compaction eval ${NONCE} r1-A`,
               metadata: {},
             },
-      async () => storage,
+      async () =>
+        options.vanish?.failStats
+          ? {
+              ...storage,
+              deleteStats: async () => {
+                throw new Error("EACCES");
+              },
+            }
+          : storage,
     );
     try {
       const result = await removeSuccessor(
@@ -1142,7 +1454,13 @@ describe("removal", () => {
         recorded,
         "r1-A",
       );
-      return { result, removed, present: [cache, stats].map(existsSync) };
+      return {
+        result,
+        removed,
+        present: [cache, stats].map(existsSync),
+        open: outstanding(Ledger.read(ctx.ledger.path)),
+        kinds: Ledger.read(ctx.ledger.path).map(e => e.kind),
+      };
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1152,6 +1470,7 @@ describe("removal", () => {
     const ok = await successorRemoval({});
     expect(ok.result).toMatchObject({ action: "removed", storage: "removed" });
     expect(ok.present).toEqual([false, false]);
+    expect(ok.open.storage).toEqual([]);
     for (const refused of [
       // Another writer appended to the successor.
       {
@@ -1178,6 +1497,42 @@ describe("removal", () => {
     }
   }, 60_000);
 
+  test("a successor another writer deleted after its receipt is absent, and its storage stays the run's until that deletion's removal is confirmed", async () => {
+    const confirmed = await successorRemoval({ vanish: { failStats: false } });
+    expect(confirmed.result).toEqual({
+      id: "ses_x",
+      action: "absent",
+      storage: "removed",
+    });
+    expect(confirmed.removed).toEqual([]);
+    expect(confirmed.present).toEqual([false, false]);
+    expect(confirmed.open).toMatchObject({ sessions: [], storage: [] });
+    expect(confirmed.kinds).toEqual([
+      "storage-receipt-request",
+      "storage-receipt",
+      "session-absent",
+      "storage-removed",
+    ]);
+
+    const failed = await successorRemoval({ vanish: { failStats: true } });
+    expect(failed.result).toMatchObject({
+      action: "absent",
+      storage: { orphaned: { stats: expect.stringContaining("ses_x") } },
+    });
+    expect(failed.present).toEqual([false, true]);
+    expect(failed.open.storage).toEqual([
+      {
+        attemptId: "r1-A",
+        id: "ses_x",
+        requestId: expect.stringMatching(/^[0-9a-f]{24}$/u),
+        paths: {
+          cache: expect.stringContaining("ses_x"),
+          stats: expect.stringContaining("ses_x"),
+        },
+      },
+    ]);
+  });
+
   test("a deleted successor whose storage removal is not confirmed reports the storage left behind", async () => {
     const orphan = await successorRemoval({ failStorage: true });
     expect(orphan.removed).toEqual(["ses_x"]);
@@ -1186,6 +1541,18 @@ describe("removal", () => {
       storage: { orphaned: { cache: expect.stringContaining("ses_x") } },
     });
     expect(orphan.present).toEqual([true, true]);
+    // The run still owns that storage until a removal is confirmed.
+    expect(orphan.open.storage).toEqual([
+      {
+        attemptId: "r1-A",
+        id: "ses_x",
+        requestId: expect.stringMatching(/^[0-9a-f]{24}$/u),
+        paths: {
+          cache: expect.stringContaining("ses_x"),
+          stats: expect.stringContaining("ses_x"),
+        },
+      },
+    ]);
   }, 60_000);
 });
 
@@ -1591,6 +1958,232 @@ describe("OpenCode 2 driver", () => {
     };
   }
 
+  // A location whose plugin activation runs as OpenCode 2.0.28 runs it. The
+  // plugins available locally, the host's built-ins and the wrapper in
+  // `wrapperState`, are applied first, so the inventory is already not empty
+  // and the wrapper's commands are registered while a global package still
+  // installs; settlement adds that package's failed install. `model.default`
+  // is the real public client over a fetch that answers each request with
+  // the next of `answers`: "ready" settles the location, and "plugin" is the
+  // host's answer after its own 5 s wait. `calls` lists every read in order.
+  type Answer = "ready" | "plugin" | "other-503" | "untagged-503" | "500";
+  function activatingHost(
+    answers: Answer[] | (() => Answer),
+    wrapperState: Json = { status: "active" },
+  ) {
+    const witness = {
+      kind: "init",
+      runNonce: NONCE,
+      artifactKey: "k",
+      subjectMismatches: 0,
+      pid: PID,
+    };
+    const loaded = wrapperState.status === "active";
+    const summarizer = { providerID: "p", id: "m" };
+    const clock = { now: 0 };
+    const calls: string[] = [];
+    let settled = false;
+    const next = () =>
+      typeof answers === "function" ? answers() : answers.shift()!;
+    const reply = (status: number, body: Json) =>
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { "content-type": "application/json" },
+      });
+    const publicClient = OpenCode.make({
+      baseUrl: "http://127.0.0.1:1",
+      fetch: (async () => {
+        calls.push("model.default");
+        const answer = next();
+        if (answer === "ready") {
+          settled = true;
+          return reply(200, { location: { directory: "/eval/project" } });
+        }
+        if (answer === "plugin") {
+          clock.now += 5_000;
+          return reply(503, {
+            _tag: "ServiceUnavailableError",
+            message: "Location plugins did not finish activating",
+            service: "plugin",
+          });
+        }
+        if (answer === "other-503")
+          return reply(503, {
+            _tag: "ServiceUnavailableError",
+            message: "unavailable",
+            service: "websearch",
+          });
+        if (answer === "untagged-503")
+          return new Response("Service Unavailable", { status: 503 });
+        return reply(500, { _tag: "UnknownError", message: "boom" });
+      }) as unknown as typeof fetch,
+    });
+    const read =
+      <T>(name: string, value: () => T) =>
+      async () => {
+        calls.push(name);
+        return value();
+      };
+    const client = {
+      model: {
+        default: publicClient.model.default,
+        list: read("model.list", () => ({
+          data: [{ providerID: "p", id: "m", variants: [] }],
+        })),
+      },
+      plugin: {
+        list: read("plugin.list", () => ({
+          data: [
+            {
+              id: "opencode.policy",
+              source: { type: "builtin" },
+              state: { status: "active" },
+            },
+            {
+              id: "arkive-compact-eval",
+              source: { type: "local", path: "/cache/k/v2" },
+              state: wrapperState,
+            },
+            ...(settled
+              ? [
+                  // A failed install, which OpenCode 2.0.28 lists without
+                  // an ID.
+                  {
+                    source: { type: "package", target: "global-auth@1.0.0" },
+                    state: { status: "failed", error: "install failed" },
+                  },
+                ]
+              : []),
+          ],
+        })),
+      },
+      command: {
+        list: read("command.list", () => ({
+          data: [
+            ...["magic-compact", "magic-trim", "magic-stats", "magic-recover"],
+            ...(loaded ? [CONTROL] : []),
+          ]
+            .map((name): Json => ({ name }))
+            .concat(
+              loaded
+                ? [
+                    {
+                      name: WITNESS,
+                      description: `${WITNESS_PREFIX}${JSON.stringify(witness)}`,
+                    },
+                  ]
+                : [],
+            ),
+        })),
+      },
+      agent: {
+        list: read("agent.list", () => ({
+          data: [{ name: "magic-compact-summarizer", model: summarizer }],
+        })),
+        get: read("agent.get", () => ({ data: { model: summarizer } })),
+      },
+      config: { get: read("config.get", () => []) },
+      mcp: { list: read("mcp.list", () => ({ data: [] })) },
+    };
+    return {
+      calls,
+      clock,
+      host: v2Host(
+        "http://127.0.0.1:1",
+        undefined,
+        fetch,
+        client as never,
+        () => clock.now,
+      ),
+    };
+  }
+  const preflightOf = (read: Awaited<ReturnType<EvalHost["setup"]>>) =>
+    preflightProblems({
+      runNonce: NONCE,
+      artifactKey: "k",
+      ...read,
+      inits: 1,
+      model: parseModelSelector("p/m", "--model"),
+      descriptor: { variants: [] } as never,
+      mcp: [],
+    });
+
+  test("setup reads the location once, after its plugin activation settled, not at its first non-empty inventory", async () => {
+    const { host, calls } = activatingHost(["plugin", "plugin", "ready"]);
+    const read = await host.setup("/eval/project");
+    expect(calls.slice(0, 3)).toEqual(Array(3).fill("model.default"));
+    expect(calls.slice(3)).not.toContain("model.default");
+    expect(calls.filter(call => call === "plugin.list")).toHaveLength(1);
+    expect(read.witness).toMatchObject({ runNonce: NONCE, artifactKey: "k" });
+    // The global package's install failed in the second batch; the settled
+    // inventory records it.
+    expect(read.setup.plugins).toEqual([
+      "arkive-compact-eval@local:/cache/k/v2",
+      "package:global-auth@1.0.0 (error)",
+    ]);
+    expect(read.setup).toMatchObject({
+      summarizer: { model: "p/m", variant: null },
+      subjectSummarizer: { model: "p/m", variant: null },
+    });
+    expect(preflightOf(read)).toEqual([]);
+  });
+
+  test("a wrapper whose setup failed in a settled activation is recorded as failed and refused", async () => {
+    const { host } = activatingHost(["ready"], {
+      status: "failed",
+      error: "setup threw",
+    });
+    const read = await host.setup("/eval/project");
+    expect(read.witness).toBeNull();
+    expect(read.setup.plugins).toEqual([
+      "arkive-compact-eval@local:/cache/k/v2 (error)",
+      "package:global-auth@1.0.0 (error)",
+    ]);
+    expect(preflightOf(read)).toEqual([
+      "the eval wrapper did not load in the eval project",
+      `command ${CONTROL} is missing`,
+    ]);
+  });
+
+  test("only the host's plugin-activation answer is asked again; any other failure ends setup before any read", async () => {
+    for (const answer of ["other-503", "untagged-503", "500"] as const) {
+      const { host, calls } = activatingHost([answer, "ready"]);
+      await expect(host.setup("/eval/project")).rejects.toThrow();
+      expect([answer, calls]).toEqual([answer, ["model.default"]]);
+    }
+  });
+
+  test("a location still activating after 30 s refuses setup, with nothing read", async () => {
+    const { host, calls, clock } = activatingHost(() => "plugin");
+    await expect(host.setup("/eval/project")).rejects.toThrow(
+      new EvalError(
+        "OpenCode did not finish activating the plugins at /eval/project within 30 s; nothing there was read.",
+      ),
+    );
+    expect(calls).toEqual(Array(6).fill("model.default"));
+    expect(clock.now).toBe(30_000);
+  });
+
+  test("the judge's model and agent reads settle their location first", async () => {
+    const { host, calls } = activatingHost(["plugin", "ready", "ready"]);
+    const model = parseModelSelector("p/m", "--judge");
+    expect(await host.describeModel("/eval/judge", model)).toMatchObject({
+      providerID: "p",
+      modelID: "m",
+    });
+    expect(await host.resolvedAgent("/eval/judge", "judge")).toEqual({
+      model: "p/m",
+      variant: null,
+    });
+    expect(calls).toEqual([
+      "model.default",
+      "model.default",
+      "model.list",
+      "model.default",
+      "agent.get",
+    ]);
+  });
+
   test("every pending kind keeps a session; an idle one has none", async () => {
     const { state, host } = v2();
     sourceSession(state, "ses_x", []);
@@ -1631,8 +2224,6 @@ describe("OpenCode 2 driver", () => {
       prompt: "packet",
       ledger: { intent() {}, created() {}, removed() {} },
     });
-    const created = state.sessions.get(answer.sessionID!)!;
-    expect(answer.expected).toEqual(createdState(created as never));
     const { dir, ctx } = stubContext(host);
     try {
       state.messages
@@ -1801,8 +2392,27 @@ describe("scratch ownership", () => {
     expect(existsSync(join(owned, MARKER))).toBe(true);
   });
 
-  test("never names the output directory's ancestors as a root", () => {
-    expect(rootProblem(join(out, ".."), owner)).not.toBeNull();
+  // A root that would otherwise pass, named and marked like one, is refused
+  // and kept because the output directory is inside it.
+  test("never names or removes an ancestor of the output directory as a root", () => {
+    const parent = scratch();
+    made.push(parent);
+    const ancestor = join(parent, "arkive-compaction-eval-Anc123");
+    const inside = join(ancestor, "out");
+    mkdirSync(inside, { recursive: true });
+    const nested = { runNonce: NONCE, out: inside };
+    writeFileSync(
+      join(ancestor, MARKER),
+      `${JSON.stringify({ ...nested, root: ancestor, role: "root" })}\n`,
+    );
+
+    expect(rootProblem(ancestor, nested)).toBe(
+      `${ancestor} contains ${inside}`,
+    );
+    expect(removeOwnedTree(ancestor, [], nested)).toBe(
+      `${ancestor} contains ${inside}`,
+    );
+    expect(existsSync(inside)).toBe(true);
   });
 });
 
@@ -1845,7 +2455,9 @@ describe("cleanup", () => {
       }),
     );
     mkdirSync(join(dir, "channel"));
+    // As `runEval` writes it: its run-start first.
     const ledger = new Ledger(join(dir, "ledger.jsonl"));
+    ledger.append("run-start", { runNonce: NONCE });
     const root = createRoot(owner, "run");
     roots.push(root);
     ledger.append("scratch-root", { directory: root });
@@ -2121,6 +2733,451 @@ describe("cleanup", () => {
     expect(existsSync(held.project)).toBe(true);
   });
 
+  // A successor the run removed, or found gone after its receipt was
+  // prepared, whose storage removal was never confirmed.
+  const REQUEST = "a".repeat(24);
+  function removedSuccessorStorage(
+    f: Fixture,
+    end: "session-removed" | "session-absent" = "session-removed",
+  ) {
+    f.ledger.append("session-created", {
+      attemptId: "r1-A",
+      role: "successor",
+      id: "ses_succ",
+      intentSeq: null,
+    });
+    f.ledger.append("storage-receipt-request", {
+      attemptId: "r1-A",
+      id: "ses_succ",
+      requestId: REQUEST,
+    });
+    if (end === "session-absent")
+      f.ledger.append("storage-receipt", {
+        attemptId: "r1-A",
+        id: "ses_succ",
+        requestId: REQUEST,
+        phase: "prepared",
+        paths: { cache: "/c", stats: "/s" },
+      });
+    f.ledger.append(end, { attemptId: "r1-A", id: "ses_succ" });
+    f.ledger.append("storage-orphaned", {
+      attemptId: "r1-A",
+      id: "ses_succ",
+      requestId: REQUEST,
+      paths: { cache: "/c", stats: "/s" },
+    });
+  }
+  const storageLine = (
+    at: number,
+    fields: { sessionID?: string; requestId?: string; removed: boolean },
+  ) => ({
+    at,
+    kind: "control",
+    phase: "storage",
+    sessionID: "ses_succ",
+    requestId: REQUEST,
+    ...fields,
+  });
+
+  test("unconfirmed successor storage, from a removal or a deletion found after the receipt, keeps the tree and fails cleanup until a late confirmation closes exactly its receipt", async () => {
+    for (const end of ["session-removed", "session-absent"] as const) {
+      const f = runFixture();
+      removedSuccessorStorage(f, end);
+      const { host, calls } = memoryHost(f.project, []);
+      // Lines that confirm nothing: another request, another session, and a
+      // removal the wrapper reported as failed.
+      f.channelLine(
+        storageLine(5, { requestId: "b".repeat(24), removed: true }),
+      );
+      f.channelLine(storageLine(6, { sessionID: "ses_other", removed: true }));
+      f.channelLine(storageLine(7, { removed: false }));
+      const first = await cleanup(f.dir, host);
+      expect(first.unconfirmedStorage).toEqual([
+        {
+          attemptId: "r1-A",
+          id: "ses_succ",
+          requestId: REQUEST,
+          paths: { cache: "/c", stats: "/s" },
+        },
+      ]);
+      expect(first.complete).toBe(false);
+      expect(first.disposal[0]).toMatchObject({ scratchRemoved: false });
+      expect(calls).toEqual([]);
+      expect(existsSync(f.project)).toBe(true);
+
+      f.channelLine(storageLine(8, { removed: true }));
+      const second = await cleanup(f.dir, host);
+      expect(second.unconfirmedStorage).toEqual([]);
+      expect(second.complete).toBe(true);
+      expect(calls).toEqual([`dispose:${f.project}`]);
+      expect(existsSync(f.root)).toBe(false);
+      const confirmations = () =>
+        Ledger.read(join(f.dir, "ledger.jsonl")).filter(
+          e => e.kind === "storage-removed",
+        );
+      expect(confirmations()).toEqual([
+        expect.objectContaining({
+          attemptId: "r1-A",
+          id: "ses_succ",
+          requestId: REQUEST,
+          reconciled: true,
+        }),
+      ]);
+      await cleanup(f.dir, host);
+      expect(confirmations()).toHaveLength(1);
+    }
+  });
+
+  test("a successor already gone is settled from the receipt the wrapper prepared for that exact request and session, never by a new request", async () => {
+    const f = runFixture();
+    f.ledger.append("command-start", {
+      attemptId: "r1-A",
+      sourceID: "ses_src",
+      startedAt: 1,
+    });
+    f.ledger.append("attempt-settled", {
+      attemptId: "r1-A",
+      status: "delivered",
+    });
+    f.ledger.append("session-created", {
+      attemptId: "r1-A",
+      role: "successor",
+      id: "ses_succ",
+      intentSeq: null,
+    });
+    f.ledger.append("successor-verified", {
+      attemptId: "r1-A",
+      id: "ses_succ",
+      ...expectedOf(recorded(f.project, "ses_succ")),
+    });
+    // A request whose answer was never recorded, as an earlier writer or a
+    // crash leaves it.
+    f.ledger.append("storage-receipt-request", {
+      attemptId: "r1-A",
+      id: "ses_succ",
+      requestId: REQUEST,
+    });
+    // The host no longer has the successor, and has no command route: a new
+    // receipt request would fail the cleanup.
+    const { host, calls } = memoryHost(f.project, []);
+    const paths = { cache: "/c", stats: "/s" };
+    const control = (at: number, fields: Record<string, unknown>) =>
+      f.channelLine({
+        at,
+        kind: "control",
+        sessionID: "ses_succ",
+        requestId: REQUEST,
+        ...fields,
+      });
+    // Receipts that are not this request's for this session.
+    control(5, { phase: "prepared", requestId: "b".repeat(24), paths });
+    control(6, { phase: "prepared", sessionID: "ses_other", paths });
+    const first = await cleanup(f.dir, host);
+    expect(first.sessions).toEqual([
+      {
+        id: "ses_succ",
+        action: "retained",
+        reason: expect.stringMatching(/prepared no receipt/u),
+      },
+    ]);
+    expect(first.stillOwned).toEqual(["ses_succ"]);
+    expect(first.complete).toBe(false);
+    expect(calls).toEqual([]);
+
+    control(7, { phase: "prepared", paths });
+    control(8, { phase: "storage", removed: true, failed: [], paths });
+    const second = await cleanup(f.dir, host);
+    expect(second.sessions).toEqual([
+      { id: "ses_succ", action: "absent", storage: "removed" },
+    ]);
+    expect(second.complete).toBe(true);
+    expect(calls).toEqual([`dispose:${f.project}`]);
+    expect(
+      Ledger.read(join(f.dir, "ledger.jsonl"))
+        .filter(e => e["id"] === "ses_succ")
+        .map(e => [e.kind, e["reconciled"] ?? false]),
+    ).toEqual([
+      ["session-created", false],
+      ["successor-verified", false],
+      ["storage-receipt-request", false],
+      ["session-retained", false],
+      ["storage-receipt", true],
+      ["session-absent", false],
+      ["storage-removed", true],
+    ]);
+  });
+
+  test("a later receipt request whose answer the channel refused can hold the receipt, and the deletion's removal under it settles the gone successor", async () => {
+    const f = runFixture();
+    f.ledger.append("command-start", {
+      attemptId: "r1-A",
+      sourceID: "ses_src",
+      startedAt: 1,
+    });
+    f.ledger.append("attempt-settled", {
+      attemptId: "r1-A",
+      status: "delivered",
+    });
+    f.ledger.append("session-created", {
+      attemptId: "r1-A",
+      role: "successor",
+      id: "ses_succ",
+      intentSeq: null,
+    });
+    f.ledger.append("successor-verified", {
+      attemptId: "r1-A",
+      id: "ses_succ",
+      ...expectedOf(recorded(f.project, "ses_succ")),
+    });
+    // The wrapper's real control and the subject's real storage, writing to
+    // this run's channel.
+    const channel = join(f.dir, "channel");
+    const storage = await subjectStorage("v1", PACKAGE_DIR);
+    const paths = storage.paths("ses_succ");
+    mkdirSync(join(paths.stats, ".."), { recursive: true });
+    writeFileSync(paths.cache, "{}");
+    writeFileSync(paths.stats, "{}");
+    const control = createControl(
+      evalOptions({
+        evalRunNonce: NONCE,
+        evalChannel: channel,
+        evalSummarizerVariant: null,
+      }),
+      f.project,
+      async id =>
+        id === "ses_succ"
+          ? {
+              directory: f.project,
+              title: "Source",
+              metadata: {
+                magicCompact: { successorOf: "ses_src", ready: true },
+              },
+            }
+          : {
+              directory: f.project,
+              title: `arkive compaction eval ${NONCE} r1-A`,
+              metadata: {},
+            },
+      async () => storage,
+    );
+    const request = (requestId: string) => {
+      f.ledger.append("storage-receipt-request", {
+        attemptId: "r1-A",
+        id: "ses_succ",
+        requestId,
+      });
+      return control.prepare(
+        "ses_succ",
+        JSON.stringify({ runNonce: NONCE, requestId, sourceID: "ses_src" }),
+      );
+    };
+    // The first request is prepared and recorded, and the successor is kept.
+    expect(await request(REQUEST)).toMatch(/prepared$/u);
+    f.ledger.append("storage-receipt", {
+      attemptId: "r1-A",
+      id: "ses_succ",
+      requestId: REQUEST,
+      phase: "prepared",
+      paths,
+    });
+    f.ledger.append("session-retained", {
+      attemptId: "r1-A",
+      id: "ses_succ",
+      reason: "session status is busy",
+    });
+    // The second replaces the wrapper's receipt, then the file system refuses
+    // its answer.
+    const later = "b".repeat(24);
+    const file = join(channel, `host-${process.pid}.jsonl`);
+    chmodSync(file, 0o444);
+    try {
+      await expect(request(later)).rejects.toThrow(/EACCES|permission/iu);
+    } finally {
+      chmodSync(file, 0o644);
+    }
+    // Another writer deletes the successor and the host reports it. A
+    // removal line from another run confirms nothing.
+    await control.deleted("ses_succ");
+    appendFileSync(
+      file,
+      `${JSON.stringify({ at: Date.now(), runNonce: "f".repeat(32), kind: "control", phase: "storage", sessionID: "ses_succ", requestId: REQUEST, removed: true })}\n`,
+    );
+    const { host } = memoryHost(f.project, []);
+    const result = await cleanup(f.dir, host);
+    expect(result.sessions).toEqual([
+      { id: "ses_succ", action: "absent", storage: "removed" },
+    ]);
+    expect(result.complete).toBe(true);
+    expect([paths.cache, paths.stats].map(existsSync)).toEqual([false, false]);
+    expect(
+      Ledger.read(join(f.dir, "ledger.jsonl")).filter(
+        e => e.kind === "storage-removed",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        id: "ses_succ",
+        requestId: later,
+        reconciled: true,
+      }),
+    ]);
+  });
+
+  test("a scratch root kept for an invalid marker or a session the run cannot account for is reported as unresolved, not owned, until a later cleanup resolves it", async () => {
+    // An invalid location marker, then fixed.
+    const marked = runFixture();
+    const marker = join(marked.project, MARKER);
+    const original = readFileSync(marker, "utf8");
+    writeFileSync(marker, "{}");
+    const a = memoryHost(marked.project, []);
+    expect((await cleanup(marked.dir, a.host)).complete).toBe(false);
+    const keptMarker = summarizeRun(marked.dir, corpus);
+    expect(keptMarker.residue).toEqual({
+      sessions: [],
+      storage: [],
+      unresolvedIntents: [],
+      unknownOutcomes: [],
+    });
+    expect(keptMarker.unresolvedOwnership).toEqual([
+      {
+        directory: marked.root,
+        reason: expect.stringMatching(/^ownership not proven/u),
+      },
+    ]);
+    expect(formatReport([keptMarker])).toContain(
+      `Unresolved ownership (scratch roots the last disposal kept, with its reason; not counted as owned`,
+    );
+    writeFileSync(marker, original);
+    expect((await cleanup(marked.dir, a.host)).complete).toBe(true);
+    expect(a.calls).toEqual([`dispose:${marked.project}`]);
+    expect(summarizeRun(marked.dir, corpus).unresolvedOwnership).toEqual([]);
+
+    // A session the host lists that the run never created, then gone.
+    const foreign = runFixture();
+    const b = memoryHost(foreign.project, ["ses_foreign"]);
+    expect((await cleanup(foreign.dir, b.host)).complete).toBe(false);
+    const keptSession = summarizeRun(foreign.dir, corpus);
+    expect(keptSession.cleanupRetained).toEqual([]);
+    expect(keptSession.unresolvedOwnership).toEqual([
+      {
+        directory: foreign.root,
+        reason: "the host still lists sessions at an eval location",
+        location: foreign.project,
+        sessions: ["ses_foreign"],
+      },
+    ]);
+    expect(formatReport([keptSession])).toContain("sessions ses_foreign");
+    b.sessions.delete("ses_foreign");
+    expect((await cleanup(foreign.dir, b.host)).complete).toBe(true);
+    expect(b.calls).toEqual([`dispose:${foreign.project}`]);
+    expect(summarizeRun(foreign.dir, corpus).unresolvedOwnership).toEqual([]);
+
+    // A root kept for a missing root marker, then deleted by hand.
+    const removed = runFixture();
+    unlinkSync(join(removed.root, MARKER));
+    const c = memoryHost(removed.project, []);
+    expect((await cleanup(removed.dir, c.host)).complete).toBe(false);
+    expect(summarizeRun(removed.dir, corpus).unresolvedOwnership).toEqual([
+      {
+        directory: removed.root,
+        reason: expect.stringMatching(/^ownership not proven/u),
+      },
+    ]);
+    rmSync(removed.root, { recursive: true });
+    expect((await cleanup(removed.dir, c.host)).complete).toBe(true);
+    expect(c.calls).toEqual([]);
+    expect(summarizeRun(removed.dir, corpus).unresolvedOwnership).toEqual([]);
+  });
+
+  test("a source stays while its attempt's successor is still the run's, whatever kept the successor", async () => {
+    const f = runFixture();
+    recordedSource(f);
+    f.ledger.append("command-start", {
+      attemptId: "r1-A",
+      sourceID: "ses_src",
+      startedAt: 1,
+    });
+    f.ledger.append("attempt-settled", {
+      attemptId: "r1-A",
+      status: "delivered",
+    });
+    // The successor is registered after a location that proves no ownership.
+    f.ledger.append("location", {
+      role: "project",
+      directory: join(f.dir, "elsewhere", "project"),
+    });
+    f.ledger.append("session-created", {
+      attemptId: "r1-A",
+      role: "successor",
+      id: "ses_succ",
+      intentSeq: null,
+    });
+    const { host, calls } = memoryHost(f.project, ["ses_src", "ses_succ"]);
+    const summary = await cleanup(f.dir, host);
+    expect(summary.sessions).toEqual([
+      {
+        id: "ses_succ",
+        action: "retained",
+        reason: "its eval location does not prove ownership",
+      },
+      {
+        id: "ses_src",
+        action: "retained",
+        reason: expect.stringMatching(/its successor is kept/u),
+      },
+    ]);
+    expect(summary.stillOwned).toEqual(["ses_src", "ses_succ"]);
+    expect(calls).toEqual([]);
+  });
+
+  test("a ledger write that fails stops cleanup before anything is disposed, and the next cleanup settles from the host", async () => {
+    const f = runFixture();
+    recordedSource(f);
+    const { host, calls } = memoryHost(f.project, ["ses_src"]);
+    const ledgerPath = join(f.dir, "ledger.jsonl");
+    const inputs = () =>
+      ["run.json", "ledger.jsonl"].map(name =>
+        readFileSync(join(f.dir, name), "utf8"),
+      );
+    const before = inputs();
+    chmodSync(ledgerPath, 0o444);
+    try {
+      await expect(cleanup(f.dir, host)).rejects.toThrow(/EACCES/u);
+    } finally {
+      chmodSync(ledgerPath, 0o644);
+    }
+    // The removal ran but could not be recorded; nothing was disposed.
+    expect(calls).toEqual(["remove:ses_src"]);
+    expect(inputs()).toEqual(before);
+    expect(existsSync(f.project)).toBe(true);
+    const settled = await cleanup(f.dir, host);
+    expect(settled.sessions).toEqual([{ id: "ses_src", action: "absent" }]);
+    expect(settled.complete).toBe(true);
+    expect(existsSync(f.root)).toBe(false);
+  });
+
+  test("a torn ledger refuses cleanup and reports before anything is sent, removed or written", async () => {
+    const f = runFixture();
+    recordedSource(f);
+    const ledgerPath = join(f.dir, "ledger.jsonl");
+    appendFileSync(ledgerPath, '{"seq":8,"at":"t","kind":"session-rem');
+    const before = readFileSync(ledgerPath, "utf8");
+    const { host, calls } = memoryHost(f.project, ["ses_src"]);
+    let fetched = 0;
+    await expect(
+      cleanup(f.dir, host, {
+        fetch: async (...args) => {
+          fetched += 1;
+          return v1Server(...args);
+        },
+      }),
+    ).rejects.toThrow(/line 8: .*incomplete/u);
+    expect(() => summarizeRun(f.dir, corpus)).toThrow(/line 8: .*incomplete/u);
+    expect(fetched).toBe(0);
+    expect(calls).toEqual([]);
+    expect(readFileSync(ledgerPath, "utf8")).toBe(before);
+    expect(existsSync(f.project)).toBe(true);
+  });
+
   // The real CLI against a stand-in server that only identifies itself as
   // OpenCode 1: the exit status is what a script running `cleanup` sees.
   async function cleanupCli(
@@ -2182,26 +3239,48 @@ describe("cleanup", () => {
     expect(keptRoots(f)).toEqual([]);
   });
 
-  test("cleanup exits non-zero and deletes nothing while a scratch root that exists fails its ownership check", async () => {
-    const variants: Array<[string, (f: Fixture) => void]> = [
-      ["marker missing", f => unlinkSync(join(f.root, MARKER))],
-      [
-        "marker of another run",
-        f =>
-          writeFileSync(
-            join(f.root, MARKER),
-            `${JSON.stringify({ runNonce: "f".repeat(32), out: f.dir, root: f.root, role: "root" })}\n`,
-          ),
-      ],
-      [
-        "dangling symlink in its place",
-        f => {
-          rmSync(f.root, { recursive: true });
-          symlinkSync(join(f.dir, "missing"), f.root);
-        },
-      ],
-    ];
-    for (const [name, damage] of variants) {
+  test("cleanup exits non-zero while a removed successor's storage is unconfirmed, even with its root gone", async () => {
+    const { exits } = await cleanupCli(openAt, f => {
+      removedSuccessorStorage(f);
+      rmSync(f.root, { recursive: true });
+    });
+    expect(exits.map(e => e.code)).toEqual([1]);
+    expect(exits[0]!.stderr).toContain('"unconfirmedStorage"');
+    expect(exits[0]!.stderr).toContain("ses_succ");
+  });
+
+  test.each<[string, (f: Fixture) => void, (f: Fixture) => void]>([
+    [
+      "marker missing",
+      f => unlinkSync(join(f.root, MARKER)),
+      f =>
+        expect(readFileSync(join(f.root, "keep.txt"), "utf8")).toBe(
+          "user data",
+        ),
+    ],
+    [
+      "marker of another run",
+      f =>
+        writeFileSync(
+          join(f.root, MARKER),
+          `${JSON.stringify({ runNonce: "f".repeat(32), out: f.dir, root: f.root, role: "root" })}\n`,
+        ),
+      f =>
+        expect(readFileSync(join(f.root, "keep.txt"), "utf8")).toBe(
+          "user data",
+        ),
+    ],
+    [
+      "dangling symlink in its place",
+      f => {
+        rmSync(f.root, { recursive: true });
+        symlinkSync(join(f.dir, "missing"), f.root);
+      },
+      f => expect(lstatSync(f.root).isSymbolicLink()).toBe(true),
+    ],
+  ])(
+    "cleanup exits non-zero and deletes nothing while a scratch root that exists fails its ownership check: %s",
+    async (_name, damage, untouched) => {
       const { f, exits } = await cleanupCli(
         openAt,
         f => {
@@ -2223,15 +3302,13 @@ describe("cleanup", () => {
         Ledger.read(join(f.dir, "ledger.jsonl")).some(
           e => e.kind === "scratch-removed",
         ),
-        name,
       ).toBe(false);
-      if (name !== "dangling symlink in its place")
-        expect(readFileSync(join(f.root, "keep.txt"), "utf8")).toBe(
-          "user data",
-        );
-      else expect(lstatSync(f.root).isSymbolicLink()).toBe(true);
-    }
-  });
+      untouched(f);
+    },
+    // Two cleanup runs, each a Bun child loading the eval CLI; on a loaded
+    // host one start has taken over 2 s. Room for startup, not a latency bound.
+    20_000,
+  );
 
   test("cleanup reports the retained root in its result when the root exists but is not provably the run's", async () => {
     const f = runFixture();
@@ -2484,6 +3561,49 @@ describe("cleanup", () => {
     }
   }, 60_000);
 
+  test("a successor removal the ledger refused to record is settled by the next cleanup from its prepared receipt, with its storage and source", async () => {
+    const run = await v2Attempt({
+      beforeInspect: (state, id) =>
+        void state.instructions.set(id, [{ key: "foreign", value: "x" }]),
+    });
+    expect(run.record.status).toBe("delivered-invalid");
+    const successor = run.record.successorID!;
+    const source = run.record.sourceID!;
+    run.state.instructions.delete(successor);
+    const ledgerPath = join(run.f.dir, "ledger.jsonl");
+    const remove = run.host.remove;
+    run.host.remove = async (directory, id) => {
+      await remove(directory, id);
+      // The deletion happened; the file system refuses its record.
+      if (id === successor) chmodSync(ledgerPath, 0o444);
+    };
+    try {
+      await expect(cleanup(run.f.dir, run.host)).rejects.toThrow(/EACCES/u);
+    } finally {
+      chmodSync(ledgerPath, 0o644);
+    }
+    expect(run.state.sessions.has(successor)).toBe(false);
+    expect(run.files(successor)).toEqual([null, null]);
+    const ends = () =>
+      Ledger.read(ledgerPath).filter(
+        e =>
+          (e.kind === "session-removed" || e.kind === "session-absent")
+          && e["id"] === successor,
+      );
+    expect(ends()).toEqual([]);
+
+    const settled = await cleanup(run.f.dir, run.host);
+    expect(settled.sessions).toEqual([
+      { id: successor, action: "absent", storage: "removed" },
+      { id: source, action: "removed" },
+    ]);
+    expect(settled.stillOwned).toEqual([]);
+    expect(settled.unconfirmedStorage).toEqual([]);
+    expect(settled.complete).toBe(true);
+    expect(ends().map(e => e.kind)).toEqual(["session-absent"]);
+    expect(run.state.sessions.has(source)).toBe(false);
+  }, 60_000);
+
   test("a source changed before it was first read is not adopted and is kept", async () => {
     const changes: Array<
       [string, (session: Json, messages: V2Message[]) => void]
@@ -2528,7 +3648,7 @@ describe("cleanup", () => {
       const summary = await cleanup(run.f.dir, run.host);
       expect([label, summary.stillOwned]).toEqual([
         label,
-        [run.record.sourceID],
+        [run.record.sourceID!],
       ]);
       expect(summary.disposal[0]).toMatchObject({ scratchRemoved: false });
       expect(run.state.sessions.has(run.record.sourceID!)).toBe(true);
@@ -2554,13 +3674,12 @@ describe("cleanup", () => {
 // --- saved runs, grading and scoring -----------------------------------------
 
 describe("judge answers", () => {
-  test("the judge prompt carries the schema derived from the judgment shape", () => {
-    expect(JUDGMENT_JSON_SCHEMA).toEqual(
-      z.toJSONSchema(JudgmentSchema, { target: "draft-07" }),
-    );
-    expect(JUDGE_SYSTEM).toContain(JSON.stringify(JUDGMENT_JSON_SCHEMA));
+  // The judge's answer is accepted only through `JudgmentSchema`, so the
+  // schema the judge is asked to match must be generated from that parser:
+  // a hand-written or stale copy would ask for answers it then refuses.
+  test("the judge prompt carries the schema generated from the parser that accepts the answer", () => {
     expect(judgePrompt(caseA, corpus.followup, "summary")).toContain(
-      JSON.stringify(JUDGMENT_JSON_SCHEMA),
+      JSON.stringify(z.toJSONSchema(JudgmentSchema, { target: "draft-07" })),
     );
   });
 
@@ -2908,8 +4027,135 @@ describe("saved runs and reports", () => {
     expect(readRun(dir, corpus).attempts).toHaveLength(1);
   });
 
+  test("the report shows what the run still owns now, from the ledger, without rewriting attempts", () => {
+    savedRun([
+      {
+        attemptId: "r1-A",
+        status: "failed",
+        sourceID: "ses_src",
+        cleanup: [
+          {
+            id: "ses_src",
+            action: "retained",
+            reason: "session changed since the run recorded it",
+          },
+        ],
+      },
+    ]);
+    const ledger = new Ledger(join(dir, "ledger.jsonl"));
+    ledger.append("run-start", { runNonce: NONCE });
+    const sessions = ledger.sessions("r1-A");
+    sessions.intent("source", null, "t");
+    sessions.created("source", "ses_src");
+    ledger.append("session-retained", {
+      attemptId: "r1-A",
+      id: "ses_src",
+      reason: "session changed since the run recorded it",
+    });
+    ledger.append("session-created", {
+      attemptId: "r2-A",
+      role: "successor",
+      id: "ses_succ",
+      intentSeq: null,
+    });
+    ledger.append("storage-receipt-request", {
+      attemptId: "r2-A",
+      id: "ses_succ",
+      requestId: "a".repeat(24),
+    });
+    ledger.append("session-removed", { attemptId: "r2-A", id: "ses_succ" });
+    ledger.append("storage-orphaned", {
+      attemptId: "r2-A",
+      id: "ses_succ",
+      requestId: "a".repeat(24),
+      paths: { cache: "/cache/ses_succ.json", stats: "/stats/ses_succ.json" },
+    });
+    const attempt = join(dir, "attempts", "r1-A.json");
+    const record = readFileSync(attempt, "utf8");
+
+    const before = summarizeRun(dir, corpus);
+    expect(before.residue).toEqual({
+      sessions: [
+        {
+          id: "ses_src",
+          attemptId: "r1-A",
+          role: "source",
+          reason: "session changed since the run recorded it",
+        },
+      ],
+      storage: [
+        {
+          attemptId: "r2-A",
+          id: "ses_succ",
+          requestId: "a".repeat(24),
+          paths: {
+            cache: "/cache/ses_succ.json",
+            stats: "/stats/ses_succ.json",
+          },
+        },
+      ],
+      unresolvedIntents: [],
+      unknownOutcomes: [],
+    });
+    // `report --json` keeps its `cleanupRetained` list, now the sessions the
+    // ledger shows the run still owns.
+    expect(before.cleanupRetained).toEqual(["ses_src"]);
+    const text = formatReport([before]);
+    expect(text).toContain(
+      "ses_src (session changed since the run recorded it)",
+    );
+    expect(text).toContain("/cache/ses_succ.json");
+
+    // A later cleanup removed the source and saw the storage removal confirmed.
+    ledger.append("session-removed", { attemptId: "r1-A", id: "ses_src" });
+    ledger.append("storage-removed", {
+      attemptId: "r2-A",
+      id: "ses_succ",
+      requestId: "a".repeat(24),
+      reconciled: true,
+    });
+    const after = summarizeRun(dir, corpus);
+    expect(after.residue).toEqual({
+      sessions: [],
+      storage: [],
+      unresolvedIntents: [],
+      unknownOutcomes: [],
+    });
+    expect(after.cleanupRetained).toEqual([]);
+    expect(formatReport([after])).not.toMatch(/ses_src|ses_succ/u);
+    expect(readFileSync(attempt, "utf8")).toBe(record);
+  });
+
+  test("a run without a ledger reads, with what it owns reported unknown; an intact ledger that recorded nothing owned reports none", () => {
+    // Its source creation failed before an ID returned, so the attempt names
+    // no session, yet the host may still hold one.
+    savedRun([{ attemptId: "r1-A", status: "setup-failed" }]);
+    const missing = summarizeRun(dir, corpus);
+    expect(missing.residue).toBeNull();
+    expect(missing.unresolvedOwnership).toBeNull();
+    expect(missing.cleanupRetained).toEqual([]);
+    expect(formatReport([missing])).toContain("- Ownership unknown");
+
+    new Ledger(join(dir, "ledger.jsonl")).append("run-start", {
+      runNonce: NONCE,
+    });
+    const empty = summarizeRun(dir, corpus);
+    expect(empty.ownershipKnown).toBe(true);
+    expect(empty.residue).toEqual({
+      sessions: [],
+      storage: [],
+      unresolvedIntents: [],
+      unknownOutcomes: [],
+    });
+    expect(empty.unresolvedOwnership).toEqual([]);
+    expect(formatReport([empty])).not.toContain("Ownership unknown");
+  });
+
   test("standalone grading refuses another server before creating anything", async () => {
     savedRun([{ attemptId: "r1-A" }]);
+    const ledgerPath = join(dir, "ledger.jsonl");
+    new Ledger(ledgerPath).append("run-start", { runNonce: NONCE });
+    const before = readFileSync(ledgerPath, "utf8");
     const other = counting(v1Server);
     await expect(gradeWith("http://127.0.0.1:2", other.fetch)).rejects.toThrow(
       /pass exactly --server http:\/\/127\.0\.0\.1:1/u,
@@ -2918,7 +4164,74 @@ describe("saved runs and reports", () => {
     await expect(gradeWith(SERVER_URL, v2Server(PID))).rejects.toThrow(
       /not the kind of host/u,
     );
-    expect(existsSync(join(dir, "ledger.jsonl"))).toBe(false);
+    expect(readFileSync(ledgerPath, "utf8")).toBe(before);
+  });
+
+  test("without the ledger its run wrote, judge grading refuses before any request, cleanup refuses a missing ledger and settles only what an earlier grade's ledger recorded, and ownership stays unknown or incomplete", async () => {
+    savedRun([{ attemptId: "r1-A" }]);
+    const ledgerPath = join(dir, "ledger.jsonl");
+    const judgeRoots = () =>
+      readdirSync(tmpdir()).filter(name =>
+        name.startsWith("arkive-compaction-eval-judge-"),
+      );
+    const roots = judgeRoots();
+    const server = counting(v1Server);
+    await expect(gradeWith(SERVER_URL, server.fetch)).rejects.toThrow(
+      /has no ledger written by its run/u,
+    );
+    await expect(
+      cleanupRun({
+        dir,
+        server: SERVER_URL,
+        auth: undefined,
+        assertHostVersion: null,
+        fetch: server.fetch,
+        log: () => {},
+      }),
+    ).rejects.toThrow(/has no ledger/u);
+    expect(server.calls).toBe(0);
+    expect(existsSync(ledgerPath)).toBe(false);
+    expect(judgeRoots()).toEqual(roots);
+    const missing = summarizeRun(dir, corpus);
+    expect([missing.residue, missing.ownershipKnown]).toEqual([null, false]);
+
+    // What an earlier `grade` left when it began a ledger for this run: its
+    // judge root and a judge session it kept. Both stay listed, and the run's
+    // own ownership stays unknown.
+    const ledger = new Ledger(ledgerPath);
+    ledger.append("scratch-root", { directory: "/tmp/judge-root" });
+    ledger.sessions("r1-A").created("judge", "ses_judge");
+    ledger.append("session-retained", {
+      attemptId: "r1-A",
+      id: "ses_judge",
+      reason: "the judge session's state is unknown",
+    });
+    const legacy = readFileSync(ledgerPath, "utf8");
+    await expect(gradeWith(SERVER_URL, server.fetch)).rejects.toThrow(
+      /has no ledger written by its run/u,
+    );
+    expect(server.calls).toBe(0);
+    expect(readFileSync(ledgerPath, "utf8")).toBe(legacy);
+    const partial = summarizeRun(dir, corpus);
+    expect(partial.ownershipKnown).toBe(false);
+    expect(partial.cleanupRetained).toEqual(["ses_judge"]);
+    expect(formatReport([partial])).toContain("- Ownership incomplete");
+    // A cleanup works from what that ledger recorded, and never reports the
+    // run complete.
+    const cleaned = await cleanupRun({
+      dir,
+      server: SERVER_URL,
+      auth: undefined,
+      assertHostVersion: null,
+      fetch: v1Server,
+      log: () => {},
+      host: stubHost({}),
+    });
+    expect(cleaned).toMatchObject({
+      stillOwned: ["ses_judge"],
+      ownershipKnown: false,
+      complete: false,
+    });
   });
 
   test("refuses attempts for cases, repeats or statuses the run could not have written", () => {

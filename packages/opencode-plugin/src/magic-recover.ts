@@ -2,21 +2,20 @@ import type { Message, Part, ToolPart } from "@opencode-ai/sdk/v2";
 import type { V2Client } from "./api";
 import { RECOVER_NOOP, recoverSuccess } from "./commands";
 import type { MessageWithParts } from "./compact/plan";
-import { getCompactionCount } from "./compact/session";
+import { getCompactionCount } from "./policy/lineage";
 import {
   appendedNoticeMessage,
   applySuccessorEdits,
   assertHistoryFinished,
-  assertRecoverySourceUnchanged,
   createSuccessor,
   isUnfinishedAssistant,
   isUnfinishedTool,
   readRecoverableSource,
   undeliveredBackgroundTasks,
-  withExclusiveSource,
   type Successor,
   type SuccessorEdit,
 } from "./compact/successor";
+import { withExclusiveSource } from "./policy/successor";
 import {
   RECOVER_COMMAND_NAME,
   RECOVERED_RESPONSE_ERROR,
@@ -30,12 +29,11 @@ import {
 } from "./policy/recovery";
 import { readStats } from "./storage/stats";
 import {
-  CONTROL_OPERATION_TIMEOUT_MS,
   createToastFeedback,
   failureToast,
   IN_PROGRESS_TOAST_DURATION_MS,
-  isRecord,
-} from "./util";
+} from "./toast-v1";
+import { CONTROL_OPERATION_TIMEOUT_MS, isRecord } from "./util";
 
 const COMMAND = RECOVER_COMMAND_NAME;
 
@@ -279,17 +277,6 @@ export async function executeMagicRecover(
         mediaTokensProjected:
           (await readStats(sessionID))?.mediaTokensProjected ?? 0,
         recovery: plan.records,
-        recheckSource: async () =>
-          assertRecoverySourceUnchanged(
-            COMMAND,
-            source,
-            await readRecoverableSource(
-              v2,
-              COMMAND,
-              sessionID,
-              controlTimeoutMs,
-            ),
-          ),
         controlTimeoutMs,
       });
       return { successor, text };

@@ -6,10 +6,7 @@
 //   bun packages/opencode-plugin/eval/decisions/run.ts run --provider jev|openai-decisions --out DIR [options]
 //   bun packages/opencode-plugin/eval/decisions/run.ts report RUN... [--dataset PATH] [--threshold T]
 import { parseArgs } from "node:util";
-import {
-  RETENTION_MODEL,
-  type RetentionFetch,
-} from "../../src/retention/classifier";
+import type { RetentionFetch } from "../../src/retention/classifier";
 import {
   DECISION_EVALUATION_THRESHOLD,
   DEFAULT_DATASET_PATH,
@@ -27,7 +24,6 @@ import {
 import {
   DEFAULT_TIMEOUT_MS,
   isProviderID,
-  OPENAI_DECISIONS_MODELS,
   PROVIDER_IDS,
   PROVIDERS,
   type ProviderAdapter,
@@ -66,8 +62,10 @@ Commands
 
 run options
   --provider ID       ${PROVIDER_IDS.join(" | ")}
-  --model NAME        Jev: a versioned ID (default ${RETENTION_MODEL}); aliases are refused.
-                      openai-decisions: ${OPENAI_DECISIONS_MODELS.join(", ")} (the only model OpenAI offers).
+${PROVIDER_IDS.map(
+  (id, index) =>
+    `${index === 0 ? "  --model NAME        " : " ".repeat(22)}${id}: ${PROVIDERS[id].modelHelp}`,
+).join("\n")}
   --dataset PATH      Dataset file, or "default" for the bundled synthetic pack.
   --out DIR           New result directory. Existing paths are never overwritten.
   --repeat N          Send each case N times (default 1, at most 10). Measures stability.
@@ -201,9 +199,7 @@ async function run(args: string[], deps: CliDeps): Promise<number> {
   const plan = planRun({
     dataset: datasetOption(values.dataset),
     adapter,
-    model:
-      values.model
-      ?? (adapter.id === "jev" ? RETENTION_MODEL : OPENAI_DECISIONS_MODELS[0]),
+    model: values.model ?? adapter.defaultModel,
     threshold: numeric(values.threshold, DECISION_EVALUATION_THRESHOLD),
     repeat: numeric(values.repeat, 1),
     concurrency: numeric(values.concurrency, DEFAULT_CONCURRENCY),

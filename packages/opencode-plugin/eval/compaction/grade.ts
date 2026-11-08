@@ -3,7 +3,8 @@
 // Scores are always computed here from per-fact judgments; a grader never
 // supplies a score.
 import { z } from "zod";
-import { sha256, type CorpusCase, type Fact } from "./corpus";
+import { sha256, Sha256Hex, type CorpusCase, type Fact } from "./corpus";
+import type { AttemptRecord, AttemptStatus } from "./run";
 
 export const GRADES_FORMAT = "arkive-compaction-eval-grades/1";
 const FALSE_ASSERTION_PENALTY = 2;
@@ -25,8 +26,7 @@ export const JudgmentSchema = z.strictObject({
 });
 export type Judgment = z.infer<typeof JudgmentSchema>;
 
-// The JSON Schema the judge prompt shows, derived from JudgmentSchema.
-export const JUDGMENT_JSON_SCHEMA = z.toJSONSchema(JudgmentSchema, {
+const JUDGMENT_JSON_SCHEMA = z.toJSONSchema(JudgmentSchema, {
   target: "draft-07",
 });
 
@@ -51,7 +51,7 @@ export function parseJudgeAnswer(
 export const GradeItemSchema = JudgmentSchema.extend({
   attemptId: z.string(),
   caseId: z.string(),
-  outputSha256: z.string().regex(/^[0-9a-f]{64}$/u),
+  outputSha256: Sha256Hex,
 });
 export const GradesFileSchema = z.strictObject({
   format: z.literal(GRADES_FORMAT),
@@ -215,12 +215,58 @@ ${output}
 </output>`;
 }
 
+// How the frozen rubric treats each attempt status. A settled attempt that
+// delivered no valid summary scores 0 and is not usable; an attempt whose
+// outcome is unknown, or that never reached the model, is not scored at
+// all; a delivered summary is scored only from an accepted grade and is
+// never counted as 0.
+const DISPOSITIONS = {
+  delivered: "delivered",
+  "delivered-invalid": "zero",
+  noop: "zero",
+  failed: "zero",
+  // The model does not accept the case's image: a capability refusal.
+  "preflight-skipped": "zero",
+  "outcome-unknown": "unscored",
+  "setup-failed": "unscored",
+} as const satisfies Record<AttemptStatus, "delivered" | "zero" | "unscored">;
+export type Disposition = (typeof DISPOSITIONS)[AttemptStatus];
+
+export const disposition = (attempt: { status: AttemptStatus }): Disposition =>
+  DISPOSITIONS[attempt.status];
+
 export type GradedAttempt = {
   attemptId: string;
   caseId: string;
   outputSha256: string;
   capsule: string;
 };
+
+// The summaries a grade may judge: those of delivered attempts, each with
+// the exact capsule and digest a grade binds to.
+export function gradedAttempts(
+  attempts: Array<
+    Pick<
+      AttemptRecord,
+      "attemptId" | "caseId" | "status" | "capsule" | "outputSha256"
+    >
+  >,
+): GradedAttempt[] {
+  return attempts.flatMap(a =>
+    disposition(a) === "delivered"
+    && a.capsule !== null
+    && a.outputSha256 !== null
+      ? [
+          {
+            attemptId: a.attemptId,
+            caseId: a.caseId,
+            outputSha256: a.outputSha256,
+            capsule: a.capsule,
+          },
+        ]
+      : [],
+  );
+}
 
 // Validates a grades file against the run it claims to grade. Items for
 // unknown attempts, mismatched cases or outputs, duplicates and invalid

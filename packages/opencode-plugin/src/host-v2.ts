@@ -1,16 +1,17 @@
 import type { Plugin } from "@opencode/plugin";
 import {
   COMMAND_DESCRIPTIONS,
+  type CommandTitle,
   commandFailureMessage,
   COMPACT_COMMAND,
   compactSuccess,
   parseMagicCompactArguments,
   parseMagicRecoverArguments,
+  parseMagicStatsArguments,
   parseMagicTrimArguments,
   RECOVER_COMMAND,
   RECOVER_NOOP,
   recoverSuccess,
-  STATS_ARGUMENTS_ERROR,
   STATS_COMMAND,
   TRIM_COMMAND,
   TRIM_NOOP,
@@ -21,10 +22,10 @@ import {
   MAGIC_COMPACT_SUMMARIZER_PROMPT,
   READ_OMITTED_CONTENT_DESCRIPTION,
   READ_OMITTED_CONTENT_ID_DESCRIPTION,
-} from "./compact/constants";
-import { getCompactionCount } from "./compact/session";
+} from "./policy/protocol";
+import { getCompactionCount } from "./policy/lineage";
 import { commandRetentionPolicy } from "./policy/retention";
-import { recordAssistantCompletion } from "./stats/events";
+import { recordCompletionEvent } from "./stats/events";
 import { statsSummaryMessage } from "./stats/constants";
 import { omissionReadDiagnostic, readOmittedContent } from "./storage/omission";
 import { readStats } from "./storage/stats";
@@ -45,8 +46,7 @@ import {
 } from "./v2/media";
 import { OwnedSessions, V2_SUMMARY_TOOL } from "./v2/owned";
 import { projectReadableReasoning } from "./v2/reasoning";
-import { SESSION_SUMMARY_RESPONSE_SCHEMA } from "./compact/constants";
-import type { SuccessorCommand } from "./policy/successor";
+import { SESSION_SUMMARY_RESPONSE_SCHEMA } from "./policy/protocol";
 import { readV2History, v2StorageKey, type V2Message } from "./v2/session";
 import { executeV2Recover } from "./v2/recover";
 import { executeV2Trim } from "./v2/trim";
@@ -62,12 +62,12 @@ const RESPONSE_TOOL_REJECTED =
 const SUMMARY_TOOL_REJECTED =
   "Magic Compact's session summary tool is only available in its own structured session summary requests.";
 
-// Runs a compact or trim command and returns its success or no-op message.
+// Runs a command and returns its result message.
 // A failure is rethrown as the error OpenCode 2 returns to the client: the
 // plugin's own error unchanged when its message is already the feedback,
 // otherwise an error carrying the feedback, with the original as its cause.
 async function commandResult(
-  command: SuccessorCommand,
+  command: CommandTitle,
   run: () => Promise<string>,
 ): Promise<string> {
   try {
@@ -111,18 +111,19 @@ export async function setup(
       name: STATS_COMMAND,
       description: COMMAND_DESCRIPTIONS[STATS_COMMAND],
       execute: async ({ sessionID, prompt }) => {
-        if (prompt.text.trim() !== "") throw new Error(STATS_ARGUMENTS_ERROR);
-        const session = await ctx.session.get({ sessionID });
-        const stats = await readStats(v2StorageKey(sessionID));
-        throw new Error(
-          stats
+        const result = await commandResult("Magic Stats", async () => {
+          parseMagicStatsArguments(prompt.text);
+          const session = await ctx.session.get({ sessionID });
+          const stats = await readStats(v2StorageKey(sessionID));
+          return stats
             ? statsSummaryMessage(
                 getCompactionCount(session),
                 stats,
                 session.model?.id ?? null,
               )
-            : "No Magic Compact stats recorded for this session. Did you run /magic-compact or /magic-trim yet?",
-        );
+            : "No Magic Compact stats recorded for this session. Did you run /magic-compact or /magic-trim yet?";
+        });
+        throw new Error(result);
       },
     });
     editor.add({
@@ -373,7 +374,10 @@ export async function setup(
   void (async () => {
     for await (const event of ctx.event.subscribe({ signal: events.signal })) {
       if (event.type !== "session.step.ended") continue;
-      await recordAssistantCompletion(
+      // Invalid stats are left alone by `recordCompletionEvent`. Any other
+      // failure loses only this increment, and the subscription keeps
+      // counting later responses.
+      await recordCompletionEvent(
         v2StorageKey(event.data.sessionID),
         event.data.assistantMessageID,
       ).catch(() => undefined);

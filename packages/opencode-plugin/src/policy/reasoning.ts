@@ -5,6 +5,8 @@
 // summary. Adapters turn their native records into `ReasoningUnit`s and their
 // model descriptors into `ReasoningRoute`s; the choices, fallbacks and
 // feedback below are the same on both hosts.
+import { isNonArrayRecord } from "../util";
+import type { Fit } from "./budget";
 
 export type ModelIdentity = { providerID: string; modelID: string };
 
@@ -102,16 +104,10 @@ const PROTECTED_KEYS = [
   "thoughtSignature",
 ];
 
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-// The protected payload in a reasoning record's stored provider state, or
-// undefined.
 export function protectedPayload(state: unknown): string | undefined {
-  if (!isObject(state)) return undefined;
+  if (!isNonArrayRecord(state)) return undefined;
   for (const record of [state, ...Object.values(state)]) {
-    if (!isObject(record)) continue;
+    if (!isNonArrayRecord(record)) continue;
     for (const key of PROTECTED_KEYS) {
       const payload = record[key];
       if (typeof payload === "string" && payload.length > 0) return payload;
@@ -120,11 +116,10 @@ export function protectedPayload(state: unknown): string | undefined {
   return undefined;
 }
 
-// The provider item ID in a reasoning record's stored provider state.
 export function reasoningItemID(state: unknown): string | undefined {
-  if (!isObject(state)) return undefined;
+  if (!isNonArrayRecord(state)) return undefined;
   for (const record of [state, ...Object.values(state)]) {
-    if (isObject(record) && typeof record["itemId"] === "string") {
+    if (isNonArrayRecord(record) && typeof record["itemId"] === "string") {
       return record["itemId"];
     }
   }
@@ -265,6 +260,30 @@ export function chooseStage(
   };
 }
 
+// Settles a `match` choice by the matched model's capacity. The matched plan
+// is fitted whether or not `--match-model` is set, so feedback can say what
+// the flag would do. Only a capacity refusal turns the choice into the
+// `capacity` fallback; an error the fit throws is not a capacity outcome and
+// propagates. Only `matchModel` returns the matched plan to run; otherwise the
+// stage runs on the configured summarizer, which the caller fits and refuses
+// in its own words. The caller closes `fitMatched` over the same nonce and
+// inputs as the configured plan, so a plan that is not run claims nothing.
+export function settleMatch<T>(
+  choice: StageChoice,
+  matchModel: boolean,
+  fitMatched: (model: ModelIdentity, variant: string | undefined) => Fit<T>,
+): { choice: StageChoice; matched: T | undefined } {
+  if (choice.kind !== "match") return { choice, matched: undefined };
+  const fit = fitMatched(choice.model, choice.variant);
+  if (fit.kind === "capacity") {
+    return {
+      choice: { kind: "fallback", reason: "capacity" },
+      matched: undefined,
+    };
+  }
+  return { choice, matched: matchModel ? fit.value : undefined };
+}
+
 // One summary request as the feedback reports it. `onOrigin` is true when the
 // request ran on the one verified model that wrote all of its target's
 // protected reasoning, whether `--match-model` chose it or it was already
@@ -279,13 +298,6 @@ export type StageReport = {
   onOrigin: boolean;
   access: ReasoningAccess;
   replayUnknown: number;
-};
-
-// `--match-model`, and the list each summary request of a command adds its
-// report to.
-export type ReasoningReports = {
-  matchModel: boolean;
-  reports: StageReport[];
 };
 
 export function stageReport(request: {

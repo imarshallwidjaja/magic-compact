@@ -5,25 +5,23 @@ import {
   MAGIC_COMPACT_SUMMARIZER_PROMPT,
   READ_OMITTED_CONTENT_DESCRIPTION,
   READ_OMITTED_CONTENT_ID_DESCRIPTION,
-} from "./compact/constants";
+} from "./policy/protocol";
 import { connectListener, createListenerIdentity } from "./api";
-import {
-  isOwnedGenerationFork,
-  rejectNativeCompactionOfGenerationFork,
-  requestAllTurnsReasoning,
-} from "./compact/compact";
+import { requestAllTurnsReasoning } from "./compact/compact";
+import { blockNativeCompaction, isOwnedFork } from "./compact/owned";
 import {
   COMMAND_DESCRIPTIONS,
+  type CommandTitle,
   COMPACT_COMMAND,
   COMPACT_NOOP,
   compactSuccess,
   parseMagicCompactArguments,
   parseMagicRecoverArguments,
+  parseMagicStatsArguments,
   parseMagicTrimArguments,
   RECOVER_COMMAND,
   RECOVER_NOOP,
   recoverSuccess,
-  STATS_ARGUMENTS_ERROR,
   STATS_COMMAND,
   TRIM_COMMAND,
   TRIM_NOOP,
@@ -34,20 +32,12 @@ import { executeMagicRecover } from "./magic-recover";
 import { STATS_SUCCESS, executeMagicStats } from "./magic-stats";
 import { executeMagicTrim } from "./magic-trim";
 import { commandRetentionPolicy } from "./policy/retention";
-import {
-  isOwnedSessionSummaryFork,
-  rejectNativeCompactionOfSummaryFork,
-} from "./retention/summary";
 import { omissionReadDiagnostic, readOmittedContent } from "./storage/omission";
 import { handleStatsEvent } from "./stats/events";
 import { projectManifestCoveredMedia } from "./compact/media";
 import type { MessageWithParts } from "./compact/plan";
-import type { SuccessorCommand } from "./policy/successor";
-import {
-  attemptWithinDeadline,
-  CONTROL_OPERATION_TIMEOUT_MS,
-  failureToast,
-} from "./util";
+import { failureToast } from "./toast-v1";
+import { attemptWithinDeadline, CONTROL_OPERATION_TIMEOUT_MS } from "./util";
 
 const SUMMARIZER_PERMISSION = { "*": "deny" } as const;
 
@@ -61,7 +51,7 @@ const server: Plugin = async input => {
   // `serverUrl` that another process may own. Delivery is best effort and
   // the original error is rethrown.
   const preflight = async <T>(
-    command: SuccessorCommand,
+    command: CommandTitle,
     prepare: () => Promise<T>,
   ): Promise<T> => {
     try {
@@ -107,11 +97,12 @@ const server: Plugin = async input => {
     },
     "command.execute.before": async command => {
       if (command.command === STATS_COMMAND) {
-        if (command.arguments.trim() !== "") {
-          throw new Error(STATS_ARGUMENTS_ERROR);
-        }
-
-        await executeMagicStats(await listener(), command.sessionID);
+        const v2 = await preflight("Magic Stats", async () => {
+          parseMagicStatsArguments(command.arguments);
+          return listener();
+        });
+        // Reports its own failure through the verified listener.
+        await executeMagicStats(v2, command.sessionID);
         throw new Error(STATS_SUCCESS);
       }
 
@@ -183,15 +174,13 @@ const server: Plugin = async input => {
     // natively: that would send another model request and replace the
     // history being summarized.
     "experimental.session.compacting": async input => {
-      rejectNativeCompactionOfSummaryFork(input.sessionID);
-      rejectNativeCompactionOfGenerationFork(input.sessionID);
+      blockNativeCompaction(input.sessionID);
     },
     // Only this plugin's own summary and generation forks, and only on the
     // verified OpenAI Responses route, ask for every turn's reasoning.
     "chat.params": async (input, output) => {
       requestAllTurnsReasoning(
-        isOwnedSessionSummaryFork(input.sessionID)
-          || isOwnedGenerationFork(input.sessionID),
+        isOwnedFork(input.sessionID),
         input.model,
         output.options,
       );

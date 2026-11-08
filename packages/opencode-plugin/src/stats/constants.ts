@@ -1,5 +1,6 @@
 import { getCachedReadPrice } from "./pricing";
 import type { ConversationStats } from "../storage/stats";
+import type { StoredHistoryCount } from "./stored-history";
 
 export const STATS_METADATA = {
   magicCompact: {
@@ -63,19 +64,6 @@ export function preservedTurnsFeedback({
 // Counts cover the whole stored history, including any prefix a native
 // checkpoint hides from the model, so they are not the model's request size.
 const CONTEXT_LABEL = "Stored history (estimate)";
-
-// Inline files a stored history holds, whether or not a request projects them.
-export type InlineFileInventory = { count: number; encodedBytes: number };
-
-// One side of a compact or trim notice. `tokens` is the canonical
-// stored-history count that gates, profitability, stats and the successor
-// check use; `inlineFileTokens` is the part of it that inline file data still
-// counted as text contributes.
-export type StoredHistoryCount = {
-  tokens: number;
-  inlineFileTokens: number;
-  inlineFiles: InlineFileInventory;
-};
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;

@@ -24,12 +24,6 @@
     "NOTICE.md"
   ],
   "license": "SEE LICENSE IN LICENSE.md",
-  "scripts": {
-    "test": "bun test",
-    "typecheck": "tsc --noEmit -p ../../tsconfig.json",
-    "lint": "eslint src test",
-    "format": "prettier --write src"
-  },
   "keywords": [
     "opencode",
     "opencode-plugin",

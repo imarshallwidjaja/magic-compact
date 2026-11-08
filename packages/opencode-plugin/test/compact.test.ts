@@ -4,12 +4,14 @@ import {
   beforeEach,
   describe,
   expect,
+  spyOn,
   test,
 } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import * as fs from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Config, PluginInput } from "@opencode-ai/plugin";
 import type { AssistantMessage, Event } from "@opencode-ai/sdk";
 import type { Message, Part, Session, TextPart } from "@opencode-ai/sdk/v2";
@@ -19,72 +21,66 @@ import {
   LISTENER_REQUIRED,
   type V2Client,
 } from "../src/api";
+import { estimateNativeTurnCost } from "../src/compact/batch";
 import {
   computeNativeBatchBudget,
-  estimateNativeTurnCost,
   NATIVE_BATCH_FIXED_RESERVE_TOKENS,
   NATIVE_BATCH_PLANNING_NONCE,
-  planNativeGenerationBatches,
-  type NativeBatchProtocol,
-} from "../src/compact/batch";
-import { generateCompactionSummaries } from "../src/compact/compact";
-import { projectManifestCoveredMedia } from "../src/compact/media";
+  planNativeGenerationRequest,
+  requireFit,
+  type NativeRequestProtocol,
+} from "../src/policy/budget";
 import {
-  ForkCleanupError,
-  ForkHistoryError,
-  forkSession,
-} from "../src/compact/fork";
+  generateCompactionSummaries,
+  summarizerCatalogLoader,
+  type GenerationOptions,
+} from "../src/compact/compact";
+import { projectManifestCoveredMedia } from "../src/compact/media";
+import { isOwnedFork, releaseOwnedFork } from "../src/compact/owned";
+import { createForkCut, ForkHistoryError } from "../src/compact/fork";
+import { CONTROL_OPERATION_TIMEOUT_MS } from "../src/util";
 import {
   BOUNDARY_METADATA,
+  GENERATION_PROTOCOL,
   MAGIC_COMPACT_SUMMARIZER_PROMPT,
   POST_COMPACTION_NOTICE,
-  summaryEnvelopeTextPart,
-} from "../src/compact/constants";
+} from "../src/policy/protocol";
+import { summaryEnvelopeTextPart } from "../src/compact/capsule";
 import {
-  assertCompactionSourceUnchanged,
   buildTurns,
-  createCompactionPlan,
-  NativeCheckpointChangedError,
   planCompaction,
-  snapshotSourceMessages,
   type CompactionPlan,
   type MessageWithParts,
   type Turn,
 } from "../src/compact/plan";
+import { readSourceAtRest } from "../src/compact/successor";
 import {
-  readSourceAtRest,
-  SourceNotAtRestError,
-  SuccessorFailure,
-} from "../src/compact/successor";
-import {
+  COMPACT_INSUFFICIENT_SAVINGS,
   hasUsefulSavings,
   SourceChangedError,
+  SourceNotAtRestError,
+  SuccessorFailure,
   successorFailure,
   unfinishedHistoryRefusal,
 } from "../src/policy/successor";
 import {
   COMPACT_ARGUMENTS_ERROR,
+  COMPACT_NOOP,
   COMPACT_THRESHOLD_ERROR,
   commandFailureMessage,
   parseMagicCompactArguments,
+  STATS_ARGUMENTS_ERROR,
   TRIM_ARGUMENTS_ERROR,
   TRIM_NOOP,
   TRIM_THRESHOLD_ERROR,
 } from "../src/commands";
 import { preservedTurnsFeedback, statsMessage } from "../src/stats/constants";
-import {
-  countCanonicalContentTokens,
-  countGptTokens,
-  countModelFacingContentTokens,
-} from "../src/stats/tokenize";
-import {
-  COMPACT_INSUFFICIENT_SAVINGS,
-  COMPACT_NOOP,
-  executeMagicCompact,
-} from "../src/magic-compact";
+import { countModelFacingContentTokens } from "../src/compact/accounting";
+import { countGptTokens } from "../src/stats/tokenize";
+import { executeMagicCompact } from "../src/magic-compact";
 import { executeMagicRecover } from "../src/magic-recover";
 import { executeMagicStats } from "../src/magic-stats";
-import { reasoningFeedback, type StageReport } from "../src/policy/reasoning";
+import { reasoningFeedback } from "../src/policy/reasoning";
 import {
   isRecoveryContext,
   recoveryContext,
@@ -93,23 +89,22 @@ import {
 import server from "../src/host-v1";
 import tuiPlugin from "../src/tui";
 import {
-  allocateOmission,
   cachePath,
+  commitPlannedOmission,
   deleteCache,
-  readCache,
+  planOmission,
   readOmittedContent,
 } from "../src/storage/omission";
 import { pluginStorageDirectory } from "../src/storage/store";
-import { failureToast } from "../src/util";
-import {
-  PluginMessageError,
-  undeletedSessionIDs,
-} from "../src/policy/feedback";
+import { failureToast } from "../src/toast-v1";
+import { PluginMessageError, unremovedSessions } from "../src/policy/feedback";
 import {
   type ConversationStats,
   deleteStats,
+  InvalidStatsError,
   readStats,
   writeStats,
+  writeSuccessorStats,
 } from "../src/storage/stats";
 import {
   commandRetentionPolicy,
@@ -163,13 +158,18 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  await Promise.all([
-    deleteCache("source"),
-    deleteCache("backup"),
-    deleteStats("source"),
-    deleteStats("backup"),
-  ]);
+  await Promise.all([deleteCache("source"), deleteStats("source")]);
 });
+
+const cacheExists = (sessionID: string) =>
+  Bun.file(cachePath(sessionID)).exists();
+const cacheText = (sessionID: string) => Bun.file(cachePath(sessionID)).text();
+
+// Physical pruning stats count stored records before media projection.
+async function storedTokens(messages: MessageWithParts[]): Promise<number> {
+  const count = await countModelFacingContentTokens(messages);
+  return count.tokens + count.projectedMediaTokens;
+}
 
 afterAll(async () => {
   if (originalDataHome === undefined) delete process.env.XDG_DATA_HOME;
@@ -178,6 +178,20 @@ afterAll(async () => {
 });
 
 describe("chronological forks", () => {
+  // Creates and populates a fork as a request does. Populating deletes
+  // nothing: the request that registered the fork owns its cleanup.
+  const populatedFork = async (
+    ...[
+      v2,
+      session,
+      messages,
+      controlTimeoutMs = CONTROL_OPERATION_TIMEOUT_MS,
+    ]: [...Parameters<typeof createForkCut>, number?]
+  ) => {
+    const fork = await createForkCut(v2, session, messages);
+    await fork.populate(controlTimeoutMs);
+    return fork;
+  };
   // The assistant has repeated part types with distinct content, so a reordered
   // part list cannot compare equal by type alone.
   const source = (
@@ -274,7 +288,7 @@ describe("chronological forks", () => {
         const host = chronologyHost(messages, { clock: hostClock(step) });
         const before = structuredClone(host.history.read("source"));
         try {
-          await forkSession(host.v2, sourceSession(), messages);
+          await populatedFork(host.v2, sourceSession(), messages);
           const backup = host.history.read("backup");
           // One cut native fork, then one replay; no record is copied under a
           // host-minted ID.
@@ -340,16 +354,17 @@ describe("chronological forks", () => {
       },
     );
 
-    // 2100 messages with two parts each carry the minted ordinals across
-    // several 4096-record windows of one clock reading.
+    // Two messages of 2,050 parts carry the minted ordinals past one
+    // 4,096-record window of one clock reading; the host reads parts back in
+    // ID order, so a wrapped counter would reorder the second message.
     test("orders more than one counter window of records", async () => {
-      const messages = Array.from({ length: 2100 }, (_, index) => {
+      const messages = Array.from({ length: 2 }, (_, index) => {
         const id = `bulk-${index}`;
         return message(
           id,
           index % 2 === 0 ? "user" : "assistant",
-          ["a", "b"].map(suffix =>
-            textPart(`${id}-${suffix}`, id, `${id}-${suffix}`),
+          Array.from({ length: 2_050 }, (_, part) =>
+            textPart(`${id}-${part}`, id, `${id}-${part}`),
           ),
         );
       });
@@ -361,7 +376,7 @@ describe("chronological forks", () => {
       });
       const host = chronologyHost(messages);
       try {
-        await forkSession(host.v2, sourceSession(), messages);
+        await populatedFork(host.v2, sourceSession(), messages);
         const backup = host.history.read("backup");
         expect(
           backup.map(item =>
@@ -389,7 +404,7 @@ describe("chronological forks", () => {
     test("forks an empty history natively without replay and rejects any copied record", async () => {
       const empty = chronologyHost([]);
       try {
-        const fork = await forkSession(empty.v2, sourceSession(), []);
+        const fork = await populatedFork(empty.v2, sourceSession(), []);
         expect(fork.id).toBe("backup");
         expect(empty.forkRequests).toEqual([
           {
@@ -408,12 +423,12 @@ describe("chronological forks", () => {
       const appended = chronologyHost(source());
       try {
         await expect(
-          forkSession(appended.v2, sourceSession(), []),
+          populatedFork(appended.v2, sourceSession(), []),
         ).rejects.toThrow(
           "chronological fork initialization failed (fork was not empty)",
         );
         expect(appended.replayCalls).toBe(0);
-        expect(appended.deleted).toEqual(["backup"]);
+        expect(appended.deleted).toEqual([]);
       } finally {
         appended.history.close();
       }
@@ -471,7 +486,7 @@ describe("chronological forks", () => {
     const host = chronologyHost(messages);
     try {
       await expect(
-        forkSession(host.v2, sourceSession(), messages),
+        populatedFork(host.v2, sourceSession(), messages),
       ).rejects.toThrow(
         "chronological fork initialization failed (source history was invalid)",
       );
@@ -479,8 +494,6 @@ describe("chronological forks", () => {
       expect(host.reads).toEqual([]);
       expect(host.replayCalls).toBe(0);
       expect(host.deleted).toEqual([]);
-      expect(await readCache("backup")).toBeNull();
-      expect(await readStats("backup")).toBeNull();
     } finally {
       host.history.close();
     }
@@ -509,13 +522,11 @@ describe("chronological forks", () => {
       else host.beforeFork = change;
       try {
         await expect(
-          forkSession(host.v2, sourceSession(), messages),
+          populatedFork(host.v2, sourceSession(), messages),
         ).rejects.toThrow(
           "chronological fork initialization failed (source history changed)",
         );
-        expect(host.deleted).toEqual(["backup"]);
-        expect(await readCache("backup")).toBeNull();
-        expect(await readStats("backup")).toBeNull();
+        expect(host.deleted).toEqual([]);
       } finally {
         host.history.close();
       }
@@ -536,7 +547,7 @@ describe("chronological forks", () => {
       host.history.write(second);
     };
     try {
-      await forkSession(host.v2, sourceSession(), messages);
+      await populatedFork(host.v2, sourceSession(), messages);
       const backup = host.history.read("backup");
       expect(backup.map(item => item.info.time)).toEqual(
         messages.map(item => item.info.time),
@@ -550,8 +561,14 @@ describe("chronological forks", () => {
       expect(
         host.history.read("source").map(item => item.info.time.created),
       ).toEqual([99, 100, 7, 6]);
-      expect(snapshotSourceMessages(host.history.read("source"))).toEqual(
-        snapshotSourceMessages(messages),
+      const withoutTime = (history: MessageWithParts[]) =>
+        history.map(item => {
+          const info: Record<string, unknown> = { ...item.info };
+          delete info["time"];
+          return { info, parts: item.parts };
+        });
+      expect(withoutTime(host.history.read("source"))).toEqual(
+        withoutTime(messages),
       );
       expect(host.deleted).toEqual([]);
     } finally {
@@ -592,14 +609,12 @@ describe("chronological forks", () => {
       };
       try {
         await expect(
-          forkSession(host.v2, sourceSession(), messages),
+          populatedFork(host.v2, sourceSession(), messages),
         ).rejects.toThrow(
           "chronological fork initialization failed (replayed fork did not match the plan)",
         );
-        expect(host.deleted).toEqual(["backup"]);
+        expect(host.deleted).toEqual([]);
         expect(host.history.read("source")).toEqual(messages);
-        expect(await readCache("backup")).toBeNull();
-        expect(await readStats("backup")).toBeNull();
       } finally {
         host.history.close();
       }
@@ -612,36 +627,33 @@ describe("chronological forks", () => {
     host.replayedSession = "elsewhere";
     try {
       await expect(
-        forkSession(host.v2, sourceSession(), messages),
+        populatedFork(host.v2, sourceSession(), messages),
       ).rejects.toThrow(
         "chronological fork initialization failed (replayed fork did not match the plan)",
       );
       expect(host.reads).toHaveLength(1);
-      expect(host.deleted).toEqual(["backup"]);
+      expect(host.deleted).toEqual([]);
     } finally {
       host.history.close();
     }
   });
 
-  test("awaits partial replay cleanup and reports a sanitized orphan if deletion fails", async () => {
+  test("reports a failed replay request with a sanitized reason", async () => {
     const messages = source();
     const host = chronologyHost(messages);
     host.afterReplay = () => {
       throw new Error("private replay body");
     };
-    host.deleteError = new Error("private cleanup body");
     try {
-      let failure: unknown;
-      try {
-        await forkSession(host.v2, sourceSession(), messages);
-      } catch (error) {
-        failure = error;
-      }
-      expect(failure).toBeInstanceOf(ForkCleanupError);
+      const failure = await populatedFork(
+        host.v2,
+        sourceSession(),
+        messages,
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(ForkHistoryError);
+      expect((failure as ForkHistoryError).reason).toBe("replay-failed");
       expect(nestedErrorMessages(failure).join(" ")).not.toContain("private");
-      expect(String(failure)).toContain("(history replay failed)");
-      expect(String(failure)).toContain("partial fork backup manually");
-      expect(host.deleted).toEqual(["backup"]);
+      expect(host.deleted).toEqual([]);
       expect(host.history.read("source")).toEqual(messages);
     } finally {
       host.history.close();
@@ -685,7 +697,7 @@ describe("chronological forks", () => {
         host.readOverride = (_sessionID, number) =>
           number === read ? FAULTS[fault]() : undefined;
         try {
-          const fork = await forkSession(
+          const fork = await populatedFork(
             host.v2,
             sourceSession(),
             messages,
@@ -708,7 +720,7 @@ describe("chronological forks", () => {
       ["reject", "history read failed", "read-failed"],
       ["error", "history read failed", "read-failed"],
     ] as const)(
-      "stops after two %s attempts with a sanitized reason and awaited cleanup",
+      "stops after two %s attempts with a sanitized reason",
       async (fault, detail, reason) => {
         const { messages, host } = prepared();
         host.readOverride = (_sessionID, number) =>
@@ -716,7 +728,7 @@ describe("chronological forks", () => {
         const started = Date.now();
         try {
           const failure = await rejection(
-            forkSession(host.v2, sourceSession(), messages, TIMEOUT_MS),
+            populatedFork(host.v2, sourceSession(), messages, TIMEOUT_MS),
           );
           expect(failure).toBeInstanceOf(ForkHistoryError);
           expect((failure as ForkHistoryError).reason).toBe(reason);
@@ -730,7 +742,7 @@ describe("chronological forks", () => {
           expect(host.reads).toHaveLength(2);
           expect(host.forkCalls).toBe(1);
           expect(host.replayCalls).toBe(0);
-          expect(host.deleted).toEqual(["backup"]);
+          expect(host.deleted).toEqual([]);
           expect(host.history.read("source")).toEqual(messages);
         } finally {
           host.history.close();
@@ -744,14 +756,14 @@ describe("chronological forks", () => {
         number === 2 || number === 3 ? FAULTS.reject() : undefined;
       try {
         const failure = await rejection(
-          forkSession(host.v2, sourceSession(), messages, TIMEOUT_MS),
+          populatedFork(host.v2, sourceSession(), messages, TIMEOUT_MS),
         );
         expect((failure as ForkHistoryError).reason).toBe("read-failed");
         // Empty-cut read, then two failed verification attempts.
         expect(host.reads).toHaveLength(3);
         expect(host.forkCalls).toBe(1);
         expect(host.replayCalls).toBe(1);
-        expect(host.deleted).toEqual(["backup"]);
+        expect(host.deleted).toEqual([]);
       } finally {
         host.history.close();
       }
@@ -767,7 +779,7 @@ describe("chronological forks", () => {
       };
       try {
         const started = Date.now();
-        await forkSession(host.v2, sourceSession(), messages, TIMEOUT_MS);
+        await populatedFork(host.v2, sourceSession(), messages, TIMEOUT_MS);
         expect(Date.now() - started).toBeGreaterThan(TIMEOUT_MS);
         expect(host.reads).toHaveLength(4);
       } finally {
@@ -788,7 +800,7 @@ describe("chronological forks", () => {
         host.readOverride = (_sessionID, number) =>
           number === 1 ? abandoned : undefined;
         try {
-          const fork = await forkSession(
+          const fork = await populatedFork(
             host.v2,
             sourceSession(),
             messages,
@@ -826,37 +838,13 @@ describe("chronological forks", () => {
       };
       try {
         const failure = await rejection(
-          forkSession(host.v2, sourceSession(), messages, TIMEOUT_MS),
+          populatedFork(host.v2, sourceSession(), messages, TIMEOUT_MS),
         );
         expect((failure as ForkHistoryError).reason).toBe(reason);
         expect(host.reads).toHaveLength(script.length);
         expect(host.forkCalls).toBe(1);
         expect(host.replayCalls).toBe(0);
-        expect(host.deleted).toEqual(["backup"]);
-      } finally {
-        host.history.close();
-      }
-    });
-
-    test("keeps the read reason in the aggregate when partial-fork deletion fails", async () => {
-      const { messages, host } = prepared();
-      host.readOverride = () => FAULTS.timeout();
-      host.deleteError = new Error("private cleanup body");
-      try {
-        const failure = await rejection(
-          forkSession(host.v2, sourceSession(), messages, TIMEOUT_MS),
-        );
-        expect(failure).toBeInstanceOf(ForkCleanupError);
-        const [primary] = (failure as ForkCleanupError).errors;
-        expect(primary).toBeInstanceOf(ForkHistoryError);
-        expect((primary as ForkHistoryError).reason).toBe("read-timeout");
-        expect(String(failure)).toContain("(history read timed out)");
-        expect(String(failure)).toContain(
-          "delete partial fork backup manually",
-        );
-        expect(undeletedSessionIDs([failure])).toEqual(["backup"]);
-        expect(nestedErrorMessages(failure).join(" ")).not.toContain("private");
-        expect(host.deleted).toEqual(["backup"]);
+        expect(host.deleted).toEqual([]);
       } finally {
         host.history.close();
       }
@@ -865,11 +853,13 @@ describe("chronological forks", () => {
 });
 
 describe("native generation batch planning", () => {
-  const budget = computeNativeBatchBudget({
-    context: 1_000_000,
-    input: 500_000,
-    output: 64_000,
-  });
+  const budget = requireFit(
+    computeNativeBatchBudget({
+      context: 1_000_000,
+      input: 500_000,
+      output: 64_000,
+    }),
+  );
   const marker = (ordinal: number, nonce = NATIVE_BATCH_PLANNING_NONCE) =>
     `<magic-compact-turn nonce="${nonce}" ordinal="${ordinal}" />`;
   const estimate = (
@@ -886,49 +876,53 @@ describe("native generation batch planning", () => {
   });
   type Estimate = ReturnType<typeof estimate>;
   const renderExplicitRequest = (
-    candidates: Estimate[],
+    candidate: Estimate | null,
     globalIndexPrompt = '{"globalTurnIndex":[]}',
   ) =>
     [
       "Generate summaries from retained native history.",
       globalIndexPrompt,
       JSON.stringify({
-        turns: candidates.map(candidate => ({
-          ordinal: candidate.ordinal,
-          marker: candidate.marker,
-          expectedInlineImages: candidate.expectedInlineImages,
+        turns: (candidate ? [candidate] : []).map(item => ({
+          ordinal: item.ordinal,
+          marker: item.marker,
+          expectedInlineImages: item.expectedInlineImages,
         })),
       }),
     ].join("\n");
   const generationProtocol = (
     globalIndexPrompt = '{"globalTurnIndex":[]}',
-  ): NativeBatchProtocol<Estimate> => ({
-    explicitRequestTokens: candidates =>
-      countGptTokens(renderExplicitRequest(candidates, globalIndexPrompt))
-      + candidates.reduce(
-        (total, candidate) => total + countGptTokens(candidate.marker),
-        0,
-      ),
-    responseProtocolTokens: candidates =>
+  ): NativeRequestProtocol<Estimate> => ({
+    explicitRequestTokens: candidate =>
+      countGptTokens(renderExplicitRequest(candidate, globalIndexPrompt))
+      + (candidate ? countGptTokens(candidate.marker) : 0),
+    responseProtocolTokens: candidate =>
       countGptTokens(
         JSON.stringify({
-          turns: candidates.map(candidate => ({
-            ordinal: candidate.ordinal,
-            marker: candidate.marker,
-            summary: "",
-            visualDescriptions: Array.from(
-              { length: candidate.expectedInlineImages },
-              (_, index) => ({ ordinal: index + 1, description: "" }),
-            ),
-          })),
+          turns: [
+            {
+              ordinal: candidate.ordinal,
+              marker: candidate.marker,
+              summary: "",
+              visualDescriptions: Array.from(
+                { length: candidate.expectedInlineImages },
+                (_, index) => ({ ordinal: index + 1, description: "" }),
+              ),
+            },
+          ],
         }),
       ),
   });
   const plan = (
-    candidates: Estimate[],
+    candidate: Estimate,
     candidateBudget = budget,
     protocol = generationProtocol(),
-  ) => planNativeGenerationBatches(candidates, candidateBudget, protocol);
+  ) => planNativeGenerationRequest(candidate, candidateBudget, protocol);
+  const planned = (
+    candidate: Estimate,
+    candidateBudget = budget,
+    protocol = generationProtocol(),
+  ) => requireFit(plan(candidate, candidateBudget, protocol));
 
   test("derives output, normal, hard-turn, and halo limits from the configured model", () => {
     expect(NATIVE_BATCH_PLANNING_NONCE).toHaveLength(22);
@@ -944,81 +938,89 @@ describe("native generation batch planning", () => {
     expect(
       computeNativeBatchBudget({ context: 400_000, output: 64_000 }),
     ).toEqual({
-      outputTarget: 32_000,
-      usableInput: 368_000,
-      normalInputTarget: 294_400,
-      hardSingleTurnInput: 331_200,
-      haloInputLimit: 331_200,
+      kind: "fits",
+      value: {
+        outputTarget: 32_000,
+        usableInput: 368_000,
+        normalInputTarget: 294_400,
+        hardSingleTurnInput: 331_200,
+        haloInputLimit: 331_200,
+      },
     });
   });
 
   test("rejects missing or invalid context limits and uses the fallback output target", () => {
-    expect(() => computeNativeBatchBudget({} as { context: number })).toThrow(
-      "positive configured compaction model context limit",
-    );
-    expect(() =>
-      computeNativeBatchBudget({ context: 0, output: 64_000 }),
-    ).toThrow("positive configured compaction model context limit");
+    expect(computeNativeBatchBudget({} as { context: number })).toEqual({
+      kind: "capacity",
+      message:
+        "Magic Compact requires a positive configured compaction model context limit.",
+    });
+    expect(computeNativeBatchBudget({ context: 0, output: 64_000 })).toEqual({
+      kind: "capacity",
+      message:
+        "Magic Compact requires a positive configured compaction model context limit.",
+    });
     expect(computeNativeBatchBudget({ context: 400_000 })).toMatchObject({
-      outputTarget: 16_000,
-      usableInput: 384_000,
-      normalInputTarget: 307_200,
-      hardSingleTurnInput: 345_600,
-      haloInputLimit: 345_600,
+      value: {
+        outputTarget: 16_000,
+        usableInput: 384_000,
+        normalInputTarget: 307_200,
+        hardSingleTurnInput: 345_600,
+        haloInputLimit: 345_600,
+      },
     });
   });
 
   test("rejects a model input budget too small to fit the fixed request reserve", () => {
-    expect(() =>
+    expect(
       computeNativeBatchBudget({ context: 40_889, output: 64_000 }),
-    ).toThrow(/input budget.*too small/i);
-    expect(() =>
+    ).toMatchObject({
+      kind: "capacity",
+      message: expect.stringMatching(/input budget.*too small/i),
+    });
+    expect(
       computeNativeBatchBudget({
         context: 1_000_000,
         input: 8_889,
         output: 64_000,
       }),
-    ).toThrow(/input budget.*too small/i);
+    ).toMatchObject({
+      kind: "capacity",
+      message: expect.stringMatching(/input budget.*too small/i),
+    });
     expect(
       computeNativeBatchBudget({ context: 40_890, output: 64_000 }),
-    ).toMatchObject({ hardSingleTurnInput: 8_001 });
+    ).toMatchObject({ value: { hardSingleTurnInput: 8_001 } });
   });
 
   test("uses the complete rendered request at the normal input boundary", () => {
-    const template = estimate(1, 0);
-    const explicitRequestTokens = generationProtocol().explicitRequestTokens([
-      template,
-    ]);
+    const explicitRequestTokens = generationProtocol().explicitRequestTokens(
+      estimate(1, 0),
+    );
     const exactHistoryTokens =
       budget.normalInputTarget
       - NATIVE_BATCH_FIXED_RESERVE_TOKENS
       - explicitRequestTokens;
-    const below = plan([estimate(1, exactHistoryTokens - 1)]);
-    const exact = plan([estimate(1, exactHistoryTokens)]);
-    const above = plan([estimate(1, exactHistoryTokens + 1), estimate(2, 1)]);
 
-    expect(below).toMatchObject([
-      {
-        estimatedInputTokens: 399_999,
-        inputLimit: budget.normalInputTarget,
-        candidates: [{ ordinal: 1 }],
-      },
-    ]);
-    expect(exact).toMatchObject([
-      {
-        estimatedInputTokens: 400_000,
-        inputLimit: budget.normalInputTarget,
-        candidates: [{ ordinal: 1 }],
-      },
-    ]);
-    expect(above).toMatchObject([
-      {
-        estimatedInputTokens: 400_001,
-        inputLimit: budget.hardSingleTurnInput,
-        candidates: [{ ordinal: 1 }],
-      },
-      { inputLimit: budget.normalInputTarget, candidates: [{ ordinal: 2 }] },
-    ]);
+    expect(planned(estimate(1, exactHistoryTokens - 1))).toMatchObject({
+      estimatedInputTokens: 399_999,
+      inputLimit: budget.normalInputTarget,
+      candidate: { ordinal: 1 },
+    });
+    expect(planned(estimate(1, exactHistoryTokens))).toMatchObject({
+      estimatedInputTokens: 400_000,
+      inputLimit: budget.normalInputTarget,
+      candidate: { ordinal: 1 },
+    });
+    expect(planned(estimate(1, exactHistoryTokens + 1))).toMatchObject({
+      estimatedInputTokens: 400_001,
+      inputLimit: budget.hardSingleTurnInput,
+      candidate: { ordinal: 1 },
+    });
+    expect(planned(estimate(2, 1))).toMatchObject({
+      inputLimit: budget.normalInputTarget,
+      candidate: { ordinal: 2 },
+    });
   });
 
   test("plans one target per request with its global index charged once", () => {
@@ -1027,32 +1029,21 @@ describe("native generation batch planning", () => {
         globalTurnIndex: [{ sourceOrdinal: 1, anchor: "global orientation" }],
       }),
     );
-    const candidates = [
+    for (const candidate of [
       estimate(1, 1, 1),
       estimate(2, 1, 1),
       estimate(3, 1, 1),
-    ];
-    const batches = plan(candidates, budget, protocol);
-
-    expect(protocol.explicitRequestTokens(candidates)).toBeLessThan(
-      budget.normalInputTarget,
-    );
-    expect(batches.map(batch => batch.candidates)).toEqual(
-      candidates.map(candidate => [candidate]),
-    );
-    for (const [index, batch] of batches.entries()) {
-      const candidate = candidates[index]!;
-      expect(batch).toEqual({
-        candidates: [candidate],
+    ]) {
+      expect(planned(candidate, budget, protocol)).toEqual({
+        candidate,
         estimatedInputTokens:
           NATIVE_BATCH_FIXED_RESERVE_TOKENS
           + candidate.inputTokens
-          + protocol.explicitRequestTokens([candidate]),
-        estimatedExplicitRequestTokens: protocol.explicitRequestTokens([
-          candidate,
-        ]),
+          + protocol.explicitRequestTokens(candidate),
+        estimatedExplicitRequestTokens:
+          protocol.explicitRequestTokens(candidate),
         estimatedOutputTokens:
-          candidate.outputTokens + protocol.responseProtocolTokens([candidate]),
+          candidate.outputTokens + protocol.responseProtocolTokens(candidate),
         inputLimit: budget.normalInputTarget,
       });
     }
@@ -1064,55 +1055,65 @@ describe("native generation batch planning", () => {
     });
     const protocol = generationProtocol(globalIndexPrompt);
     const exactUsableInput =
-      NATIVE_BATCH_FIXED_RESERVE_TOKENS + protocol.explicitRequestTokens([]);
+      NATIVE_BATCH_FIXED_RESERVE_TOKENS + protocol.explicitRequestTokens(null);
+    // The request without its target is the floor every request repeats; it
+    // must fit before any target is planned.
+    const tiny = estimate(1, 0, 0);
     expect(
-      plan([], { ...budget, usableInput: exactUsableInput }, protocol),
-    ).toEqual([]);
-    expect(() =>
-      plan([], { ...budget, usableInput: exactUsableInput - 1 }, protocol),
-    ).toThrow(
-      /explicit request.*global turn index.*magic-trim.*input capacity/i,
-    );
+      plan(tiny, { ...budget, usableInput: exactUsableInput }, protocol),
+    ).toMatchObject({ kind: "fits" });
+    expect(
+      plan(tiny, { ...budget, usableInput: exactUsableInput - 1 }, protocol),
+    ).toMatchObject({
+      kind: "capacity",
+      message: expect.stringMatching(
+        /explicit request.*global turn index.*magic-trim.*input capacity/i,
+      ),
+    });
   });
 
   test("uses the complete rendered request at the hard single-turn boundary", () => {
-    const template = estimate(1, 0);
-    const explicitRequestTokens = generationProtocol().explicitRequestTokens([
-      template,
-    ]);
+    const explicitRequestTokens = generationProtocol().explicitRequestTokens(
+      estimate(1, 0),
+    );
     const exactHistoryTokens =
       budget.hardSingleTurnInput
       - NATIVE_BATCH_FIXED_RESERVE_TOKENS
       - explicitRequestTokens;
-    expect(plan([estimate(1, exactHistoryTokens)])).toMatchObject([
-      { estimatedInputTokens: 450_000, candidates: [{ ordinal: 1 }] },
-    ]);
-    expect(() => plan([estimate(1, exactHistoryTokens + 1)])).toThrow(
-      /magic-trim.*first/i,
-    );
+    expect(planned(estimate(1, exactHistoryTokens))).toMatchObject({
+      estimatedInputTokens: 450_000,
+      candidate: { ordinal: 1 },
+    });
+    expect(plan(estimate(1, exactHistoryTokens + 1))).toMatchObject({
+      kind: "capacity",
+      message: expect.stringMatching(/magic-trim.*first/i),
+    });
   });
 
   test("adds the complete response envelope, markers, and visuals to content output", () => {
     const candidate = estimate(17, 1, 700, 2);
-    const protocolTokens = generationProtocol().responseProtocolTokens([
-      candidate,
-    ]);
-    const batches = plan([candidate]);
+    const protocolTokens =
+      generationProtocol().responseProtocolTokens(candidate);
+    const request = planned(candidate);
 
-    expect(batches[0]!.estimatedOutputTokens).toBe(700 + protocolTokens);
-    expect(batches[0]!.estimatedOutputTokens).toBeLessThanOrEqual(
+    expect(request.estimatedOutputTokens).toBe(700 + protocolTokens);
+    expect(request.estimatedOutputTokens).toBeLessThanOrEqual(
       budget.outputTarget,
     );
   });
 
   test("requires more model output capacity when one complete turn response exceeds the target", () => {
-    const template = estimate(1, 1, 0);
-    const responseProtocolTokens = generationProtocol().responseProtocolTokens([
-      template,
-    ]);
-    expect(() =>
-      plan([estimate(1, 1, budget.outputTarget - responseProtocolTokens + 1)]),
-    ).toThrow(/single compaction turn.*more output capacity/i);
+    const responseProtocolTokens = generationProtocol().responseProtocolTokens(
+      estimate(1, 1, 0),
+    );
+    expect(
+      plan(estimate(1, 1, budget.outputTarget - responseProtocolTokens + 1)),
+    ).toMatchObject({
+      kind: "capacity",
+      message: expect.stringMatching(
+        /single compaction turn.*more output capacity/i,
+      ),
+    });
   });
 
   test.each([
@@ -1172,9 +1173,12 @@ describe("native generation batch planning", () => {
       const cost = estimateNativeTurnCost(turn);
 
       expect(cost.inputTokens).toBeGreaterThan(dataURL.length);
-      expect(() =>
-        plan([estimate(1, cost.inputTokens, cost.outputTokens)]),
-      ).toThrow(/magic-trim.*first/i);
+      expect(
+        plan(estimate(1, cost.inputTokens, cost.outputTokens)),
+      ).toMatchObject({
+        kind: "capacity",
+        message: expect.stringMatching(/magic-trim.*first/i),
+      });
     },
   );
 
@@ -1355,13 +1359,12 @@ describe("bounded native compaction generation", () => {
     const harness = generationHarness([turn], responseFor([turn]));
     const before = structuredClone(turn);
     try {
-      await expect(
-        generateCompactionSummaries(
-          harness.v2,
-          sourceSession(),
-          generationPlan([turn]),
-        ),
-      ).resolves.toHaveLength(1);
+      const { summaries } = await generate(
+        harness.v2,
+        sourceSession(),
+        generationPlan([turn]),
+      );
+      expect(summaries).toHaveLength(1);
       expect(
         harness.promptHistories[0]!.messages.map(item => item.info.role),
       ).toEqual(["user", "assistant"]);
@@ -1468,22 +1471,16 @@ describe("bounded native compaction generation", () => {
         ).rejects.toThrow(LISTENER_REQUIRED);
       }
       expect(requests).toEqual(["/config", "/config", "/config"]);
-      // OpenCode 1 shows a thrown command error to no client, so compact and
-      // trim report through the plugin input's own client, once each.
-      expect(toasts).toEqual([
-        {
-          title: "Magic Compact Failed",
+      // OpenCode 1 shows a thrown command error to no client, so each
+      // command reports through the plugin input's own client, once.
+      expect(toasts).toEqual(
+        ["Magic Compact", "Magic Trim", "Magic Stats"].map(title => ({
+          title: `${title} Failed`,
           message: LISTENER_REQUIRED,
           variant: "error",
           duration: expect.any(Number),
-        },
-        {
-          title: "Magic Trim Failed",
-          message: LISTENER_REQUIRED,
-          variant: "error",
-          duration: expect.any(Number),
-        },
-      ]);
+        })),
+      );
       // Compact and trim built a task-aware policy from the fake environment.
       expect(keyReads).toBe(2);
       expect(process.env).toBe(fakeEnv);
@@ -1601,6 +1598,7 @@ describe("bounded native compaction generation", () => {
         "Magic Trim Failed",
         TRIM_THRESHOLD_ERROR,
       ],
+      ["magic-stats", "now", "Magic Stats Failed", STATS_ARGUMENTS_ERROR],
     ] as const) {
       await expect(
         hooks["command.execute.before"]!(
@@ -1615,7 +1613,7 @@ describe("bounded native compaction generation", () => {
         duration: expect.any(Number),
       });
     }
-    expect(toasts).toHaveLength(4);
+    expect(toasts).toHaveLength(5);
   });
 
   test("leaves outcome and execution-failure toasts to the verified listener", async () => {
@@ -1748,7 +1746,7 @@ describe("bounded native compaction generation", () => {
     ]);
     const harness = generationHarness([turn], responseFor([turn]));
 
-    const summaries = await generateCompactionSummaries(
+    const { summaries } = await generate(
       harness.v2,
       sourceSession(),
       generationPlan([turn]),
@@ -1804,12 +1802,9 @@ describe("bounded native compaction generation", () => {
         ),
       ]),
     ];
-    const planClient = {
-      session: { messages: async () => ({ data: messages }) },
-    } as unknown as V2Client;
-    const plan = await createCompactionPlan(planClient, "source", 2);
+    const plan = planCompaction(messages, 2);
     const harness = generationHarness(
-      plan.summarizedTurns,
+      plan.targets.map(target => target.turn),
       {
         turns: [
           result(1, "Indexed target summary."),
@@ -1819,7 +1814,7 @@ describe("bounded native compaction generation", () => {
       { sourceMessages: messages },
     );
 
-    await generateCompactionSummaries(harness.v2, sourceSession(), plan);
+    await generate(harness.v2, sourceSession(), plan);
 
     const globalIndex = generationGlobalTurnIndex(harness.prompts[0]!);
     expect(globalIndex).toEqual([
@@ -1834,6 +1829,73 @@ describe("bounded native compaction generation", () => {
     ]);
     expect(generationGlobalTurnIndexText(harness.prompts[0]!)).not.toContain(
       "active incomplete turn",
+    );
+  });
+
+  // An empty first ordinary text still anchors its turn; only a turn whose
+  // first user message has no ordinary text part takes a later one's.
+  test("anchors each turn by its first ordinary user text, even when that text is empty", async () => {
+    const assistant = (id: string) => candidateMessages(id, "unused", [])[1]!;
+    const messages = [
+      message("anchor-same-user", "user", [
+        textPart("anchor-same-empty", "anchor-same-user", ""),
+        textPart("anchor-same-later", "anchor-same-user", "same message text"),
+      ]),
+      assistant("anchor-same"),
+      message("anchor-adjacent-first", "user", [
+        textPart("anchor-adjacent-empty", "anchor-adjacent-first", ""),
+      ]),
+      message("anchor-adjacent-second", "user", [
+        textPart(
+          "anchor-adjacent-text",
+          "anchor-adjacent-second",
+          "adjacent text",
+        ),
+      ]),
+      assistant("anchor-adjacent"),
+      message("anchor-notice-first", "user", [
+        {
+          ...textPart("anchor-notice", "anchor-notice-first", "host notice"),
+          synthetic: true,
+        },
+      ]),
+      message("anchor-notice-second", "user", [
+        textPart(
+          "anchor-notice-request",
+          "anchor-notice-second",
+          "request after notice",
+        ),
+      ]),
+      assistant("anchor-notice"),
+    ];
+    const plan = planCompaction(messages, 2);
+    const harness = generationHarness(
+      plan.targets.map(target => target.turn),
+      { turns: [result(1, "Same-message target summary.")] },
+      { sourceMessages: messages },
+    );
+
+    await generate(harness.v2, sourceSession(), plan);
+
+    const { marker } = generationPromptIndex(harness.prompts[0]!).turns[0]!;
+    expect(promptText(harness.prompts[0]!)).toBe(
+      [
+        "Generate one continuation summary for the indexed target turn using the retained native history.",
+        GENERATION_PROTOCOL,
+        "Submit the object through StructuredOutput. Its turns array must contain exactly one object, for the single target index entry below.",
+        "The globalTurnIndex is an orientation-only user-anchor map. Its sourceOrdinal values are immutable source-history positions, not target ordinals, and it does not supply distant assistant or tool detail. Each entry contains only its sourceOrdinal and bounded user anchor:",
+        JSON.stringify({
+          globalTurnIndex: [
+            { sourceOrdinal: 1, anchor: "" },
+            { sourceOrdinal: 2, anchor: "" },
+            { sourceOrdinal: 3, anchor: "request after notice" },
+          ],
+        }),
+        "Use the ephemeral markers only as ordering guides. Echo each exact marker token and target ordinal; marker echo is allowed. Never include the active generation nonce or marker token in summaries or visual descriptions; useful source identifiers may remain when you include them.",
+        JSON.stringify({
+          turns: [{ ordinal: 1, marker, expectedInlineImages: 0 }],
+        }),
+      ].join("\n"),
     );
   });
 
@@ -1875,7 +1937,7 @@ describe("bounded native compaction generation", () => {
       turns: [result(1, "Target summary.")],
     });
 
-    await generateCompactionSummaries(
+    await generate(
       harness.v2,
       sourceSession(),
       generationPlan([distant, spacer, target]),
@@ -1916,11 +1978,7 @@ describe("bounded native compaction generation", () => {
     });
 
     await expect(
-      generateCompactionSummaries(
-        harness.v2,
-        sourceSession(),
-        generationPlan(turns),
-      ),
+      generate(harness.v2, sourceSession(), generationPlan(turns)),
     ).rejects.toThrow(/global turn index.*magic-trim.*more input capacity/i);
     expect(harness.forks).toEqual([]);
     expect(harness.prompts).toEqual([]);
@@ -1930,29 +1988,19 @@ describe("bounded native compaction generation", () => {
     const turns = [candidateTurn("first", "alpha", [])];
     const harness = generationHarness(turns, responseFor(turns));
 
-    const summaries = await generateCompactionSummaries(
+    const { summaries } = await generate(
       harness.v2,
       sourceSession(),
       generationPlan(turns),
     );
 
     expect(summaries).toHaveLength(1);
-    expect(harness.events).toEqual([
-      "agents",
-      "providers",
-      "messages",
-      "fork",
-      // Empty cut, replayed fork, live source.
-      "messages",
-      "messages",
-      "messages",
-      "deny",
-      "messages",
-      "messages",
-      "marker",
-      "prompt",
-      "delete",
-    ]);
+    // One of each lifecycle step, in order; history reads are not pinned.
+    expect(
+      harness.events.filter(event =>
+        ["fork", "deny", "marker", "prompt", "delete"].includes(event),
+      ),
+    ).toEqual(["fork", "deny", "marker", "prompt", "delete"]);
     expect(harness.updates).toEqual([
       {
         sessionID: "generation-fork",
@@ -2036,7 +2084,7 @@ describe("bounded native compaction generation", () => {
       responseText: "invalid JSON from an unrelated text part",
     });
 
-    const summaries = await generateCompactionSummaries(
+    const { summaries } = await generate(
       harness.v2,
       sourceSession(),
       generationPlan([turn]),
@@ -2059,11 +2107,7 @@ describe("bounded native compaction generation", () => {
 
     let failure: unknown;
     try {
-      await generateCompactionSummaries(
-        harness.v2,
-        sourceSession(),
-        generationPlan([turn]),
-      );
+      await generate(harness.v2, sourceSession(), generationPlan([turn]));
     } catch (error) {
       failure = error;
     }
@@ -2087,7 +2131,7 @@ describe("bounded native compaction generation", () => {
       providerDelayByFirstOrdinal: { 1: 20 },
     });
 
-    const summaries = await generateCompactionSummaries(
+    const { summaries } = await generate(
       harness.v2,
       sourceSession(),
       generationPlan(turns),
@@ -2208,16 +2252,12 @@ describe("bounded native compaction generation", () => {
       input: 500_000,
       output: 1_536,
     };
-    const budget = computeNativeBatchBudget(modelLimits);
+    const budget = requireFit(computeNativeBatchBudget(modelLimits));
     const harness = generationHarness(turns, responseFor(turns), {
       modelLimits,
     });
 
-    await generateCompactionSummaries(
-      harness.v2,
-      sourceSession(),
-      generationPlan(turns),
-    );
+    await generate(harness.v2, sourceSession(), generationPlan(turns));
 
     expect(
       harness.prompts
@@ -2275,7 +2315,7 @@ describe("bounded native compaction generation", () => {
       providerDelayMs: 20,
     });
 
-    const summaries = await generateCompactionSummaries(
+    const { summaries } = await generate(
       harness.v2,
       sourceSession(),
       generationPlan(turns),
@@ -2307,7 +2347,7 @@ describe("bounded native compaction generation", () => {
       turns: [result(1, "Target summary.")],
     });
 
-    await generateCompactionSummaries(
+    await generate(
       harness.v2,
       sourceSession(),
       generationPlan([opaque, target]),
@@ -2345,7 +2385,7 @@ describe("bounded native compaction generation", () => {
     const messages = [...preceding, ...target, ...following];
     const before = structuredClone(messages);
     const plan = planCompaction(messages, 1);
-    expect(plan.summarizedTurns).toHaveLength(1);
+    expect(plan.targets).toHaveLength(1);
     expect(plan.nextTurn?.user[0]!.info.id).toBe("halo-following-user");
     const userTexts = (history: MessageWithParts[]) =>
       history.flatMap(message =>
@@ -2363,11 +2403,11 @@ describe("bounded native compaction generation", () => {
       output: number;
     }) => {
       const harness = generationHarness(
-        plan.summarizedTurns,
+        plan.targets.map(target => target.turn),
         { turns: [result(1, "Target summary.")] },
         { sourceMessages: messages, ...(modelLimits ? { modelLimits } : {}) },
       );
-      await generateCompactionSummaries(harness.v2, sourceSession(), plan, {
+      await generate(harness.v2, sourceSession(), plan, {
         nonceFactory: () => "uB_4fLx2Xv5Tz7E1M-8vQn",
       });
       const request = harness.prompts[0]!;
@@ -2413,11 +2453,13 @@ describe("bounded native compaction generation", () => {
     );
     expect(actualTokens).toBeLessThanOrEqual(recordedTokens);
     expect(recordedTokens).toBeLessThanOrEqual(
-      computeNativeBatchBudget({
-        context: 1_000_000,
-        input,
-        output: 64_000,
-      }).hardSingleTurnInput,
+      requireFit(
+        computeNativeBatchBudget({
+          context: 1_000_000,
+          input,
+          output: 64_000,
+        }),
+      ).hardSingleTurnInput,
     );
   });
 
@@ -2429,17 +2471,14 @@ describe("bounded native compaction generation", () => {
       ...persistedSummaryTurn("checkpoint-opaque", 2),
       ...candidateMessages("checkpoint-fresh", "fresh", []),
     ];
-    const planClient = {
-      session: { messages: async () => ({ data: messages }) },
-    } as unknown as V2Client;
-    const plan = await createCompactionPlan(planClient, "source", 0);
+    const plan = planCompaction(messages, 0);
     const harness = generationHarness(
-      plan.summarizedTurns,
+      plan.targets.map(target => target.turn),
       { turns: [result(1, "Fresh summary.")] },
       { sourceMessages: messages },
     );
 
-    await generateCompactionSummaries(harness.v2, sourceSession(), plan);
+    await generate(harness.v2, sourceSession(), plan);
 
     expect(
       harness.promptHistories[0]!.messages.map(message => ({
@@ -2463,17 +2502,14 @@ describe("bounded native compaction generation", () => {
       nativeSummary("checkpoint-halo-summary", "checkpoint-halo-marker"),
       ...candidateMessages("checkpoint-halo-target", "target", []),
     ];
-    const planClient = {
-      session: { messages: async () => ({ data: messages }) },
-    } as unknown as V2Client;
-    const plan = await createCompactionPlan(planClient, "source", 0);
+    const plan = planCompaction(messages, 0);
     const harness = generationHarness(
-      plan.summarizedTurns,
+      plan.targets.map(target => target.turn),
       { turns: [result(1, "Target summary.")] },
       { sourceMessages: messages },
     );
 
-    await generateCompactionSummaries(harness.v2, sourceSession(), plan);
+    await generate(harness.v2, sourceSession(), plan);
 
     expect(
       harness.promptHistories[0]!.messages.map(message => ({
@@ -2497,11 +2533,7 @@ describe("bounded native compaction generation", () => {
       "provider-native reasoning must not enter the explicit prompt";
     const harness = generationHarness([turn], responseFor([turn]));
 
-    await generateCompactionSummaries(
-      harness.v2,
-      sourceSession(),
-      generationPlan([turn]),
-    );
+    await generate(harness.v2, sourceSession(), generationPlan([turn]));
 
     expect(harness.prompts[0]).toMatchObject({
       model: { providerID: "configured-provider", modelID: "configured-model" },
@@ -2524,12 +2556,11 @@ describe("bounded native compaction generation", () => {
         responseFor([first, second]),
         { extraProviders: [solProvider()] },
       );
-      const reasoning = { matchModel, reports: [] as StageReport[] };
-      await generateCompactionSummaries(
+      const reasoning = await generate(
         harness.v2,
         sourceSession(),
         generationPlan([first, second]),
-        { reasoning },
+        { matchModel },
       );
       const byOrdinal = new Map(
         harness.prompts.map(request => [
@@ -2590,12 +2621,11 @@ describe("bounded native compaction generation", () => {
     const harness = generationHarness([turn], responseFor([turn]), {
       extraProviders: [solProvider()],
     });
-    const reasoning = { matchModel: false, reports: [] as StageReport[] };
-    await generateCompactionSummaries(
+    const reasoning = await generate(
       harness.v2,
       sourceSession(),
       generationPlan([turn]),
-      { reasoning, nonceFactory: () => "uB_4fLx2Xv5Tz7E1M-8vQn" },
+      { matchModel: false, nonceFactory: () => "uB_4fLx2Xv5Tz7E1M-8vQn" },
     );
     expect(harness.markerUpdates.map(update => update.part.text)).toEqual([
       '<magic-compact-turn nonce="uB_4fLx2Xv5Tz7E1M-8vQn" ordinal="1" />',
@@ -2615,12 +2645,11 @@ describe("bounded native compaction generation", () => {
       const harness = generationHarness([turn], responseFor([turn]), {
         extraProviders: [provider],
       });
-      const reasoning = { matchModel: true, reports: [] as StageReport[] };
-      await generateCompactionSummaries(
+      const reasoning = await generate(
         harness.v2,
         sourceSession(),
         generationPlan([turn]),
-        { reasoning },
+        { matchModel: true },
       );
       expect(harness.prompts[0]).toMatchObject({
         model: {
@@ -2654,12 +2683,11 @@ describe("bounded native compaction generation", () => {
       const harness = generationHarness([turn], responseFor([turn]), {
         extraProviders: [provider],
       });
-      const reasoning = { matchModel: true, reports: [] as StageReport[] };
-      await generateCompactionSummaries(
+      const reasoning = await generate(
         harness.v2,
         sourceSession(),
         generationPlan([turn]),
-        { reasoning },
+        { matchModel: true },
       );
       return {
         prompt: harness.prompts[0],
@@ -2728,12 +2756,11 @@ describe("bounded native compaction generation", () => {
       responseFor([large, small]),
       { extraProviders: [solProvider()] },
     );
-    const reasoning = { matchModel: true, reports: [] as StageReport[] };
-    await generateCompactionSummaries(
+    const reasoning = await generate(
       harness.v2,
       sourceSession(),
       generationPlan([large, small]),
-      { reasoning },
+      { matchModel: true },
     );
     const request = (ordinal: number) => {
       const prompt = harness.prompts.find(
@@ -2780,7 +2807,7 @@ describe("bounded native compaction generation", () => {
       responseFor([large, small]),
       { extraProviders: [solProvider()] },
     );
-    await generateCompactionSummaries(
+    await generate(
       configured.v2,
       sourceSession(),
       generationPlan([large, small]),
@@ -2813,7 +2840,7 @@ describe("bounded native compaction generation", () => {
       { nextTurn: next },
     );
 
-    await generateCompactionSummaries(harness.v2, sourceSession(), {
+    await generate(harness.v2, sourceSession(), {
       ...generationPlan([selected], next),
     });
 
@@ -2859,7 +2886,7 @@ describe("bounded native compaction generation", () => {
         turns: [result(1, "First summary."), result(2, "Second summary.")],
       });
 
-      const summaries = await generateCompactionSummaries(
+      const { summaries } = await generate(
         harness.v2,
         sourceSession(),
         generationPlan(turns),
@@ -2921,11 +2948,7 @@ describe("bounded native compaction generation", () => {
 
       let failure: unknown;
       try {
-        await generateCompactionSummaries(
-          harness.v2,
-          sourceSession(),
-          generationPlan([turn]),
-        );
+        await generate(harness.v2, sourceSession(), generationPlan([turn]));
       } catch (error) {
         failure = error;
       }
@@ -2966,7 +2989,7 @@ describe("bounded native compaction generation", () => {
       ],
     });
 
-    const summaries = await generateCompactionSummaries(
+    const { summaries } = await generate(
       harness.v2,
       sourceSession(),
       generationPlan([turn]),
@@ -3044,7 +3067,7 @@ describe("bounded native compaction generation", () => {
       ],
     });
 
-    const summaries = await generateCompactionSummaries(
+    const { summaries } = await generate(
       harness.v2,
       sourceSession(),
       generationPlan([turn]),
@@ -3165,11 +3188,7 @@ describe("bounded native compaction generation", () => {
     });
 
     await expect(
-      generateCompactionSummaries(
-        harness.v2,
-        sourceSession(),
-        generationPlan([turn]),
-      ),
+      generate(harness.v2, sourceSession(), generationPlan([turn])),
     ).rejects.toThrow("response validation failed: invalid visual coverage.");
     expect(harness.deletes).toEqual(["generation-fork"]);
   });
@@ -3267,15 +3286,16 @@ describe("bounded native compaction generation", () => {
       { nextTurn: next },
     );
 
-    const summaries = await generateCompactionSummaries(
+    const { summaries } = await generate(
       harness.v2,
       sourceSession(),
       generationPlan(turns, next),
     );
 
+    // The opaque turn is not a target, so it has no summary.
+    expect(summaries).toHaveLength(2);
     expect(summaries[0]).toMatchObject({ text: "First duplicate summary." });
-    expect(summaries[1]).toBeNull();
-    expect(summaries[2]).toMatchObject({ text: "Empty-line summary." });
+    expect(summaries[1]).toMatchObject({ text: "Empty-line summary." });
     const forkMarkers = ["generation-fork", "generation-fork-2"].map(
       sessionID =>
         harness.markerUpdates.filter(update => update.sessionID === sessionID),
@@ -3352,11 +3372,7 @@ describe("bounded native compaction generation", () => {
     });
 
     await expect(
-      generateCompactionSummaries(
-        harness.v2,
-        sourceSession(),
-        generationPlan([turn]),
-      ),
+      generate(harness.v2, sourceSession(), generationPlan([turn])),
     ).rejects.toThrow(
       "response validation failed: invalid turn shape or identity (marker at target ordinal 1).",
     );
@@ -3378,7 +3394,7 @@ describe("bounded native compaction generation", () => {
       ],
     });
 
-    const summaries = await generateCompactionSummaries(
+    const { summaries } = await generate(
       harness.v2,
       sourceSession(),
       generationPlan([turn]),
@@ -3403,7 +3419,7 @@ describe("bounded native compaction generation", () => {
     const values = [collidingNonce, replacementNonce];
     const regenerated = generationHarness([turn], responseFor([turn]));
 
-    const summaries = await generateCompactionSummaries(
+    const { summaries } = await generate(
       regenerated.v2,
       sourceSession(),
       generationPlan([turn]),
@@ -3419,12 +3435,9 @@ describe("bounded native compaction generation", () => {
 
     const exhausted = generationHarness([turn], responseFor([turn]));
     await expect(
-      generateCompactionSummaries(
-        exhausted.v2,
-        sourceSession(),
-        generationPlan([turn]),
-        { nonceFactory: () => collidingNonce },
-      ),
+      generate(exhausted.v2, sourceSession(), generationPlan([turn]), {
+        nonceFactory: () => collidingNonce,
+      }),
     ).rejects.toThrow("generation marker nonce collision");
     expect(exhausted.forks).toEqual([]);
     expect(exhausted.markerUpdates).toEqual([]);
@@ -3442,11 +3455,7 @@ describe("bounded native compaction generation", () => {
     });
 
     await expect(
-      generateCompactionSummaries(
-        shapeHarness.v2,
-        sourceSession(),
-        generationPlan([turn]),
-      ),
+      generate(shapeHarness.v2, sourceSession(), generationPlan([turn])),
     ).rejects.toThrow(
       "fork history verification failed (replayed fork did not match the plan)",
     );
@@ -3458,11 +3467,7 @@ describe("bounded native compaction generation", () => {
       markerError: new Error("raw marker failure"),
     });
     await expect(
-      generateCompactionSummaries(
-        markerHarness.v2,
-        sourceSession(),
-        generationPlan([turn]),
-      ),
+      generate(markerHarness.v2, sourceSession(), generationPlan([turn])),
     ).rejects.toThrow("fork marker injection failed");
     expect(markerHarness.prompts).toEqual([]);
     expect(markerHarness.aborts).toEqual([]);
@@ -3475,11 +3480,7 @@ describe("bounded native compaction generation", () => {
       forkReadFault: load =>
         load === 1 ? Promise.reject(new Error("private read body")) : undefined,
     });
-    await generateCompactionSummaries(
-      recovered.v2,
-      sourceSession(),
-      generationPlan([turn]),
-    );
+    await generate(recovered.v2, sourceSession(), generationPlan([turn]));
     expect(recovered.forks).toHaveLength(1);
     expect(recovered.prompts).toHaveLength(1);
     expect(recovered.deletes).toEqual(["generation-fork"]);
@@ -3487,7 +3488,7 @@ describe("bounded native compaction generation", () => {
     const stalled = generationHarness([turn], responseFor([turn]), {
       forkReadFault: () => new Promise(() => {}),
     });
-    const failure = await generateCompactionSummaries(
+    const failure = await generate(
       stalled.v2,
       sourceSession(),
       generationPlan([turn]),
@@ -3565,11 +3566,7 @@ describe("bounded native compaction generation", () => {
       });
 
       await expect(
-        generateCompactionSummaries(
-          harness.v2,
-          sourceSession(),
-          generationPlan(turns),
-        ),
+        generate(harness.v2, sourceSession(), generationPlan(turns)),
       ).rejects.toThrow("fork history shape verification failed");
       expect(
         harness.markerUpdates.filter(
@@ -3597,11 +3594,7 @@ describe("bounded native compaction generation", () => {
       });
 
       await expect(
-        generateCompactionSummaries(
-          harness.v2,
-          sourceSession(),
-          generationPlan([turn]),
-        ),
+        generate(harness.v2, sourceSession(), generationPlan([turn])),
       ).rejects.toThrow(/model (?:descriptor|context limit)/i);
       expect(harness.forks).toEqual([]);
       expect(harness.prompts).toEqual([]);
@@ -3626,11 +3619,7 @@ describe("bounded native compaction generation", () => {
       });
 
       await expect(
-        generateCompactionSummaries(
-          harness.v2,
-          sourceSession(),
-          generationPlan([turn]),
-        ),
+        generate(harness.v2, sourceSession(), generationPlan([turn])),
       ).rejects.toThrow("image-capable configured compaction model");
       expect(harness.forks).toEqual([]);
       expect(harness.prompts).toEqual([]);
@@ -3728,11 +3717,7 @@ describe("bounded native compaction generation", () => {
       });
 
       await expect(
-        generateCompactionSummaries(
-          harness.v2,
-          sourceSession(),
-          generationPlan(turns, nextTurn),
-        ),
+        generate(harness.v2, sourceSession(), generationPlan(turns, nextTurn)),
       ).rejects.toThrow("image-capable configured compaction model");
       expect(harness.forks).toEqual([]);
       expect(harness.prompts).toEqual([]);
@@ -3756,7 +3741,7 @@ describe("bounded native compaction generation", () => {
       modelImageCapability: false,
     });
 
-    const summaries = await generateCompactionSummaries(
+    const { summaries } = await generate(
       harness.v2,
       sourceSession(),
       generationPlan([turn]),
@@ -3781,7 +3766,7 @@ describe("bounded native compaction generation", () => {
       modelImageCapability: false,
     });
 
-    await generateCompactionSummaries(
+    await generate(
       harness.v2,
       sourceSession(),
       generationPlan([selected], nextTurn),
@@ -3791,52 +3776,6 @@ describe("bounded native compaction generation", () => {
     expect(JSON.stringify(harness.promptHistories[0]!.messages)).not.toContain(
       "image/png",
     );
-  });
-
-  test("keeps a completed compacted tool attachment non-visible and compacted-costed through the real plan path", async () => {
-    const hiddenDataURL = `data:image/png;base64,${"A".repeat(2_000_000)}`;
-    const messages = [
-      ...candidateMessages("compacted-attachment", "inspect attachment", [
-        toolPart(
-          "compacted-attachment-tool",
-          "compacted-attachment-assistant",
-          {
-            status: "completed",
-            input: {},
-            output: hiddenDataURL,
-            title: "Attachment",
-            metadata: {},
-            time: { start: 1, end: 2, compacted: 3 },
-            attachments: [{ mime: "image/png", url: hiddenDataURL }],
-          },
-        ),
-      ]),
-    ];
-    const planClient = {
-      session: { messages: async () => ({ data: messages }) },
-    } as unknown as V2Client;
-    const plan = await createCompactionPlan(planClient, "source", 0);
-    const harness = generationHarness(
-      plan.summarizedTurns,
-      responseFor(plan.summarizedTurns),
-      {
-        sourceMessages: messages,
-        modelImageCapability: false,
-      },
-    );
-
-    const summaries = await generateCompactionSummaries(
-      harness.v2,
-      sourceSession(),
-      plan,
-    );
-
-    expect(summaries).toHaveLength(1);
-    expect(
-      estimateNativeTurnCost(plan.summarizedTurns[0]!).inputTokens,
-    ).toBeLessThan(10_000);
-    expect(harness.forks.length).toBe(1);
-    expect(harness.prompts.length).toBe(1);
   });
 
   test.each([
@@ -3853,11 +3792,7 @@ describe("bounded native compaction generation", () => {
       });
 
       await expect(
-        generateCompactionSummaries(
-          harness.v2,
-          sourceSession(),
-          generationPlan([turn]),
-        ),
+        generate(harness.v2, sourceSession(), generationPlan([turn])),
       ).rejects.toThrow(
         summarizerAgent === "model-missing"
           ? "requires an explicit model"
@@ -3878,23 +3813,19 @@ describe("bounded native compaction generation", () => {
       ...candidateMessages("fresh", "fresh request", []),
     ];
     const before = structuredClone(messages.slice(0, 6));
-    const planClient = {
-      session: { messages: async () => ({ data: messages }) },
-    } as unknown as V2Client;
 
-    const plan = await createCompactionPlan(planClient, "source", 0);
-    const harness = generationHarness(plan.summarizedTurns, {
-      turns: [result(1, "Fresh turn summary.")],
-    });
-    const summaries = await generateCompactionSummaries(
-      harness.v2,
-      sourceSession(),
-      plan,
+    const plan = planCompaction(messages, 0);
+    const harness = generationHarness(
+      plan.targets.map(target => target.turn),
+      { turns: [result(1, "Fresh turn summary.")] },
+      { sourceMessages: messages },
     );
+    const { summaries } = await generate(harness.v2, sourceSession(), plan);
 
     expect(messages.slice(0, 6)).toEqual(before);
-    expect(summaries.slice(0, 3)).toEqual([null, null, null]);
-    expect(summaries[3]).toMatchObject({ text: "Fresh turn summary." });
+    // Only the summary-free turn is a target.
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]).toMatchObject({ text: "Fresh turn summary." });
     expect(harness.forks).toHaveLength(1);
     expect(harness.prompts).toHaveLength(1);
   });
@@ -3912,16 +3843,91 @@ describe("bounded native compaction generation", () => {
     });
 
     await expect(
-      generateCompactionSummaries(
-        harness.v2,
-        sourceSession(),
-        generationPlan([turn]),
-      ),
+      generate(harness.v2, sourceSession(), generationPlan([turn])),
     ).rejects.toThrow(/trim.*first/i);
 
     expect(harness.aborts).toEqual(["generation-fork"]);
     expect(harness.deletes).toEqual(["generation-fork"]);
     expect(harness.prompts).toHaveLength(1);
+  });
+
+  // OpenCode runs the compacting hook before any native compaction request,
+  // replay or auto-continue; its throw ends the fork's prompt loop, and the
+  // host then fails or returns the prompt call with whatever error it keeps.
+  test.each(["fails", "returns"] as const)(
+    "reports a native compaction the hook blocked as an overflow when the prompt %s",
+    async outcome => {
+      const turn = candidateTurn("native-compaction", "compaction request", []);
+      const hooks = await server({} as PluginInput);
+      const compacting = (sessionID: string) =>
+        hooks["experimental.session.compacting"]!(
+          { sessionID },
+          { context: [], prompt: undefined },
+        );
+      let hookError: unknown;
+      const harness = generationHarness([turn], responseFor([turn]), {
+        // A plain host error: nothing in it names a context overflow.
+        ...(outcome === "fails"
+          ? { providerError: new Error("host failure with private detail") }
+          : {}),
+        onPrompt: async forkID => {
+          hookError = await compacting(forkID).then(
+            () => undefined,
+            (error: unknown) => error,
+          );
+        },
+      });
+
+      const failure = await generate(
+        harness.v2,
+        sourceSession(),
+        generationPlan([turn]),
+      ).then(
+        () => undefined,
+        (error: unknown) => error as Error,
+      );
+
+      expect(hookError).toBeInstanceOf(Error);
+      expect(failure?.message).toBe(
+        "The complete forked session exceeded the configured compaction model context. Run /magic-trim first, then retry /magic-compact.",
+      );
+      expect(harness.aborts).toEqual(["generation-fork"]);
+      expect(harness.deletes).toEqual(["generation-fork"]);
+      // Released after the confirmed deletion: the hooks pass it again.
+      await expect(compacting("generation-fork")).resolves.toBeUndefined();
+    },
+  );
+
+  test("keeps guarding a generation fork whose deletion failed", async () => {
+    const turn = candidateTurn("kept-guard", "kept guard request", []);
+    const hooks = await server({} as PluginInput);
+    const harness = generationHarness([turn], responseFor([turn]), {
+      deleteError: new Error("raw delete"),
+    });
+    try {
+      const failure = await generate(
+        harness.v2,
+        sourceSession(),
+        generationPlan([turn]),
+      ).catch((error: unknown) => error);
+      expect((failure as Error).message).toBe(
+        "Compaction generation fork deletion failed. Fork generation-fork could not be deleted.",
+      );
+      expect(unremovedSessions([failure])).toEqual([
+        { id: "generation-fork", removal: "failed" },
+      ]);
+      await expect(
+        hooks["experimental.session.compacting"]!(
+          { sessionID: "generation-fork" },
+          { context: [], prompt: undefined },
+        ),
+      ).rejects.toThrow("native compaction is blocked");
+    } finally {
+      releaseOwnedFork({
+        id: "generation-fork",
+        nativeCompactionBlocked: false,
+      });
+    }
   });
 
   test("waits for the model without applying the control-operation deadline", async () => {
@@ -3930,7 +3936,7 @@ describe("bounded native compaction generation", () => {
       providerDelayMs: 20,
     });
 
-    const summaries = await generateCompactionSummaries(
+    const { summaries } = await generate(
       harness.v2,
       sourceSession(),
       generationPlan([turn]),
@@ -3955,7 +3961,7 @@ describe("bounded native compaction generation", () => {
     });
 
     let settled = false;
-    const operation = generateCompactionSummaries(
+    const operation = generate(
       harness.v2,
       sourceSession(),
       generationPlan([turn]),
@@ -3968,7 +3974,7 @@ describe("bounded native compaction generation", () => {
     expect(settled).toBeFalse();
     expect(harness.prompts).toEqual([]);
     releaseFork();
-    await expect(operation).resolves.toEqual([
+    expect((await operation).summaries).toEqual([
       { text: "Turn 1 outcome and continuation details." },
     ]);
 
@@ -3992,7 +3998,7 @@ describe("bounded native compaction generation", () => {
       deleteGateForFirstOrdinal: 1,
     });
     let settled = false;
-    const operation = generateCompactionSummaries(
+    const operation = generate(
       harness.v2,
       sourceSession(),
       generationPlan(turns),
@@ -4019,13 +4025,14 @@ describe("bounded native compaction generation", () => {
       responseFinish: "length",
     });
 
-    await expect(
-      generateCompactionSummaries(
-        harness.v2,
-        sourceSession(),
-        generationPlan([turn]),
-      ),
-    ).resolves.toEqual([{ text: "Turn 1 outcome and continuation details." }]);
+    const { summaries } = await generate(
+      harness.v2,
+      sourceSession(),
+      generationPlan([turn]),
+    );
+    expect(summaries).toEqual([
+      { text: "Turn 1 outcome and continuation details." },
+    ]);
   });
 
   test.each([
@@ -4097,7 +4104,7 @@ describe("bounded native compaction generation", () => {
       const turn = candidateTurn("truncated", "truncate request", []);
       const harness = generationHarness([turn], { turns: [] }, options);
 
-      const failure = await generateCompactionSummaries(
+      const failure = await generate(
         harness.v2,
         sourceSession(),
         generationPlan([turn]),
@@ -4124,7 +4131,7 @@ describe("bounded native compaction generation", () => {
       },
     });
 
-    const failure = await generateCompactionSummaries(
+    const failure = await generate(
       harness.v2,
       sourceSession(),
       generationPlan([turn]),
@@ -4152,7 +4159,7 @@ describe("bounded native compaction generation", () => {
       },
     });
 
-    const failure = await generateCompactionSummaries(
+    const failure = await generate(
       harness.v2,
       sourceSession(),
       generationPlan([turn]),
@@ -4171,60 +4178,45 @@ describe("bounded native compaction generation", () => {
     expect(harness.deletes).toEqual(["generation-fork"]);
   });
 
-  test("preserves trim-first overflow guidance through one sanitized nested cause", async () => {
-    const turn = candidateTurn("nested-overflow", "overflow request", []);
-    const providerError = new Error("outer raw error", {
-      cause: { name: "ContextOverflowError", data: { message: "raw inner" } },
-    });
-    const harness = generationHarness([turn], responseFor([turn]), {
-      providerError,
-    });
-
-    await expect(
-      generateCompactionSummaries(
-        harness.v2,
-        sourceSession(),
-        generationPlan([turn]),
-      ),
-    ).rejects.toThrow(/trim.*first/i);
-  });
-
-  test.each([
-    ["context window", "context_window_exceeded"],
-    ["prompt too long", "prompt_too_long"],
-    ["input too long", "input_too_long"],
-  ])(
-    "recognizes deeply nested %s overflow without surfacing provider text",
-    async (_name, code) => {
-      const turn = candidateTurn("deep-overflow", "overflow request", []);
-      const providerError = {
-        error: {
-          cause: {
-            data: {
-              error: { code, message: "raw provider text must stay hidden" },
-            },
+  const nestedCode = (code: string) =>
+    ({
+      error: {
+        cause: {
+          data: {
+            error: { code, message: "raw provider text must stay hidden" },
           },
         },
-      } as unknown as Error;
+      },
+    }) as unknown as Error;
+  test.each([
+    [
+      "a named context overflow cause",
+      new Error("outer raw error", {
+        cause: { name: "ContextOverflowError", data: { message: "raw inner" } },
+      }),
+    ],
+    ["context window", nestedCode("context_window_exceeded")],
+    ["prompt too long", nestedCode("prompt_too_long")],
+    ["input too long", nestedCode("input_too_long")],
+  ])(
+    "recognizes nested %s overflow without surfacing provider text",
+    async (_name, providerError) => {
+      const turn = candidateTurn("deep-overflow", "overflow request", []);
       const harness = generationHarness([turn], responseFor([turn]), {
         providerError,
       });
       let failure: unknown;
 
       try {
-        await generateCompactionSummaries(
-          harness.v2,
-          sourceSession(),
-          generationPlan([turn]),
-        );
+        await generate(harness.v2, sourceSession(), generationPlan([turn]));
       } catch (error) {
         failure = error;
       }
 
-      expect(String(failure)).toMatch(/trim.*first/i);
-      expect(nestedErrorMessages(failure).join(" ")).not.toContain(
-        "raw provider text",
+      expect((failure as Error).message).toBe(
+        "The complete forked session exceeded the configured compaction model context. Run /magic-trim first, then retry /magic-compact.",
       );
+      expect(nestedErrorMessages(failure).join(" ")).not.toContain("raw");
       expect(harness.aborts).toEqual(["generation-fork"]);
       expect(harness.deletes).toEqual(["generation-fork"]);
     },
@@ -4239,30 +4231,33 @@ describe("bounded native compaction generation", () => {
       const turn = candidateTurn("lifecycle", "lifecycle request", []);
       const harness = generationHarness([turn], responseFor([turn]), options);
 
-      await expect(
-        generateCompactionSummaries(
-          harness.v2,
-          sourceSession(),
-          generationPlan([turn]),
-        ),
-      ).rejects.toThrow(
-        name === "permission update"
-          ? "permission update failed"
-          : "fork deletion failed",
-      );
-      expect(harness.prompts).toHaveLength(
-        name === "permission update" ? 0 : 1,
-      );
-      expect(harness.forks[0]).toMatchObject({
-        directory: "/workspace",
-        workspace: "workspace",
-      });
-      expect(harness.deleteRequests[0]).toMatchObject({
-        directory: "/workspace",
-        workspace: "workspace",
-      });
-      if (name === "permission update") {
-        expect(harness.aborts).toEqual([]);
+      try {
+        await expect(
+          generate(harness.v2, sourceSession(), generationPlan([turn])),
+        ).rejects.toThrow(
+          name === "permission update"
+            ? "permission update failed"
+            : "fork deletion failed",
+        );
+        expect(harness.prompts).toHaveLength(
+          name === "permission update" ? 0 : 1,
+        );
+        expect(harness.forks[0]).toMatchObject({
+          directory: "/workspace",
+          workspace: "workspace",
+        });
+        expect(harness.deleteRequests[0]).toMatchObject({
+          directory: "/workspace",
+          workspace: "workspace",
+        });
+        if (name === "permission update") {
+          expect(harness.aborts).toEqual([]);
+        }
+      } finally {
+        releaseOwnedFork({
+          id: "generation-fork",
+          nativeCompactionBlocked: false,
+        });
       }
     },
   );
@@ -4277,22 +4272,20 @@ describe("bounded native compaction generation", () => {
     let failure: unknown;
 
     try {
-      await generateCompactionSummaries(
-        harness.v2,
-        sourceSession(),
-        generationPlan([turn]),
-      );
+      await generate(harness.v2, sourceSession(), generationPlan([turn]));
     } catch (error) {
       failure = error;
+    } finally {
+      releaseOwnedFork({
+        id: "generation-fork",
+        nativeCompactionBlocked: false,
+      });
     }
 
     expect(failure).toBeInstanceOf(AggregateError);
-    expect(nestedErrorMessages(failure)).toEqual(
-      expect.arrayContaining([
-        "Compaction generation model request failed.",
-        "Compaction generation fork abort failed.",
-        "Compaction generation fork deletion failed.",
-      ]),
+    // The fork is named once, after the reasons, which never name it.
+    expect((failure as Error).message).toBe(
+      "Compaction generation and fork cleanup both failed. Compaction generation model request failed. Compaction generation fork abort failed. Compaction generation fork deletion failed. Fork generation-fork could not be deleted.",
     );
     expect(nestedErrorMessages(failure).join(" ")).not.toContain("raw");
     expect(harness.abortRequests[0]).toMatchObject({
@@ -4319,6 +4312,7 @@ describe("compaction orchestration", () => {
           ),
         ]),
       ],
+      "Native compaction part on checkpoint-malformed-assistant must belong to a user message.",
     ],
     [
       "ambiguous",
@@ -4335,6 +4329,7 @@ describe("compaction orchestration", () => {
           { finish: undefined },
         ),
       ],
+      "Native compaction marker checkpoint-ambiguous-marker has ambiguous summary children.",
     ],
     [
       "dangling",
@@ -4342,6 +4337,7 @@ describe("compaction orchestration", () => {
         ...candidateMessages("checkpoint-dangling", "before", []),
         nativeMarker("checkpoint-dangling-marker"),
       ],
+      "Native compaction marker checkpoint-dangling-marker is incomplete or errored.",
     ],
     [
       "active incomplete",
@@ -4352,15 +4348,23 @@ describe("compaction orchestration", () => {
           finish: undefined,
         }),
       ],
+      "Native compaction marker checkpoint-active-marker is incomplete or errored.",
     ],
-  ] as const)("rejects %s native checkpoint state", async (_name, fixture) => {
-    const messages = fixture();
-    const v2 = {
-      session: { messages: async () => ({ data: messages }) },
-    } as unknown as V2Client;
+  ] as const)(
+    "rejects %s native checkpoint state",
+    (_name, fixture, reason) => {
+      const messages = fixture();
 
-    await expect(createCompactionPlan(v2, "source", 0)).rejects.toThrow();
-  });
+      let failure: unknown;
+      try {
+        planCompaction(messages, 0);
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(PluginMessageError);
+      expect((failure as Error).message).toBe(reason);
+    },
+  );
 
   test("keeps native checkpoint history frozen and selects only its suffix", async () => {
     const messages = [
@@ -4389,14 +4393,11 @@ describe("compaction orchestration", () => {
       },
       ...candidateMessages("suffix", "suffix request", []),
     ];
-    const v2 = {
-      session: { messages: async () => ({ data: messages }) },
-    } as unknown as V2Client;
 
-    const plan = await createCompactionPlan(v2, "source", 0);
+    const plan = planCompaction(messages, 0);
 
-    expect(plan.summarizedTurns).toHaveLength(1);
-    expect(plan.summarizedTurns[0]!.user[0]!.info.id).toBe("suffix-user");
+    expect(plan.targets).toHaveLength(1);
+    expect(plan.targets[0]!.turn.user[0]!.info.id).toBe("suffix-user");
     expect(plan.nextTurn).toBeNull();
   });
 
@@ -4416,14 +4417,11 @@ describe("compaction orchestration", () => {
           textPart("preserved-trailing-text", "preserved-trailing-user", "?"),
         ]),
       ];
-      const v2 = {
-        session: { messages: async () => ({ data: messages }) },
-      } as unknown as V2Client;
 
-      const plan = await createCompactionPlan(v2, "source", keepTurns);
+      const plan = planCompaction(messages, keepTurns);
 
       expect(plan.preservedTurnCount).toBe(preserved);
-      expect(plan.summarizedTurns).toHaveLength(summarized);
+      expect(plan.targets).toHaveLength(summarized);
     },
   );
 
@@ -4443,70 +4441,78 @@ describe("compaction orchestration", () => {
       ...boundaryTurn,
       ...candidateMessages("preserved-new", "third", []),
     ];
-    const v2 = {
-      session: { messages: async () => ({ data: messages }) },
-    } as unknown as V2Client;
 
-    const plan = await createCompactionPlan(v2, "source", 5);
+    const plan = planCompaction(messages, 5);
 
     expect(plan.preservedTurnCount).toBe(2);
-    expect(plan.summarizedTurns).toHaveLength(0);
+    expect(plan.targets).toHaveLength(0);
   });
 
-  test("treats a concurrent compacted-bit change as source drift", async () => {
-    const messages = [
-      ...candidateMessages("drift-compacted", "inspect", [
-        toolPart("drift-compacted-tool", "drift-compacted-assistant", {
-          status: "completed",
-          input: {},
-          output: "result",
-          title: "Read",
-          metadata: {},
-          time: { start: 1, end: 2 },
-        }),
-      ]),
-    ];
-    const planClient = {
-      session: { messages: async () => ({ data: messages }) },
-    } as unknown as V2Client;
-    const plan = await createCompactionPlan(planClient, "source", 0);
+  // The handoff recheck compares the semantic compacted bit but not the
+  // start and end times of a tool call.
+  test.each([
+    [
+      "a compacted-bit change discards the candidate",
+      { start: 1, end: 2 },
+      (time: Record<string, unknown>) => {
+        time["compacted"] = 3;
+      },
+      true,
+    ],
+    [
+      "start and end churn keeps it",
+      { start: 1, end: 2, compacted: 3 },
+      (time: Record<string, unknown>) => {
+        time["start"] = 100;
+        time["end"] = 200;
+      },
+      false,
+    ],
+  ] as const)(
+    "at the handoff recheck %s",
+    async (_name, time, change, drift) => {
+      const messages = compactableCommandMessages(
+        "drift-tool-time",
+        "large output ".repeat(1_000),
+      );
+      const toolState = (live: MessageWithParts[]) =>
+        (
+          live[1]!.parts.find(part => part.type === "tool") as unknown as {
+            state: { time: Record<string, unknown> };
+          }
+        ).state;
+      toolState(messages).time = { ...time };
+      const harness = commandHarness(messages, {
+        generationResponse: { turns: [result(1, "Completed.")] },
+        driftAfterSuccessorCreate: live => change(toolState(live).time),
+      });
 
-    const tool = messages[1]!.parts.find(
-      part => part.type === "tool",
-    ) as unknown as { state: { time: Record<string, unknown> } };
-    tool.state.time.compacted = 3;
+      const outcome = executeMagicCompact(
+        harness.v2,
+        "source",
+        0,
+        HEURISTIC_OPTIONS,
+      );
 
-    expect(() => assertCompactionSourceUnchanged(messages, plan)).toThrow(
-      NativeCheckpointChangedError,
-    );
-  });
-
-  test("ignores volatile tool timing changes in source revalidation", async () => {
-    const messages = [
-      ...candidateMessages("drift-timing", "inspect", [
-        toolPart("drift-timing-tool", "drift-timing-assistant", {
-          status: "completed",
-          input: {},
-          output: "result",
-          title: "Read",
-          metadata: {},
-          time: { start: 1, end: 2, compacted: 3 },
-        }),
-      ]),
-    ];
-    const planClient = {
-      session: { messages: async () => ({ data: messages }) },
-    } as unknown as V2Client;
-    const plan = await createCompactionPlan(planClient, "source", 0);
-
-    const tool = messages[1]!.parts.find(
-      part => part.type === "tool",
-    ) as unknown as { state: { time: Record<string, unknown> } };
-    tool.state.time.start = 100;
-    tool.state.time.end = 200;
-
-    expect(() => assertCompactionSourceUnchanged(messages, plan)).not.toThrow();
-  });
+      if (drift) {
+        await expect(outcome).rejects.toThrow(
+          "The session changed while Magic Compact was preparing",
+        );
+        expect(harness.deletedSessions).toContain("successor");
+        expect(
+          harness.updateRequests.some(
+            request => request.sessionID === "successor",
+          ),
+        ).toBeFalse();
+      } else {
+        await expect(outcome).resolves.toMatchObject({
+          session: { id: "successor" },
+        });
+        expect(harness.deletedSessions).not.toContain("successor");
+      }
+      expect(harness.sourceWrites).toEqual([]);
+    },
+  );
 
   test("keeps unprofitable turns exact while compacting profitable turns", async () => {
     const small = [
@@ -4590,7 +4596,7 @@ describe("compaction orchestration", () => {
       expect(JSON.stringify(noOp.messages)).not.toContain(
         "Compacting session...",
       );
-      expect(await readCache("source")).toBeNull();
+      expect(await cacheExists("source")).toBeFalse();
       expect(await readStats("source")).toBeNull();
 
       const successMessages = compactableCommandMessages(
@@ -4660,12 +4666,8 @@ describe("compaction orchestration", () => {
       expect(JSON.stringify(failed.modelPrompts)).not.toContain(
         "Compacting session...",
       );
-      expect(JSON.stringify(await readCache("source"))).not.toContain(
-        "Compacting session...",
-      );
-      expect(JSON.stringify(await readStats("source"))).not.toContain(
-        "Compacting session...",
-      );
+      expect(await cacheExists("source")).toBeFalse();
+      expect(await readStats("source")).toBeNull();
     },
   );
 
@@ -4701,7 +4703,7 @@ describe("compaction orchestration", () => {
     expect(JSON.stringify(harness.messages)).not.toContain(
       "Compacting session...",
     );
-    expect(await readCache("source")).toBeNull();
+    expect(await cacheExists("source")).toBeFalse();
     expect(await readStats("source")).toBeNull();
   });
 
@@ -4812,9 +4814,7 @@ describe("compaction orchestration", () => {
     );
     expect(await readOmittedContent("successor", contentID!)).toBe(output);
     expect(await readOmittedContent("source", contentID!)).toBeNull();
-    expect(JSON.stringify(await readCache("successor"))).not.toContain(
-      assistantImage.url,
-    );
+    expect(await cacheText("successor")).not.toContain(assistantImage.url);
     expect(boundaryParts(successor)).toHaveLength(1);
     expect(await readStats("source")).toBeNull();
     const stats = await readStats("successor");
@@ -4838,8 +4838,7 @@ describe("compaction orchestration", () => {
     expect(before.inlineFileTokens).toBe(countGptTokens(assistantImage.url));
     expect(after.inlineFileTokens).toBe(0);
     expect(stats?.totalTokensPruned).toBe(
-      (await countCanonicalContentTokens(original))
-        - (await countCanonicalContentTokens(successor)),
+      (await storedTokens(original)) - (await storedTokens(successor)),
     );
     expect(statsNotice!.text).toBe(
       statsMessage(
@@ -4889,8 +4888,8 @@ describe("compaction orchestration", () => {
 
     expect(messages).toEqual(original);
     const successor = harness.successorMessages();
-    const storedBefore = await countCanonicalContentTokens(original);
-    const storedAfter = await countCanonicalContentTokens(successor);
+    const storedBefore = await storedTokens(original);
+    const storedAfter = await storedTokens(successor);
     const preserved = { requested: 1, preserved: 1 };
     const notice = successor
       .flatMap(item => item.parts)
@@ -5041,7 +5040,7 @@ describe("compaction orchestration", () => {
     );
     messages[1]!.parts.push(task);
     const original = structuredClone(messages);
-    const beforeTokens = await countCanonicalContentTokens(messages);
+    const beforeTokens = await storedTokens(messages);
     const harness = commandHarness(messages, {
       generationResponse: {
         turns: [result(1, "Completed the delegated work.")],
@@ -5078,12 +5077,14 @@ describe("compaction orchestration", () => {
       `[Historical task prompt omitted; Content ID: ${contentID}. Retrieve before reuse.]`,
     );
     expect(await readOmittedContent("successor", contentID!)).toBe(prompt);
-    const cache = await readCache("successor");
+    const cache = JSON.parse(await cacheText("successor")) as {
+      entries: Record<string, { content: string }>;
+    };
     expect(
-      Object.values(cache!.entries).filter(entry => entry.content === prompt),
+      Object.values(cache.entries).filter(entry => entry.content === prompt),
     ).toHaveLength(1);
     expect((await readStats("successor"))?.totalTokensPruned).toBe(
-      beforeTokens - (await countCanonicalContentTokens(successor)),
+      beforeTokens - (await storedTokens(successor)),
     );
   });
 
@@ -5398,12 +5399,17 @@ describe("compaction orchestration", () => {
       },
     });
 
-    await expect(
-      executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
-    ).rejects.toThrow(
-      "response validation failed: turn count mismatch (expected 1, received 0).",
-    );
+    const failure = await executeMagicCompact(
+      harness.v2,
+      "source",
+      0,
+      HEURISTIC_OPTIONS,
+    ).catch((error: unknown) => error);
 
+    expect((failure as Error).name).toBe("GenerationLifecycleError");
+    expect((failure as Error).message).toBe(
+      "Compaction generation response validation failed: turn count mismatch (expected 1, received 0).",
+    );
     const forks = [
       "generation-fork",
       ...Array.from(
@@ -5418,45 +5424,6 @@ describe("compaction orchestration", () => {
     expect(harness.sourceWrites).toEqual([]);
     expect(boundaryParts(messages)).toEqual([]);
     expect(harness.successors).toEqual([]);
-    expect(await readStats("source")).toBeNull();
-  });
-
-  test("reports a post-request count mismatch as a categorized lifecycle error", async () => {
-    const messages = compactableCommandMessages(
-      "post-request-count",
-      "large output ".repeat(1_000),
-    );
-    const before = structuredClone(messages);
-    const harness = commandHarness(messages, {
-      generationResponse: {
-        turns: [result(1, "Completed request.")],
-      },
-      transformGenerationResponse: response => {
-        const turns = [...response.turns];
-        Object.defineProperty(turns, "map", { value: () => [] });
-        return { turns };
-      },
-    });
-    let failure: unknown;
-
-    try {
-      await executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS);
-    } catch (error) {
-      failure = error;
-    }
-
-    expect(failure).toBeInstanceOf(Error);
-    expect((failure as Error).name).toBe("GenerationLifecycleError");
-    expect((failure as Error).message).toBe(
-      "Compaction generation response validation failed: turn count mismatch (expected 1, received 0).",
-    );
-
-    expect(messages).toEqual(before);
-    expect(harness.forks).toEqual(["generation-fork"]);
-    expect(harness.sourceWrites).toEqual([]);
-    expect(boundaryParts(messages)).toEqual([]);
-    expect(harness.successors).toEqual([]);
-    expect(harness.deletedSessions).toEqual(["generation-fork"]);
     expect(await readStats("source")).toBeNull();
   });
 
@@ -5488,6 +5455,11 @@ describe("compaction orchestration", () => {
       await executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS);
     } catch (error) {
       failure = error;
+    } finally {
+      releaseOwnedFork({
+        id: "generation-fork-2",
+        nativeCompactionBlocked: false,
+      });
     }
 
     expect(failure).toBeInstanceOf(AggregateError);
@@ -5500,13 +5472,14 @@ describe("compaction orchestration", () => {
       expect.arrayContaining([
         "Compaction generation model request failed.",
         "Compaction generation fork abort failed.",
-        "Compaction generation fork deletion failed.",
+        "Compaction generation fork deletion failed. Fork generation-fork-2 could not be deleted.",
       ]),
     );
     expect(nestedErrorMessages(failure).join(" ")).not.toContain("raw");
-    // The toast says why the batches failed, once for each distinct reason.
+    // The toast says why the batches failed, once for each distinct reason,
+    // and then names the fork left behind.
     expect(harness.toasts.at(-1)?.message).toBe(
-      "Multiple compaction generation batches failed. Compaction generation model request failed. Compaction generation fork abort failed. Compaction generation fork deletion failed.",
+      "Multiple compaction generation batches failed. Compaction generation model request failed. Compaction generation fork abort failed. Compaction generation fork deletion failed. Fork generation-fork-2 could not be deleted.",
     );
     expect(messages).toEqual(before);
     expect(harness.forks).toEqual(["generation-fork", "generation-fork-2"]);
@@ -5517,7 +5490,6 @@ describe("compaction orchestration", () => {
     expect(harness.sourceWrites).toEqual([]);
     expect(boundaryParts(messages)).toEqual([]);
     expect(await readStats("source")).toBeNull();
-    expect(await readStats("backup")).toBeNull();
   });
 
   test("names every partial fork that could not be deleted, however many reasons the batches have", async () => {
@@ -5561,39 +5533,47 @@ describe("compaction orchestration", () => {
       HEURISTIC_OPTIONS,
     ).catch((error: unknown) => error);
 
-    expect(failure).toBeInstanceOf(AggregateError);
-    expect((failure as AggregateError).errors).toHaveLength(5);
-    expect(
-      (failure as AggregateError).errors.every(
-        error => error instanceof ForkCleanupError,
-      ),
-    ).toBeTrue();
-    expect(undeletedSessionIDs([failure])).toEqual(orphans);
-    const shown = harness.toasts.at(-1)?.message ?? "";
-    expect(shown).toBe(
-      [
-        "Multiple compaction generation batches failed.",
-        "Magic Compact chronological fork initialization failed (history replay failed).",
-        "Magic Compact chronological fork initialization failed (history read failed).",
-        "Magic Compact chronological fork initialization failed (fork was not empty).",
-        `Delete partial forks ${orphans.join(", ")} manually.`,
-      ].join(" "),
-    );
-    expect(shown).not.toContain("replayed fork did not match the plan");
-    expect((failure as AggregateError).message).toBe(shown);
-    expect(shown.length).toBeLessThan(700);
-    expect(nestedErrorMessages(failure).join(" ")).not.toContain("raw");
-    // Every fork's deletion was attempted once and refused; the sixth batch
-    // was never admitted.
-    expect(harness.forks).toEqual(orphans);
-    expect([...harness.deletedSessions].sort()).toEqual([...orphans].sort());
-    expect(harness.sourceWrites).toEqual([]);
-    expect(harness.successors).toEqual([]);
-    expect(messages).toEqual(before);
-    expect(await readStats("source")).toBeNull();
+    try {
+      expect(failure).toBeInstanceOf(AggregateError);
+      expect((failure as AggregateError).errors).toHaveLength(5);
+      expect(unremovedSessions([failure])).toEqual(
+        orphans.map(id => ({ id, removal: "failed" })),
+      );
+      const shown = harness.toasts.at(-1)?.message ?? "";
+      // The fork-history reason survives each failed deletion; reasons are
+      // capped, the forks are not.
+      expect(shown).toBe(
+        [
+          "Multiple compaction generation batches failed.",
+          "Compaction generation fork history verification failed (history replay failed).",
+          "Compaction generation fork deletion failed.",
+          "Compaction generation fork history verification failed (history read failed).",
+          `Forks ${orphans.join(", ")} could not be deleted.`,
+        ].join(" "),
+      );
+      expect(shown).not.toContain("fork was not empty");
+      expect((failure as AggregateError).message).toBe(shown);
+      expect(shown.length).toBeLessThan(700);
+      expect(nestedErrorMessages(failure).join(" ")).not.toContain("raw");
+      // Every fork's deletion was attempted once and refused; the sixth batch
+      // was never admitted.
+      expect(harness.forks).toEqual(orphans);
+      expect([...harness.deletedSessions].sort()).toEqual([...orphans].sort());
+      expect(harness.sourceWrites).toEqual([]);
+      expect(harness.successors).toEqual([]);
+      expect(messages).toEqual(before);
+      expect(await readStats("source")).toBeNull();
+    } finally {
+      for (const id of orphans) {
+        releaseOwnedFork({ id, nativeCompactionBlocked: false });
+      }
+    }
   });
 
-  test("keeps the one partial fork's ID when only some batches left one", async () => {
+  // A fork is owned from the moment its ID is known: one whose population
+  // failed and whose deletion was refused keeps the native compaction guard,
+  // like a prompted fork whose deletion was refused.
+  test("names and keeps guarding every fork whose deletion failed, partly populated or prompted", async () => {
     const messages = Array.from({ length: 2 }, (_, index) =>
       compactableCommandMessages(
         `orphan-one-${index + 1}`,
@@ -5610,6 +5590,71 @@ describe("compaction orchestration", () => {
       generationErrorsByFirstOrdinal: { 1: new Error("raw provider payload") },
       generationForkDeleteFails: true,
     });
+    const hooks = await server({} as PluginInput);
+    const orphans = ["generation-fork", "generation-fork-2"];
+
+    try {
+      const failure = await executeMagicCompact(
+        harness.v2,
+        "source",
+        0,
+        HEURISTIC_OPTIONS,
+      ).catch((error: unknown) => error);
+
+      expect(unremovedSessions([failure])).toEqual(
+        orphans.map(id => ({ id, removal: "failed" })),
+      );
+      expect(harness.toasts.at(-1)?.message).toEndWith(
+        "Forks generation-fork, generation-fork-2 could not be deleted.",
+      );
+      expect(harness.modelPrompts).toHaveLength(1);
+      for (const id of orphans) {
+        await expect(
+          hooks["experimental.session.compacting"]!(
+            { sessionID: id },
+            { context: [], prompt: undefined },
+          ),
+        ).rejects.toThrow("native compaction is blocked");
+      }
+    } finally {
+      for (const id of orphans) {
+        releaseOwnedFork({ id, nativeCompactionBlocked: false });
+      }
+    }
+  });
+
+  test("admits no batch after a fork fails to populate, while its deletion still runs", async () => {
+    // Six turns, five concurrent batches. The first fork's replay fails and
+    // its deletion is held until the other four batches have succeeded and
+    // been deleted. Their workers are then free, but the sixth turn must not
+    // start: the failure was seen before the deletion began.
+    const messages = Array.from({ length: 6 }, (_, index) =>
+      compactableCommandMessages(
+        `held-delete-${index + 1}`,
+        `large output ${index + 1} `.repeat(1_000),
+      ),
+    ).flat();
+    let releaseFirst!: () => void;
+    const firstHeld = new Promise<void>(resolve => {
+      releaseFirst = resolve;
+    });
+    let othersDeleted = 0;
+    const harness = commandHarness(messages, {
+      generationResponse: {
+        turns: Array.from({ length: 6 }, (_, index) =>
+          result(index + 1, `Summary ${index + 1}.`),
+        ),
+      },
+      generationForkFaults: { 1: "replay-failed" },
+      beforeGenerationForkDelete: async sessionID => {
+        if (sessionID === "generation-fork") {
+          await firstHeld;
+          return;
+        }
+        othersDeleted += 1;
+        if (othersDeleted === 4) releaseFirst();
+      },
+    });
 
     const failure = await executeMagicCompact(
       harness.v2,
@@ -5618,10 +5663,19 @@ describe("compaction orchestration", () => {
       HEURISTIC_OPTIONS,
     ).catch((error: unknown) => error);
 
-    expect(undeletedSessionIDs([failure])).toEqual(["generation-fork-2"]);
-    expect(harness.toasts.at(-1)?.message).toEndWith(
-      "Delete partial fork generation-fork-2 manually.",
+    expect((failure as Error).message).toBe(
+      "Compaction generation fork history verification failed (history replay failed).",
     );
+    expect(harness.forks).toEqual([
+      "generation-fork",
+      "generation-fork-2",
+      "generation-fork-3",
+      "generation-fork-4",
+      "generation-fork-5",
+    ]);
+    expect(harness.activeGenerationForks).toEqual([]);
+    expect(isOwnedFork("generation-fork")).toBeFalse();
+    expect(harness.successors).toEqual([]);
   });
 
   test("shows the actionable reason of an aggregated batch failure first and once", async () => {
@@ -5726,7 +5780,6 @@ describe("compaction orchestration", () => {
     expect(harness.sourceWrites).toEqual([]);
     expect(boundaryParts(messages)).toEqual([]);
     expect(await readStats("source")).toBeNull();
-    expect(await readStats("backup")).toBeNull();
   });
 
   test("rejects a response item that still echoes an anchor before backup or source writes", async () => {
@@ -5764,7 +5817,6 @@ describe("compaction orchestration", () => {
     expect(harness.sourceWrites).toEqual([]);
     expect(boundaryParts(messages)).toEqual([]);
     expect(await readStats("source")).toBeNull();
-    expect(await readStats("backup")).toBeNull();
   });
 
   test("rejects an active nonce leaked into a visual description before backup or source writes", async () => {
@@ -5811,7 +5863,6 @@ describe("compaction orchestration", () => {
     expect(harness.sourceWrites).toEqual([]);
     expect(boundaryParts(messages)).toEqual([]);
     expect(await readStats("source")).toBeNull();
-    expect(await readStats("backup")).toBeNull();
   });
 
   test.each([
@@ -6062,7 +6113,10 @@ describe("compaction orchestration", () => {
       const failure = successorFailure("Magic Trim", refusal, {
         stage: "recheck",
         sourceID: "source",
-        candidateID,
+        candidate: {
+          id: candidateID,
+          disposal: { outcome: "kept", keptBy: "history" },
+        },
       });
       const full = commandFailureMessage("Magic Trim", failure);
       const toast = failureToast("Magic Trim", failure);
@@ -6217,20 +6271,91 @@ describe("compaction orchestration", () => {
     });
     const before = structuredClone(messages);
 
-    await expect(
-      executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
-    ).rejects.toThrow("The session changed while Magic Compact was preparing");
+    const error = await executeMagicCompact(
+      harness.v2,
+      "source",
+      0,
+      HEURISTIC_OPTIONS,
+    ).catch((caught: unknown) => caught);
 
+    expect((error as Error).message).toBe(
+      "The session changed while Magic Compact was preparing its successor. The session was left unchanged; retry when it is at rest.",
+    );
     expect(messages.slice(0, 2)).toEqual(before);
     expect(harness.sourceWrites).toEqual([]);
     expect(harness.deletedSessions).toContain("successor");
     expect(harness.successorMessages()).toEqual([]);
-    expect(await readCache("successor")).toBeNull();
+    expect(await cacheExists("successor")).toBeFalse();
     expect(await readStats("successor")).toBeNull();
     expect(
       harness.updateRequests.some(request => request.sessionID === "successor"),
     ).toBeFalse();
   });
+
+  // The drift sentence states no outcome; the candidate's own text does.
+  test.each([
+    [
+      "a kept candidate",
+      { foreignCandidateHeader: { title: "Renamed elsewhere" } },
+      { outcome: "kept", keptBy: "record" },
+      "Successor candidate successor was kept because it could not be confirmed as unmodified; this run did not mark it ready, so inspect it or delete it manually.",
+    ],
+    [
+      "a candidate the host no longer finds",
+      { removeCandidateAtSourceRecheck: true },
+      { outcome: "absent", storageAttempted: true },
+      "Successor candidate successor was not found when this run checked it, which does not prove that it was removed; check for it before continuing. Any omission cache or stats this run saved for it were left in place.",
+    ],
+  ] as const)(
+    "reports source drift with %s by that candidate's outcome",
+    async (_name, candidateChange, cleanup, candidateText) => {
+      const messages = compactableCommandMessages(
+        "drift-outcome",
+        "large output ".repeat(1_000),
+      );
+      const before = structuredClone(messages);
+      const harness = commandHarness(messages, {
+        generationResponse: { turns: [result(1, "Completed.")] },
+        driftAfterSuccessorCreate: live => {
+          live.push(
+            message("drift-outcome-late", "user", [
+              textPart("drift-outcome-late-text", "drift-outcome-late", "late"),
+            ]),
+          );
+        },
+        ...candidateChange,
+      });
+
+      const error = await executeMagicCompact(
+        harness.v2,
+        "source",
+        0,
+        HEURISTIC_OPTIONS,
+      ).catch((caught: unknown) => caught);
+
+      const expected = `The session changed while Magic Compact was preparing its successor. The session was left unchanged; retry when it is at rest. ${candidateText}`;
+      expect(error).toBeInstanceOf(SuccessorFailure);
+      expect((error as SuccessorFailure).details).toEqual({
+        stage: "recheck",
+        sourceID: "source",
+        candidateID: "successor",
+        cleanup,
+      });
+      expect((error as Error).message).toBe(expected);
+      expect(harness.toasts.at(-1)).toMatchObject({
+        title: "Magic Compact Failed",
+        message: `${expected}\nDetails: stage recheck.`,
+      });
+      expect(harness.deletedSessions).not.toContain("successor");
+      expect(
+        harness.updateRequests.some(
+          request => request.sessionID === "successor",
+        ),
+      ).toBeFalse();
+      expect(messages.slice(0, 2)).toEqual(before);
+      expect(harness.sourceWrites).toEqual([]);
+    },
+  );
 
   test("keeps and names a candidate that another writer changed", async () => {
     const messages = compactableCommandMessages(
@@ -6249,6 +6374,81 @@ describe("compaction orchestration", () => {
     );
     expect(harness.deletedSessions).not.toContain("successor");
     expect(harness.sourceWrites).toEqual([]);
+  });
+
+  test("names a candidate the host no longer finds instead of reporting it removed", async () => {
+    const messages = compactableCommandMessages(
+      "removed-candidate",
+      "large output ".repeat(1_000),
+    );
+    const harness = commandHarness(messages, {
+      generationResponse: { turns: [result(1, "Completed.")] },
+      removeCandidateAfterReplay: true,
+    });
+
+    const error = await executeMagicCompact(
+      harness.v2,
+      "source",
+      0,
+      HEURISTIC_OPTIONS,
+    ).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(SuccessorFailure);
+    expect((error as SuccessorFailure).details).toMatchObject({
+      stage: "verify",
+      candidateID: "successor",
+      cleanup: { outcome: "absent", storageAttempted: false },
+    });
+    expect((error as Error).message).toBe(
+      "Magic Compact could not verify its successor session (replayed fork did not match the plan). The original session was left unchanged. Successor candidate successor was not found when this run checked it, which does not prove that it was removed; check for it before continuing.",
+    );
+    expect(harness.deletedSessions).not.toContain("successor");
+  });
+
+  test("names a deleted candidate whose omission cache could not be removed", async () => {
+    const messages = compactableCommandMessages(
+      "cache-residue",
+      "large output ".repeat(1_000),
+    );
+    const harness = commandHarness(messages, {
+      generationResponse: { turns: [result(1, "Completed.")] },
+      driftAfterSuccessorCreate: live => {
+        live.push(
+          message("cache-residue-late", "user", [
+            textPart("cache-residue-late-text", "cache-residue-late", "late"),
+          ]),
+        );
+      },
+      // A directory where the candidate's cache file was makes its removal
+      // fail.
+      beforeSuccessorDelete: async sessionID => {
+        await rm(cachePath(sessionID), { force: true });
+        await mkdir(join(cachePath(sessionID), "kept"), { recursive: true });
+      },
+    });
+
+    const error = await executeMagicCompact(
+      harness.v2,
+      "source",
+      0,
+      HEURISTIC_OPTIONS,
+    )
+      .catch((caught: unknown) => caught)
+      .finally(() =>
+        rm(cachePath("successor"), { recursive: true, force: true }),
+      );
+
+    expect(error).toBeInstanceOf(SuccessorFailure);
+    expect((error as SuccessorFailure).details).toMatchObject({
+      stage: "recheck",
+      candidateID: "successor",
+      cleanup: { outcome: "deleted-with-residue", residue: ["cache"] },
+    });
+    expect(harness.deletedSessions).toContain("successor");
+    expect(String(error)).toContain(
+      "Successor candidate successor was deleted, but its omission cache could not be removed; delete the files named after successor in Magic Compact's storage directory.",
+    );
+    expect(await readStats("successor")).toBeNull();
   });
 
   test.each([
@@ -6560,7 +6760,14 @@ describe("compaction orchestration", () => {
     const kept = successorFailure(
       "Magic Trim",
       Object.assign(new Error("x"), { status: 503, code: "ENOSPC" }),
-      { stage: "cache", sourceID: "source", candidateID: "ses_kept" },
+      {
+        stage: "cache",
+        sourceID: "source",
+        candidate: {
+          id: "ses_kept",
+          disposal: { outcome: "kept", keptBy: "record" },
+        },
+      },
     );
     expect(commandFailureMessage("Magic Trim", kept)).toBe(
       "Magic Trim could not finish preparing its successor session. The original session was left unchanged. Successor candidate ses_kept was kept because it could not be confirmed as unmodified; this run did not mark it ready, so inspect it or delete it manually.\nDetails: stage cache, HTTP 503, ENOSPC.",
@@ -6569,8 +6776,7 @@ describe("compaction orchestration", () => {
     const unconfirmed = successorFailure("Magic Compact", new Error("x"), {
       stage: "ready",
       sourceID: "source",
-      candidateID: "ses_maybe",
-      readyAttempted: true,
+      candidate: { id: "ses_maybe", disposal: { outcome: "ready-attempted" } },
     });
     expect(commandFailureMessage("Magic Compact", unconfirmed)).toBe(
       "Magic Compact could not confirm that successor session ses_maybe became ready. The original session was left unchanged; inspect ses_maybe before continuing in it.\nDetails: stage ready.",
@@ -6702,6 +6908,17 @@ describe("compaction orchestration", () => {
         synthetic ? { ...text, synthetic: true } : text,
       ]);
     };
+    // A launch `/magic-recover` marked as never delivered, naming `job`.
+    const abandoned = (id: string, child: string, job = child) => {
+      const launch = call(id, child, running(child));
+      const part = launch.parts[0]!;
+      if (part.type !== "tool" || part.state.status !== "completed")
+        throw new Error("Expected a completed tool part.");
+      part.state.metadata["magicCompact"] = {
+        recovered: { delivery: "abandoned", job },
+      };
+      return launch;
+    };
     const read = (history: MessageWithParts[]) =>
       readSourceAtRest(
         commandHarness(
@@ -6737,6 +6954,14 @@ describe("compaction orchestration", () => {
         "a result stored before its job started",
         [delivery("b", "ses_kid"), call("a", "ses_kid", running("ses_kid"))],
       ],
+      [
+        "a second start after an abandoned one, without its result",
+        [abandoned("a", "ses_kid"), call("c", "ses_kid", running("ses_kid"))],
+      ],
+      [
+        "a launch whose recovery mark names another job",
+        [abandoned("a", "ses_kid", "ses_other")],
+      ],
     ])("refuses %s, naming the child", async (_name, history) => {
       await expect(read(history)).rejects.toThrow(
         "background subagent session ses_kid has not delivered its result",
@@ -6764,6 +6989,14 @@ describe("compaction orchestration", () => {
         [
           call("a", "ses_kid", running("ses_kid")),
           call("c", "ses_kid", running("ses_kid", "Background task updated")),
+          delivery("b", "ses_kid"),
+        ],
+      ],
+      [
+        "an abandoned launch and a second start with its own result",
+        [
+          abandoned("a", "ses_kid"),
+          call("c", "ses_kid", running("ses_kid")),
           delivery("b", "ses_kid"),
         ],
       ],
@@ -6921,6 +7154,276 @@ describe("compaction orchestration", () => {
     expect(notice).toContain("not provider usage or media billing");
   });
 
+  test("counts concurrent completions once each without losing an increment", async () => {
+    await writeStats(
+      "source",
+      conversationStats({ totalTokensPruned: 100, mediaTokensProjected: 7 }),
+    );
+    const hooks = await server({} as PluginInput);
+    const ids = ["a1", "a2", "a3", "a4", "a5"];
+
+    await Promise.all(
+      [...ids, ...ids].map(id => hooks.event?.({ event: assistantEvent(id) })),
+    );
+
+    const stats = await readStats("source");
+    expect(stats).toMatchObject({
+      cachedTokensSaved: 500,
+      cachedMediaTokensSaved: 35,
+    });
+    expect([...stats!.processedAssistantMessageIds].sort()).toEqual(ids);
+  });
+
+  test("never opens stats permissions: a first write is private and a replacement keeps the file's mode", async () => {
+    const path = `${pluginStorageDirectory()}/stats/source.json`;
+    const temporaryModes: number[] = [];
+    const realRename = fs.rename;
+    const renames = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (to === path) temporaryModes.push((await stat(from)).mode & 0o777);
+      return realRename(from, to);
+    });
+    await mkdir(dirname(path), { recursive: true });
+    // A umask that strips owner read must not leave the first write unreadable.
+    const umask = process.umask(0o400);
+    try {
+      await writeStats(
+        "source",
+        conversationStats({ totalTokensPruned: 100, mediaTokensProjected: 7 }),
+      );
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+      expect(await readStats("source")).toMatchObject({
+        totalTokensPruned: 100,
+      });
+
+      const hooks = await server({} as PluginInput);
+      for (const [id, mode] of [
+        ["owner-only", 0o600],
+        ["group-readable", 0o640],
+      ] as const) {
+        await chmod(path, mode);
+        await hooks.event!({ event: assistantEvent(id) });
+        expect((await stat(path)).mode & 0o777).toBe(mode);
+      }
+    } finally {
+      process.umask(umask);
+      renames.mockRestore();
+    }
+    expect(temporaryModes).toEqual([0o600, 0o600, 0o640]);
+    expect(await readStats("source")).toMatchObject({
+      cachedTokensSaved: 200,
+      processedAssistantMessageIds: ["owner-only", "group-readable"],
+    });
+  });
+
+  test("a successor copies the source's stats after every completion admitted before it", async () => {
+    await deleteStats("successor");
+    await writeStats(
+      "source",
+      conversationStats({ totalTokensPruned: 100, mediaTokensProjected: 7 }),
+    );
+    const path = `${pluginStorageDirectory()}/stats/source.json`;
+    const held = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const realRename = fs.rename;
+    // The completion's replacement of the source file waits until released.
+    const renames = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (to === path) {
+        held.resolve();
+        await release.promise;
+      }
+      return realRename(from, to);
+    });
+    let copiedWhileHeld = false;
+    try {
+      const hooks = await server({} as PluginInput);
+      const completion = hooks.event!({ event: assistantEvent("admitted") });
+      await held.promise;
+      const copy = writeSuccessorStats({
+        sourceKey: "source",
+        successorKey: "successor",
+        sourceSessionID: "source",
+        tokensPruned: 10,
+        mediaTokensProjected: 3,
+        assistantMessageIDs: ["successor-assistant"],
+      }).then(() => {
+        copiedWhileHeld = true;
+      });
+      await Promise.race([copy, Bun.sleep(50)]);
+      expect(copiedWhileHeld).toBeFalse();
+      release.resolve();
+      await Promise.all([completion, copy]);
+    } finally {
+      release.resolve();
+      renames.mockRestore();
+    }
+    expect(await readStats("source")).toMatchObject({
+      cachedTokensSaved: 100,
+      processedAssistantMessageIds: ["admitted"],
+    });
+    expect(await readStats("successor")).toEqual({
+      version: 1,
+      sourceSessionId: "source",
+      rootSessionId: "source",
+      totalTokensPruned: 110,
+      cachedTokensSaved: 100,
+      mediaTokensProjected: 3,
+      cachedMediaTokensSaved: 7,
+      processedAssistantMessageIds: ["successor-assistant"],
+    });
+  });
+
+  test.each([
+    ["not JSON", '{"version":1,"rootSessionId":"PRIVATE-STATS-CANARY"'],
+    [
+      "not the stats schema",
+      '{"version":2,"rootSessionId":"PRIVATE-STATS-CANARY"}\n',
+    ],
+  ])(
+    "keeps saved stats that are %s and stops the commands that need them",
+    async (_kind, bytes) => {
+      const path = `${pluginStorageDirectory()}/stats/source.json`;
+      await mkdir(dirname(path), { recursive: true });
+      await Bun.write(path, bytes);
+      const unchanged = async () =>
+        expect(await Bun.file(path).text()).toBe(bytes);
+      const content = (text: string | undefined) => {
+        expect(text).not.toContain("PRIVATE-STATS-CANARY");
+        expect(text).not.toContain(storageDirectory);
+      };
+
+      // A completion event neither counts nor rewrites invalid stats, and
+      // does not fail the host's event processing.
+      const hooks = await server({} as PluginInput);
+      await hooks.event?.({ event: assistantEvent("after-invalid") });
+      await unchanged();
+
+      const prompts: unknown[] = [];
+      const statsToasts: Array<{ title?: string; message?: string }> = [];
+      const v2 = {
+        session: {
+          get: async () => ({ data: sourceSession() }),
+          prompt: async (request: unknown) => {
+            prompts.push(request);
+            return { data: true };
+          },
+        },
+        tui: {
+          showToast: async (toast: { title?: string; message?: string }) => {
+            statsToasts.push(toast);
+            return { data: true };
+          },
+        },
+      } as unknown as V2Client;
+      const statsError = await executeMagicStats(v2, "source").then(
+        () => undefined,
+        (error: unknown) => error as Error,
+      );
+      expect(statsError).toBeInstanceOf(InvalidStatsError);
+      expect(prompts).toEqual([]);
+      expect(statsToasts).toEqual([
+        expect.objectContaining({
+          title: "Magic Stats Failed",
+          message: statsError!.message,
+        }),
+      ]);
+      content(statsError!.message);
+
+      // A no-op never needs the totals.
+      const noop = commandHarness(
+        compactableCommandMessages("fresh", "large output"),
+        {},
+      );
+      await expect(
+        executeMagicCompact(noop.v2, "source", 1, HEURISTIC_OPTIONS),
+      ).resolves.toBeNull();
+
+      // Compaction stops before any summary fork or model request.
+      const harness = commandHarness(
+        compactableCommandMessages("fresh", "large output"),
+        {
+          generationResponse: {
+            turns: [result(1, "Completed the compaction candidate.")],
+          },
+        },
+      );
+      await expect(
+        executeMagicCompact(harness.v2, "source", 0, HEURISTIC_OPTIONS),
+      ).rejects.toBeInstanceOf(InvalidStatsError);
+      expect(harness.modelPrompts).toEqual([]);
+      expect(harness.forks).toEqual([]);
+      expect(harness.successors).toEqual([]);
+      expect(harness.sourceWrites).toEqual([]);
+      expect(harness.toasts.at(-1)).toMatchObject({
+        title: "Magic Compact Failed",
+        message: statsError!.message,
+      });
+      await unchanged();
+    },
+  );
+
+  test("reports a stats read failure by its system code, never as invalid stats", async () => {
+    const path = `${pluginStorageDirectory()}/stats/source.json`;
+    await mkdir(path, { recursive: true });
+    try {
+      const statsToasts: Array<{ message?: string }> = [];
+      const v2 = {
+        session: { get: async () => ({ data: sourceSession() }) },
+        tui: {
+          showToast: async (toast: { message?: string }) => {
+            statsToasts.push(toast);
+            return { data: true };
+          },
+        },
+      } as unknown as V2Client;
+      await expect(executeMagicStats(v2, "source")).rejects.toMatchObject({
+        code: "EISDIR",
+      });
+      expect(statsToasts.map(toast => toast.message)).toEqual([
+        "Magic Stats stopped on an unexpected error (EISDIR). The original session was left unchanged. Retry; if it fails again, check the OpenCode server log.",
+      ]);
+      // Only invalid stats are left to the commands; this failure reaches the
+      // host.
+      const hooks = await server({} as PluginInput);
+      await expect(
+        hooks.event!({ event: assistantEvent("unreadable") }),
+      ).rejects.toMatchObject({ code: "EISDIR" });
+    } finally {
+      await rm(path, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(process.getuid?.() === 0)(
+    "keeps saved stats when a write fails and counts the next completion",
+    async () => {
+      await writeStats(
+        "source",
+        conversationStats({ totalTokensPruned: 10, mediaTokensProjected: 1 }),
+      );
+      const directory = `${pluginStorageDirectory()}/stats`;
+      const before = await Bun.file(`${directory}/source.json`).text();
+      const hooks = await server({} as PluginInput);
+      await chmod(directory, 0o500);
+      try {
+        await expect(
+          hooks.event!({ event: assistantEvent("write-fails") }),
+        ).rejects.toMatchObject({ code: "EACCES" });
+      } finally {
+        await chmod(directory, 0o700);
+      }
+      expect(await Bun.file(`${directory}/source.json`).text()).toBe(before);
+      expect(
+        (await readdir(directory)).filter(name => name.endsWith(".tmp")),
+      ).toEqual([]);
+
+      await hooks.event!({ event: assistantEvent("next") });
+      expect(await readStats("source")).toMatchObject({
+        cachedTokensSaved: 10,
+        cachedMediaTokensSaved: 1,
+        processedAssistantMessageIds: ["next"],
+      });
+    },
+  );
+
   test("keeps prior summary turns opaque and carries cache/stat lineage into the successor", async () => {
     const historical = persistedMediaTurn(
       "historical",
@@ -6933,12 +7436,10 @@ describe("compaction orchestration", () => {
       ...historical,
       ...compactableCommandMessages("fresh-second", "large output"),
     ];
-    const contentID = await allocateOmission(
-      "source",
-      { content: "lineage omission" },
-      () => "B".repeat(22),
-    );
-    const sourceCache = await readCache("source");
+    const omission = planOmission("source", { content: "lineage omission" });
+    await commitPlannedOmission("source", omission);
+    const { contentID } = omission;
+    const sourceCache = await cacheText("source");
     await writeStats(
       "source",
       conversationStats({
@@ -6969,7 +7470,7 @@ describe("compaction orchestration", () => {
     expect(await readOmittedContent("successor", contentID)).toBe(
       "lineage omission",
     );
-    expect(await readCache("source")).toEqual(sourceCache);
+    expect(await cacheText("source")).toBe(sourceCache);
     expect(await readStats("source")).toEqual(sourceStats);
     expect(await readStats("successor")).toMatchObject({
       sourceSessionId: "source",
@@ -7023,6 +7524,8 @@ function generationHarness(
     ) => void;
     // Awaited before the numbered (1-based) fork history read is answered.
     forkReadFault?: (load: number) => Promise<unknown> | undefined;
+    // Awaited when a fork is prompted, before the model answers.
+    onPrompt?: (sessionID: string) => Promise<void>;
   } = {},
 ) {
   const events: string[] = [];
@@ -7195,6 +7698,7 @@ function generationHarness(
         }
         try {
           await promptGate;
+          await options.onPrompt?.(sessionID);
           const delay =
             options.providerDelayByFirstOrdinal?.[firstOrdinal]
             ?? options.providerDelayMs;
@@ -7417,6 +7921,8 @@ function result(
   return { ordinal, summary, visualDescriptions };
 }
 
+// The planner's own plan for `turns` as targets, with `nextTurn` kept whole
+// by N=1.
 function generationPlan(
   turns: Turn[],
   nextTurn: Turn | null = null,
@@ -7425,15 +7931,20 @@ function generationPlan(
     ...turns.flatMap(turn => [...turn.user, ...turn.assistants]),
     ...(nextTurn ? [...nextTurn.user, ...nextTurn.assistants] : []),
   ];
-  return {
-    summarizedTurns: turns,
-    nextTurn,
-    sourceTurnStartIndex: 0,
-    effectiveSourceTurnStartIndex: 0,
-    effectiveSourceTurnEndIndex: turns.length + (nextTurn ? 1 : 0),
-    sourceSnapshot: snapshotSourceMessages(messages),
-    sourceMessages: messages,
-  } as CompactionPlan;
+  return planCompaction(messages, nextTurn ? 1 : 0);
+}
+
+// Per-turn generation with the catalog a command shares for that session.
+function generate(
+  v2: V2Client,
+  session: Session,
+  plan: CompactionPlan,
+  options: Omit<GenerationOptions, "catalog"> = {},
+) {
+  return generateCompactionSummaries(v2, session, plan, {
+    catalog: summarizerCatalogLoader(v2, session),
+    ...options,
+  });
 }
 
 function candidateTurn(id: string, userText: string, parts: Part[]): Turn {
@@ -7994,6 +8505,8 @@ type CommandHarnessOptions = {
   generationForkFaults?: Record<number, GenerationForkFault>;
   // Every generation fork deletion is rejected, so a failed fork is orphaned.
   generationForkDeleteFails?: boolean;
+  // Awaited before the host deletes a generation fork.
+  beforeGenerationForkDelete?: (sessionID: string) => Promise<void>;
   holdGenerationPromptsUntil?: number;
   transformGenerationResponse?: (
     response: GenerationResponse,
@@ -8015,6 +8528,14 @@ type CommandHarnessOptions = {
   foreignCandidateHeader?: Partial<Session>;
   // The successor replay persists this many events, then fails.
   failSuccessorReplay?: number;
+  // Another client deletes the candidate right after its replay; the host
+  // then reports it as not found.
+  removeCandidateAfterReplay?: boolean;
+  // Another client deletes the candidate while the source is read again just
+  // before the ready update.
+  removeCandidateAtSourceRecheck?: boolean;
+  // Runs before the host deletes a successor candidate.
+  beforeSuccessorDelete?: (sessionID: string) => Promise<void>;
   failReadyUpdate?: boolean;
   // Thrown by the host for the successor at that call instead of a response.
   successorHostErrors?: Partial<
@@ -8037,6 +8558,8 @@ function commandHarness(
   options: CommandHarnessOptions,
 ) {
   const events: string[] = [];
+  // Summarizer agent and model list reads.
+  const catalogReads: string[] = [];
   const forks: string[] = [];
   const sourceWrites: string[] = [];
   const abortedSessions: string[] = [];
@@ -8072,6 +8595,7 @@ function commandHarness(
       })
     : undefined;
   const sessionInfo = new Map<string, Session>();
+  const removedSessions = new Set<string>();
   const sourceInfo = (): Session => ({
     ...sourceSession(),
     ...options.sessionOverrides,
@@ -8080,54 +8604,63 @@ function commandHarness(
 
   const v2 = {
     app: {
-      agents: async () => ({
-        data: [
-          {
-            name: "magic-compact-summarizer",
-            native: false,
-            hidden: true,
-            model: {
-              providerID: "configured-provider",
-              modelID: "configured-model",
+      agents: async () => {
+        catalogReads.push("agents");
+        return {
+          data: [
+            {
+              name: "magic-compact-summarizer",
+              native: false,
+              hidden: true,
+              model: {
+                providerID: "configured-provider",
+                modelID: "configured-model",
+              },
+              variant: "configured-variant",
             },
-            variant: "configured-variant",
-          },
-        ],
-      }),
+          ],
+        };
+      },
     },
     provider: {
-      list: async () => ({
-        data: {
-          all: [
-            {
-              id: "configured-provider",
-              models: {
-                "configured-model": {
-                  capabilities: { input: { image: true } },
-                  limit: {
-                    context: 1_000_000,
-                    input: 500_000,
-                    output: 64_000,
+      list: async () => {
+        catalogReads.push("providers");
+        return {
+          data: {
+            all: [
+              {
+                id: "configured-provider",
+                models: {
+                  "configured-model": {
+                    capabilities: { input: { image: true } },
+                    limit: {
+                      context: 1_000_000,
+                      input: 500_000,
+                      output: 64_000,
+                    },
                   },
                 },
               },
-            },
-            ...(options.extraProviders ?? []),
-          ],
-          connected: ["configured-provider"],
-          default: {},
-        },
-      }),
+              ...(options.extraProviders ?? []),
+            ],
+            connected: ["configured-provider"],
+            default: {},
+          },
+        };
+      },
     },
     permission: { list: async () => ({ data: options.permissions ?? [] }) },
     question: { list: async () => ({ data: options.questions ?? [] }) },
     session: {
-      get: async (request: { sessionID: string }) => ({
-        data:
-          request.sessionID === "source"
-            ? sourceInfo()
-            : sessionInfo.get(request.sessionID),
-      }),
+      get: async (request: { sessionID: string }) =>
+        removedSessions.has(request.sessionID)
+          ? { error: { name: "NotFoundError" }, response: { status: 404 } }
+          : {
+              data:
+                request.sessionID === "source"
+                  ? sourceInfo()
+                  : sessionInfo.get(request.sessionID),
+            },
       status: async () => ({ data: options.statuses ?? {} }),
       children: async (request: { sessionID: string }) => ({
         data: (options.children?.[request.sessionID] ?? []).map(id => ({
@@ -8142,6 +8675,17 @@ function commandHarness(
             generationForkOrdinal(request.sessionID) ?? 0
           ];
         if (fault === "read-failed") throw new Error("raw read payload");
+        // A successor exists only after every earlier source read.
+        if (
+          request.sessionID === "source"
+          && options.removeCandidateAtSourceRecheck
+        ) {
+          for (const id of successors) {
+            sessionInfo.delete(id);
+            history.delete(id);
+            removedSessions.add(id);
+          }
+        }
         return {
           data:
             request.sessionID === "source"
@@ -8314,6 +8858,10 @@ function commandHarness(
         ) {
           throw options.successorHostErrors.delete;
         }
+        if (successors.includes(request.sessionID))
+          await options.beforeSuccessorDelete?.(request.sessionID);
+        if (request.sessionID.startsWith("generation-fork"))
+          await options.beforeGenerationForkDelete?.(request.sessionID);
         deletedSessions.push(request.sessionID);
         if (request.sessionID.startsWith("generation-fork")) {
           events.push("generation-delete");
@@ -8384,6 +8932,11 @@ function commandHarness(
           throw options.successorHostErrors.replay;
         }
         history.replay(request.events);
+        if (successors.includes(target) && options.removeCandidateAfterReplay) {
+          sessionInfo.delete(target);
+          history.delete(target);
+          removedSessions.add(target);
+        }
         if (successors.includes(target) && options.foreignCandidateHeader) {
           sessionInfo.set(target, {
             ...sessionInfo.get(target)!,
@@ -8434,6 +8987,7 @@ function commandHarness(
     messages,
     modelPrompts,
     events,
+    catalogReads,
     forks,
     sourceWrites,
     abortedSessions,
@@ -8603,6 +9157,8 @@ describe("magic compact task-aware retention", () => {
       "retention-summary",
       "generation-delete",
     ]);
+    // The retention summary and both turn requests share one catalog read.
+    expect(harness.catalogReads).toEqual(["agents", "providers"]);
     const successor = harness.successorMessages();
     expect(summaryParts(successor)).toHaveLength(2);
     const tools = successor
@@ -8695,7 +9251,6 @@ describe("magic compact task-aware retention", () => {
       executeMagicCompact(retainedHarness.v2, "source", 0, taskAware()),
     ).rejects.toThrow(COMPACT_INSUFFICIENT_SAVINGS);
     expect(retained).toEqual(before);
-    expect(retainedHarness.forks).not.toContain("backup");
     expect(await readStats("source")).toBeNull();
   });
 
@@ -8999,6 +9554,7 @@ describe("magic compact task-aware retention", () => {
       );
       for (const harness of [nothingEligible, allOpaque]) {
         expect(harness.events).toEqual([]);
+        expect(harness.catalogReads).toEqual([]);
         expect(harness.modelPrompts).toEqual([]);
         expect(harness.successors).toEqual([]);
         expect(harness.sourceWrites).toEqual([]);
@@ -9006,6 +9562,29 @@ describe("magic compact task-aware retention", () => {
       expect(requests).toBe(0);
     },
   );
+
+  test("a missing selected key stops compaction before any summarizer catalog read", async () => {
+    const harness = commandHarness(retainedTurns(), {
+      generationResponse: { turns: [] },
+    });
+
+    const error = await executeMagicCompact(harness.v2, "source", 0, {
+      retention: commandRetentionPolicy(
+        "compact",
+        parseMagicCompactArguments(""),
+        {},
+      ),
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(RetentionClassificationError);
+    expect((error as RetentionClassificationError).kind).toBe(
+      "missing-api-key",
+    );
+    expect(harness.catalogReads).toEqual([]);
+    expect(harness.forks).toEqual([]);
+    expect(harness.modelPrompts).toEqual([]);
+    expect(harness.successors).toEqual([]);
+  });
 });
 
 function compactableCommandMessages(

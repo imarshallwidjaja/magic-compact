@@ -46,11 +46,13 @@ The harness never reads OpenCode's credential stores or provider pool. OpenCode'
 
 Jev aliases (`jev-latest`, `jev-preview`) are refused because they move between releases and would make runs unrepeatable. Production stays pinned to `jev-1.13.0`; the evaluation may select any version to measure it. For both providers the response `model` must equal the requested model exactly, for a probability and for a refusal; anything else is recorded as a `model-mismatch` failure. That means the requested Jev version, or `gpt-6-luna` for OpenAI. The harness accepts no dated snapshot label and no variant such as `gpt-6-luna-fast`, because no first-party contract says how to normalize one. If OpenAI starts returning a dated label for `gpt-6-luna`, runs fail with `model-mismatch` until a documented normalization is added here. An unsupported OpenAI model is rejected before any request, rather than sent and rejected case by case.
 
-Adding a provider means adding one adapter object to `PROVIDERS` in `providers.ts`: a model check, a request translation, and a strict response reader. There is no registry or plugin loading. A provider that production also uses takes its serializer and reader from `src/retention/backends.ts`, so the evaluation reads answers exactly as production does.
+Adding a provider means adding one adapter object to `PROVIDERS` in `providers.ts`: its default model and the `--help` text for its models, its documented body limit, a model check, a request translation, and a strict response reader. There is no registry or plugin loading. A provider that production also uses takes its serializer and reader from `src/retention/backends.ts`, so the evaluation reads answers exactly as production does.
 
 ### Request translation
 
 Every case becomes one singleton request through `buildRetentionRequests` (batch size 1), with the case ID as the candidate ID. The result is the canonical request. Its hash (`canonicalRequestSha256`) covers the production `state` and `questions`, so it does not depend on the provider or model.
+
+The canonical request carries no body limit. As in production, only Jev has one: when a run is planned or loaded, a case whose exact Jev wire body, with the selected model ID, is larger than TypeSafe's 32 MiB is refused with `budget` before any request. OpenAI Decisions documents no body limit, so its bodies are not capped locally and the service enforces its own token limit.
 
 Jev receives the canonical body with only `model` replaced. For the production model the bytes equal what the shipped classifier sends, and a test asserts that.
 
@@ -110,7 +112,7 @@ A custom dataset is sent in plain text to the provider you select. Do not use da
 
 `--threshold` (default `0.8`) turns a probability into keep (`>= threshold`) or trim. `0.8` is this evaluation's own reference cutoff, frozen by its protocol as `DECISION_EVALUATION_THRESHOLD` in `eval/decisions/dataset.ts`. It no longer equals production: runtime retention keeps at `>= 0.60` by default, and a server can override that with `MAGIC_COMPACT_KEEP_THRESHOLD_PERCENT` (see [RetentionEvaluation.md](RetentionEvaluation.md)). This harness never reads that variable, so results do not move with the runtime setting. Stored results, including the October 15 smoke run below, were scored at `0.8` and keep that meaning.
 
-To see how a model behaves at the runtime default, pass `--threshold 0.6` on a smoke or development dataset. That is a development comparison, not a held-out result and not a calibration. Other models or providers are not calibrated to either cutoff, so a comparison shows how each model behaves at that cutoff and does not say that it is right for them. The option changes nothing in production. For `heldout` datasets, `run` and `report` refuse any value other than `0.8`, including `0.6`. For other splits, `report --threshold` re-reads stored probabilities at another cutoff; do not use that to tune production.
+To see how a model behaves at the runtime default, pass `--threshold 0.6` on a smoke or development dataset. That is a development comparison, not a held-out result and not a calibration. Other models or providers are not calibrated to either cutoff, so a comparison shows how each model behaves at that cutoff and does not say that it is right for them. The option changes nothing in production. For `heldout` datasets, `run` and `report` accept `--threshold 0.8` and refuse any other value, including `0.6`; a saved held-out result whose manifest records another threshold is refused too. For other splits, `report --threshold` re-reads stored probabilities at another cutoff; do not use that to tune production.
 
 ## Results
 

@@ -1,12 +1,9 @@
+// The one tokenizer every estimate on both hosts uses. Every count goes
+// through this module, which pins the tokenizer's behavior and settings.
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { performance } from "node:perf_hooks";
-import type { Part } from "@opencode-ai/sdk/v2";
 import { countTokens, encodeGenerator, setMergeCacheSize } from "gpt-tokenizer";
-import { unwrap, type V2Client } from "../api";
-import { projectManifestCoveredMedia } from "../compact/media";
-import type { MessageWithParts } from "../compact/plan";
-import type { StoredHistoryCount } from "./constants";
 
 const PINNED_GPT_TOKENIZER_VERSION = "3.4.0";
 const PINNED_O200K_MAX_TOKEN_BYTES = 128;
@@ -59,68 +56,18 @@ export function countGptTokensWithinLimit(
   return count <= limit ? count : null;
 }
 
-function stringifyToolContent(value: unknown): string {
-  return typeof value === "string" ? value : JSON.stringify(value);
-}
-
-function extractToolContent(part: Part): string[] {
-  if (part.type !== "tool") {
-    return [];
-  }
-
-  const contents: string[] = [];
-
-  if (part.state.input !== undefined) {
-    contents.push(stringifyToolContent(part.state.input));
-  }
-
-  if (part.state.status === "completed" && part.state.output !== undefined) {
-    contents.push(stringifyToolContent(part.state.output));
-  } else if (part.state.status === "error" && part.state.error) {
-    contents.push(stringifyToolContent(part.state.error));
-  }
-
-  return contents;
-}
-
-function extractPartTexts(
-  part: Part,
-  role: MessageWithParts["info"]["role"],
-): string[] {
-  switch (part.type) {
-    case "text":
-      return part.ignored === true && role === "user" ? [] : [part.text];
-    case "reasoning":
-      return [part.text];
-    case "tool":
-      return extractToolContent(part);
-    case "subtask":
-      return [part.prompt, part.description];
-    case "file":
-      return [part.url];
-    case "snapshot":
-      return [part.snapshot];
-    case "patch":
-      return part.files;
-    default:
-      return [];
-  }
-}
-
-// A part text this long (a file URL with inline data, or a large tool value)
-// is counted exactly, but in slices that give the event loop back, and is
-// memoized by its SHA-256, because accounting counts the same unchanged
-// text several times per command and the host serves every client from this
-// event loop. One tokenizer piece is never split, so a single long uniform run
-// still blocks while it is counted.
-const LARGE_PART_TEXT_CHARS = 65_536;
-const LARGE_PART_TEXT_COUNT_ENTRIES = 1_024;
+// Counts a long text exactly, but in slices that give the event loop back,
+// and memoizes it by its SHA-256, because accounting counts the same
+// unchanged text several times per command and the host serves every client
+// from this event loop. One tokenizer piece is never split, so a single long
+// uniform run still blocks while it is counted.
+const YIELDING_COUNT_ENTRIES = 1_024;
 const COUNT_SLICE_MS = 10;
-const largePartTextCounts = new Map<string, number>();
+const yieldingCounts = new Map<string, number>();
 
-async function countLargeTextTokens(text: string): Promise<number> {
+export async function countGptTokensYielding(text: string): Promise<number> {
   const key = createHash("sha256").update(text).digest("hex");
-  const cached = largePartTextCounts.get(key);
+  const cached = yieldingCounts.get(key);
   if (cached !== undefined) return cached;
   let count = 0;
   let pieces = 0;
@@ -136,86 +83,9 @@ async function countLargeTextTokens(text: string): Promise<number> {
       sliceStart = performance.now();
     }
   }
-  if (largePartTextCounts.size >= LARGE_PART_TEXT_COUNT_ENTRIES) {
-    largePartTextCounts.delete(largePartTextCounts.keys().next().value!);
+  if (yieldingCounts.size >= YIELDING_COUNT_ENTRIES) {
+    yieldingCounts.delete(yieldingCounts.keys().next().value!);
   }
-  largePartTextCounts.set(key, count);
+  yieldingCounts.set(key, count);
   return count;
-}
-
-export async function countSessionTokens(
-  v2: V2Client,
-  sessionID: string,
-): Promise<number> {
-  return (await countSessionTokenProjection(v2, sessionID)).tokens;
-}
-
-export async function countSessionTokenProjection(
-  v2: V2Client,
-  sessionID: string,
-): Promise<ModelFacingTokenCount> {
-  const messages = unwrap(
-    await v2.session.messages({ sessionID }),
-  ) as MessageWithParts[];
-  return countModelFacingContentTokens(messages);
-}
-
-export type ModelFacingTokenCount = StoredHistoryCount & {
-  projectedMediaTokens: number;
-};
-
-// The inline files are those of the stored messages, so an image the
-// projection replaces with its placeholder still counts as a stored file,
-// while its placeholder counts as ordinary text.
-export async function countModelFacingContentTokens(
-  messages: MessageWithParts[],
-): Promise<ModelFacingTokenCount> {
-  const persisted = await countCanonicalContent(messages);
-  const projected = await countCanonicalContent(
-    projectManifestCoveredMedia(messages),
-  );
-  return {
-    tokens: projected.tokens,
-    projectedMediaTokens: persisted.tokens - projected.tokens,
-    inlineFileTokens: projected.inlineFileTokens,
-    inlineFiles: persisted.inlineFiles,
-  };
-}
-
-export async function countCanonicalContentTokens(
-  messages: MessageWithParts[],
-): Promise<number> {
-  return (await countCanonicalContent(messages)).tokens;
-}
-
-// A file part whose URL carries its data inline. Canonical accounting counts
-// the whole URL as text; any other URL stays an ordinary short string.
-function isInlineFile(part: Part): part is Extract<Part, { type: "file" }> {
-  return part.type === "file" && part.url.startsWith("data:");
-}
-
-// One counting pass over `messages`: the canonical total, the part of it
-// inline file URLs contribute, and the inline files themselves.
-async function countCanonicalContent(
-  messages: MessageWithParts[],
-): Promise<StoredHistoryCount> {
-  let tokens = 0;
-  let inlineFileTokens = 0;
-  const inlineFiles = { count: 0, encodedBytes: 0 };
-  for (const message of messages) {
-    for (const part of message.parts) {
-      const text = extractPartTexts(part, message.info.role).join("\n\n");
-      const count =
-        text.length > LARGE_PART_TEXT_CHARS
-          ? await countLargeTextTokens(text)
-          : countGptTokens(text);
-      tokens += count;
-      if (isInlineFile(part)) {
-        inlineFileTokens += count;
-        inlineFiles.count += 1;
-        inlineFiles.encodedBytes += Buffer.byteLength(part.url);
-      }
-    }
-  }
-  return { tokens, inlineFileTokens, inlineFiles };
 }

@@ -1,13 +1,13 @@
 import type { AssistantMessage, Message, Part } from "@opencode-ai/sdk/v2";
-import { isDeepStrictEqual } from "node:util";
-import { unwrap, type V2Client } from "../api";
+import { isBoundaryMetadata } from "../policy/protocol";
 import { isRecord } from "../util";
 import {
   compactionTurnRange,
   groupTurns,
   trimmedTurnRange,
 } from "../policy/turns";
-import { hasPluginMessage, PluginMessageError } from "../policy/feedback";
+import { PluginMessageError } from "../policy/feedback";
+import { turnHasPersistedSummary } from "./capsule";
 
 export type MessageWithParts = {
   info: Message;
@@ -19,44 +19,39 @@ export type Turn = {
   assistants: MessageWithParts[];
 };
 
+// A turn in the compaction range that holds no Magic summary yet. A turn
+// that already holds one is opaque persisted data: never a target, never
+// edited, but still in the global index and still a possible halo.
+export type CompactionTarget = {
+  turn: Turn;
+  // Zero-based position among all complete source turns (`sourceTurns`).
+  sourceTurnIndex: number;
+};
+
 export type CompactionPlan = {
-  summarizedTurns: Turn[];
+  targets: CompactionTarget[];
   nextTurn: Turn | null;
   // Complete request turns kept whole by N; fewer than N when N exceeds the
   // eligible turns.
   preservedTurnCount: number;
-  sourceTurnStartIndex: number;
+  // Every request turn of the source, in order.
+  sourceTurns: Turn[];
+  // The complete turns after the newest native checkpoint, as the half-open
+  // range of their `sourceTurns` positions.
   effectiveSourceTurnStartIndex: number;
   effectiveSourceTurnEndIndex: number;
+  // Normalized for drift comparison only; native consumers read
+  // `sourceMessages`.
   sourceSnapshot: SourceSnapshot;
-  // The complete source records the plan was made from, which hold the step
-  // counters the snapshot drops.
+  // The complete source records the plan was made from.
   sourceMessages: MessageWithParts[];
 };
 
 export type SourceSnapshot = Array<{ info: unknown; parts: unknown[] }>;
 
-export class NativeCheckpointChangedError extends PluginMessageError {
-  constructor(cause?: unknown) {
-    const detail = hasPluginMessage(cause) ? ` ${cause.message}` : "";
-    super(`OpenCode source changed during Magic Compact.${detail}`, { cause });
-    this.name = "NativeCheckpointChangedError";
-  }
-}
-
 export type TrimPlan = {
   trimmedTurns: Turn[];
-  messages: MessageWithParts[];
-  sourceSnapshot: SourceSnapshot;
 };
-
-export async function createCompactionPlan(
-  v2: V2Client,
-  sessionID: string,
-  keepTurns: number,
-): Promise<CompactionPlan> {
-  return planCompaction(await loadMessages(v2, sessionID), keepTurns);
-}
 
 export function planCompaction(
   messages: MessageWithParts[],
@@ -85,55 +80,36 @@ export function planCompaction(
     effectiveSourceTurnStartIndex + turns.length;
 
   const range = compactionTurnRange(turns.length, boundaryTurnIndex, keepTurns);
-  const compactionStartIndex = range.start;
-  const compactionEndIndex = range.end;
-
-  const summarizedTurns = turns.slice(compactionStartIndex, compactionEndIndex);
-
-  const nextTurn = turns[compactionEndIndex] ?? null;
-  const sourceTurnStartIndex =
-    effectiveSourceTurnStartIndex + compactionStartIndex;
-
   return {
-    summarizedTurns,
-    nextTurn,
+    targets: compactionTargets(
+      turns.slice(range.start, range.end),
+      effectiveSourceTurnStartIndex + range.start,
+    ),
+    nextTurn: turns[range.end] ?? null,
     preservedTurnCount: range.preserved,
-    sourceTurnStartIndex,
+    sourceTurns,
     effectiveSourceTurnStartIndex,
     effectiveSourceTurnEndIndex,
-    sourceSnapshot: captureSourceSnapshot(messages),
+    sourceSnapshot: snapshotSourceMessages(messages),
     sourceMessages: messages,
   };
 }
 
-export async function createTrimPlan(
-  v2: V2Client,
-  sessionID: string,
-  keepTurns: number,
-): Promise<TrimPlan> {
-  return planTrim(await loadMessages(v2, sessionID), keepTurns);
+// The range's turns without a Magic summary, each with its source position;
+// the range starts at source position `start`.
+function compactionTargets(range: Turn[], start: number): CompactionTarget[] {
+  return range.flatMap((turn, index) =>
+    turnHasPersistedSummary(turn)
+      ? []
+      : [{ turn, sourceTurnIndex: start + index }],
+  );
 }
 
 export function planTrim(
   messages: MessageWithParts[],
   keepTurns: number,
 ): TrimPlan {
-  return {
-    trimmedTurns: trimmedTurnRange(buildTurns(messages), keepTurns),
-    messages,
-    sourceSnapshot: snapshotSourceMessages(messages),
-  };
-}
-
-async function loadMessages(
-  v2: V2Client,
-  sessionID: string,
-): Promise<MessageWithParts[]> {
-  return unwrap(
-    await v2.session.messages({
-      sessionID,
-    }),
-  );
+  return { trimmedTurns: trimmedTurnRange(buildTurns(messages), keepTurns) };
 }
 
 export function buildTurns(messages: MessageWithParts[]): Turn[] {
@@ -142,16 +118,6 @@ export function buildTurns(messages: MessageWithParts[]): Turn[] {
       ? message.info.role
       : "other",
   );
-}
-
-export function assertCompactionSourceUnchanged(
-  messages: MessageWithParts[],
-  plan: CompactionPlan,
-): void {
-  const current = captureSourceSnapshot(messages);
-  if (!isDeepStrictEqual(current, plan.sourceSnapshot)) {
-    throw new NativeCheckpointChangedError();
-  }
 }
 
 export function assertForkMessageShape(
@@ -176,15 +142,6 @@ export function assertForkMessageShape(
       throw new Error("Compaction generation fork history shape mismatch.");
     }
   }
-}
-
-function captureSourceSnapshot(messages: MessageWithParts[]): SourceSnapshot {
-  try {
-    inspectNativeCheckpoints(messages);
-  } catch (error) {
-    throw new NativeCheckpointChangedError(error);
-  }
-  return snapshotSourceMessages(messages);
 }
 
 export function snapshotSourceMessages(
@@ -454,15 +411,5 @@ function removeTrailingAssistantlessTurn(turns: Turn[]): void {
 }
 
 function isBoundaryPart(part: Part): boolean {
-  if (part.type !== "text") {
-    return false;
-  }
-
-  const metadata = part.metadata;
-  if (!isRecord(metadata)) {
-    return false;
-  }
-
-  const magicCompact = metadata["magicCompact"];
-  return isRecord(magicCompact) && magicCompact["boundary"] === true;
+  return part.type === "text" && isBoundaryMetadata(part.metadata);
 }

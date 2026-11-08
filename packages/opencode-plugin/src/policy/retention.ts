@@ -14,7 +14,6 @@ import {
   classifyRetention,
   formatKeepThresholdPercent,
   resolveKeepThreshold,
-  RETENTION_FAILURE_GUIDANCE,
   retentionFailureGuidance,
   RETENTION_KEEP_THRESHOLD,
   RETENTION_KEEP_THRESHOLD_PERCENT_ENV,
@@ -23,7 +22,14 @@ import {
   type RetentionFetch,
   type RetentionInvocation,
 } from "../retention/classifier";
-import { hasPluginMessage, PluginMessageError } from "./feedback";
+import {
+  hasPluginMessage,
+  PluginMessageError,
+  unremovedSessionsText,
+  type LeavesSessions,
+  type UnremovedSession,
+} from "./feedback";
+import type { StageReport } from "./reasoning";
 import { toolTrimChangesContent, type ToolCallView } from "./tool-rules";
 
 export type RetentionPolicy =
@@ -287,15 +293,29 @@ export async function collectRetentionCandidates(
   return { latestUserRequest: text, candidates };
 }
 
+// The whole-session summary retention judges against, and the reasoning
+// report of the request that made it.
+export type SessionSummary = { text: string; report: StageReport };
+
+// What retention decided, with the reasoning report of each summary request
+// it made: none without candidates, otherwise the one session summary.
+export type RetentionDecision = {
+  plan: RetentionPlan;
+  reports: StageReport[];
+};
+
 // Summarizes the session and classifies every candidate. Any failure throws
 // before the caller creates a successor, and no partial decision set is ever
-// returned.
+// returned. Without candidates nothing is summarized and no key is read; a
+// missing selected key fails before the summary is requested.
 export async function decideRetentionWith(
   found: RetentionCandidates,
   policy: Extract<RetentionPolicy, { mode: "task-aware" }>,
-  summarize: () => Promise<string>,
-): Promise<RetentionPlan> {
-  if (found.candidates.length === 0) return retentionWithoutCandidates(policy);
+  summarize: () => Promise<SessionSummary>,
+): Promise<RetentionDecision> {
+  if (found.candidates.length === 0) {
+    return { plan: retentionWithoutCandidates(policy), reports: [] };
+  }
   const keepThreshold = resolveKeepThreshold(policy.keepThreshold);
   const { invocation } = policy;
   const selected = selectedBackend(policy);
@@ -306,9 +326,17 @@ export async function decideRetentionWith(
         model: selected.model,
       });
     }
-    const sessionSummary = await summarize();
+    let summary: SessionSummary;
+    try {
+      summary = await summarize();
+    } catch (error) {
+      throw sessionSummaryFailure(error, invocation);
+    }
     const { decisions, truncated } = await classifyRetention(
-      { latestUserRequest: found.latestUserRequest, sessionSummary },
+      {
+        latestUserRequest: found.latestUserRequest,
+        sessionSummary: summary.text,
+      },
       found.candidates,
       {
         backend: selected.backend,
@@ -325,12 +353,15 @@ export async function decideRetentionWith(
       if (decision.keep) keep.add(candidate.id);
     }
     return {
-      mode: "task-aware",
-      ...selected,
-      evaluated: found.candidates.length,
-      keep,
-      keepThreshold,
-      truncated,
+      plan: {
+        mode: "task-aware",
+        ...selected,
+        evaluated: found.candidates.length,
+        keep,
+        keepThreshold,
+        truncated,
+      },
+      reports: [summary.report],
     };
   } catch (error) {
     // A command's failure suggests repeating the person's own arguments.
@@ -342,23 +373,7 @@ export async function decideRetentionWith(
         invocation,
       );
     }
-    if (invocation) addOwnCommandGuidance(error, invocation);
     throw error;
-  }
-}
-
-// A session-summary failure ends in the guidance for a caller with no command.
-// The error keeps its type, stage and any sessions it names; only the closing
-// advice becomes the person's own command, as for a classification failure.
-function addOwnCommandGuidance(
-  error: unknown,
-  invocation: RetentionInvocation,
-): void {
-  if (
-    hasPluginMessage(error)
-    && error.message.endsWith(RETENTION_FAILURE_GUIDANCE)
-  ) {
-    error.message = `${error.message.slice(0, -RETENTION_FAILURE_GUIDANCE.length)}${retentionFailureGuidance(invocation)}`;
   }
 }
 
@@ -422,22 +437,169 @@ export type SessionSummaryStage =
   | "abort"
   | "delete";
 
-// Messages are fixed text plus an optional HTTP status; they never carry
-// session content, model output, or provider bodies.
-export class SessionSummaryError extends PluginMessageError {
+// The fork (OpenCode 1) or temporary session (OpenCode 2) a summary request
+// creates.
+export type SummaryTemporary = "fork" | "session";
+
+// One stage that failed. `overflow` marks a request that outgrew the model,
+// and `detail` is a fixed fork-history reason. A `delete` stage names the
+// fork or temporary session whose removal failed, or the OpenCode 2 session
+// the host no longer found after an earlier stage failed.
+export type SessionSummaryStageFailure =
+  | {
+      kind: "stage";
+      stage: Exclude<SessionSummaryStage, "delete">;
+      status?: number;
+      overflow?: boolean;
+      detail?: string;
+    }
+  | {
+      kind: "stage";
+      stage: "delete";
+      status?: number;
+      temporary: SummaryTemporary;
+      session: UnremovedSession;
+    };
+
+// What went wrong while making the retention session summary, without the
+// advice that closes its message.
+export type SessionSummaryFailure =
+  | SessionSummaryStageFailure
+  // Several stages failed, in order: the request's own, if any, then the
+  // cleanup of the fork or temporary session it created.
+  | {
+      kind: "cleanup";
+      temporary: SummaryTemporary;
+      failures: readonly SessionSummaryStageFailure[];
+    }
+  // A message the plugin wrote itself before the summary asked the host for
+  // any session, such as a missing summarizer model.
+  | { kind: "refusal"; message: string };
+
+export const SESSION_SUMMARY_TOO_LARGE =
+  "The session is too large for the configured compaction model to summarize for task-aware retention.";
+
+export function sessionSummaryStageFailure(
+  stage: Exclude<SessionSummaryStage, "delete">,
+  facts: { status?: number; overflow?: boolean; detail?: string } = {},
+): SessionSummaryError {
+  return new SessionSummaryError({ kind: "stage", stage, ...facts });
+}
+
+// The stage a summary request reports for an error it caught: its own stage
+// failure, or otherwise a validation failure.
+export function caughtSummaryStage(error: unknown): SessionSummaryStageFailure {
+  return error instanceof SessionSummaryError && error.failure.kind === "stage"
+    ? error.failure
+    : { kind: "stage", stage: "validation" };
+}
+
+// The one error for the stages a summary request and its cleanup failed, or
+// undefined when none did.
+export function failedSummaryStages(
+  failures: readonly SessionSummaryStageFailure[],
+  temporary: SummaryTemporary,
+): SessionSummaryError | undefined {
+  if (failures.length === 0) return undefined;
+  return new SessionSummaryError(
+    failures.length === 1
+      ? failures[0]!
+      : { kind: "cleanup", temporary, failures },
+  );
+}
+
+// Every retention session summary failure. The message is fixed text with
+// each stage's optional HTTP status and fork-history reason, then the fork
+// or temporary session whose removal it could not confirm, then the advice
+// for `invocation`: the person's own command, or /magic-trim for a caller
+// without one. It never carries session content, model output or provider
+// bodies.
+export class SessionSummaryError
+  extends PluginMessageError
+  implements LeavesSessions
+{
+  readonly reason: string;
+  readonly unremovedSessions: readonly UnremovedSession[];
+
   constructor(
-    readonly stage: SessionSummaryStage,
-    readonly status?: number,
-    overflow = false,
-    detail?: string,
+    readonly failure: SessionSummaryFailure,
+    invocation?: RetentionInvocation,
   ) {
+    const reason = sessionSummaryFailureText(failure);
+    const deletions = failedDeletions(failure);
     super(
-      `${
-        stage === "budget" || overflow
-          ? "The session is too large for the configured compaction model to summarize for task-aware retention."
-          : `Task-aware retention session summary failed (${stage}${status === undefined ? "" : ` ${status}`}${detail === undefined ? "" : `: ${detail}`}).`
-      } ${RETENTION_FAILURE_GUIDANCE}`,
+      [
+        reason,
+        ...deletions.map(({ temporary, session }) =>
+          unremovedSessionsText(
+            [session],
+            temporary === "fork" ? "Fork" : "Temporary session",
+          ),
+        ),
+        retentionFailureGuidance(invocation),
+      ].join(" "),
     );
     this.name = "SessionSummaryError";
+    this.reason = reason;
+    this.unremovedSessions = deletions.map(({ session }) => session);
   }
+}
+
+function failedDeletions(failure: SessionSummaryFailure) {
+  const stages =
+    failure.kind === "stage"
+      ? [failure]
+      : failure.kind === "cleanup"
+        ? failure.failures
+        : [];
+  return stages.flatMap(stage => (stage.stage === "delete" ? [stage] : []));
+}
+
+// A request that outgrew the model is explained as such, even when its
+// cleanup failed; the stage list then follows the explanation.
+function sessionSummaryFailureText(failure: SessionSummaryFailure): string {
+  if (failure.kind === "refusal") return failure.message;
+  if (failure.kind === "stage") {
+    return outgrewModel(failure)
+      ? SESSION_SUMMARY_TOO_LARGE
+      : `Task-aware retention session summary failed (${stageLabel(failure)}).`;
+  }
+  const stages = `Task-aware retention session summary and ${failure.temporary === "fork" ? "fork " : ""}cleanup failed (${failure.failures.map(stageLabel).join(", ")}).`;
+  return failure.failures.some(outgrewModel)
+    ? `${SESSION_SUMMARY_TOO_LARGE} ${stages}`
+    : stages;
+}
+
+function outgrewModel(failure: SessionSummaryStageFailure): boolean {
+  return (
+    failure.stage === "budget"
+    || (failure.stage !== "delete" && failure.overflow === true)
+  );
+}
+
+function stageLabel(failure: SessionSummaryStageFailure): string {
+  const status = failure.status === undefined ? "" : ` ${failure.status}`;
+  const detail =
+    failure.stage === "delete" || failure.detail === undefined
+      ? ""
+      : `: ${failure.detail}`;
+  return `${failure.stage}${status}${detail}`;
+}
+
+// A failure while summarizing, as this invocation reports it: a new error
+// whose message ends in this invocation's retention advice for every refusal
+// the plugin wrote. Any other error is passed on unchanged and is reported as
+// unexpected.
+function sessionSummaryFailure(
+  error: unknown,
+  invocation: RetentionInvocation | undefined,
+): unknown {
+  if (error instanceof SessionSummaryError) {
+    return new SessionSummaryError(error.failure, invocation);
+  }
+  if (!hasPluginMessage(error)) return error;
+  return new SessionSummaryError(
+    { kind: "refusal", message: error.message },
+    invocation,
+  );
 }

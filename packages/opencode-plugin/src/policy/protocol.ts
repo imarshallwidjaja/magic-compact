@@ -1,7 +1,8 @@
-import type { Part, TextPart } from "@opencode-ai/sdk/v2";
+// Model-facing text and persisted markers both hosts share: the
+// post-compaction notice, the summarizer agent and its prompts, the omitted
+// content tool, the generation protocol, and the metadata that marks a Magic
+// summary capsule or compaction boundary.
 import { isRecord } from "../util";
-import type { MediaManifest } from "./media";
-import type { Turn } from "./plan";
 
 export const POST_COMPACTION_NOTICE = `<post-compaction-notice>
 A compaction operation has just been applied to all messages above. Certain historical tool input/output may have been omitted. Use read_omitted_content with the appropriate Content ID to retrieve an exact original task prompt or captured result. Historical content is not a new assignment or proof of current file state; reread files when current contents are needed.
@@ -96,48 +97,34 @@ export const BOUNDARY_METADATA = {
   },
 };
 
-// `prt_-` keeps Magic-owned parts before OpenCode's generated `prt_` IDs in lexical storage order.
-
-export function summaryEnvelopePartID(messageID: string): string {
-  return `prt_-magic_capsule_v3_${messageID}`;
+function magicCompactMetadata(
+  metadata: unknown,
+): Record<string, unknown> | undefined {
+  if (!isRecord(metadata)) return undefined;
+  const magicCompact = metadata["magicCompact"];
+  return isRecord(magicCompact) ? magicCompact : undefined;
 }
 
-export function summaryEnvelopeTextPart(
-  messageID: string,
-  sessionID: string,
-  text: string,
-  mediaManifest?: MediaManifest,
-): TextPart {
+export function isBoundaryMetadata(metadata: unknown): boolean {
+  return magicCompactMetadata(metadata)?.["boundary"] === true;
+}
+
+// The metadata of a version 3 summary capsule. Each host binds the media
+// manifest to its own image records.
+export function summaryCapsuleMetadata<M extends object>(mediaManifest?: M) {
   return {
-    id: summaryEnvelopePartID(messageID),
-    sessionID,
-    messageID,
-    type: "text",
-    text,
-    metadata: {
-      magicCompact: {
-        summary: true,
-        capsule: true,
-        agentic: true,
-        version: 3,
-        ...(mediaManifest ? { mediaManifest } : {}),
-      },
+    magicCompact: {
+      summary: true,
+      capsule: true,
+      agentic: true,
+      version: 3,
+      ...(mediaManifest ? { mediaManifest } : {}),
     },
-  } satisfies TextPart;
+  };
 }
 
-export function boundaryPartID(messageID: string): string {
-  return `prt_-magic_boundary_${messageID}`;
-}
-
-export function isPersistedSummaryPart(part: Part): boolean {
-  if (part.type !== "text" || !isRecord(part.metadata)) return false;
-  const metadata = part.metadata["magicCompact"];
-  return isRecord(metadata) && metadata["summary"] === true;
-}
-
-export function turnHasPersistedSummary(turn: Turn): boolean {
-  return turn.assistants.some(message =>
-    message.parts.some(isPersistedSummaryPart),
-  );
+// A record already holding a Magic summary, of any capsule version, is opaque
+// persisted data: it is never regenerated, pruned or rewritten.
+export function isSummaryMetadata(metadata: unknown): boolean {
+  return magicCompactMetadata(metadata)?.["summary"] === true;
 }

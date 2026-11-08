@@ -1,7 +1,7 @@
 // V1 host adapter for the shared task-aware retention policy.
 import type { Session } from "@opencode-ai/sdk/v2";
 import type { V2Client } from "../api";
-import type { SummaryReasoningOptions } from "../compact/compact";
+import type { LoadSummarizerCatalog } from "../compact/compact";
 import { buildTurns, type MessageWithParts, type Turn } from "../compact/plan";
 import { toolCallView } from "../compact/prune";
 import {
@@ -10,6 +10,7 @@ import {
   formatRetentionFeedback,
   type RetentionCandidates,
   type RetentionCall,
+  type RetentionDecision,
   type RetentionPlan,
   type RetentionPolicy,
 } from "../policy/retention";
@@ -18,6 +19,7 @@ import { generateSessionSummary } from "./summary";
 export {
   HEURISTIC_RETENTION,
   retentionWithoutCandidates,
+  type RetentionDecision,
   type RetentionPlan,
   type RetentionPolicy,
 } from "../policy/retention";
@@ -44,13 +46,14 @@ export async function decideRetention(
   messages: MessageWithParts[],
   found: RetentionCandidates,
   policy: Extract<RetentionPolicy, { mode: "task-aware" }>,
-  options: { controlTimeoutMs: number; reasoning?: SummaryReasoningOptions },
-): Promise<RetentionPlan> {
+  options: {
+    controlTimeoutMs: number;
+    matchModel: boolean;
+    catalog: LoadSummarizerCatalog;
+  },
+): Promise<RetentionDecision> {
   return decideRetentionWith(found, policy, () =>
-    generateSessionSummary(v2, session, messages, {
-      controlTimeoutMs: options.controlTimeoutMs,
-      ...(options.reasoning ? { reasoning: options.reasoning } : {}),
-    }),
+    generateSessionSummary(v2, session, messages, options),
   );
 }
 

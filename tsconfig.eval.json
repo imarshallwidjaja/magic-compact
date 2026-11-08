@@ -10,6 +10,7 @@
   "include": [
     "packages/opencode-plugin/eval/compaction/**/*.ts",
     "packages/opencode-plugin/eval/decisions/**/*.ts",
+    "packages/opencode-plugin/eval/retention/**/*.ts",
     "packages/opencode-plugin/test/compaction-eval.test.ts",
     "packages/opencode-plugin/test/decision-eval.test.ts"
   ]

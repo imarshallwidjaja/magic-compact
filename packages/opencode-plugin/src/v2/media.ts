@@ -7,7 +7,10 @@ import {
   mediaPlaceholderText,
   projectsSmaller,
 } from "../policy/media";
-import type { StoredHistoryCount } from "../stats/constants";
+import {
+  modelFacingCount,
+  type ModelFacingCount,
+} from "../stats/stored-history";
 import { isRecord } from "../util";
 import { countV2Content, v2Turns } from "./history";
 import type { V2Message } from "./session";
@@ -222,24 +225,13 @@ export function planV2MediaProjection(
   return projection;
 }
 
-// `tokens` are canonical tokens with covered images projected, and
-// `projectedMediaTokens` the tokens the projection removes from every request.
-// The inline files are the stored ones, projected or not.
-export type V2ModelFacingTokens = StoredHistoryCount & {
-  projectedMediaTokens: number;
-};
-
 export function countV2ModelFacingTokens(
   records: readonly V2Message[],
-): V2ModelFacingTokens {
-  const persisted = countV2Content(records);
-  const projected = countV2Content(records, planV2MediaProjection(records));
-  return {
-    tokens: projected.tokens,
-    projectedMediaTokens: persisted.tokens - projected.tokens,
-    inlineFileTokens: projected.inlineFileTokens,
-    inlineFiles: persisted.inlineFiles,
-  };
+): ModelFacingCount {
+  return modelFacingCount(
+    countV2Content(records),
+    countV2Content(records, planV2MediaProjection(records)),
+  );
 }
 
 // The fields of an `@opencode/ai` request message this projection reads.

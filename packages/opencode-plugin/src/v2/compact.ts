@@ -3,14 +3,13 @@ import { isDeepStrictEqual } from "node:util";
 import { COMPACT_NOOP } from "../commands";
 import {
   BOUNDARY_METADATA,
+  isBoundaryMetadata,
+  isSummaryMetadata,
   POST_COMPACTION_NOTICE,
-} from "../compact/constants";
-import { getCompactionCount } from "../compact/session";
-import {
-  capCodePoints,
-  GLOBAL_ANCHOR_CHARACTER_LIMIT,
-  globalTurnIndexPrompt,
-} from "../policy/generation";
+  summaryCapsuleMetadata,
+} from "../policy/protocol";
+import { getCompactionCount } from "../policy/lineage";
+import { globalTurnIndexPrompt } from "../policy/generation";
 import { keepsHostInjectedText } from "../policy/host-text";
 import {
   collectRetentionCandidates,
@@ -18,7 +17,7 @@ import {
   formatRetentionFeedback,
   HEURISTIC_RETENTION,
   retentionWithoutCandidates,
-  type RetentionPlan,
+  type RetentionDecision,
   type RetentionPolicy,
 } from "../policy/retention";
 import {
@@ -33,7 +32,7 @@ import {
   type PreservedTurns,
 } from "../stats/constants";
 import { planOmission, type PlannedOmission } from "../storage/omission";
-import { isRecord } from "../util";
+import { assertStatsUsable } from "../storage/stats";
 import {
   trimV2Tool,
   v2ModelVisibleHistory,
@@ -50,16 +49,13 @@ import {
   type V2GenerationTurn,
 } from "./generation";
 import { countV2ModelFacingTokens } from "./media";
+import { generateV2SessionSummary, type OwnedSessions } from "./owned";
+import { resolveV2SummarizerModel, type V2SummarizerModel } from "./summarizer";
 import {
-  generateV2SessionSummary,
-  resolveV2SummarizerModel,
-  type OwnedSessions,
-} from "./owned";
-import {
-  assertV2SourceUnchanged,
   createV2Successor,
   isInstructionNotice,
   readV2SourceAtRest,
+  v2StorageKey,
   type V2Message,
   type V2Successor,
 } from "./session";
@@ -68,7 +64,6 @@ import {
   NO_REPLAY,
   reasoningFeedback,
   replayFeedback,
-  type ReasoningReports,
 } from "../policy/reasoning";
 import { v2ReplayEstimate } from "./reasoning";
 
@@ -76,18 +71,12 @@ const COMMAND = "Magic Compact";
 
 type V2Turn = PolicyTurn<V2Message> & { start: number; end: number };
 
-// A turn already holding a Magic summary is opaque persisted data: it is
-// never regenerated, pruned or rewritten.
 export function isV2SummaryCarrier(message: V2Message): boolean {
-  if (message.type !== "assistant" || !isRecord(message.metadata)) return false;
-  const magicCompact = message.metadata["magicCompact"];
-  return isRecord(magicCompact) && magicCompact["summary"] === true;
+  return message.type === "assistant" && isSummaryMetadata(message.metadata);
 }
 
 function isBoundary(message: V2Message): boolean {
-  if (message.type !== "synthetic" || !isRecord(message.metadata)) return false;
-  const magicCompact = message.metadata["magicCompact"];
-  return isRecord(magicCompact) && magicCompact["boundary"] === true;
+  return message.type === "synthetic" && isBoundaryMetadata(message.metadata);
 }
 
 // Request turns with the index range of every record they own: from the
@@ -150,10 +139,12 @@ export function planV2Compaction(
   };
 }
 
-function firstUserLine(turn: V2Turn): string {
+// A turn is anchored by its first user message's text, even when it is empty.
+// OpenCode 2 keeps host notices in their own message types, so that text is
+// ordinary.
+function anchorText(turn: V2Turn): string {
   const user = turn.user[0];
-  const text = user?.type === "user" ? user.text : "";
-  return text.split(/\r\n|\r|\n/u, 1)[0] ?? "";
+  return user?.type === "user" ? user.text : "";
 }
 
 function noopMessage(preserved: PreservedTurns): string {
@@ -220,15 +211,7 @@ async function compactTurn(
         ? {
             metadata: {
               ...message.metadata,
-              magicCompact: {
-                summary: true,
-                capsule: true,
-                agentic: true,
-                version: 3,
-                ...(summary.mediaManifest
-                  ? { mediaManifest: summary.mediaManifest }
-                  : {}),
-              },
+              ...summaryCapsuleMetadata(summary.mediaManifest),
             },
           }
         : {}),
@@ -284,17 +267,18 @@ export async function executeV2Compact(
       };
     }
 
-    // One descriptor serves the retention summary and every generation.
-    const model = await resolveV2SummarizerModel(
-      host,
-      source,
-      controlTimeoutMs,
-    );
-    const reasoning: ReasoningReports = {
-      matchModel: options.matchModel === true,
+    // Every target needs a request, so the saved totals are checked first.
+    await assertStatsUsable(v2StorageKey(sessionID));
+    // Resolved on first need, after a missing retention key has had its say,
+    // and shared by the retention summary and every generation.
+    let summarizer: Promise<V2SummarizerModel> | undefined;
+    const model = () =>
+      (summarizer ??= resolveV2SummarizerModel(host, source, controlTimeoutMs));
+    const matchModel = options.matchModel === true;
+    let retention: RetentionDecision = {
+      plan: HEURISTIC_RETENTION,
       reports: [],
     };
-    let retention: RetentionPlan = HEURISTIC_RETENTION;
     if (options.retention.mode === "task-aware") {
       const policy = options.retention;
       const eligible = new Set(
@@ -312,14 +296,14 @@ export async function executeV2Compact(
           eligible,
         ),
         policy,
-        () =>
+        async () =>
           generateV2SessionSummary(
             host,
             owned,
             source,
-            model,
+            await model(),
             controlTimeoutMs,
-            reasoning,
+            matchModel,
           ),
       );
     }
@@ -333,22 +317,19 @@ export async function executeV2Compact(
         ...(previous ? { previous: span(previous) } : {}),
       };
     });
-    const summaries = await generateV2Summaries(
+    const generation = await generateV2Summaries(
       host,
       owned,
       source,
-      model,
+      await model(),
       generationTurns,
       globalTurnIndexPrompt(
         plan.turns.map((turn, index) => ({
           sourceOrdinal: plan.sourceTurnOffset + index + 1,
-          anchor: capCodePoints(
-            firstUserLine(turn),
-            GLOBAL_ANCHOR_CHARACTER_LIMIT,
-          ),
+          userText: anchorText(turn),
         })),
       ),
-      { controlTimeoutMs, reasoning },
+      { controlTimeoutMs, matchModel },
     );
 
     // A turn is replaced only when its model-facing projection, with the
@@ -361,8 +342,8 @@ export async function executeV2Compact(
       const turnEdits = await compactTurn(
         span(turn),
         turn,
-        summaries[index]!,
-        retention.keep,
+        generation.summaries[index]!,
+        retention.plan.keep,
         async entry => {
           const omission = planOmission(sessionID, entry);
           turnOmissions.push(omission);
@@ -418,8 +399,8 @@ export async function executeV2Compact(
 
     const compactionCount = getCompactionCount(source.session) + 1;
     const reasoningLine = reasoningFeedback(
-      reasoning.reports,
-      reasoning.matchModel,
+      [...retention.reports, ...generation.reports],
+      matchModel,
     );
     const primary = source.session.model
       ? {
@@ -438,7 +419,10 @@ export async function executeV2Compact(
       after,
       selected.length,
       preserved,
-      formatRetentionFeedback(retention, v2RetentionCalls(source.messages)),
+      formatRetentionFeedback(
+        retention.plan,
+        v2RetentionCalls(source.messages),
+      ),
       [
         ...(reasoningLine === undefined
           ? []
@@ -461,12 +445,6 @@ export async function executeV2Compact(
         + before.projectedMediaTokens
         - (after.tokens + after.projectedMediaTokens),
       mediaTokensProjected: after.projectedMediaTokens,
-      recheckSource: async () =>
-        assertV2SourceUnchanged(
-          COMMAND,
-          source,
-          await readV2SourceAtRest(host, COMMAND, sessionID, controlTimeoutMs),
-        ),
       controlTimeoutMs,
     });
     const actual = countV2ModelFacingTokens(successor.messages);

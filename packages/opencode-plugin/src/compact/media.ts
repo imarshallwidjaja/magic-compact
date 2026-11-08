@@ -6,6 +6,7 @@ import {
   mediaPlaceholderText,
   projectsSmaller,
 } from "../policy/media";
+import { hasExactKeys, isPlainRecord } from "../util";
 import { buildTurns, type MessageWithParts, type Turn } from "./plan";
 
 export const MEDIA_MANIFEST_VERSION = 1;
@@ -157,7 +158,7 @@ function summaryManifest(
 function parseManifest(value: unknown, summaryVersion: 2 | 3): MediaManifest {
   if (
     !isPlainRecord(value)
-    || !exactKeys(value, ["images", "version"])
+    || !hasExactKeys(value, ["images", "version"])
     || value["version"] !== MEDIA_MANIFEST_VERSION
     || !Array.isArray(value["images"])
     || value["images"].length === 0
@@ -172,7 +173,7 @@ function parseManifest(value: unknown, summaryVersion: 2 | 3): MediaManifest {
         : ["mime", "ordinal", "urlSha256"];
     if (
       !isPlainRecord(entry)
-      || !exactKeys(entry, expectedKeys)
+      || !hasExactKeys(entry, expectedKeys)
       || entry["ordinal"] !== index + 1
       || (summaryVersion === 2
         && (typeof entry["partId"] !== "string"
@@ -207,21 +208,4 @@ function mediaPlaceholder(
     text: mediaPlaceholderText(entry.ordinal, entry.mime),
     synthetic: true,
   };
-}
-
-function exactKeys(value: Record<string, unknown>, keys: string[]): boolean {
-  const actual = Object.keys(value).sort();
-  const expected = [...keys].sort();
-  return (
-    actual.length === expected.length
-    && actual.every((key, index) => key === expected[index])
-  );
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return false;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
 }

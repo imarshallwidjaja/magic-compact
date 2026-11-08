@@ -68,14 +68,21 @@ export function parseMagicRecoverArguments(raw: string): void {
   if (raw.trim() !== "") throw new PluginMessageError(RECOVER_ARGUMENTS_ERROR);
 }
 
-// What a person sees when compact or trim fails: a toast on OpenCode 1, the
+export function parseMagicStatsArguments(raw: string): void {
+  if (raw.trim() !== "") throw new PluginMessageError(STATS_ARGUMENTS_ERROR);
+}
+
+// The name failure feedback gives a command.
+export type CommandTitle = SuccessorCommand | "Magic Stats";
+
+// What a person sees when a command fails: a toast on OpenCode 1, the
 // command error on OpenCode 2. An error the plugin marked as its own message
 // (`policy/feedback.ts`) shows that message without the class name, and a
 // successor failure adds its classified stage, HTTP status and system code.
 // Any other error, whatever its type, is described only by its classified
 // status and code, never by its own text.
 export function commandFailureMessage(
-  command: SuccessorCommand,
+  command: CommandTitle,
   error: unknown,
 ): string {
   if (error instanceof SuccessorFailure) {

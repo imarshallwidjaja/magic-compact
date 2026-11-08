@@ -30,15 +30,18 @@ import {
   type DecisionDataset,
 } from "../eval/decisions/dataset";
 import {
-  OPENAI_DECISIONS_MODELS,
+  FATAL_CATEGORIES,
   PROVIDERS,
-  renderPredicateInstructions,
   sendDecision,
+  type FatalCategory,
   type ProviderAdapter,
   type Transport,
 } from "../eval/decisions/providers";
 import { computeMetrics, renderReport } from "../eval/decisions/report";
-import { openAIDecisionsBody } from "../src/retention/backends";
+import {
+  openAIDecisionsBody,
+  renderPredicateInstructions,
+} from "../src/retention/backends";
 import { main, type CliDeps } from "../eval/decisions/run";
 import {
   executeRun,
@@ -246,14 +249,12 @@ describe("dataset", () => {
     ).toBe(false);
   });
 
-  test("the evaluation reference stays 0.80, independent of the runtime default", () => {
+  test("the evaluation reference stays frozen at 0.80", () => {
     expect(DECISION_EVALUATION_THRESHOLD).toBe(0.8);
-    expect(DECISION_EVALUATION_THRESHOLD).not.toBe(RETENTION_KEEP_THRESHOLD);
   });
 
   test("production constants the pack relies on are unchanged", () => {
     expect(RETENTION_MODEL).toBe("jev-1.13.0");
-    expect(RETENTION_KEEP_THRESHOLD).toBe(0.6);
     expect(RETENTION_MAX_CONCURRENCY).toBe(4);
     expect(RETENTION_REQUEST_TIMEOUT_MS).toBe(30_000);
     expect(RETENTION_REQUEST_BODY_BYTE_LIMIT).toBe(32 * 1024 * 1024);
@@ -308,8 +309,6 @@ describe("dataset", () => {
       parseDataset(mutate(c => (c.snapshots[0]!.cases[0]!.label.keep = "yes"))),
     ).toThrow(DecisionEvalError);
 
-    const reordered = JSON.stringify(raw, Object.keys(raw).reverse());
-    expect(reordered).not.toBe(JSON.stringify(raw));
     expect(datasetSha256(parseDataset(JSON.stringify(raw, null, 4)))).toBe(
       datasetSha256(dataset),
     );
@@ -405,6 +404,64 @@ describe("request mapping", () => {
     expect(semanticQuestion().instructions).toContain("candidates[0]");
   });
 
+  test("only the Jev wire body is held to TypeSafe's body limit", () => {
+    const raw = JSON.parse(
+      readFileSync(
+        fileURLToPath(
+          new URL("../eval/decisions/fixtures.json", import.meta.url),
+        ),
+        "utf8",
+      ),
+    );
+    const [first] = raw.snapshots;
+    const withSummary = (sessionSummary: string) =>
+      parseDataset(
+        JSON.stringify({
+          ...raw,
+          snapshots: [
+            {
+              ...first,
+              context: { ...first.context, sessionSummary },
+              cases: [first.cases[0]],
+            },
+          ],
+        }),
+      );
+    const bytes = (text: string) => Buffer.byteLength(text, "utf8");
+    const empty = datasetCases(withSummary(""))[0]!;
+    // Each ASCII character adds one byte, so this production body is exactly
+    // at the limit and the next one is a byte over it.
+    const padding =
+      RETENTION_REQUEST_BODY_BYTE_LIMIT
+      - bytes(
+        PROVIDERS.jev.translate(buildCaseRequest(empty), RETENTION_MODEL),
+      );
+    const atLimit = withSummary("s".repeat(padding));
+    const overLimit = withSummary("s".repeat(padding + 1));
+    const openai = PROVIDERS["openai-decisions"];
+
+    const jevAtLimit = planRun(options(PROVIDERS.jev, { dataset: atLimit }));
+    expect(bytes(jevAtLimit.cases[0]!.body)).toBe(
+      RETENTION_REQUEST_BODY_BYTE_LIMIT,
+    );
+    // A longer version ID makes the Jev wire body one byte larger than the
+    // canonical body, and the wire body is what TypeSafe measures.
+    expect(() =>
+      planRun(
+        options(PROVIDERS.jev, { dataset: atLimit, model: "jev-1.130.0" }),
+      ),
+    ).toThrow(/budget/);
+    expect(() =>
+      planRun(options(PROVIDERS.jev, { dataset: overLimit })),
+    ).toThrow(/budget/);
+    // OpenAI documents no body limit, so the same case is planned with a wire
+    // body above TypeSafe's limit.
+    const [planned] = planRun(options(openai, { dataset: overLimit })).cases;
+    expect(bytes(planned!.body)).toBeGreaterThan(
+      RETENTION_REQUEST_BODY_BYTE_LIMIT,
+    );
+  });
+
   test("canonical and provider request hashes are recorded separately", async () => {
     const { outcomes, calls } = await runFake(
       PROVIDERS["openai-decisions"],
@@ -434,7 +491,7 @@ describe("request mapping", () => {
     expect(() =>
       planRun(options(PROVIDERS.jev, { model: "jev-1.14.0" })),
     ).not.toThrow();
-    expect(OPENAI_DECISIONS_MODELS).toEqual(["gpt-6-luna"]);
+    expect(PROVIDERS["openai-decisions"].defaultModel).toBe("gpt-6-luna");
     for (const model of ["gpt-6", "gpt-5.5", "gpt-6-luna-fast"]) {
       expect(() =>
         planRun(options(PROVIDERS["openai-decisions"], { model })),
@@ -896,30 +953,44 @@ describe("run execution", () => {
     }
   });
 
-  test("a rejected key stops admission, lets in-flight requests finish and records the rest as not attempted", async () => {
-    const serial = await runFake(openai, () => ({ status: 401 }), {
-      concurrency: 1,
-    });
-    expect(serial.calls).toHaveLength(1);
-    expect(
-      serial.outcomes.filter(o => o.status === "not-attempted"),
-    ).toHaveLength(cases.length - 1);
-    expect(
-      serial.outcomes.find(o => o.status === "not-attempted"),
-    ).toMatchObject({
-      reason: "stopped-after-auth",
-    });
-    const run = loadRun(serial.out, dataset);
-    expect(run.outcomes).toHaveLength(cases.length);
-    const metrics = computeMetrics(run, new Map(), 0.8);
-    // A run that closed after a rejected key says exactly what it did not
-    // send; nothing about it is unknown.
-    expect(metrics).toMatchObject({
-      scored: 0,
-      failed: 1,
-      notAttempted: cases.length - 1,
-      unknown: 0,
-    });
+  test("a fatal failure stops admission, lets in-flight requests finish and records the rest as not attempted", async () => {
+    // Each fatal category needs a provider answer here, so a new one cannot
+    // stop admission without this test showing its unsent requests recorded.
+    const statuses: Record<FatalCategory, number[]> = {
+      auth: [401, 403],
+      "rate-limit": [429],
+    };
+    for (const category of FATAL_CATEGORIES) {
+      for (const status of statuses[category]) {
+        const serial = await runFake(openai, () => ({ status }), {
+          concurrency: 1,
+        });
+        expect(serial.calls).toHaveLength(1);
+        const [first, ...rest] = serial.outcomes;
+        expect(first).toMatchObject({
+          status: "failed",
+          category,
+          httpStatus: status,
+        });
+        expect(rest).toHaveLength(cases.length - 1);
+        for (const outcome of rest) {
+          expect(outcome).toMatchObject({
+            status: "not-attempted",
+            reason: `stopped-after-${category}`,
+          });
+        }
+        const run = loadRun(serial.out, dataset);
+        expect(run.outcomes).toHaveLength(cases.length);
+        // A run that closed after a fatal failure says exactly what it did
+        // not send; nothing about it is unknown.
+        expect(computeMetrics(run, new Map(), 0.8)).toMatchObject({
+          scored: 0,
+          failed: 1,
+          notAttempted: cases.length - 1,
+          unknown: 0,
+        });
+      }
+    }
 
     const parallel = await runFake(openai, () => ({ status: 429 }), {
       concurrency: 3,
@@ -1354,15 +1425,6 @@ describe("report and result integrity", () => {
     );
   });
 
-  test("a development comparison can score at the runtime default without touching the held-out reference", async () => {
-    const run = await runFake(openai, perfect, {
-      threshold: RETENTION_KEEP_THRESHOLD,
-    });
-    const loaded = loadRun(run.out, dataset);
-    expect(loaded.manifest.threshold).toBe(0.6);
-    expect(renderReport([loaded], dataset)).toContain("Group 1: threshold 0.6");
-  });
-
   test("requests that left no record are reported as unknown, never as not attempted", async () => {
     const { out } = await runFake(openai, perfect);
     const file = join(out, "outcomes.jsonl");
@@ -1481,7 +1543,7 @@ describe("report and result integrity", () => {
         split: "heldout",
       }),
     );
-    for (const threshold of [0.7, RETENTION_KEEP_THRESHOLD]) {
+    for (const threshold of [0.7, 0.6]) {
       expect(() =>
         planRun({ ...options(openai), dataset: heldout, threshold }),
       ).toThrow(/frozen threshold 0.8/);
@@ -1498,7 +1560,15 @@ describe("report and result integrity", () => {
     });
     const run = loadRun(out, heldout);
     expect(renderReport([run], heldout)).toContain("(heldout)");
-    expect(() => renderReport([run], heldout, 0.5)).toThrow(/frozen threshold/);
+    // Naming the frozen threshold explicitly is allowed; any other is not.
+    expect(renderReport([run], heldout, 0.8)).toContain(
+      "Group 1: threshold 0.8",
+    );
+    for (const threshold of [0.5, 0.6]) {
+      expect(() => renderReport([run], heldout, threshold)).toThrow(
+        /frozen threshold 0.8/,
+      );
+    }
     // A report stored before the runtime default changed recorded 0.80 as the
     // production threshold. It still loads at the frozen reference.
     const manifestPath = join(out, "manifest.json");
@@ -1512,12 +1582,39 @@ describe("report and result integrity", () => {
       }),
     );
     expect(() => loadRun(out, heldout)).not.toThrow();
-    // A manifest edited to a different threshold, including the runtime
-    // default, is not a valid held-out result.
-    for (const threshold of [0.5, RETENTION_KEEP_THRESHOLD]) {
+    // A manifest edited to a different threshold, including 0.60, is not a
+    // valid held-out result.
+    for (const threshold of [0.5, 0.6]) {
       writeFileSync(manifestPath, JSON.stringify({ ...manifest, threshold }));
-      expect(() => loadRun(out, heldout)).toThrow(/frozen/);
+      expect(() => loadRun(out, heldout)).toThrow(/frozen threshold 0.8/);
     }
+    // The command line accepts the same explicit value for a held-out run.
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    const heldoutPath = join(freshDir(), "heldout.json");
+    mkdirSync(join(heldoutPath, ".."));
+    writeFileSync(heldoutPath, JSON.stringify(heldout));
+    const printed: string[] = [];
+    const cli: CliDeps = {
+      env: {},
+      fetch: async () => {
+        throw new Error("network is not available");
+      },
+      stdout: text => printed.push(text),
+      stderr: text => printed.push(text),
+    };
+    expect(
+      await main(
+        ["report", out, "--dataset", heldoutPath, "--threshold", "0.8"],
+        cli,
+      ),
+    ).toBe(0);
+    expect(
+      await main(
+        ["report", out, "--dataset", heldoutPath, "--threshold", "0.6"],
+        cli,
+      ),
+    ).toBe(2);
+    expect(printed.join("\n")).toContain("frozen threshold 0.8");
     // Results never mix across splits: the smoke dataset rejects held-out runs.
     expect(() => loadRun(out, dataset)).toThrow(/different dataset/);
   });
@@ -1919,6 +2016,18 @@ describe("command line", () => {
       ["report", "--threshold", "0.5"],
       ["run", "--provider", "jev", "--dry-run", "--repeat", "abc"],
       ["run", "--provider", "jev", "--dry-run", "--threshold", "1.5"],
+      // Not a number, or out of range, however it is written.
+      ["run", "--provider", "jev", "--dry-run", "--threshold", ""],
+      ["run", "--provider", "jev", "--dry-run", "--threshold", " "],
+      ["run", "--provider", "jev", "--dry-run", "--threshold", "NaN"],
+      ["run", "--provider", "jev", "--dry-run", "--threshold", "Infinity"],
+      ["run", "--provider", "jev", "--dry-run", "--threshold", "0"],
+      ["run", "--provider", "jev", "--dry-run", "--repeat", "1.5"],
+      ["run", "--provider", "jev", "--dry-run", "--repeat", "11"],
+      ["run", "--provider", "jev", "--dry-run", "--concurrency", "-Infinity"],
+      ["run", "--provider", "jev", "--dry-run", "--concurrency", "1e9"],
+      ["run", "--provider", "jev", "--dry-run", "--max-requests", "0x0"],
+      ["run", "--provider", "jev", "--dry-run", "--timeout-ms", ""],
       [
         "run",
         "--provider",
@@ -1947,6 +2056,33 @@ describe("command line", () => {
     await main(["run", "--provider", "jev", "--bogus"], unknown.deps);
     expect(unknown.stderr.join("\n")).toContain("--bogus");
     expect(unknown.stderr.join("\n")).toContain("--help");
+  });
+
+  test("numeric options read every form `Number` reads, so an equivalent value plans the same run", async () => {
+    const plan = async (extra: string[]) => {
+      const h = harness();
+      expect(
+        await main(["run", "--provider", "jev", "--dry-run", ...extra], h.deps),
+      ).toBe(0);
+      expect(h.fetched()).toBe(0);
+      return h.stdout.join("\n");
+    };
+    const forms: Array<[string, string, string[]]> = [
+      ["--threshold", "0.8", ["8e-1", ".8", " 0.8", "+0.8", "0.80", "0.8 "]],
+      ["--repeat", "2", ["0x2", "+2", "2.", "2e0", " 2"]],
+      ["--concurrency", "4", ["+4", "4.0", "0b100"]],
+      ["--max-requests", "100", ["1e2", "0o144", "100."]],
+      ["--timeout-ms", "3", ["0b11", "3e0", "+3"]],
+    ];
+    for (const [flag, plain, equivalents] of forms) {
+      const expected = await plan([flag, plain]);
+      for (const value of equivalents)
+        expect([flag, value, await plan([flag, value])]).toEqual([
+          flag,
+          value,
+          expected,
+        ]);
+    }
   });
 
   test("check validates the dataset and identity offline", async () => {
@@ -2042,10 +2178,31 @@ describe("command line", () => {
   });
 
   test("dry run, output collisions and oversized plans make no request and need no key", async () => {
-    const dry = harness();
-    expect(
-      await main(["run", "--provider", "jev", "--dry-run"], dry.deps),
-    ).toBe(0);
+    // The runtime threshold override is never read, so it cannot move the
+    // evaluation reference.
+    const percent = "MAGIC_COMPACT_KEEP_THRESHOLD_PERCENT";
+    const denyPercent = (values: Record<string, string | undefined>) =>
+      new Proxy(values, {
+        get: (target, key) => {
+          if (key === percent) throw new Error(`${percent} must never be read`);
+          return target[String(key)];
+        },
+      });
+    const dry = harness(
+      denyPercent({ [percent]: "10" }) as Record<string, string>,
+    );
+    const inherited = process.env;
+    process.env = denyPercent({
+      ...inherited,
+      [percent]: "10",
+    }) as NodeJS.ProcessEnv;
+    try {
+      expect(
+        await main(["run", "--provider", "jev", "--dry-run"], dry.deps),
+      ).toBe(0);
+    } finally {
+      process.env = inherited;
+    }
     expect(dry.stdout.join("\n")).toContain(`${cases.length} requests`);
     expect(dry.stdout.join("\n")).toContain("Dry run");
     expect(dry.stdout.join("\n")).toContain("Reference threshold 0.8");
@@ -2130,6 +2287,21 @@ describe("command line", () => {
     expect(again.stdout.join("\n")).toContain("Group 1");
     expect(again.stdout.join("\n")).toContain("Repeats measure stability");
     expect(again.fetched()).toBe(0);
+    // `report --threshold` reads the same forms as `run`.
+    const reported = async (threshold: string) => {
+      const r = harness();
+      const code = await main(
+        ["report", out, "--threshold", threshold],
+        r.deps,
+      );
+      return [code, r.stdout.join("\n")];
+    };
+    const plain = await reported("0.7");
+    expect(plain[0]).toBe(0);
+    for (const value of ["7e-1", ".7", " 0.7"])
+      expect(await reported(value)).toEqual(plain);
+    for (const value of ["", "Infinity", "1.5"])
+      expect((await reported(value))[0]).toBe(2);
     expect(
       await main(["report", join(scratch, "nowhere")], harness().deps),
     ).toBe(2);

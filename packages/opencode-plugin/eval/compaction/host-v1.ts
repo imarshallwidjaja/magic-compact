@@ -2,10 +2,13 @@
 import { createOpencodeClient } from "@opencode-ai/sdk/v2/client";
 import { isDeepStrictEqual } from "node:util";
 import { loadHistory, replayHistory } from "../../src/compact/fork";
+import { MAGIC_COMPACT_SUMMARIZER_AGENT } from "../../src/policy/protocol";
 import { mintV2ID } from "../../src/v2/session";
 import { sha256, v1SourceHistory } from "./corpus";
 import {
   authHeaders,
+  JUDGE_AGENT,
+  WITNESS_PREFIX,
   stateOf,
   type CommandResult,
   type EvalHost,
@@ -14,10 +17,10 @@ import {
   type SessionState,
   type Witness,
 } from "./host";
-import { v1SuccessorInspection, WITNESS_PREFIX } from "./inspect";
+import { v1SuccessorInspection } from "./inspect";
+import { WITNESS } from "./wrapper/core";
 
 const CONTROL_MS = 30_000;
-const JUDGE_AGENT = "arkive-eval-judge";
 const DENY_ALL = [{ permission: "*", pattern: "*", action: "deny" }] as const;
 
 type Rec = Record<string, unknown>;
@@ -100,9 +103,9 @@ export function v1Host(
     );
   // The wrapper publishes its witness as a disabled agent's description.
   const witnessOf = (config: Rec): Witness | null => {
-    const text = ((config["agent"] ?? {}) as Record<string, Rec>)[
-      "arkive-eval-witness"
-    ]?.["description"];
+    const text = ((config["agent"] ?? {}) as Record<string, Rec>)[WITNESS]?.[
+      "description"
+    ];
     return typeof text === "string" && text.startsWith(WITNESS_PREFIX)
       ? JSON.parse(text.slice(WITNESS_PREFIX.length))
       : null;
@@ -146,7 +149,7 @@ export function v1Host(
           $schema: "https://opencode.ai/config.json",
           plugin: [pluginEntry],
           agent: {
-            "magic-compact-summarizer": {
+            [MAGIC_COMPACT_SUMMARIZER_AGENT]: {
               model: `${summarizer.providerID}/${summarizer.modelID}`,
               ...(summarizer.variant ? { variant: summarizer.variant } : {}),
             },
@@ -190,7 +193,7 @@ export function v1Host(
     async setup(directory) {
       const config = await projectConfig(directory);
       const agents = (config["agent"] ?? {}) as Record<string, Rec>;
-      const summarizer = agents["magic-compact-summarizer"] ?? {};
+      const summarizer = agents[MAGIC_COMPACT_SUMMARIZER_AGENT] ?? {};
       const mcp = (config["mcp"] ?? {}) as Record<
         string,
         { enabled?: boolean }
@@ -220,7 +223,7 @@ export function v1Host(
           // The agent list is what the subject itself reads.
           subjectSummarizer: await resolvedAgent(
             directory,
-            "magic-compact-summarizer",
+            MAGIC_COMPACT_SUMMARIZER_AGENT,
           ),
           commands: Object.keys((config["command"] ?? {}) as object).sort(),
         },

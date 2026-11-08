@@ -10,8 +10,6 @@ import type {
 } from "@opencode-ai/sdk/v2";
 import type { V2Client } from "../src/api";
 import type { MessageWithParts } from "../src/compact/plan";
-import { deleteCache } from "../src/storage/omission";
-import { deleteStats } from "../src/storage/stats";
 import {
   persistedForkHistory,
   providerCatalog,
@@ -22,7 +20,6 @@ import {
 export const PRIVATE_BODY = "PRIVATE-SESSION-BODY-7f3a";
 
 export type V1CommandHarnessOptions = {
-  toastMode?: "hang" | "fail";
   sessionRevert?: { messageID: string };
   // Runs while the retention summary request is in flight.
   duringSummary?: () => void;
@@ -42,6 +39,15 @@ export type V1CommandHarnessOptions = {
   summaryText?: string;
 };
 
+const openHistories = new Set<{ close(): void }>();
+
+// Closes the in-memory history of every harness created since the last call;
+// suites run it after each test.
+export function closeV1CommandHarnesses(): void {
+  for (const history of openHistories) history.close();
+  openHistories.clear();
+}
+
 export function v1CommandHarness(
   sessionID: string,
   messages: MessageWithParts[],
@@ -59,6 +65,7 @@ export function v1CommandHarness(
     }
   });
   const history = persistedForkHistory([]);
+  openHistories.add(history);
   const successorIDs: string[] = [];
   const summaryForkID = `${sessionID}_summary`;
   const sourceSession = {
@@ -105,11 +112,13 @@ export function v1CommandHarness(
         }
         return { data: structuredClone(messages) };
       },
+      // Like the HTTP API, every read returns its own copy.
       get: async (request: { sessionID: string }) => ({
-        data:
+        data: structuredClone(
           request.sessionID === sessionID
             ? { ...sourceSession, ...(revert ? { revert } : {}) }
             : sessions.get(request.sessionID),
+        ),
       }),
       status: async () => ({ data: options.statuses ?? {} }),
       children: async (request: { sessionID: string }) => ({
@@ -128,12 +137,15 @@ export function v1CommandHarness(
         const successorID = `${sessionID}_successor${created.length === 0 ? "" : `_${created.length + 1}`}`;
         successorIDs.push(successorID);
         created.push(successorID);
-        const info = {
+        const info = structuredClone({
           ...sourceSession,
           id: successorID,
           title: String(request.title),
+          agent: request.agent,
+          model: request.model,
+          permission: request.permission,
           metadata: request.metadata,
-        } as Session;
+        }) as Session;
         sessions.set(successorID, info);
         options.duringSuccessorCreate?.();
         return { data: info };
@@ -193,6 +205,8 @@ export function v1CommandHarness(
       replay: async (request: {
         events: Parameters<typeof history.replay>[0];
       }) => {
+        if (request.events.some(event => event.aggregateID === sessionID))
+          sourceWrites.push("sync.replay");
         history.replay(request.events);
         return { data: { sessionID: request.events[0]!.aggregateID } };
       },
@@ -200,8 +214,6 @@ export function v1CommandHarness(
     tui: {
       showToast: async (toast: { message?: string }) => {
         toasts.push(toast);
-        if (options.toastMode === "hang") return new Promise(() => {});
-        if (options.toastMode === "fail") throw new Error("toast failed");
         return { data: true };
       },
     },
@@ -248,15 +260,6 @@ export function v1CommandHarness(
       revert = value;
     },
   };
-}
-
-export async function cleanupSessions(...sessionIDs: string[]): Promise<void> {
-  await Promise.all(
-    sessionIDs.flatMap(sessionID => [
-      deleteCache(sessionID),
-      deleteStats(sessionID),
-    ]),
-  );
 }
 
 export function message(

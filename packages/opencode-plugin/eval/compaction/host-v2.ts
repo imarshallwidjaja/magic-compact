@@ -2,10 +2,14 @@
 // location or a session the run created.
 import { OpenCode } from "@opencode/client";
 import { isDeepStrictEqual } from "node:util";
+import { MAGIC_COMPACT_SUMMARIZER_AGENT } from "../../src/policy/protocol";
 import { mintV2ID } from "../../src/v2/session";
 import { sha256, v2SourceHistory } from "./corpus";
 import {
   authHeaders,
+  EvalError,
+  JUDGE_AGENT,
+  WITNESS_PREFIX,
   stateOf,
   type CommandResult,
   type EvalHost,
@@ -14,19 +18,25 @@ import {
   type ServerAuth,
   type SessionState,
 } from "./host";
-import { v2SuccessorInspection, WITNESS_PREFIX } from "./inspect";
+import { v2SuccessorInspection } from "./inspect";
+import { WITNESS } from "./wrapper/core";
 
 const CONTROL_MS = 30_000;
-const JUDGE_AGENT = "arkive-eval-judge";
 const DENY_ALL = [{ action: "*", resource: "*", effect: "deny" as const }];
 
 type Rec = Record<string, unknown>;
 const json = (value: unknown) => JSON.parse(JSON.stringify(value ?? null));
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const tag = (error: unknown) =>
   typeof error === "object" && error !== null
     ? (error as Rec)["_tag"]
     : undefined;
+// What OpenCode 2.0.28 answers on a route that waits for the location's
+// plugins (`awaitPlugins`, server/src/location.ts) when they have not
+// settled within its own 5 s wait: HTTP 503 with this tagged error, which
+// the public client throws with its `_tag` and `service`.
+const pluginsActivating = (error: unknown) =>
+  tag(error) === "ServiceUnavailableError"
+  && (error as Rec)["service"] === "plugin";
 
 const sortedEntries = (entries: Rec[]) =>
   json(
@@ -72,7 +82,7 @@ export function createdState(created: Rec): ExpectedState {
   return { headerSha256, historySha256 };
 }
 
-// `host` lets tests supply an in-memory host.
+// `host` lets tests supply an in-memory host, and `now` a monotonic clock.
 export function v2Host(
   url: string,
   auth: ServerAuth,
@@ -82,9 +92,39 @@ export function v2Host(
     headers: authHeaders(auth),
     fetch: fetchImpl as typeof fetch,
   }),
+  now: () => number = () => performance.now(),
 ): EvalHost {
   const within = (ms = CONTROL_MS) => ({ signal: AbortSignal.timeout(ms) });
   const location = (directory: string) => ({ location: { directory } });
+  // Returns once the location's plugin activation has settled: the state
+  // `session.command` waits for before it runs a command. OpenCode 2.0.28
+  // activates a location's plugins in the background on its first use,
+  // first those available locally, then packages it must install, and
+  // settles after both, failures included (core/plugin/supervisor.ts). The
+  // read-only `model.default` route waits for that settlement for up to 5 s
+  // and then answers that the plugins are still activating; only that answer
+  // is asked again, within one CONTROL_MS budget. Settlement is a fresh
+  // fact, not a lock: a later config or package change can start another
+  // activation.
+  const settle = async (directory: string) => {
+    const deadline = now() + CONTROL_MS;
+    for (
+      let remaining = CONTROL_MS;
+      remaining > 0;
+      remaining = deadline - now()
+    ) {
+      const signal = AbortSignal.timeout(Math.ceil(remaining));
+      try {
+        await host.model.default(location(directory), { signal });
+        return;
+      } catch (error) {
+        if (!signal.aborted && !pluginsActivating(error)) throw error;
+      }
+    }
+    throw new EvalError(
+      `OpenCode did not finish activating the plugins at ${directory} within ${CONTROL_MS / 1000} s; nothing there was read.`,
+    );
+  };
   const exportOf = async (sessionID: string) =>
     (await host.session.export(
       { sessionID, sanitize: false },
@@ -113,7 +153,7 @@ export function v2Host(
       instructions,
     };
   };
-  const resolvedAgent = async (directory: string, agentID: string) => {
+  const agentModel = async (directory: string, agentID: string) => {
     const model = (
       (await host.agent.get({ agentID, ...location(directory) }, within()))
         .data as unknown as Rec
@@ -177,7 +217,7 @@ export function v2Host(
           $schema: "https://opencode.ai/config.json",
           plugins: ["-arkive-compact", pluginEntry],
           agents: {
-            "magic-compact-summarizer": { model: summarizer.selector },
+            [MAGIC_COMPACT_SUMMARIZER_AGENT]: { model: summarizer.selector },
           },
           ...mcpConfig(mcp),
         },
@@ -204,18 +244,12 @@ export function v2Host(
     },
 
     async setup(directory) {
-      // Plugin activation can finish after the first read; read until two
-      // consecutive reads agree.
-      let last = "";
-      let plugins: Rec[] = [];
-      for (let attempt = 0; attempt < 40; attempt++) {
-        plugins = (await host.plugin.list(location(directory), within()))
-          .data as unknown as Rec[];
-        const current = JSON.stringify(plugins);
-        if (current === last) break;
-        last = current;
-        await sleep(750);
-      }
+      // The plugin, command, agent, config and MCP routes answer from the
+      // current inventory without waiting, so each is read once, after
+      // settlement.
+      await settle(directory);
+      const plugins = (await host.plugin.list(location(directory), within()))
+        .data as unknown as Rec[];
       const commands = (await host.command.list(location(directory), within()))
         .data as unknown as Rec[];
       const agents = (await host.agent.list(location(directory), within()))
@@ -235,17 +269,18 @@ export function v2Host(
       const disabled = servers
         .filter(server => server.status.status === "disabled")
         .map(server => server.name);
-      const witnessText = commands.find(
-        c => c["name"] === "arkive-eval-witness",
-      )?.["description"];
+      const witnessText = commands.find(c => c["name"] === WITNESS)?.[
+        "description"
+      ];
       const summarizer = agents.find(
-        agent => (agent["name"] ?? agent["id"]) === "magic-compact-summarizer",
+        agent =>
+          (agent["name"] ?? agent["id"]) === MAGIC_COMPACT_SUMMARIZER_AGENT,
       );
       const model = summarizer?.["model"] as Rec | undefined;
       // The located agent read is what the subject itself reads.
-      const subjectSummarizer = await resolvedAgent(
+      const subjectSummarizer = await agentModel(
         directory,
-        "magic-compact-summarizer",
+        MAGIC_COMPACT_SUMMARIZER_AGENT,
       ).catch(() => ({ model: null, variant: null }));
       return {
         setup: {
@@ -256,7 +291,11 @@ export function v2Host(
             )
             .map(plugin => {
               const source = (plugin["source"] ?? {}) as Rec;
-              return `${plugin["id"]}@${source["type"]}:${source["path"] ?? source["target"]}${plugin["error"] ? " (error)" : ""}`;
+              const failed =
+                (plugin["state"] as Rec | undefined)?.["status"] === "failed";
+              // A package whose install failed is listed without an ID.
+              const id = plugin["id"] === undefined ? "" : `${plugin["id"]}@`;
+              return `${id}${source["type"]}:${source["path"] ?? source["target"]}${failed ? " (error)" : ""}`;
             }),
           instructionFingerprints: entries.flatMap(entry =>
             (entry.info?.instructions ?? []).map(path => sha256(String(path))),
@@ -278,9 +317,13 @@ export function v2Host(
       };
     },
 
-    resolvedAgent,
+    async resolvedAgent(directory, agentID) {
+      await settle(directory);
+      return agentModel(directory, agentID);
+    },
 
     async describeModel(directory, model) {
+      await settle(directory);
       const models = (await host.model.list(location(directory), within()))
         .data as unknown as Rec[];
       const found = models.find(

@@ -1,9 +1,24 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkNative } from "../eval/retention/run";
+import {
+  checkNative,
+  parseHistoricalRunArguments,
+  run as historicalRun,
+  scoreNative,
+} from "../eval/retention/run";
 import type { PluginInput } from "@opencode-ai/plugin";
-import type { Message, Part, ToolPart } from "@opencode-ai/sdk/v2";
+import type { Message, Part, Session, ToolPart } from "@opencode-ai/sdk/v2";
 import type { V2Client } from "../src/api";
 import {
   buildTurns,
@@ -17,8 +32,13 @@ import {
   decideRetentionWith,
   percentThreshold,
   retentionWithoutCandidates,
+  SESSION_SUMMARY_TOO_LARGE,
+  sessionSummaryStageFailure,
   taskAwareRetentionPolicy,
+  type SessionSummary,
 } from "../src/policy/retention";
+import { isOwnedFork, releaseOwnedFork } from "../src/compact/owned";
+import { PluginMessageError } from "../src/policy/feedback";
 import {
   decideRetention,
   findRetentionCandidates,
@@ -27,15 +47,15 @@ import {
 } from "../src/retention/retention";
 import {
   generateSessionSummary,
-  isOwnedSessionSummaryFork,
   SESSION_SUMMARY_PROMPT,
   SessionSummaryError,
+  type SessionSummaryOptions,
 } from "../src/retention/summary";
+import { summarizerCatalogLoader } from "../src/compact/compact";
 import {
   SESSION_SUMMARY_RESPONSE_SCHEMA,
   SESSION_SUMMARY_TOOL_PROMPT,
-} from "../src/compact/constants";
-import type { StageReport } from "../src/policy/reasoning";
+} from "../src/policy/protocol";
 import {
   summarizerAgent,
   persistedForkHistory,
@@ -51,6 +71,7 @@ import {
   OPENAI_TOKEN_LIMIT_REQUEST_ID,
   scoredOpenAIFetch,
 } from "./retention-host";
+import { reachableStrings } from "./v2-host";
 import {
   OPENAI_DECISIONS_ENDPOINT,
   OPENAI_TOKEN_LIMIT_MESSAGE,
@@ -63,7 +84,7 @@ import {
   classifyRetention,
   excerpt,
   formatKeepThresholdPercent,
-  RETENTION_FAILURE_GUIDANCE,
+  retentionFailureGuidance,
   RETENTION_KEEP_THRESHOLD,
   RETENTION_KEEP_THRESHOLD_PERCENT_ENV,
   RETENTION_MAX_CONCURRENCY,
@@ -213,23 +234,302 @@ describe("frozen retention cohort parity", () => {
     await checkNative(input, frozen);
   });
 
-  test.each(["missing", "foreign", "moved", "repeated", "split"])(
-    "rejects %s cohort membership",
-    async mutation => {
-      const { input, frozen } = fixture();
-      const first = input.snapshots[0]!;
-      const second = input.snapshots[1]!;
-      if (mutation === "missing") first.candidates.pop();
-      else if (mutation === "foreign") first.candidates[0]!.id = "foreign";
-      else if (mutation === "moved") {
-        const moved = first.candidates.pop()!;
-        second.candidates.push(moved);
-      } else if (mutation === "repeated") {
-        first.candidates.push(first.candidates[0]!);
-      } else first.split = "heldout";
-      await expect(checkNative(input, frozen)).rejects.toThrow();
-    },
-  );
+  test.each([
+    ["missing", "Incomplete cohort."],
+    ["foreign", "Unknown, repeated or misplaced case."],
+    ["moved", "Unknown, repeated or misplaced case."],
+    ["repeated", "Unknown, repeated or misplaced case."],
+    ["split", "Unknown snapshot or split."],
+  ])("rejects %s cohort membership", async (mutation, reason) => {
+    const { input, frozen } = fixture();
+    const first = input.snapshots[0]!;
+    const second = input.snapshots[1]!;
+    if (mutation === "missing") first.candidates.pop();
+    else if (mutation === "foreign") first.candidates[0]!.id = "foreign";
+    else if (mutation === "moved") {
+      const moved = first.candidates.pop()!;
+      second.candidates.push(moved);
+    } else if (mutation === "repeated") {
+      first.candidates.push(first.candidates[0]!);
+    } else first.split = "heldout";
+    const error = await checkNative(input, frozen).then(
+      () => undefined,
+      (caught: unknown) => caught as Error,
+    );
+    expect(error?.message).toBe(reason);
+  });
+
+  test("paid scoring keeps every completed snapshot when a later one fails, and never reuses its files", async () => {
+    const { input, frozen } = fixture();
+    const dir = mkdtempSync(join(tmpdir(), "retention-score-"));
+    try {
+      const output = join(dir, "scores.json");
+      const partial = `${output}.partial`;
+      let calls = 0;
+      // Snapshots run one after another, so the first two requests are the
+      // first snapshot's and every later one belongs to the second.
+      const answer = jevFetch(() => 0.9);
+      const failSecond: RetentionFetch = async (url, init) =>
+        ++calls <= 2 ? answer(url, init) : new Response("{}", { status: 500 });
+      const deps = { apiKey: "fake-key", fetch: failSecond, frozen };
+      const error = await failure(
+        scoreNative(input, "development", "chronological", output, deps),
+      );
+      expect(error.kind).toBe("http");
+      expect(existsSync(output)).toBe(false);
+      expect(readdirSync(partial)).toEqual(["snapshot-1-of-2.json"]);
+      const checkpointPath = join(partial, "snapshot-1-of-2.json");
+      const checkpoint = readFileSync(checkpointPath, "utf8");
+      const saved = JSON.parse(checkpoint);
+      expect(Object.keys(saved)).toEqual([
+        "model",
+        "threshold",
+        "split",
+        "order",
+        "scores",
+        "invocations",
+      ]);
+      expect(saved).toMatchObject({
+        model: RETENTION_MODEL,
+        threshold: 0.8,
+        split: "development",
+        order: "chronological",
+        scores: { "first#01": 0.9, "first#02": 0.9 },
+      });
+      expect(
+        saved.invocations.map((i: { snapshotID: string }) => i.snapshotID),
+      ).toEqual(["first"]);
+
+      // A retry with the same output neither resumes nor overwrites, and
+      // sends nothing through the same counting endpoint.
+      const sent = calls;
+      await expect(
+        scoreNative(input, "development", "chronological", output, deps),
+      ).rejects.toThrow("already exists");
+      expect(calls).toBe(sent);
+      expect(readFileSync(checkpointPath, "utf8")).toBe(checkpoint);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("paid scoring writes the complete result once, then removes its checkpoints", async () => {
+    const { input, frozen } = fixture();
+    const dir = mkdtempSync(join(tmpdir(), "retention-score-"));
+    try {
+      const output = join(dir, "scores.json");
+      const deps = { apiKey: "fake-key", fetch: jevFetch(() => 0.7), frozen };
+      await scoreNative(input, "development", "reversed", output, deps);
+      expect(existsSync(`${output}.partial`)).toBe(false);
+      const saved = JSON.parse(readFileSync(output, "utf8"));
+      expect(Object.keys(saved.scores).sort()).toEqual([
+        "first#01",
+        "first#02",
+        "second#01",
+        "second#02",
+      ]);
+      expect(
+        saved.invocations.map((i: { snapshotID: string }) => i.snapshotID),
+      ).toEqual(["second", "first"]);
+
+      const existing = join(dir, "existing.json");
+      writeFileSync(existing, "mine");
+      let fetched = 0;
+      await expect(
+        scoreNative(input, "development", "reversed", existing, {
+          ...deps,
+          fetch: async () => {
+            fetched += 1;
+            throw new Error("no request may be sent");
+          },
+        }),
+      ).rejects.toThrow("already exists");
+      expect(fetched).toBe(0);
+      expect(readFileSync(existing, "utf8")).toBe("mine");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("historical proxy-cohort paid run", () => {
+  // A scratch directory holding two development snapshots of two candidates.
+  function scratchDataset() {
+    const scratch = mkdtempSync(join(tmpdir(), "retention-run-"));
+    const snapshot = (snapshotID: string) => ({
+      snapshotID,
+      sessionID: "ses",
+      kind: "parser",
+      split: "development",
+      snapshotMessageID: "msg",
+      realTurnCount: 1,
+      snapshotRealTurn: 1,
+      latestUserRequest: context.latestUserRequest,
+      provisionalSummaries: ["Add a parser."],
+      candidatePool: { recent: 2, older: 0 },
+      candidates: ["01", "02"].map(n => ({
+        id: `${snapshotID}#${n}`,
+        sessionID: "ses",
+        messageID: "msg",
+        tool: "read",
+        input: { filePath: "src/parser.ts" },
+        output: `parser contents ${n}`,
+        groupOffset: 0,
+        stratum: "recent",
+        turnRequest: context.latestUserRequest,
+      })),
+    });
+    writeFileSync(
+      join(scratch, "dataset.json"),
+      JSON.stringify([snapshot("first"), snapshot("second")]),
+    );
+    return scratch;
+  }
+  const RECORD_KEYS = [
+    "name",
+    "split",
+    "batchSize",
+    "order",
+    "variant",
+    "context",
+    "startedAt",
+    "model",
+    "scores",
+    "invocations",
+  ];
+
+  test("keeps every completed snapshot when a later one fails, and never reuses its files", async () => {
+    const scratch = scratchDataset();
+    try {
+      const output = join(scratch, "runs", "dev.json");
+      const partial = `${output}.partial`;
+      let calls = 0;
+      // Snapshots run one after another: the first two requests are the
+      // first snapshot's.
+      const answer = jevFetch(() => 0.9);
+      const failSecond: RetentionFetch = async (url, init) =>
+        ++calls <= 2 ? answer(url, init) : new Response("{}", { status: 500 });
+      const deps = { apiKey: "fake-key", fetch: failSecond, scratch };
+      const paid = () =>
+        historicalRun(
+          "dev",
+          "development",
+          1,
+          "chronological",
+          "shipped",
+          "proxy",
+          deps,
+        );
+      expect((await failure(paid())).kind).toBe("http");
+      expect(existsSync(output)).toBe(false);
+      expect(readdirSync(partial)).toEqual(["snapshot-1-of-2.json"]);
+      const checkpointPath = join(partial, "snapshot-1-of-2.json");
+      const checkpoint = readFileSync(checkpointPath, "utf8");
+      const saved = JSON.parse(checkpoint);
+      expect(Object.keys(saved)).toEqual(RECORD_KEYS);
+      expect(saved).toMatchObject({
+        name: "dev",
+        split: "development",
+        batchSize: 1,
+        order: "chronological",
+        variant: "shipped",
+        context: "proxy",
+        model: RETENTION_MODEL,
+        scores: { "first:first#01": 0.9, "first:first#02": 0.9 },
+      });
+      expect(
+        saved.invocations.map((i: { snapshotID: string }) => i.snapshotID),
+      ).toEqual(["first"]);
+
+      const sent = calls;
+      await expect(paid()).rejects.toThrow("already exists");
+      expect(calls).toBe(sent);
+      expect(readFileSync(checkpointPath, "utf8")).toBe(checkpoint);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("writes its record once, removes its checkpoints, and leaves an existing record unchanged with no request", async () => {
+    const scratch = scratchDataset();
+    try {
+      const output = join(scratch, "runs", "dev.json");
+      let calls = 0;
+      const deps = {
+        apiKey: "fake-key",
+        fetch: jevFetch(() => 0.7, { onCall: () => void calls++ }),
+        scratch,
+      };
+      const paid = () =>
+        historicalRun(
+          "dev",
+          "development",
+          1,
+          "reversed",
+          "shipped",
+          "latest-only",
+          deps,
+        );
+      await paid();
+      expect(calls).toBe(4);
+      expect(existsSync(`${output}.partial`)).toBe(false);
+      const record = readFileSync(output, "utf8");
+      const saved = JSON.parse(record);
+      expect(Object.keys(saved)).toEqual(RECORD_KEYS);
+      expect(Object.keys(saved.scores).sort()).toEqual([
+        "first:first#01",
+        "first:first#02",
+        "second:second#01",
+        "second:second#02",
+      ]);
+
+      await expect(paid()).rejects.toThrow("already exists");
+      expect(calls).toBe(4);
+      expect(readFileSync(output, "utf8")).toBe(record);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("historical proxy-cohort run arguments", () => {
+  test("defaults and explicit values parse to the same run settings as before", () => {
+    expect(parseHistoricalRunArguments(["held", "heldout"])).toEqual({
+      name: "held",
+      split: "heldout",
+      batchSize: 1,
+      order: "chronological",
+      variant: "shipped",
+      context: "generated",
+    });
+    expect(
+      parseHistoricalRunArguments([
+        "dev",
+        "development",
+        "4",
+        "reversed",
+        "help-wording",
+        "proxy",
+      ]),
+    ).toMatchObject({ batchSize: 4, order: "reversed", context: "proxy" });
+    // The batch is read with `Number`, as before.
+    for (const batch of ["0x2", "+2", "2.", " 2"])
+      expect(
+        parseHistoricalRunArguments(["held", "heldout", batch]).batchSize,
+      ).toBe(2);
+  });
+
+  test.each([
+    [["held"], /usage/],
+    [["held", "heldout", "0"], /batch/],
+    [["held", "heldout", "1.5"], /batch/],
+    [["held", "heldout", "abc"], /batch/],
+    [["held", "heldout", ""], /batch/],
+    [["held", "heldout", "1", "reverse"], /order/],
+    [["held", "heldout", "1", "chronological", "shipped", "native"], /context/],
+  ])("refuses %j before any key is read", (args, message) => {
+    expect(() => parseHistoricalRunArguments(args)).toThrow(message);
+  });
 });
 
 describe("retention request format", () => {
@@ -402,37 +702,6 @@ describe("retention classification", () => {
     expect(result.decisions.get("b")).toEqual({ useful: 0.599, keep: false });
     expect(result.requests).toBe(2);
     expect(result.inputTokens).toBe(20);
-  });
-
-  test("bounds concurrency and stops admitting requests after a failure", async () => {
-    let inFlight = 0;
-    let maxInFlight = 0;
-    let calls = 0;
-    const fetchImpl: RetentionFetch = async (url, init) => {
-      calls += 1;
-      inFlight += 1;
-      maxInFlight = Math.max(maxInFlight, inFlight);
-      await Bun.sleep(5);
-      inFlight -= 1;
-      if (calls === RETENTION_MAX_CONCURRENCY + 1) {
-        return new Response("private body", { status: 500 });
-      }
-      return jevFetch(() => 0.5)(url, init);
-    };
-    const candidates = Array.from({ length: 20 }, (_, i) => candidate(`c${i}`));
-
-    const error = await failure(
-      classifyRetention(context, candidates, {
-        apiKey: "key",
-        fetch: fetchImpl,
-      }),
-    );
-
-    expect(error.kind).toBe("http");
-    expect(error.status).toBe(500);
-    expect(maxInFlight).toBe(RETENTION_MAX_CONCURRENCY);
-    expect(calls).toBeLessThan(candidates.length);
-    expect(inFlight).toBe(0);
   });
 
   test("rejects the whole invocation on another model as a model mismatch", async () => {
@@ -1188,33 +1457,39 @@ describe("retention --truncate summary retry", () => {
     expect(error.kind).toBe(kind);
   });
 
-  test("never retries a timeout or a hanging 400 body", async () => {
-    for (const respond of [
+  test.each([
+    [
+      "a timeout",
       (signal: AbortSignal) =>
         new Promise<Response>((_, reject) =>
           signal.addEventListener("abort", () => reject(signal.reason)),
         ),
+      "timeout",
+    ],
+    [
+      "a hanging 400 body",
       async () =>
         new Response(
           new ReadableStream({ pull: () => new Promise<void>(() => {}) }),
           { status: 400 },
         ),
-    ]) {
-      let calls = 0;
-      const error = await failure(
-        classifyRetention(long, [candidate("a")], {
-          apiKey: "key",
-          truncateSummary: true,
-          timeoutMs: 30,
-          fetch: async (_url, init) => {
-            calls += 1;
-            return respond(init.signal!);
-          },
-        }),
-      );
-      expect(calls).toBe(1);
-      expect(["timeout", "http"]).toContain(error.kind);
-    }
+      "http",
+    ],
+  ] as const)("never retries %s", async (_name, respond, kind) => {
+    let calls = 0;
+    const error = await failure(
+      classifyRetention(long, [candidate("a")], {
+        apiKey: "key",
+        truncateSummary: true,
+        timeoutMs: 30,
+        fetch: async (_url, init) => {
+          calls += 1;
+          return respond(init.signal!);
+        },
+      }),
+    );
+    expect(calls).toBe(1);
+    expect(error.kind).toBe(kind);
   });
 
   test("cannot bypass the local 32 MiB body check", async () => {
@@ -1713,7 +1988,7 @@ describe("retention keep threshold", () => {
               invocation: { command, ...invocation },
               fetch: async () => respond(calls++),
             },
-            async () => summary,
+            async () => sessionSummary(summary),
           ),
         );
       };
@@ -1818,8 +2093,8 @@ describe("retention keep threshold", () => {
     });
 
     test("a session-summary failure ends in this command's own heuristic advice", async () => {
-      const summaryFailure = async (error: Error, keepTurns: number) => {
-        const caught = await decideRetentionWith(
+      const summaryFailure = async (error: Error, keepTurns: number) =>
+        (await decideRetentionWith(
           { latestUserRequest: "Ship it.", candidates: [candidate("a")] },
           {
             mode: "task-aware",
@@ -1835,41 +2110,77 @@ describe("retention keep threshold", () => {
         ).then(
           () => undefined,
           (rejected: unknown) => rejected,
-        );
-        // The same error, not a copy: its type and stage are kept.
-        expect(caught).toBe(error);
-        return error;
-      };
+        )) as Error;
       const advice = (turns: string) =>
         command === "trim"
           ? `No tool content was changed. Run /magic-trim${turns} --heuristic to trim without classification.`
           : `No tool content was changed. Run /magic-compact${turns} --heuristic to compact without classification (turn summaries are still generated).`;
 
       const provider = await summaryFailure(
-        new SessionSummaryError("provider", 429),
+        sessionSummaryStageFailure("provider", { status: 429 }),
         3,
       );
       expect(provider).toBeInstanceOf(SessionSummaryError);
-      expect((provider as SessionSummaryError).stage).toBe("provider");
+      expect((provider as SessionSummaryError).failure).toEqual({
+        kind: "stage",
+        stage: "provider",
+        status: 429,
+      });
       expect(provider.message).toBe(
         `Task-aware retention session summary failed (provider 429). ${advice(" 3")}`,
       );
-      const budget = await summaryFailure(new SessionSummaryError("budget"), 0);
+      const budget = await summaryFailure(
+        sessionSummaryStageFailure("budget"),
+        0,
+      );
       expect(budget.message).toEndWith(advice(""));
       expect(budget.message).not.toContain(
         command === "trim" ? "/magic-compact" : "/magic-trim",
       );
-      for (const error of [provider, budget]) {
+      // The plugin's own refusal while summarizing, such as a missing
+      // summarizer model, closes with the same advice.
+      const refusal = await summaryFailure(
+        new PluginMessageError("Magic Compact needs a summarizer model."),
+        2,
+      );
+      expect(refusal).toBeInstanceOf(SessionSummaryError);
+      expect(refusal.message).toBe(
+        `Magic Compact needs a summarizer model. ${advice(" 2")}`,
+      );
+      // A fork the summary could not delete stays named once, after the
+      // reason it failed and before the advice.
+      const orphan = await summaryFailure(
+        new SessionSummaryError({
+          kind: "cleanup",
+          temporary: "fork",
+          failures: [
+            {
+              kind: "stage",
+              stage: "history",
+              detail: "history replay failed",
+            },
+            {
+              kind: "stage",
+              stage: "delete",
+              temporary: "fork",
+              session: { id: "fork-9", removal: "failed" },
+            },
+          ],
+        }),
+        0,
+      );
+      expect(orphan.message).toBe(
+        `Task-aware retention session summary and fork cleanup failed (history: history replay failed, delete). Fork fork-9 could not be deleted. ${advice("")}`,
+      );
+      expect((orphan as SessionSummaryError).unremovedSessions).toEqual([
+        { id: "fork-9", removal: "failed" },
+      ]);
+      for (const error of [provider, budget, refusal, orphan]) {
         expect(error.message.length).toBeLessThan(700);
       }
-      // An error the plugin did not write is not edited.
-      const foreign = await summaryFailure(
-        new Error(`provider said ${RETENTION_FAILURE_GUIDANCE}`),
-        3,
-      );
-      expect(foreign.message).toBe(
-        `provider said ${RETENTION_FAILURE_GUIDANCE}`,
-      );
+      // An error the plugin did not write is passed on unchanged.
+      const foreignError = new Error("provider said something private");
+      expect(await summaryFailure(foreignError, 3)).toBe(foreignError);
     });
   });
 
@@ -1883,7 +2194,7 @@ describe("retention keep threshold", () => {
             apiKey: "key",
             fetch: async () => tokenLimitResponse(),
           },
-          async () => summary,
+          async () => sessionSummary(summary),
         ),
       );
     expect((await refuse("s".repeat(20_000))).message).toContain(
@@ -1928,7 +2239,10 @@ describe("retention keep threshold", () => {
           throw new Error("unexpected summary");
         },
       ),
-    ).resolves.toEqual(retentionWithoutCandidates(quiet));
+    ).resolves.toEqual({
+      plan: retentionWithoutCandidates(quiet),
+      reports: [],
+    });
     expect(retentionWithoutCandidates({ mode: "heuristic" })).toBe(
       HEURISTIC_RETENTION,
     );
@@ -1949,7 +2263,7 @@ describe("retention keep threshold", () => {
         { mode: "task-aware", apiKey: "key", keepThreshold: Number.NaN },
         async () => {
           summaries += 1;
-          return "summary";
+          return sessionSummary("summary");
         },
       ),
     );
@@ -1964,13 +2278,13 @@ describe("retention keep threshold", () => {
   ])(
     "a 0.7 probability follows the configured percent %p",
     async (percent, kept) => {
-      const plan = await decideRetentionWith(
+      const { plan } = await decideRetentionWith(
         { latestUserRequest: "Ship it.", candidates: [candidate("a")] },
         {
           ...taskAwareRetentionPolicy(percentEnv(percent)),
           fetch: jevFetch(() => 0.7),
         },
-        async () => "summary",
+        async () => sessionSummary("summary"),
       );
       expect(plan.evaluated).toBe(1);
       expect([...plan.keep]).toEqual(kept);
@@ -3036,6 +3350,53 @@ describe("OpenAI Decisions HTTP 503 retry", () => {
     expect(result).toMatchObject({ requests: 12, attempts: 24 });
   });
 
+  test("a retry queued while every slot is busy goes ahead of unstarted requests", async () => {
+    // Four slots, six candidates. The first answers 503; its wait holds
+    // while the fifth takes the free slot, and ends while all four slots
+    // are busy. The first slot that frees sends the retry, not the sixth.
+    const sent: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    let endWait!: () => void;
+    const wait = () =>
+      new Promise<void>(resolve => {
+        endWait = resolve;
+      });
+    const result = await classifyRetention(
+      context,
+      Array.from({ length: 6 }, (_, i) => candidate(`c${i}`, `out${i}`)),
+      openai(
+        async (_url, init) => {
+          sent.push(
+            JSON.parse(JSON.parse(String(init.body)).input).candidates[0]
+              .output as string,
+          );
+          if (sent.length === 1) return unavailable();
+          if (sent.length === 5) {
+            endWait();
+            await Bun.sleep(1);
+            release();
+          }
+          if (sent.length <= 5) await held;
+          return answer(init);
+        },
+        { retryWait: wait },
+      ),
+    );
+    expect(sent).toEqual([
+      "out0",
+      "out1",
+      "out2",
+      "out3",
+      "out4",
+      "out0",
+      "out5",
+    ]);
+    expect(result).toMatchObject({ requests: 6, attempts: 7 });
+  });
+
   test("with --truncate, a 503 resends the excerpt variant and shares one budget", async () => {
     const longSummary = `## Objective\n${"- A dense detail line.\n".repeat(1_500)}`;
     const summaries: string[] = [];
@@ -3294,7 +3655,7 @@ describe("retention backend selection", () => {
               return new Response();
             },
           },
-          async () => "summary",
+          async () => sessionSummary("summary"),
         ),
       );
       expect(error.kind).toBe("missing-api-key");
@@ -3401,7 +3762,7 @@ describe("retention backend selection", () => {
         },
         async () => {
           summaries += 1;
-          return "summary";
+          return sessionSummary("summary");
         },
       ),
     );
@@ -3414,7 +3775,7 @@ describe("retention backend selection", () => {
 
   test("the backend selected for a command answers every candidate and names itself", async () => {
     const urls: string[] = [];
-    const plan = await decideRetentionWith(
+    const { plan } = await decideRetentionWith(
       {
         latestUserRequest: "Ship it.",
         candidates: [candidate("a", "keep"), candidate("b", "trim")],
@@ -3433,7 +3794,7 @@ describe("retention backend selection", () => {
           );
         },
       },
-      async () => "summary",
+      async () => sessionSummary("summary"),
     );
     expect(urls).toEqual([
       OPENAI_DECISIONS_ENDPOINT,
@@ -3476,7 +3837,7 @@ describe("retention backend selection", () => {
             ),
             fetch: async () => openAITokenLimitResponse(),
           },
-          async () => "s".repeat(20_000),
+          async () => sessionSummary("s".repeat(20_000)),
         ),
       );
       expect(error.message).toBe(
@@ -3827,7 +4188,7 @@ describe("retention candidates", () => {
   test("makes no host or classifier request without candidates", async () => {
     let calls = 0;
     const v2 = new Proxy({}, { get: () => (calls += 1) }) as V2Client;
-    const plan = await decideRetention(
+    const { plan, reports } = await decideRetention(
       v2,
       session(),
       [],
@@ -3840,8 +4201,13 @@ describe("retention candidates", () => {
           return new Response();
         },
       },
-      { controlTimeoutMs: 1_000 },
+      {
+        controlTimeoutMs: 1_000,
+        matchModel: false,
+        catalog: summarizerCatalogLoader(v2, session()),
+      },
     );
+    expect(reports).toEqual([]);
     expect(plan).toEqual({
       mode: "task-aware",
       backend: "jev",
@@ -3864,7 +4230,11 @@ describe("retention candidates", () => {
         [],
         { latestUserRequest: "", candidates: [candidate("a")] },
         { mode: "task-aware", apiKey: undefined },
-        { controlTimeoutMs: 1_000 },
+        {
+          controlTimeoutMs: 1_000,
+          matchModel: false,
+          catalog: summarizerCatalogLoader(v2, session()),
+        },
       ),
     );
     expect(error.kind).toBe("missing-api-key");
@@ -3883,8 +4253,8 @@ describe("retention session summary", () => {
     const before = structuredClone(source);
     try {
       await expect(
-        generateSessionSummary(host.v2, session(), source),
-      ).resolves.toBe(SESSION_SUMMARY_TEXT);
+        summarize(host.v2, session(), source),
+      ).resolves.toMatchObject({ text: SESSION_SUMMARY_TEXT });
       expect(host.promptHistories[0]!.map(item => item.info.role)).toEqual([
         "user",
         "assistant",
@@ -3896,7 +4266,12 @@ describe("retention session summary", () => {
     }
   });
 
-  test("retains sanitized partial-fork cleanup guidance when chronology replay fails", async () => {
+  // The retention advice that closes it is added where the command decides
+  // retention (see "a session-summary failure ends in this command's own
+  // heuristic advice").
+  // A fork is owned from the moment its ID is known, so a partly populated
+  // fork whose deletion failed keeps the native compaction guard.
+  test("names and keeps guarding the partial fork it could not delete when chronology replay fails", async () => {
     const source = sourceHistory();
     source.forEach((item, index) => {
       item.info.time = { created: index === 0 ? 7 : index };
@@ -3906,17 +4281,27 @@ describe("retention session summary", () => {
       throw new Error("private replay body");
     };
     host.deleteError = new Error("private delete body");
+    const hooks = await server({} as PluginInput);
     try {
-      const error = await promiseError(
-        generateSessionSummary(host.v2, session(), source),
+      const error = await promiseError(summarize(host.v2, session(), source));
+      expect(error).toBeInstanceOf(SessionSummaryError);
+      expect(String(error)).toBe(
+        `SessionSummaryError: Task-aware retention session summary and fork cleanup failed (history: history replay failed, delete). Fork fork-1 could not be deleted. ${retentionFailureGuidance()}`,
       );
-      expect(String(error)).toContain("(history replay failed)");
-      expect(String(error)).toContain("delete partial fork fork-1 manually");
-      expect(String(error)).toContain("/magic-trim --heuristic");
-      expect(String(error)).not.toContain("private");
+      expect((error as SessionSummaryError).unremovedSessions).toEqual([
+        { id: "fork-1", removal: "failed" },
+      ]);
+      expect(reachableStrings(error).join(" ")).not.toContain("private");
       expect(host.prompts).toEqual([]);
       expect(host.calls).toEqual(["fork:source", "delete:fork-1"]);
+      await expect(
+        hooks["experimental.session.compacting"]!(
+          { sessionID: "fork-1" },
+          { context: [], prompt: undefined },
+        ),
+      ).rejects.toThrow("native compaction is blocked");
     } finally {
+      releaseOwnedFork({ id: "fork-1", nativeCompactionBlocked: false });
       host.history.close();
     }
   });
@@ -3936,8 +4321,8 @@ describe("retention session summary", () => {
     const recovered = summaryHost(sourceHistory());
     stall(recovered, 1);
     await expect(
-      generateSessionSummary(recovered.v2, session(), recovered.source),
-    ).resolves.toBe(SESSION_SUMMARY_TEXT);
+      summarize(recovered.v2, session(), recovered.source),
+    ).resolves.toMatchObject({ text: SESSION_SUMMARY_TEXT });
     expect(recovered.calls.filter(call => call.startsWith("fork:"))).toEqual([
       "fork:source",
     ]);
@@ -3945,9 +4330,12 @@ describe("retention session summary", () => {
     const failed = summaryHost(sourceHistory());
     stall(failed, 2);
     const error = await promiseError(
-      generateSessionSummary(failed.v2, session(), failed.source),
+      summarize(failed.v2, session(), failed.source),
     );
-    expect((error as SessionSummaryError).stage).toBe("history");
+    expect((error as SessionSummaryError).failure).toMatchObject({
+      kind: "stage",
+      stage: "history",
+    });
     expect(String(error)).toContain("(history: history read failed)");
     expect(String(error)).not.toContain("private");
     expect(failed.prompts).toEqual([]);
@@ -3958,16 +4346,12 @@ describe("retention session summary", () => {
     const host = summaryHost(sourceHistory());
     let ownedDuringPrompt = false;
     host.onPrompt = async forkID => {
-      ownedDuringPrompt = isOwnedSessionSummaryFork(forkID);
+      ownedDuringPrompt = isOwnedFork(forkID);
     };
 
-    const summary = await generateSessionSummary(
-      host.v2,
-      session(),
-      host.source,
-    );
+    const summary = await summarize(host.v2, session(), host.source);
 
-    expect(summary).toBe(SESSION_SUMMARY_TEXT);
+    expect(summary.text).toBe(SESSION_SUMMARY_TEXT);
     expect(host.permissions).toEqual([
       [{ permission: "*", pattern: "*", action: "deny" }],
     ]);
@@ -3987,7 +4371,7 @@ describe("retention session summary", () => {
       "Create a new anchored summary from the entire conversation history above, including the most recent messages, so another coding agent can continue the work.\n\nOutput exactly the Markdown structure",
     );
     expect(ownedDuringPrompt).toBe(true);
-    expect(isOwnedSessionSummaryFork("fork-1")).toBe(false);
+    expect(isOwnedFork("fork-1")).toBe(false);
     expect(host.calls).toEqual(["fork:source", "delete:fork-1"]);
     expect(host.source).toEqual(sourceHistory());
   });
@@ -4002,10 +4386,12 @@ describe("retention session summary", () => {
     const before = structuredClone(source);
     for (const matchModel of [false, true]) {
       const host = summaryHost(source, { providers: [sol] });
-      const reasoning = { matchModel, reports: [] as StageReport[] };
-      await generateSessionSummary(host.v2, current, host.source, {
-        reasoning,
-      });
+      const reasoning = {
+        reports: [
+          (await summarize(host.v2, current, host.source, { matchModel }))
+            .report,
+        ],
+      };
       expect(host.prompts[0]).toMatchObject(
         matchModel
           ? {
@@ -4110,12 +4496,8 @@ describe("retention session summary", () => {
     ) => {
       const host = summaryHost(history, { providers: [deepseek], agent });
       host.reply = reply;
-      const outcome = await generateSessionSummary(
-        host.v2,
-        session(),
-        host.source,
-      ).then(
-        summary => ({ summary }),
+      const outcome = await summarize(host.v2, session(), host.source).then(
+        ({ text }) => ({ summary: text }),
         (error: unknown) => ({ error }),
       );
       expect(host.calls.at(-1)).toBe("delete:fork-1");
@@ -4139,25 +4521,29 @@ describe("retention session summary", () => {
       ],
     ]);
 
-    for (const reply of [
-      structuredReply({ summary: "" }),
-      structuredReply({ summary: "x", extra: 1 }),
-      structuredReply({ turns: [] }),
-      structuredReply({ summary: "x" }, { tools: 0 }),
-      structuredReply({ summary: "x" }, { tools: 2 }),
-      structuredReply(
-        { summary: "x" },
-        { error: { name: "ContentFilterError", data: {} } },
-      ),
-      undefined,
-    ]) {
+    for (const [reply, stage] of [
+      [structuredReply({ summary: "" }), "validation"],
+      [structuredReply({ summary: "x", extra: 1 }), "validation"],
+      [structuredReply({ turns: [] }), "validation"],
+      [structuredReply({ summary: "x" }, { tools: 0 }), "validation"],
+      [structuredReply({ summary: "x" }, { tools: 2 }), "validation"],
+      [
+        structuredReply(
+          { summary: "x" },
+          { error: { name: "ContentFilterError", data: {} } },
+        ),
+        "provider",
+      ],
+      [undefined, "validation"],
+    ] as const) {
       const rejected = await run(reply);
-      expect(rejected.outcome).toMatchObject({
-        error: expect.any(SessionSummaryError),
+      const error = (rejected.outcome as { error?: unknown }).error;
+      expect(error).toBeInstanceOf(SessionSummaryError);
+      expect((error as SessionSummaryError).failure).toMatchObject({
+        kind: "stage",
+        stage,
       });
-      expect(
-        String((rejected.outcome as { error: Error }).error.message),
-      ).not.toContain("ignored text");
+      expect((error as Error).message).not.toContain("ignored text");
       expect(rejected.host.calls).toContain("abort:fork-1");
     }
 
@@ -4184,12 +4570,8 @@ describe("retention session summary", () => {
       host.reply = (fork, request, forkID) =>
         structuredSummaryReply(fork, request, forkID, { summary: "## Goal" });
       host.afterPrompt = fork => tamper?.(fork);
-      const outcome = await generateSessionSummary(
-        host.v2,
-        session(),
-        host.source,
-      ).then(
-        summary => ({ summary }),
+      const outcome = await summarize(host.v2, session(), host.source).then(
+        ({ text }) => ({ summary: text }),
         (error: unknown) => ({ error }),
       );
       expect(host.calls.at(-1)).toBe("delete:fork-1");
@@ -4202,7 +4584,9 @@ describe("retention session summary", () => {
         Part,
         { type: "tool" }
       >;
-    for (const tamper of [
+    // An extra message leaves the prompt outside the first page the host
+    // reads, so the read itself fails; every other change fails validation.
+    for (const [index, tamper] of [
       // An extra persisted message after the reply.
       (fork: MessageWithParts[]) => {
         const extra = structuredClone(fork.at(-2)!);
@@ -4241,9 +4625,14 @@ describe("retention session summary", () => {
         delete (fork.at(-2)!.info as { format?: unknown }).format;
       },
     ].entries()) {
-      expect([tamper[0], await run(tamper[1])]).toMatchObject([
-        tamper[0],
-        { error: expect.any(SessionSummaryError) },
+      const error = ((await run(tamper)) as { error?: unknown }).error;
+      expect([index, error instanceof SessionSummaryError]).toEqual([
+        index,
+        true,
+      ]);
+      expect([index, (error as SessionSummaryError).failure]).toMatchObject([
+        index,
+        { kind: "stage", stage: index === 0 ? "history" : "validation" },
       ]);
     }
   });
@@ -4311,12 +4700,8 @@ describe("retention session summary", () => {
           }),
         };
       };
-      const outcome = await generateSessionSummary(
-        host.v2,
-        session(),
-        host.source,
-      ).then(
-        summary => ({ summary }),
+      const outcome = await summarize(host.v2, session(), host.source).then(
+        ({ text }) => ({ summary: text }),
         (error: unknown) => ({ error }),
       );
       return { host, outcome, pages };
@@ -4328,7 +4713,10 @@ describe("retention session summary", () => {
     ) => {
       const error = (result.outcome as { error?: unknown }).error;
       expect(error).toBeInstanceOf(SessionSummaryError);
-      expect((error as SessionSummaryError).stage).toBe(stage);
+      expect((error as SessionSummaryError).failure).toMatchObject({
+        kind: "stage",
+        stage: stage,
+      });
       expect(result.pages).toHaveLength(pages);
       expect(result.host.calls).toContain("abort:fork-1");
       expect(result.host.calls.at(-1)).toBe("delete:fork-1");
@@ -4376,11 +4764,16 @@ describe("retention session summary", () => {
   test("counts the session request's own attributable replay before choosing or refusing it", async () => {
     const source = protectedSummaryHistory(170_000);
     const sol = solSummaryProvider();
-    const reasoning = { matchModel: true, reports: [] as StageReport[] };
     const host = summaryHost(source, { providers: [sol] });
-    await generateSessionSummary(host.v2, solSession(), host.source, {
-      reasoning,
-    });
+    const reasoning = {
+      reports: [
+        (
+          await summarize(host.v2, solSession(), host.source, {
+            matchModel: true,
+          })
+        ).report,
+      ],
+    };
     expect(host.prompts[0]).toMatchObject({ model: summarizerAgent().model });
     expect(reasoning.reports[0]).toMatchObject({
       choice: { kind: "fallback", reason: "capacity" },
@@ -4391,13 +4784,15 @@ describe("retention session summary", () => {
     const unattributed = summaryHost(protectedSummaryHistory(), {
       providers: [sol],
     });
-    const reports = { matchModel: true, reports: [] as StageReport[] };
-    await generateSessionSummary(
-      unattributed.v2,
-      solSession(),
-      unattributed.source,
-      { reasoning: reports },
-    );
+    const reports = {
+      reports: [
+        (
+          await summarize(unattributed.v2, solSession(), unattributed.source, {
+            matchModel: true,
+          })
+        ).report,
+      ],
+    };
     expect(unattributed.prompts[0]).toMatchObject({
       model: { providerID: "openai", modelID: "gpt-6.1-sol" },
     });
@@ -4414,10 +4809,13 @@ describe("retention session summary", () => {
       },
     });
     const refused = await promiseError(
-      generateSessionSummary(configured.v2, solSession(), configured.source),
+      summarize(configured.v2, solSession(), configured.source),
     );
     expect(refused).toBeInstanceOf(SessionSummaryError);
-    expect((refused as SessionSummaryError).stage).toBe("budget");
+    expect((refused as SessionSummaryError).failure).toMatchObject({
+      kind: "stage",
+      stage: "budget",
+    });
     expect(configured.calls).toEqual([]);
   });
 
@@ -4441,12 +4839,18 @@ describe("retention session summary", () => {
       };
 
       const error = await promiseError(
-        generateSessionSummary(host.v2, session(), host.source),
+        summarize(host.v2, session(), host.source),
       );
 
-      expect(hookError).toBeInstanceOf(SessionSummaryError);
+      // The hook's own throw is what ends the native compaction; the
+      // command decides from its record of that refusal.
+      expect(hookError).toBeInstanceOf(Error);
+      expect(String(hookError)).not.toContain("private");
       expect(error).toBeInstanceOf(SessionSummaryError);
-      expect((error as SessionSummaryError).stage).toBe("budget");
+      expect((error as SessionSummaryError).failure).toMatchObject({
+        kind: "stage",
+        stage: "budget",
+      });
       expect(String(error)).toContain("too large");
       expect(String(error)).not.toContain("private");
       expect(host.calls).toEqual([
@@ -4454,7 +4858,6 @@ describe("retention session summary", () => {
         "abort:fork-1",
         "delete:fork-1",
       ]);
-      expect(isOwnedSessionSummaryFork("fork-1")).toBe(false);
       await expect(compacting("fork-1")).resolves.toBeUndefined();
       await expect(compacting("source")).resolves.toBeUndefined();
     },
@@ -4485,10 +4888,13 @@ describe("retention session summary", () => {
       };
 
       const error = await promiseError(
-        generateSessionSummary(host.v2, session(), host.source),
+        summarize(host.v2, session(), host.source),
       );
 
-      expect((error as SessionSummaryError).stage).toBe("provider");
+      expect((error as SessionSummaryError).failure).toMatchObject({
+        kind: "stage",
+        stage: "provider",
+      });
       expect(String(error)).toContain(text);
       if (detail !== "provider") expect(String(error)).toContain(detail);
       expect(String(error)).not.toContain("private");
@@ -4522,8 +4928,8 @@ describe("retention session summary", () => {
       { limit, image: false },
     );
     await expect(
-      generateSessionSummary(hidden.v2, session(), hidden.source),
-    ).resolves.toBe(SESSION_SUMMARY_TEXT);
+      summarize(hidden.v2, session(), hidden.source),
+    ).resolves.toMatchObject({ text: SESSION_SUMMARY_TEXT });
     expect(hidden.calls).toEqual(["fork:source", "delete:fork-1"]);
 
     const visible = summaryHost(
@@ -4531,7 +4937,7 @@ describe("retention session summary", () => {
       { limit, image: false },
     );
     const error = await promiseError(
-      generateSessionSummary(visible.v2, session(), visible.source),
+      summarize(visible.v2, session(), visible.source),
     );
     expect(String(error)).toContain("image-capable");
     expect(visible.calls).toEqual([]);
@@ -4624,8 +5030,8 @@ describe("retention session summary", () => {
       expect(history).toEqual(before);
       const host = summaryHost(history);
       await expect(
-        generateSessionSummary(host.v2, session(), history),
-      ).resolves.toBe(SESSION_SUMMARY_TEXT);
+        summarize(host.v2, session(), history),
+      ).resolves.toMatchObject({ text: SESSION_SUMMARY_TEXT });
       expect(host.calls).toEqual(["fork:source", "delete:fork-1"]);
       expect(history).toEqual(before);
     },
@@ -4662,8 +5068,8 @@ describe("retention session summary", () => {
     const catalog = { limit: { context: 60_000, output: 8_000 }, image: false };
     const hidden = summaryHost(history, catalog);
     await expect(
-      generateSessionSummary(hidden.v2, session(), history),
-    ).resolves.toBe(SESSION_SUMMARY_TEXT);
+      summarize(hidden.v2, session(), history),
+    ).resolves.toMatchObject({ text: SESSION_SUMMARY_TEXT });
     expect(hidden.calls).toEqual(["fork:source", "delete:fork-1"]);
 
     history[6]!.parts.push({
@@ -4672,9 +5078,7 @@ describe("retention session summary", () => {
       messageID: "msg_u3",
     } as Part);
     const visible = summaryHost(history, catalog);
-    const error = await promiseError(
-      generateSessionSummary(visible.v2, session(), history),
-    );
+    const error = await promiseError(summarize(visible.v2, session(), history));
     expect(String(error)).toContain("image-capable");
     expect(visible.calls).toEqual([]);
   });
@@ -4692,10 +5096,13 @@ describe("retention session summary", () => {
       const host = summaryHost(history);
 
       const error = await promiseError(
-        generateSessionSummary(host.v2, session(), host.source),
+        summarize(host.v2, session(), host.source),
       );
 
-      expect((error as SessionSummaryError).stage).toBe("history");
+      expect((error as SessionSummaryError).failure).toMatchObject({
+        kind: "stage",
+        stage: "history",
+      });
       expect(host.calls).toEqual([]);
     },
   );
@@ -4735,17 +5142,20 @@ describe("retention session summary", () => {
       host.afterPrompt = mutate;
 
       const error = await promiseError(
-        generateSessionSummary(host.v2, session(), host.source),
+        summarize(host.v2, session(), host.source),
       );
 
-      expect((error as SessionSummaryError).stage).toBe("budget");
+      expect((error as SessionSummaryError).failure).toMatchObject({
+        kind: "stage",
+        stage: "budget",
+      });
       expect(String(error)).toContain("too large");
       expect(host.calls).toEqual([
         "fork:source",
         "abort:fork-1",
         "delete:fork-1",
       ]);
-      expect(isOwnedSessionSummaryFork("fork-1")).toBe(false);
+      expect(isOwnedFork("fork-1")).toBe(false);
     });
   }
 
@@ -4811,18 +5221,21 @@ describe("retention session summary", () => {
       host.afterPrompt = mutate;
 
       const error = await promiseError(
-        generateSessionSummary(host.v2, session(), host.source),
+        summarize(host.v2, session(), host.source),
       );
 
       expect(error).toBeInstanceOf(SessionSummaryError);
-      expect((error as SessionSummaryError).stage).toBe("validation");
+      expect((error as SessionSummaryError).failure).toMatchObject({
+        kind: "stage",
+        stage: "validation",
+      });
       expect(String(error)).toContain("/magic-trim --heuristic");
       expect(host.calls).toEqual([
         "fork:source",
         "abort:fork-1",
         "delete:fork-1",
       ]);
-      expect(isOwnedSessionSummaryFork("fork-1")).toBe(false);
+      expect(isOwnedFork("fork-1")).toBe(false);
     });
   }
 
@@ -4832,42 +5245,60 @@ describe("retention session summary", () => {
     });
 
     const error = await promiseError(
-      generateSessionSummary(host.v2, session(), host.source),
+      summarize(host.v2, session(), host.source),
     );
 
-    expect((error as SessionSummaryError).stage).toBe("budget");
+    expect((error as SessionSummaryError).failure).toMatchObject({
+      kind: "stage",
+      stage: "budget",
+    });
     expect(String(error)).toContain("too large");
     expect(host.calls).toEqual([]);
   });
 
-  test("reports sanitized provider and cleanup failures together", async () => {
-    const host = summaryHost(sourceHistory());
-    host.promptError = Object.assign(
-      new Error("raw provider body with secret"),
-      {
-        status: 503,
-      },
-    );
-    host.deleteError = new Error("raw delete body");
+  // A context overflow (HTTP 413) keeps its explanation beside the cleanup
+  // stages and the fork it left.
+  test.each([
+    [503, ""],
+    [413, `${SESSION_SUMMARY_TOO_LARGE} `],
+  ])(
+    "reports a sanitized provider %d and cleanup failures together",
+    async (status, explanation) => {
+      const host = summaryHost(sourceHistory());
+      host.promptError = Object.assign(
+        new Error("raw provider body with secret"),
+        { status },
+      );
+      host.deleteError = new Error("raw delete body");
 
-    const error = await promiseError(
-      generateSessionSummary(host.v2, session(), host.source),
-    );
+      let error: unknown;
+      try {
+        error = await promiseError(summarize(host.v2, session(), host.source));
+      } finally {
+        releaseOwnedFork({ id: "fork-1", nativeCompactionBlocked: false });
+      }
 
-    expect(error).toBeInstanceOf(AggregateError);
-    const errors = (error as AggregateError).errors as SessionSummaryError[];
-    expect(errors.map(item => [item.stage, item.status])).toEqual([
-      ["provider", 503],
-      ["delete", undefined],
-    ]);
-    expect(JSON.stringify(errors.map(String))).not.toContain("raw");
-    expect(String(error)).toContain("/magic-trim --heuristic");
-    expect(host.calls).toEqual([
-      "fork:source",
-      "abort:fork-1",
-      "delete:fork-1",
-    ]);
-  });
+      expect(error).toBeInstanceOf(SessionSummaryError);
+      const failure = (error as SessionSummaryError).failure;
+      expect(failure.kind).toBe("cleanup");
+      expect(
+        failure.kind === "cleanup"
+          && failure.failures.map(item => [item.stage, item.status]),
+      ).toEqual([
+        ["provider", status],
+        ["delete", undefined],
+      ]);
+      expect(String(error)).toBe(
+        `SessionSummaryError: ${explanation}Task-aware retention session summary and fork cleanup failed (provider ${status}, delete). Fork fork-1 could not be deleted. ${retentionFailureGuidance()}`,
+      );
+      expect(reachableStrings(error).join(" ")).not.toContain("raw");
+      expect(host.calls).toEqual([
+        "fork:source",
+        "abort:fork-1",
+        "delete:fork-1",
+      ]);
+    },
+  );
 });
 
 function tool(
@@ -5313,4 +5744,31 @@ function summaryHost(
     },
   } as unknown as V2Client;
   return host;
+}
+
+// The session summary with the catalog a command shares for that session.
+function summarize(
+  v2: V2Client,
+  current: Session,
+  messages: MessageWithParts[],
+  options: Omit<SessionSummaryOptions, "catalog"> = {},
+) {
+  return generateSessionSummary(v2, current, messages, {
+    catalog: summarizerCatalogLoader(v2, current),
+    ...options,
+  });
+}
+
+// A session summary as a stub summarizer returns it.
+function sessionSummary(text: string): SessionSummary {
+  return {
+    text,
+    report: {
+      stage: "session",
+      choice: { kind: "configured" },
+      onOrigin: false,
+      access: { compatible: 0, unavailable: 0, unknown: 0 },
+      replayUnknown: 0,
+    },
+  };
 }

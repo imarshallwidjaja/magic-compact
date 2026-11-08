@@ -6,6 +6,7 @@
 // shared; `backends.ts` owns each backend's wire format, limits and exact
 // error recognition. See docs/RetentionEvaluation.md.
 import { PluginMessageError } from "../policy/feedback";
+import { isNonArrayRecord } from "../util";
 import {
   DEFAULT_RETENTION_BACKEND,
   RETENTION_BACKEND_ENV,
@@ -102,8 +103,9 @@ export type RetentionOptions = {
   // Only singleton requests (batchSize 1) support it.
   truncateSummary?: boolean;
   // Tests only: replaces the timer before an HTTP 503 retry. It must settle
-  // by `ms` or once `signal` aborts; the classifier aborts it when the
-  // invocation settles and never sends a retry after that.
+  // by `ms` or once `signal` aborts, and a rejection ends the wait as a
+  // resolution does; the classifier aborts it when the invocation settles and
+  // never sends a retry after that.
   retryWait?: (ms: number, signal: AbortSignal) => Promise<void>;
 };
 
@@ -244,8 +246,6 @@ export function retentionFailureGuidance(
     ? `No tool content was changed. Run ${command} --heuristic to compact without classification (turn summaries are still generated).`
     : `No tool content was changed. Run ${command} --heuristic to trim without classification.`;
 }
-
-export const RETENTION_FAILURE_GUIDANCE = retentionFailureGuidance();
 
 // The command a person ran, with its turn count when not 0 and
 // `--match-model` when they gave it.
@@ -624,18 +624,16 @@ export async function classifyRetention(
       : undefined;
   const fetchImpl = options.fetch ?? fetch;
   const run = await runAttempts(
-    requests.length,
+    requests,
     {
       limit: RETENTION_MAX_CONCURRENCY,
       truncate: summaryExcerpt !== undefined,
       unavailableRetries: backend.serviceUnavailableRetries,
       wait: options.retryWait ?? waitFor,
     },
-    (ordinal, summary, rejected) =>
+    ({ request, ordinal, summary }, rejected) =>
       sendRequest(
-        summary === "whole"
-          ? requests[ordinal]!
-          : withSummary(requests[ordinal]!, summaryExcerpt!),
+        summary === "whole" ? request : withSummary(request, summaryExcerpt!),
         { ordinal, summary },
         backend,
         options.apiKey,
@@ -657,18 +655,18 @@ export async function classifyRetention(
   let inputTokens = 0;
   let reportedUsageRequests = 0;
   let truncated = 0;
-  run.results.forEach(({ answers, summary }, index) => {
+  for (const { request, answers, summary } of run.results) {
     if (answers.inputTokens !== undefined) {
       inputTokens += answers.inputTokens;
       reportedUsageRequests += 1;
     }
-    const keys = requests[index]!.candidates;
+    const keys = request.candidates;
     if (summary === "excerpt") truncated += keys.length;
     for (const [key, id] of keys) {
       const useful = answers.probabilities.get(key)!;
       decisions.set(id, { useful, keep: useful >= keepThreshold });
     }
-  });
+  }
   return {
     decisions,
     requests: requests.length,
@@ -698,18 +696,51 @@ type SummaryVariant = "whole" | "excerpt";
 
 type AttemptRun =
   | {
-      results: Array<{ answers: RetentionAnswers; summary: SummaryVariant }>;
+      // Every request with its answers and the summary variant they used, in
+      // planned order.
+      results: Array<{
+        request: RetentionRequest;
+        answers: RetentionAnswers;
+        summary: SummaryVariant;
+      }>;
       attempts: number;
     }
   | { failure: unknown; counts: RetentionRequestCounts };
 
-// Runs `count` requests with at most `limit` HTTP attempts in flight. An
+// One planned request and its scheduling state. It is pending from its first
+// attempt until it is answered or fails; a pending request with no attempt in
+// flight awaits a retry.
+type PlannedRequest = {
+  readonly request: RetentionRequest;
+  readonly ordinal: number;
+  // The summary its next attempt carries, and the one its answers used.
+  summary: SummaryVariant;
+  // HTTP 503 retries spent, across both summary variants.
+  unavailableRetries: number;
+  outcome:
+    | { kind: "unstarted" }
+    | { kind: "pending" }
+    | { kind: "succeeded"; answers: RetentionAnswers }
+    | { kind: "failed" };
+};
+
+type Attempt = {
+  readonly summary: SummaryVariant;
+  // Its HTTP 400 holds admission while the body is classified.
+  pausing: boolean;
+  // The wait before its HTTP 503 retry, once one is allowed.
+  retryDelay: number | undefined;
+};
+
+// Runs every request with at most `limit` HTTP attempts in flight. An
 // attempt calls `rejected` as soon as a non-OK status arrives, before any
 // error body is read; its thrown error settles it.
 //
-// The first terminal failure stops admission for good. Attempts in flight
-// drain, and then that failure is returned in place of every result, so no
-// partial result is returned and a later failure never replaces it.
+// The first terminal failure stops admission for good. It is the first
+// attempt whose status is terminal when its headers arrive, or else the first
+// to settle with a failure, so a later failure never replaces it. Attempts in
+// flight drain, and then that failure is returned in place of every result,
+// so no partial result is returned.
 //
 // With `truncate`, a whole-summary attempt rejected with HTTP 400 is not yet
 // a failure: it pauses admission while its body is classified. A confirmed
@@ -724,10 +755,14 @@ type AttemptRun =
 // admission continues, and after `wait` the same request and summary variant
 // is queued ahead of unstarted requests. The budget belongs to the request,
 // so an excerpt retry spends what its whole-summary attempts left. A wait
-// still running when the invocation settles is aborted and its retry never
-// sent; that request counts as cancelled.
+// ends when it settles, whether it resolves or rejects. A wait still running
+// when the invocation settles is aborted and its retry never sent; that
+// request counts as cancelled.
+//
+// Retries are taken newest first, each ahead of every older retry and every
+// unstarted request.
 function runAttempts(
-  count: number,
+  planned: readonly RetentionRequest[],
   policy: {
     limit: number;
     truncate: boolean;
@@ -735,161 +770,174 @@ function runAttempts(
     wait: (ms: number, signal: AbortSignal) => Promise<void>;
   },
   send: (
-    ordinal: number,
-    summary: SummaryVariant,
+    attempt: {
+      request: RetentionRequest;
+      ordinal: number;
+      summary: SummaryVariant;
+    },
     rejected: (status: number, headers: Headers) => void,
   ) => Promise<RetentionAnswers>,
 ): Promise<AttemptRun> {
   const { limit, truncate, unavailableRetries, wait } = policy;
-  const queue = Array.from({ length: count }, (_, ordinal) => ({
+  const count = planned.length;
+  const requests: PlannedRequest[] = planned.map((request, ordinal) => ({
+    request,
     ordinal,
-    summary: "whole" as SummaryVariant,
+    summary: "whole",
+    unavailableRetries: 0,
+    outcome: { kind: "unstarted" },
   }));
-  const results: Array<{ answers: RetentionAnswers; summary: SummaryVariant }> =
-    new Array(count);
-  const outcomes = new Array<
-    "pending" | "succeeded" | "failed" | "cancelled" | undefined
-  >(count);
-  const errors = new Map<number, unknown>();
-  // HTTP 503 retries spent, by request.
-  const retried = new Array<number>(count).fill(0);
-  const waits = new AbortController();
-  let first: number | undefined;
-  let active = 0;
-  let paused = 0;
+  const retries: PlannedRequest[] = [];
+  let nextUnstarted = 0;
+  const inFlight = new Set<Attempt>();
+  // Requests whose HTTP 503 wait is running.
   let waiting = 0;
   let attempts = 0;
+  let halt: { attempt: Attempt; error?: unknown } | undefined;
+  const waits = new AbortController();
   let settled = false;
   return new Promise(resolve => {
     const finish = () => {
       if (settled) return;
       settled = true;
       waits.abort();
-      if (first === undefined) {
-        resolve({ results, attempts });
+      if (halt === undefined) {
+        const results = requests.flatMap(({ request, outcome, summary }) =>
+          outcome.kind === "succeeded"
+            ? [{ request, answers: outcome.answers, summary }]
+            : [],
+        );
+        if (results.length === count) {
+          resolve({ results, attempts });
+        } else {
+          failed(new Error("A retention request finished unanswered."));
+        }
         return;
       }
-      // Nothing is in flight, so a request still pending awaits a retry that
-      // will never be sent.
-      outcomes.forEach((outcome, ordinal) => {
-        if (outcome === "pending") outcomes[ordinal] = "cancelled";
-      });
-      const tally = (outcome: (typeof outcomes)[number]) =>
-        outcomes.filter(value => value === outcome).length;
-      const unstarted = count - outcomes.filter(Boolean).length;
-      resolve({
-        failure: errors.has(first)
-          ? errors.get(first)
+      failed(
+        "error" in halt
+          ? halt.error
           : new Error("A retention request halted admission without failing."),
-        counts: {
-          planned: count,
-          started: count - unstarted,
-          succeeded: tally("succeeded"),
-          failed: tally("failed"),
-          cancelled: tally("cancelled"),
-          unstarted,
-          attempts,
-        },
-      });
+      );
     };
+    const failed = (failure: unknown) => {
+      const counts: RetentionRequestCounts = {
+        planned: count,
+        started: 0,
+        succeeded: 0,
+        failed: 0,
+        cancelled: 0,
+        unstarted: 0,
+        attempts,
+      };
+      for (const { outcome } of requests) {
+        if (outcome.kind === "unstarted") counts.unstarted += 1;
+        // Nothing is in flight, so a pending request awaits a retry that
+        // will never be sent.
+        else if (outcome.kind === "pending") counts.cancelled += 1;
+        else counts[outcome.kind] += 1;
+      }
+      counts.started = count - counts.unstarted;
+      resolve({ failure, counts });
+    };
+    const paused = () => [...inFlight].some(attempt => attempt.pausing);
+    const next = () =>
+      retries.pop()
+      ?? (nextUnstarted < count ? requests[nextUnstarted++] : undefined);
     const pump = () => {
-      while (
-        first === undefined
-        && paused === 0
-        && active < limit
-        && queue.length > 0
-      ) {
-        start(queue.shift()!);
+      while (halt === undefined && !paused() && inFlight.size < limit) {
+        const request = next();
+        if (request === undefined) break;
+        start(request);
       }
       if (
-        active === 0
-        && (first !== undefined || (queue.length === 0 && waiting === 0))
+        inFlight.size === 0
+        && (halt !== undefined
+          || (retries.length === 0 && nextUnstarted === count && waiting === 0))
       ) {
         finish();
       }
     };
-    const retryAfter = (
-      item: { ordinal: number; summary: SummaryVariant },
-      ms: number,
-    ) => {
+    const retryAfter = (request: PlannedRequest, ms: number) => {
       waiting += 1;
       const resume = () => {
         waiting -= 1;
         // Admission is checked again before it is sent.
-        if (!settled && first === undefined) queue.unshift(item);
+        if (!settled && halt === undefined) retries.push(request);
         pump();
       };
       wait(ms, waits.signal).then(resume, resume);
     };
-    const start = ({
-      ordinal,
-      summary,
-    }: {
-      ordinal: number;
-      summary: SummaryVariant;
-    }) => {
-      const id = attempts++;
-      active += 1;
-      outcomes[ordinal] = "pending";
-      let pausing = false;
-      // The wait before this attempt's 503 retry, once one is allowed.
-      let unavailable: number | undefined;
+    const start = (request: PlannedRequest) => {
+      const attempt: Attempt = {
+        summary: request.summary,
+        pausing: false,
+        retryDelay: undefined,
+      };
+      attempts += 1;
+      inFlight.add(attempt);
+      request.outcome = { kind: "pending" };
       const rejected = (status: number, headers: Headers) => {
-        if (truncate && summary === "whole" && status === 400) {
-          pausing = true;
-          paused += 1;
+        if (truncate && attempt.summary === "whole" && status === 400) {
+          attempt.pausing = true;
           return;
         }
-        if (status === 503 && retried[ordinal]! < unavailableRetries) {
-          unavailable = unavailableRetryDelay(
+        if (status === 503 && request.unavailableRetries < unavailableRetries) {
+          attempt.retryDelay = unavailableRetryDelay(
             headers.get("retry-after"),
-            retried[ordinal]!,
+            request.unavailableRetries,
           );
-          if (unavailable !== undefined) return;
+          if (attempt.retryDelay !== undefined) return;
         }
-        first ??= id;
+        halt ??= { attempt };
       };
-      send(ordinal, summary, rejected)
+      send(
+        {
+          request: request.request,
+          ordinal: request.ordinal,
+          summary: attempt.summary,
+        },
+        rejected,
+      )
         .then(
           answers => {
-            results[ordinal] = { answers, summary };
-            outcomes[ordinal] = "succeeded";
+            request.outcome = { kind: "succeeded", answers };
           },
           (error: unknown) => {
-            const recoverable =
-              pausing
-              && error instanceof RetentionClassificationError
-              && error.kind === "token-limit";
-            if (recoverable) {
+            if (attempt.pausing && isFailureKind(error, "token-limit")) {
               // Admission is checked again before it is sent.
-              queue.unshift({ ordinal, summary: "excerpt" });
+              request.summary = "excerpt";
+              retries.push(request);
             } else if (
-              unavailable !== undefined
-              && error instanceof RetentionClassificationError
-              && error.kind === "http"
+              attempt.retryDelay !== undefined
+              && isFailureKind(error, "http")
               && error.status === 503
             ) {
-              retried[ordinal]! += 1;
+              request.unavailableRetries += 1;
               // After a terminal failure the request stays pending and
               // counts as cancelled.
-              if (first === undefined) {
-                retryAfter({ ordinal, summary }, unavailable);
-              }
+              if (halt === undefined) retryAfter(request, attempt.retryDelay);
             } else {
-              errors.set(id, error);
-              first ??= id;
-              outcomes[ordinal] = "failed";
+              request.outcome = { kind: "failed" };
+              halt ??= { attempt };
+              if (halt.attempt === attempt) halt.error = error;
             }
           },
         )
         .finally(() => {
-          if (pausing) paused -= 1;
-          active -= 1;
+          inFlight.delete(attempt);
           pump();
         });
     };
     pump();
   });
+}
+
+function isFailureKind(
+  error: unknown,
+  kind: RetentionFailureKind,
+): error is RetentionClassificationError {
+  return error instanceof RetentionClassificationError && error.kind === kind;
 }
 
 // The wait before the retry after `retried` earlier 503 retries of the same
@@ -1108,8 +1156,8 @@ async function sendRequest(
   const answers = backend.parse(payload, request);
   if (!answers.ok) throw fail(answers.reason);
   // Usage is informational: a missing or unusable count stays unknown.
-  const usage = isObject(payload) ? payload["usage"] : undefined;
-  const reported = isObject(usage) ? usage["input_tokens"] : undefined;
+  const usage = isNonArrayRecord(payload) ? payload["usage"] : undefined;
+  const reported = isNonArrayRecord(usage) ? usage["input_tokens"] : undefined;
   return {
     probabilities: answers.probabilities,
     inputTokens:
@@ -1189,8 +1237,4 @@ function httpStatus(status: number): number | undefined {
   return Number.isInteger(status) && status >= 100 && status <= 599
     ? status
     : undefined;
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

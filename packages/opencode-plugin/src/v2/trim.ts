@@ -1,16 +1,17 @@
-import { getCompactionCount } from "../compact/session";
+import { getCompactionCount } from "../policy/lineage";
 import {
   collectRetentionCandidates,
   decideRetentionWith,
   formatRetentionFeedback,
   HEURISTIC_RETENTION,
-  type RetentionPlan,
+  type RetentionDecision,
   type RetentionPolicy,
 } from "../policy/retention";
 import { withExclusiveSource } from "../policy/successor";
 import { trimmedTurnRange } from "../policy/turns";
 import { trimStatsMessage } from "../stats/constants";
 import { planOmission, type PlannedOmission } from "../storage/omission";
+import { assertStatsUsable } from "../storage/stats";
 import { CONTROL_OPERATION_TIMEOUT_MS } from "../util";
 import {
   trimV2Tool,
@@ -22,21 +23,18 @@ import {
 } from "./history";
 import type { V2Host } from "./host";
 import { countV2ModelFacingTokens } from "./media";
+import { generateV2SessionSummary, type OwnedSessions } from "./owned";
+import { resolveV2SummarizerModel } from "./summarizer";
 import {
-  generateV2SessionSummary,
-  resolveV2SummarizerModel,
-  type OwnedSessions,
-} from "./owned";
-import {
-  assertV2SourceUnchanged,
   createV2Successor,
   isInstructionNotice,
   readV2SourceAtRest,
+  v2StorageKey,
   type V2Message,
   type V2Successor,
 } from "./session";
 import { PluginMessageError } from "../policy/feedback";
-import { reasoningFeedback, type ReasoningReports } from "../policy/reasoning";
+import { reasoningFeedback } from "../policy/reasoning";
 
 const COMMAND = "Magic Trim";
 
@@ -76,45 +74,44 @@ export async function executeV2Trim(
         ),
       ),
     );
-    const reasoning: ReasoningReports = {
-      matchModel: options.matchModel === true,
+    const matchModel = options.matchModel === true;
+    let retention: RetentionDecision = {
+      plan: HEURISTIC_RETENTION,
       reports: [],
     };
-    let retention: RetentionPlan = HEURISTIC_RETENTION;
     if (options.retention.mode === "task-aware") {
       const policy = options.retention;
-      retention = await decideRetentionWith(
-        await collectRetentionCandidates(
-          v2RetentionTurns(source.messages),
-          eligible,
+      const found = await collectRetentionCandidates(
+        v2RetentionTurns(source.messages),
+        eligible,
+      );
+      // Candidates mean retention requests and a likely successor.
+      if (found.candidates.length > 0) {
+        await assertStatsUsable(v2StorageKey(sessionID));
+      }
+      retention = await decideRetentionWith(found, policy, async () =>
+        generateV2SessionSummary(
+          host,
+          owned,
+          source,
+          await resolveV2SummarizerModel(host, source, controlTimeoutMs),
+          controlTimeoutMs,
+          matchModel,
         ),
-        policy,
-        async () =>
-          generateV2SessionSummary(
-            host,
-            owned,
-            source,
-            await resolveV2SummarizerModel(host, source, controlTimeoutMs),
-            controlTimeoutMs,
-            reasoning,
-          ),
       );
     }
     const retentionLine = formatRetentionFeedback(
-      retention,
+      retention.plan,
       v2RetentionCalls(source.messages),
     );
-    const reasoningLine = reasoningFeedback(
-      reasoning.reports,
-      reasoning.matchModel,
-    );
+    const reasoningLine = reasoningFeedback(retention.reports, matchModel);
 
     const omissions: PlannedOmission[] = [];
     let trimmedCalls = 0;
     const edited: V2Message[] = [];
     for (const message of source.messages) {
       const calls = v2ToolCalls(message).filter(
-        call => eligible.has(call.ref) && !retention.keep.has(call.ref),
+        call => eligible.has(call.ref) && !retention.plan.keep.has(call.ref),
       );
       if (calls.length === 0 || message.type !== "assistant") {
         edited.push(message);
@@ -163,12 +160,6 @@ export async function executeV2Trim(
       omissions,
       tokensPruned: before.tokens - after.tokens,
       mediaTokensProjected: after.projectedMediaTokens,
-      recheckSource: async () =>
-        assertV2SourceUnchanged(
-          COMMAND,
-          source,
-          await readV2SourceAtRest(host, COMMAND, sessionID, controlTimeoutMs),
-        ),
       controlTimeoutMs,
     });
     const actual = countV2ModelFacingTokens(successor.messages);

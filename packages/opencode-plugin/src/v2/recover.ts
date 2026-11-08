@@ -1,5 +1,4 @@
-import { isDeepStrictEqual } from "node:util";
-import { getCompactionCount } from "../compact/session";
+import { getCompactionCount } from "../policy/lineage";
 import {
   RECOVER_COMMAND_NAME,
   RECOVERED_RESPONSE_ERROR,
@@ -11,12 +10,12 @@ import {
   withRecoveryMarker,
   type RecoveryRecord,
 } from "../policy/recovery";
-import { SourceChangedError, withExclusiveSource } from "../policy/successor";
+import { withExclusiveSource } from "../policy/successor";
 import { readStats } from "../storage/stats";
 import { CONTROL_OPERATION_TIMEOUT_MS } from "../util";
 import type { V2Host } from "./host";
 import {
-  assertV2SourceUnchanged,
+  assertV2HistoryFinished,
   backgroundJobs,
   createV2Successor,
   isUnfinishedV2Assistant,
@@ -221,15 +220,7 @@ export async function executeV2Recover(
     ];
     if (records.length === 0) return null;
     // The successor must pass the checks every other command applies.
-    const stillOpen = plan.messages.some(
-      message =>
-        message.type === "assistant"
-        && (isUnfinishedV2Assistant(message)
-          || message.content.some(isUnfinishedV2Tool)),
-    );
-    if (stillOpen || backgroundJobs(plan.messages).undelivered.length > 0) {
-      throw new Error("Recovered history still holds an unfinished record.");
-    }
+    assertV2HistoryFinished(COMMAND, plan.messages);
     const outcome = recoveryOutcome(records);
     // The outcome is session metadata for clients; the context is the
     // synthetic message the model receives.
@@ -259,20 +250,6 @@ export async function executeV2Recover(
       mediaTokensProjected:
         (await readStats(v2StorageKey(sessionID)))?.mediaTokensProjected ?? 0,
       recovery: records,
-      recheckSource: async () => {
-        const current = await readV2RecoverableSource(
-          host,
-          COMMAND,
-          sessionID,
-          controlTimeoutMs,
-        );
-        assertV2SourceUnchanged(COMMAND, source, current.source);
-        if (
-          !isDeepStrictEqual(current.subagentRecords, initial.subagentRecords)
-        ) {
-          throw new SourceChangedError(COMMAND);
-        }
-      },
       controlTimeoutMs,
     });
     return { successor, outcome };

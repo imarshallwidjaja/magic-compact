@@ -9,7 +9,7 @@ import {
   type ToolRuleCategory,
 } from "../policy/tool-rules";
 import { groupTurns, type PolicyTurn } from "../policy/turns";
-import type { StoredHistoryCount } from "../stats/constants";
+import type { StoredHistoryCount } from "../stats/stored-history";
 import { countGptTokens } from "../stats/tokenize";
 import { isRecord } from "../util";
 import type { V2MediaProjection } from "./media";

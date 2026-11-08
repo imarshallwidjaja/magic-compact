@@ -21,18 +21,18 @@ const ASSET_FORMAT = "arkive-compaction-eval-asset/1";
 export const sha256 = (value: string | Uint8Array) =>
   createHash("sha256").update(value).digest("hex");
 
-const Hex = z.string().regex(/^[0-9a-f]{64}$/u);
+export const Sha256Hex = z.string().regex(/^[0-9a-f]{64}$/u);
 const ManifestSchema = z.strictObject({
   format: z.literal(MANIFEST_FORMAT),
   corpusId: z.string(),
   rubricId: z.string(),
   caseOrder: z.array(z.string()).min(1),
-  files: z.record(z.string(), Hex),
+  files: z.record(z.string(), Sha256Hex),
   provenance: z.strictObject({
     fixtureVersion: z.string(),
-    goldSha256: Hex,
-    casesModuleSha256: Hex,
-    originalFiles: z.record(z.string(), Hex),
+    goldSha256: Sha256Hex,
+    casesModuleSha256: Sha256Hex,
+    originalFiles: z.record(z.string(), Sha256Hex),
     note: z.string(),
   }),
 });
@@ -63,7 +63,7 @@ const AssetSchema = z.strictObject({
   format: z.literal(ASSET_FORMAT),
   name: z.string(),
   mime: z.literal("image/png"),
-  sha256: Hex,
+  sha256: Sha256Hex,
   width: z.number().int(),
   height: z.number().int(),
   base64: z.string(),
@@ -84,21 +84,23 @@ const GoldSchema = z.strictObject({
   fixtureVersion: z.string(),
   scoring: z.string(),
   cases: z.record(z.string(), GoldCaseSchema),
-  goldSha256: Hex,
+  goldSha256: Sha256Hex,
 });
 const ProvenanceSchema = z.object({
   fixtureVersion: z.string(),
-  followup: z.object({ userSha256: Hex, assistantSha256: Hex }),
+  followup: z.object({ userSha256: Sha256Hex, assistantSha256: Sha256Hex }),
   cases: z.record(
     z.string(),
     z.object({
-      targetUserSha256: Hex,
-      targetAssistantSha256: Hex,
-      image: z.object({ sha256: Hex, base64Sha256: Hex }).nullable(),
+      targetUserSha256: Sha256Hex,
+      targetAssistantSha256: Sha256Hex,
+      image: z
+        .object({ sha256: Sha256Hex, base64Sha256: Sha256Hex })
+        .nullable(),
     }),
   ),
-  goldSha256: Hex,
-  casesModuleSha256: Hex,
+  goldSha256: Sha256Hex,
+  casesModuleSha256: Sha256Hex,
 });
 
 export type Fact = z.infer<typeof FactSchema>;
@@ -454,24 +456,33 @@ export function v2SourceHistory(
   );
 }
 
-// Offline proof that every case plans exactly one target turn with one
-// preserved turn and offers task-aware retention nothing to classify, so a run
-// needs no TypeSafe key and makes no classifier call. Uses the production
-// planners and candidate finders for both hosts.
-export async function checkCompactionPlans(corpus: Corpus): Promise<
-  Array<{
-    caseId: string;
-    v1: { targets: number; preserved: number; candidates: number };
-    v2: { targets: number; preserved: number; candidates: number };
-  }>
-> {
+type HostPlan = { targets: number; preserved: number; candidates: number };
+export type CasePlan = { caseId: string; v1: HostPlan; v2: HostPlan };
+
+// The plan `check` accepts and `run` requires before it creates anything:
+// on both hosts, exactly one target turn, one preserved turn and nothing for
+// task-aware retention to classify, so a run needs no TypeSafe key and makes
+// no classifier call.
+export const isRunnablePlan = (plan: CasePlan) =>
+  [plan.v1, plan.v2].every(
+    host => host.targets === 1 && host.preserved === 1 && host.candidates === 0,
+  );
+
+// Each case's plan on both hosts, from the production planners and
+// candidate finders.
+export async function checkCompactionPlans(
+  corpus: Corpus,
+): Promise<CasePlan[]> {
   const model = { providerID: "eval", modelID: "eval-model" };
   const keepTurns = Number(corpus.command.arguments);
   const out = [];
   for (const c of corpus.cases) {
     const v1 = v1SourceHistory(corpus, c, "ses_eval_check", "/eval", model);
     const v1Plan = planCompaction(v1, keepTurns);
-    const v1Found = await findRetentionCandidates(v1, v1Plan.summarizedTurns);
+    const v1Found = await findRetentionCandidates(
+      v1,
+      v1Plan.targets.map(target => target.turn),
+    );
     let counter = 0;
     const v2 = v2SourceHistory(
       corpus,
@@ -494,7 +505,7 @@ export async function checkCompactionPlans(corpus: Corpus): Promise<
     out.push({
       caseId: c.id,
       v1: {
-        targets: v1Plan.summarizedTurns.length,
+        targets: v1Plan.targets.length,
         preserved: v1Plan.preservedTurnCount,
         candidates: v1Found.candidates.length,
       },

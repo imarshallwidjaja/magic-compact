@@ -13,17 +13,18 @@ import {
 } from "../src/commands";
 import type { MessageWithParts } from "../src/compact/plan";
 import {
-  assertRecoverySourceUnchanged,
-  assertSourceUnchanged,
+  readRecoverableSource,
   readSourceAtRest,
-  SourceChangedError,
-  SourceNotAtRestError,
 } from "../src/compact/successor";
 import server from "../src/host-v1";
 import { setup } from "../src/host-v2";
 import { executeMagicRecover } from "../src/magic-recover";
 import { executeMagicTrim } from "../src/magic-trim";
 import { PluginMessageError } from "../src/policy/feedback";
+import {
+  SourceChangedError,
+  SourceNotAtRestError,
+} from "../src/policy/successor";
 import {
   RECOVERED_RESPONSE_ERROR,
   RECOVERED_TOOL_ERROR,
@@ -49,6 +50,7 @@ import {
   assistant,
   backgroundLaunch,
   backgroundStart,
+  closeV1CommandHarnesses,
   interruptedHistory,
   message,
   recoverHarness,
@@ -75,6 +77,7 @@ beforeEach(async () => {
   process.env.XDG_DATA_HOME = storageDirectory;
 });
 afterEach(async () => {
+  closeV1CommandHarnesses();
   if (originalDataHome === undefined) delete process.env.XDG_DATA_HOME;
   else process.env.XDG_DATA_HOME = originalDataHome;
   await rm(storageDirectory, { recursive: true, force: true });
@@ -99,6 +102,23 @@ function v2ModelText(messages: V2Message[]): string {
       item.type === "user" || item.type === "synthetic" ? [item.text] : [],
     )
     .join("\n");
+}
+
+// A copied record without the IDs the successor mints for it.
+function withoutIdentity(item: MessageWithParts): unknown {
+  const info: Record<string, unknown> = { ...item.info };
+  delete info["id"];
+  delete info["sessionID"];
+  return {
+    info,
+    parts: item.parts.map(part => {
+      const copy: Record<string, unknown> = { ...part };
+      delete copy["id"];
+      delete copy["sessionID"];
+      delete copy["messageID"];
+      return copy;
+    }),
+  };
 }
 
 const contextCount = (text: string) =>
@@ -142,12 +162,10 @@ describe("magic recover on OpenCode 1", () => {
   test("closes every abandoned record in a verified successor and leaves the source", async () => {
     const messages = interruptedHistory();
     const harness = recoverHarness("ses_v1_recover", messages);
-    const before = structuredClone(messages);
 
     const successor = await executeMagicRecover(harness.v2, "ses_v1_recover");
 
     expect(successor).not.toBeNull();
-    expect(messages).toEqual(before);
     expect(harness.sourceWrites).toEqual([]);
     expect(harness.forks).toEqual([]);
     expect(harness.modelCalls).toEqual([]);
@@ -155,13 +173,11 @@ describe("magic recover on OpenCode 1", () => {
 
     const copied = harness.successorMessages();
     expect(copied).toHaveLength(messages.length + 1);
-    // User messages and every finished record are copied unchanged.
+    // User messages are copied with every native field and part unchanged
+    // apart from the successor's own identities.
     for (const index of [0, 2]) {
-      expect(copied[index]!.parts.map(part => part.type)).toEqual(
-        messages[index]!.parts.map(part => part.type),
-      );
-      expect((copied[index]!.parts[0] as { text: string }).text).toBe(
-        (messages[index]!.parts[0] as { text: string }).text,
+      expect(withoutIdentity(copied[index]!)).toEqual(
+        withoutIdentity(messages[index]!),
       );
     }
     const [launch, read] = copied[1]!.parts as ToolPart[];
@@ -261,11 +277,10 @@ describe("magic recover on OpenCode 1", () => {
       message("usr_2", "user", [userText("usr_2", "Carry on.")]),
     ];
     const harness = recoverHarness("ses_v1_launch", messages);
-    const before = structuredClone(messages);
 
     await executeMagicRecover(harness.v2, "ses_v1_launch");
 
-    expect(messages).toEqual(before);
+    expect(harness.sourceWrites).toEqual([]);
     const copied = harness.successorMessages();
     // The host's own launch result stays: not a failure and not a delivery.
     expect((copied[1]!.parts[0] as ToolPart).state).toMatchObject({
@@ -393,13 +408,11 @@ describe("magic recover on OpenCode 1", () => {
   ])("refuses %s before any write", async (_name, options, expected) => {
     const messages = interruptedHistory();
     const harness = recoverHarness("ses_v1_live", messages, options);
-    const before = structuredClone(messages);
     const error = await executeMagicRecover(harness.v2, "ses_v1_live").catch(
       (caught: unknown) => caught,
     );
     expect(error).toBeInstanceOf(SourceNotAtRestError);
     expect(String(error)).toContain(expected);
-    expect(messages).toEqual(before);
     expect(harness.created).toEqual([]);
     expect(harness.sourceWrites).toEqual([]);
     expect(harness.toasts.at(-1)?.message).toBe((error as Error).message);
@@ -461,19 +474,63 @@ describe("magic recover on OpenCode 1", () => {
     expect(await readStats("ses_v1_race_successor")).toBeNull();
   });
 
-  test("recovery's recheck sees a finished record that ordinary drift checks ignore", () => {
-    const initial = {
-      session: { id: "s" } as Session,
-      messages: [assistant("ast", [], { created: 1 })],
+  test("recovery's recheck sees a finished record that ordinary drift checks ignore", async () => {
+    // An errored response without a completion time is at rest. The host then
+    // stores its completion time, which only recovery's recheck compares.
+    const failed = assistant("ast_failed", [], { created: 2 });
+    Object.assign(failed.info, {
+      error: { name: "UnknownError", data: { message: "failed" } },
+    });
+    const messages = [
+      message("usr_1", "user", [userText("usr_1", "Go.")]),
+      failed,
+    ];
+    const harness = recoverHarness("ses_v1_lifecycle", messages);
+    const read = (strict: boolean) =>
+      (strict ? readSourceAtRest : readRecoverableSource)(
+        harness.v2,
+        strict ? "Magic Trim" : "Magic Recover",
+        "ses_v1_lifecycle",
+        1_000,
+      );
+    const atRest = await read(true);
+    const recoverable = await read(false);
+    // The recheck compares against what was read, not the caller's copy.
+    atRest.messages.length = 0;
+    (messages[1]!.info.time as { completed?: number }).completed = 3;
+    await expect(atRest.recheck()).resolves.toBeUndefined();
+    await expect(recoverable.recheck()).rejects.toThrow(SourceChangedError);
+  });
+
+  test("a recheck compares against its own copy of the first read, not the session it returned", async () => {
+    const messages = [
+      message("usr_1", "user", [userText("usr_1", "Go.")]),
+      assistant("ast_1", [], { created: 2, completed: 3 }),
+    ];
+    const sessionOverrides: Required<
+      Pick<Session, "metadata" | "model" | "permission">
+    > = {
+      metadata: { owner: "source" },
+      model: { id: "model", providerID: "provider", variant: "high" },
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
     };
-    const finished = structuredClone(initial);
-    (finished.messages[0]!.info.time as { completed?: number }).completed = 2;
-    expect(() =>
-      assertSourceUnchanged("Magic Trim", initial, finished),
-    ).not.toThrow();
-    expect(() =>
-      assertRecoverySourceUnchanged("Magic Recover", initial, finished),
-    ).toThrow(SourceChangedError);
+    const harness = recoverHarness("ses_v1_copy", messages, {
+      sessionOverrides,
+    });
+    for (const read of [readSourceAtRest, readRecoverableSource]) {
+      const source = await read(harness.v2, "Magic Trim", "ses_v1_copy", 1_000);
+      // The caller edits nested fields of the session it was given, and the
+      // host then takes the same values.
+      for (const session of [source.session, sessionOverrides]) {
+        session.metadata!["owner"] = "changed";
+        session.model!.variant = "changed";
+        session.permission![0]!.action = "deny";
+      }
+      await expect(source.recheck()).rejects.toThrow(SourceChangedError);
+      sessionOverrides.metadata["owner"] = "source";
+      sessionOverrides.model.variant = "high";
+      sessionOverrides.permission[0]!.action = "allow";
+    }
   });
 
   test("registers the command and rejects arguments with one toast before the listener", async () => {

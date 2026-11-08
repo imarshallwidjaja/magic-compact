@@ -8,6 +8,7 @@ import {
   DECISION_EVALUATION_THRESHOLD,
   DecisionEvalError,
   datasetCases,
+  thresholdRefusal,
   type DecisionDataset,
 } from "./dataset";
 import type { LoadedRun, Outcome } from "./runner";
@@ -55,7 +56,6 @@ export type RunMetrics = {
   // Only with repeats: spread of one case's probability across its repeats.
   stability: { cases: number; maxSpread: number; flips: number } | null;
   failures: Record<string, number>;
-  returnedModels: string[];
 };
 
 function ratio(numerator: number, denominator: number): number | null {
@@ -195,17 +195,6 @@ export function computeMetrics(
           }
         : null,
     failures,
-    returnedModels: [
-      ...new Set(
-        scored
-          .map(o => o.returnedModel)
-          .concat(
-            run.outcomes.flatMap(o =>
-              o.status === "refused" ? [o.returnedModel] : [],
-            ),
-          ),
-      ),
-    ].sort(),
   };
 }
 
@@ -246,26 +235,16 @@ function group<T>(items: T[], key: (item: T) => string): T[][] {
   return [...groups.values()];
 }
 
-// `thresholdOverride` re-reads the stored probabilities at another cutoff; it
-// is refused for held-out datasets, whose cutoff stays frozen.
+// `thresholdOverride` re-reads the stored probabilities at another cutoff;
+// for a held-out dataset only the frozen cutoff is accepted.
 export function renderReport(
   runs: LoadedRun[],
   dataset: DecisionDataset,
   thresholdOverride?: number,
 ): string {
   if (thresholdOverride !== undefined) {
-    if (
-      !Number.isFinite(thresholdOverride)
-      || thresholdOverride <= 0
-      || thresholdOverride > 1
-    ) {
-      throw new DecisionEvalError("--threshold must be above 0 and at most 1.");
-    }
-    if (dataset.split === "heldout") {
-      throw new DecisionEvalError(
-        `Held-out results are reported at the frozen threshold ${DECISION_EVALUATION_THRESHOLD}; --threshold is not available for them.`,
-      );
-    }
+    const refusal = thresholdRefusal(dataset.split, thresholdOverride);
+    if (refusal) throw new DecisionEvalError(`--threshold ${refusal}.`);
   }
   const labels = new Map(datasetCases(dataset).map(c => [c.caseID, c.keep]));
   const effective = (run: LoadedRun) =>
@@ -363,11 +342,6 @@ export function renderReport(
       if (m.unknown > 0) {
         notes.push(
           `${run.name}: ${m.unknown} ${m.unknown === 1 ? "request has" : "requests have"} no outcome record. The run left no record of ${m.unknown === 1 ? "it" : "them"} (it may have been interrupted), so ${m.unknown === 1 ? "it" : "they"} may have been sent and billed; the outcome is unknown. Nothing was retried.`,
-        );
-      }
-      if (m.returnedModels.some(model => model !== run.manifest.model)) {
-        notes.push(
-          `${run.name}: provider reported ${m.returnedModels.join(", ")}.`,
         );
       }
       const failures = Object.entries(m.failures)

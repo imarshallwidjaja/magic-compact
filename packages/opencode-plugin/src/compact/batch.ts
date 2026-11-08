@@ -1,97 +1,12 @@
 import type { FilePart, Part } from "@opencode-ai/sdk/v2";
+import {
+  estimateTurnOutputTokens,
+  NATIVE_BATCH_MEDIA_TOKEN_CHARGE,
+  type NativeTurnCost,
+} from "../policy/budget";
 import { countGptTokens } from "../stats/tokenize";
 import { isRecord } from "../util";
 import type { MessageWithParts, Turn } from "./plan";
-import { PluginMessageError } from "../policy/feedback";
-
-export const NATIVE_BATCH_MAX_CONCURRENCY = 5;
-export const NATIVE_BATCH_NORMAL_INPUT_TARGET = 400_000;
-export const NATIVE_BATCH_FIXED_RESERVE_TOKENS = 8_000;
-export const NATIVE_BATCH_MEDIA_TOKEN_CHARGE = 8_000;
-export const NATIVE_BATCH_MAX_OUTPUT_TARGET = 32_000;
-export const NATIVE_BATCH_MAX_HALO_INPUT = 500_000;
-// The pinned tokenizer emits one token per byte here, the maximum for a valid 22-byte nonce body.
-export const NATIVE_BATCH_PLANNING_NONCE = "uB_4fLx2Xv5Tz7E1M-8vQn";
-
-const NATIVE_BATCH_FALLBACK_OUTPUT_LIMIT = 32_000;
-const NATIVE_BATCH_MIN_TURN_OUTPUT = 512;
-const NATIVE_BATCH_MAX_TURN_TEXT_OUTPUT = 8_000;
-const NATIVE_BATCH_MEDIA_DESCRIPTION_OUTPUT = 512;
-
-export type NativeBatchBudget = {
-  outputTarget: number;
-  usableInput: number;
-  normalInputTarget: number;
-  hardSingleTurnInput: number;
-  haloInputLimit: number;
-};
-
-export type NativeTurnCost = {
-  inputTokens: number;
-  outputTokens: number;
-};
-
-export type NativeBatchProtocol<T extends NativeTurnCost> = {
-  explicitRequestTokens: (candidates: T[]) => number;
-  responseProtocolTokens: (candidates: T[]) => number;
-};
-
-export type NativeGenerationBatch<T extends NativeTurnCost> = {
-  candidates: T[];
-  estimatedInputTokens: number;
-  estimatedExplicitRequestTokens: number;
-  estimatedOutputTokens: number;
-  inputLimit: number;
-};
-
-export function computeNativeBatchBudget(limit: {
-  context: number;
-  input?: number;
-  output?: number;
-}): NativeBatchBudget {
-  if (!Number.isFinite(limit.context) || limit.context <= 0) {
-    throw new PluginMessageError(
-      "Magic Compact requires a positive configured compaction model context limit.",
-    );
-  }
-  const context = Math.floor(limit.context);
-  const outputLimit =
-    Number.isFinite(limit.output) && (limit.output ?? 0) > 0
-      ? Math.floor(limit.output!)
-      : NATIVE_BATCH_FALLBACK_OUTPUT_LIMIT;
-  const outputTarget = Math.min(
-    NATIVE_BATCH_MAX_OUTPUT_TARGET,
-    Math.floor(outputLimit * 0.5),
-  );
-  const configuredInput =
-    Number.isFinite(limit.input) && (limit.input ?? 0) > 0
-      ? Math.floor(limit.input!)
-      : Number.POSITIVE_INFINITY;
-  const usableInput = Math.floor(
-    Math.min(configuredInput, context - outputTarget),
-  );
-  if (usableInput <= NATIVE_BATCH_FIXED_RESERVE_TOKENS) {
-    throw new PluginMessageError(
-      "Magic Compact configured compaction model has no usable input budget.",
-    );
-  }
-  const hardSingleTurnInput = Math.floor(usableInput * 0.9);
-  if (hardSingleTurnInput <= NATIVE_BATCH_FIXED_RESERVE_TOKENS) {
-    throw new PluginMessageError(
-      "Magic Compact configured compaction model input budget is too small to fit the fixed host reserve.",
-    );
-  }
-  return {
-    outputTarget,
-    usableInput,
-    normalInputTarget: Math.min(
-      NATIVE_BATCH_NORMAL_INPUT_TARGET,
-      Math.floor(usableInput * 0.8),
-    ),
-    hardSingleTurnInput,
-    haloInputLimit: Math.min(NATIVE_BATCH_MAX_HALO_INPUT, hardSingleTurnInput),
-  };
-}
 
 export function estimateNativeTurnCost(turn: Turn): NativeTurnCost {
   const estimate = [...turn.user, ...turn.assistants].reduce(
@@ -115,21 +30,6 @@ export function estimateNativeTurnCost(turn: Turn): NativeTurnCost {
   };
 }
 
-// The summary output a turn is expected to need, from its visible text and
-// its inline media count. Both hosts use this estimate.
-export function estimateTurnOutputTokens(
-  textTokens: number,
-  mediaCount: number,
-): number {
-  return (
-    Math.max(
-      NATIVE_BATCH_MIN_TURN_OUTPUT,
-      Math.min(NATIVE_BATCH_MAX_TURN_TEXT_OUTPUT, Math.ceil(textTokens * 0.05)),
-    )
-    + mediaCount * NATIVE_BATCH_MEDIA_DESCRIPTION_OUTPUT
-  );
-}
-
 // Estimates native model input for a whole message history with the same
 // per-part rules as turn estimates.
 export function estimateNativeHistoryTokens(
@@ -142,58 +42,6 @@ export function estimateNativeHistoryTokens(
     }
   }
   return tokens;
-}
-
-// Every generation request owns exactly one target turn. The host does not
-// enforce the response schema, and multi-target requests returned the wrong
-// number of results live, so the response must never have to map several
-// targets back to their ordinals.
-export function planNativeGenerationBatches<T extends NativeTurnCost>(
-  candidates: T[],
-  budget: NativeBatchBudget,
-  protocol: NativeBatchProtocol<T>,
-): NativeGenerationBatch<T>[] {
-  const emptyRequestTokens = Math.ceil(protocol.explicitRequestTokens([]));
-  if (
-    NATIVE_BATCH_FIXED_RESERVE_TOKENS + emptyRequestTokens
-    > budget.usableInput
-  ) {
-    throw new PluginMessageError(
-      "Magic Compact explicit request and global turn index cannot fit the configured model input budget. Run /magic-trim first or configure a compaction model with more input capacity.",
-    );
-  }
-  return candidates.map(candidate => {
-    const estimatedExplicitRequestTokens = Math.ceil(
-      protocol.explicitRequestTokens([candidate]),
-    );
-    const estimatedInputTokens =
-      NATIVE_BATCH_FIXED_RESERVE_TOKENS
-      + estimatedExplicitRequestTokens
-      + Math.ceil(candidate.inputTokens);
-    const estimatedOutputTokens =
-      Math.ceil(protocol.responseProtocolTokens([candidate]))
-      + Math.ceil(candidate.outputTokens);
-    if (estimatedInputTokens > budget.hardSingleTurnInput) {
-      throw new PluginMessageError(
-        "A single compaction turn cannot fit the configured model input. Run /magic-trim first and retry.",
-      );
-    }
-    if (estimatedOutputTokens > budget.outputTarget) {
-      throw new PluginMessageError(
-        `A single compaction turn cannot fit the configured ${budget.outputTarget}-token output target. Configure a compaction model with more output capacity.`,
-      );
-    }
-    return {
-      candidates: [candidate],
-      estimatedInputTokens,
-      estimatedExplicitRequestTokens,
-      estimatedOutputTokens,
-      inputLimit:
-        estimatedInputTokens > budget.normalInputTarget
-          ? budget.hardSingleTurnInput
-          : budget.normalInputTarget,
-    };
-  });
 }
 
 type ContentEstimate = {

@@ -64,7 +64,6 @@ export function wrapperTemplateSha256(): string {
   );
 }
 
-// Packs the working-tree package exactly as npm would publish it.
 export function packSubject(packageDir: string, destination: string): string {
   const name = execFileSync(
     "npm",
@@ -77,7 +76,6 @@ export function packSubject(packageDir: string, destination: string): string {
   return join(destination, name);
 }
 
-// Every file under `root` with its SHA-256, by sorted relative path.
 export function treeHashes(root: string): Record<string, string> {
   const out: Record<string, string> = {};
   const walk = (dir: string) => {

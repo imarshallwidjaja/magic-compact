@@ -5,12 +5,10 @@ import { COMPACT_NOOP, compactSuccess } from "../../src/commands";
 import {
   BOUNDARY_METADATA,
   POST_COMPACTION_NOTICE,
-} from "../../src/compact/constants";
+} from "../../src/policy/protocol";
 import { STATS_METADATA } from "../../src/stats/constants";
 import { sha256, type CorpusCase } from "./corpus";
 import type { SuccessorInspection } from "./host";
-
-export const WITNESS_PREFIX = "arkive-eval-witness ";
 
 export type CommandOutcome =
   | { kind: "delivered"; successorID: string; message: string }
@@ -33,12 +31,7 @@ export function classifyOutcome(message: string): CommandOutcome {
   if (id && message.startsWith(compactSuccess(id))) {
     return { kind: "delivered", successorID: id, message };
   }
-  if (
-    message.startsWith(COMPACT_NOOP)
-    || /^No assistant turns/u.test(message)
-  ) {
-    return { kind: "noop", message };
-  }
+  if (message.startsWith(COMPACT_NOOP)) return { kind: "noop", message };
   const category: FailureCategory =
     /image|output capacity|more output|model capacity|context|too large|trim first/iu.test(
       message,

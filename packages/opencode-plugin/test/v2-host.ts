@@ -1,7 +1,9 @@
 // In-memory OpenCode 2.0.28 host for the V2 adapter suites. It implements the
 // public client methods the adapter calls, keeps array order as the
 // authoritative history order like the host's import, and simulates the agent
-// loop of an owned session through the plugin's own context-hook rule.
+// loop of an owned session. Each provider request is admitted by the owned
+// registry's one-request rule directly, or by the plugin's real `context`
+// hook when a test supplies it.
 import type { SessionInfo } from "@opencode/client";
 import type { V2Host } from "../src/v2/host";
 import type { OwnedSessions } from "../src/v2/owned";
@@ -49,6 +51,22 @@ export type FakeV2State = {
   failImport?: boolean;
   // The host runs the prompt, then the request fails on the client side.
   rejectAcceptedPrompt?: boolean;
+  // Each request a supplied `context` hook saw: the tools and messages it
+  // left, and whether it stopped the request.
+  contextRequests: ContextRequest[];
+};
+
+export type ContextEvent = {
+  sessionID: string;
+  tools: Record<string, unknown>;
+  messages: Array<{ role: string; content: unknown[] }>;
+};
+
+export type ContextRequest = {
+  sessionID: string;
+  tools: string[];
+  messages: ContextEvent["messages"];
+  stopped: boolean;
 };
 
 export function fakeV2State(): FakeV2State {
@@ -71,6 +89,7 @@ export function fakeV2State(): FakeV2State {
     modelInput: ["text", "image"],
     requests: [],
     calls: [],
+    contextRequests: [],
   };
 }
 
@@ -227,6 +246,7 @@ export function fakeV2Host(
   reply: (text: string, history: V2Message[]) => FakeReply = () => ({
     text: "reply",
   }),
+  context?: (event: ContextEvent) => Promise<void>,
 ): V2Host {
   const summarizerAt = (location?: { directory?: string }) =>
     (location?.directory === undefined
@@ -249,6 +269,41 @@ export function fakeV2Host(
     state.calls.push(`${method}:${sessionID}`);
     state.afterWrite?.(method, sessionID);
   };
+  // A request offers both plugin tools and a built-in one, with the user text
+  // and assistant content of the history.
+  const admit = async (sessionID: string) => {
+    if (!context) {
+      owned.admitRequest(sessionID);
+      return;
+    }
+    const event: ContextEvent = {
+      sessionID,
+      tools: { StructuredOutput: {}, SessionSummary: {}, read: {} },
+      messages: (state.messages.get(sessionID) ?? []).flatMap<
+        ContextEvent["messages"][number]
+      >(message =>
+        message.type === "user"
+          ? [{ role: "user", content: [{ type: "text", text: message.text }] }]
+          : message.type === "assistant"
+            ? [{ role: "assistant", content: clone(message.content) }]
+            : [],
+      ),
+    };
+    let stopped = false;
+    try {
+      await context(event);
+    } catch (error) {
+      stopped = true;
+      throw error;
+    } finally {
+      state.contextRequests.push({
+        sessionID,
+        tools: Object.keys(event.tools),
+        messages: event.messages,
+        stopped,
+      });
+    }
+  };
   const runPrompt = async (input: {
     sessionID: string;
     id: string;
@@ -257,7 +312,7 @@ export function fakeV2Host(
     const messages = state.messages.get(input.sessionID)!;
     messages.push(userMessage(input.id, input.text));
     state.requests.push({ sessionID: input.sessionID, text: input.text });
-    owned.admitRequest(input.sessionID);
+    await admit(input.sessionID);
     const response = reply(input.text, clone(messages));
     if ("error" in response) {
       messages.push(
@@ -312,7 +367,7 @@ export function fakeV2Host(
     );
     // The agent loop asks for the next step; the owned stop ends it.
     try {
-      owned.admitRequest(input.sessionID);
+      await admit(input.sessionID);
       messages.push(
         assistantMessage(`${input.id}-second`, [
           { type: "text", text: "second" },

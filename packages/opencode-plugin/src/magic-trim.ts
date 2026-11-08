@@ -2,46 +2,37 @@ import type { V2Client } from "./api";
 import { TRIM_NOOP } from "./commands";
 import { planTrim } from "./compact/plan";
 import { projectToolTrim } from "./compact/prune";
-import { getCompactionCount } from "./compact/session";
+import { getCompactionCount } from "./policy/lineage";
 import {
   appendedNoticeMessage,
   applySuccessorEdits,
-  assertSourceUnchanged,
   createSuccessor,
   readSourceAtRest,
-  withExclusiveSource,
   type Successor,
 } from "./compact/successor";
+import { withExclusiveSource } from "./policy/successor";
 import {
   decideRetention,
   findRetentionCandidates,
   HEURISTIC_RETENTION,
   retentionFeedback,
-  type RetentionPlan,
+  type RetentionDecision,
   type RetentionPolicy,
 } from "./retention/retention";
 import { STATS_METADATA, trimStatsMessage } from "./stats/constants";
-import type { SummaryReasoningOptions } from "./compact/compact";
+import { summarizerCatalogLoader } from "./compact/compact";
 import { reasoningFeedback } from "./policy/reasoning";
-import { countModelFacingContentTokens } from "./stats/tokenize";
+import { countModelFacingContentTokens } from "./compact/accounting";
 import {
-  CONTROL_OPERATION_TIMEOUT_MS,
   createToastFeedback,
   failureToast,
   IN_PROGRESS_TOAST_DURATION_MS,
-} from "./util";
+} from "./toast-v1";
+import { CONTROL_OPERATION_TIMEOUT_MS } from "./util";
 import { PluginMessageError } from "./policy/feedback";
+import { assertStatsUsable } from "./storage/stats";
 
 const COMMAND = "Magic Trim";
-
-export {
-  parseMagicTrimArguments,
-  TRIM_ARGUMENTS_ERROR,
-  TRIM_BACKEND_ERROR,
-  TRIM_NOOP,
-  TRIM_THRESHOLD_ERROR,
-  trimSuccess,
-} from "./commands";
 
 export type MagicTrimExecutionOptions = {
   retention: RetentionPolicy;
@@ -81,26 +72,33 @@ export async function executeMagicTrim(
         controlTimeoutMs,
       );
       const plan = planTrim(source.messages, keepTurns);
-      const reasoning: SummaryReasoningOptions = {
-        matchModel: options.matchModel === true,
+      const matchModel = options.matchModel === true;
+      let retention: RetentionDecision = {
+        plan: HEURISTIC_RETENTION,
         reports: [],
       };
-      let retention: RetentionPlan = HEURISTIC_RETENTION;
       if (options.retention.mode === "task-aware") {
+        const found = await findRetentionCandidates(
+          source.messages,
+          plan.trimmedTurns,
+        );
+        // Candidates mean retention requests and a likely successor.
+        if (found.candidates.length > 0) await assertStatsUsable(sessionID);
         retention = await decideRetention(
           v2,
           source.session,
           source.messages,
-          await findRetentionCandidates(source.messages, plan.trimmedTurns),
+          found,
           options.retention,
-          { controlTimeoutMs, reasoning },
+          {
+            controlTimeoutMs,
+            matchModel,
+            catalog: summarizerCatalogLoader(v2, source.session),
+          },
         );
       }
-      const reasoningLine = reasoningFeedback(
-        reasoning.reports,
-        reasoning.matchModel,
-      );
-      const retentionLine = retentionFeedback(retention, source.messages);
+      const reasoningLine = reasoningFeedback(retention.reports, matchModel);
+      const retentionLine = retentionFeedback(retention.plan, source.messages);
       // The toast carries the reasoning line after the retention line; the
       // notice gives it its own line.
       const feedback = `${retentionLine}${
@@ -109,7 +107,7 @@ export async function executeMagicTrim(
       const trim = await projectToolTrim(
         plan.trimmedTurns,
         sessionID,
-        retention.keep,
+        retention.plan.keep,
       );
       if (trim.replacements.length === 0) {
         return { successor: null, feedback };
@@ -155,19 +153,15 @@ export async function executeMagicTrim(
         omissions: trim.omissions,
         tokensPruned: before.tokens - after.tokens,
         mediaTokensProjected: after.projectedMediaTokens,
-        recheckSource: async () =>
-          assertSourceUnchanged(
-            COMMAND,
-            source,
-            await readSourceAtRest(v2, COMMAND, sessionID, controlTimeoutMs),
-          ),
         controlTimeoutMs,
       });
-      const actual = (await countModelFacingContentTokens(successor.messages))
-        .tokens;
-      if (actual !== after.tokens) {
+      const actual = await countModelFacingContentTokens(successor.messages);
+      if (
+        actual.tokens !== after.tokens
+        || actual.projectedMediaTokens !== after.projectedMediaTokens
+      ) {
         throw new PluginMessageError(
-          `Trim final canonical active token count did not match its projection in successor session ${successor.session.id} (projected ${after.tokens}, actual ${actual}).`,
+          `Trim final canonical active token count did not match its projection in successor session ${successor.session.id} (projected ${after.tokens}, actual ${actual.tokens}).`,
         );
       }
       return {

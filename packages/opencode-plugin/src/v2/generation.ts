@@ -1,14 +1,15 @@
-import type { ModelInfo, ModelRef } from "@opencode/client";
 import { isDeepStrictEqual } from "node:util";
 import {
   computeNativeBatchBudget,
   estimateTurnOutputTokens,
-  NATIVE_BATCH_MAX_CONCURRENCY,
-  NATIVE_BATCH_MEDIA_TOKEN_CHARGE,
+  fits,
   NATIVE_BATCH_PLANNING_NONCE,
-  planNativeGenerationBatches,
-} from "../compact/batch";
-import { MAGIC_COMPACT_SUMMARIZER_AGENT } from "../compact/constants";
+  planNativeGenerationRequest,
+  refuse,
+  requireFit,
+  type Fit,
+} from "../policy/budget";
+import { MAGIC_COMPACT_SUMMARIZER_AGENT } from "../policy/protocol";
 import {
   buildGenerationPrompt,
   createGenerationNonce,
@@ -24,31 +25,23 @@ import {
   type GenerationTarget,
 } from "../policy/generation";
 import {
-  hasPluginMessage,
-  MAX_REASONS,
+  distinctReasons,
   PluginMessageError,
-  undeletedSessionIDs,
+  unremovedSessions,
+  unremovedSessionsText,
   type LeavesSessions,
+  type UnremovedSession,
 } from "../policy/feedback";
-import { countGptTokens } from "../stats/tokenize";
-import { attemptWithinDeadline } from "../util";
+import { runGenerationBatches } from "../policy/generation-pool";
+import { attemptWithinDeadline, jsonForm } from "../util";
 import type { V2Host } from "./host";
 import {
-  planV2MediaProjection,
   v2HistoryShowsImages,
   v2MediaManifest,
   v2UnprojectedImages,
   type V2MediaManifest,
 } from "./media";
-import {
-  matchedV2Model,
-  removeOwnedSession,
-  v2Configured,
-  v2MatchPreflight,
-  v2Qualifies,
-  v2SummarizerRoute,
-  type OwnedSessions,
-} from "./owned";
+import { removeOwnedSession, type OwnedSessions } from "./owned";
 import {
   readableReasoningHeaderTokens,
   v2ReasoningUnits,
@@ -57,9 +50,9 @@ import {
 import {
   chooseStage,
   matchCandidate,
+  settleMatch,
   stageReport,
-  type ReasoningReports,
-  type StageChoice,
+  type StageReport,
 } from "../policy/reasoning";
 import {
   mintV2ID,
@@ -68,6 +61,16 @@ import {
   type V2Message,
   type V2Source,
 } from "./session";
+import {
+  estimateV2HistoryTokens,
+  matchedV2Model,
+  V2_IMAGE_MODEL_REQUIRED,
+  v2Configured,
+  v2MatchPreflight,
+  v2Qualifies,
+  v2SummarizerRoute,
+  type V2SummarizerModel,
+} from "./summarizer";
 
 // The response tool every generation request may call. Its name matches the
 // OpenCode 1 host tool, so both hosts send the same protocol text.
@@ -91,28 +94,13 @@ export type V2GeneratedSummary = {
   mediaManifest?: V2MediaManifest;
 };
 
-export type V2SummarizerModel = {
-  ref: ModelRef;
-  info: Pick<ModelInfo, "limit" | "capabilities" | "providerID" | "canonical">
-    & Partial<
-      Pick<ModelInfo, "variants" | "compatibility" | "modelID" | "package">
-    >;
-  // Every model the host lists, which `--match-model` chooses from, and
-  // whether the summarizer agent carries operator request options written for
-  // its own model.
-  others?: readonly ModelInfo[];
-  optionsConflict?: boolean;
-};
-
 type Candidate = GenerationTarget & {
   inputTokens: number;
   outputTokens: number;
-  turn: V2GenerationTurn;
-  mediaManifest?: V2MediaManifest;
 };
 
 type Batch = {
-  candidate: Candidate;
+  mediaManifest?: V2MediaManifest;
   history: V2Message[];
   nonce: string;
   target: GenerationTarget;
@@ -121,24 +109,24 @@ type Batch = {
   summarizer: V2SummarizerModel;
 };
 
+// `reason` says what failed without naming a temporary session left behind,
+// so an aggregate can explain failures once and still name every session.
 export class V2GenerationError
   extends PluginMessageError
   implements LeavesSessions
 {
-  // `reason` says what failed without naming a temporary session left behind,
-  // so an aggregate can explain failures once and still name every session.
   constructor(
-    message: string,
-    readonly reason: string = message,
-    readonly undeletedSessionIDs: readonly string[] = [],
+    readonly reason: string,
+    readonly unremovedSessions: readonly UnremovedSession[] = [],
   ) {
-    super(message);
+    super(
+      unremovedSessions.length === 0
+        ? reason
+        : `${reason} ${unremovedSessionsText(unremovedSessions, "Temporary session")}`,
+    );
     this.name = "V2GenerationError";
   }
 }
-
-export const V2_IMAGE_MODEL_REQUIRED =
-  "Magic Compact requires an image-capable configured compaction model for history containing images.";
 
 export const V2_IMAGE_LIMIT_EXCEEDED =
   "The images in a compaction request exceed the 25 MiB OpenCode sends to a model, so the summarizer would not see every image the summary must describe. Run /magic-trim or start a new session for this history.";
@@ -150,9 +138,16 @@ export const V2_IMAGE_LIMIT_EXCEEDED =
 // manifest binds, so such a request fails before any session is created.
 const HOST_IMAGE_BYTES_LIMIT = 25 * 1024 * 1024;
 const XAI_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp"]);
+type RequestImage = ReturnType<typeof v2UnprojectedImages>[number];
 
-function assertImagesReachModel(batch: Batch, model: V2SummarizerModel): void {
-  const images = v2UnprojectedImages(batch.history);
+// Whether the model takes every image the request still shows. A matched
+// model's preflight already required image input over a history that holds
+// this request's, and only OpenAI routes are matched, so only the configured
+// summarizer can fail here.
+function assertImagesReachModel(
+  images: readonly RequestImage[],
+  model: V2SummarizerModel,
+): void {
   if (images.length === 0) return;
   const xai = model.info.providerID === "xai" || model.info.canonical === "xai";
   if (
@@ -162,102 +157,21 @@ function assertImagesReachModel(batch: Batch, model: V2SummarizerModel): void {
   ) {
     throw new V2GenerationError(V2_IMAGE_MODEL_REQUIRED);
   }
-  if (
-    batch.candidate.mediaManifest
-    && images.reduce((total, image) => total + image.bytes, 0)
-      > HOST_IMAGE_BYTES_LIMIT
-  ) {
-    throw new V2GenerationError(V2_IMAGE_LIMIT_EXCEEDED);
-  }
+}
+
+// Whether the request's images stay within what OpenCode sends: past 25 MiB
+// the host drops the oldest, so the summarizer would miss an image the
+// target's manifest binds. The preceding turn joins only within a model's
+// halo limit, so this depends on the model's plan.
+function imagesWithinHostLimit(images: readonly RequestImage[]): boolean {
+  return (
+    images.reduce((total, image) => total + image.bytes, 0)
+    <= HOST_IMAGE_BYTES_LIMIT
+  );
 }
 
 const OVERFLOW =
   "The compaction request exceeded the configured compaction model context. Run /magic-trim first, then retry /magic-compact.";
-
-// Model-visible input estimate of OpenCode 2 records: text through the local
-// tokenizer, inline image and PDF files at the fixed media charge unless a
-// manifest projects the image to its placeholder, and other files by their
-// encoded length.
-export function estimateV2HistoryTokens(messages: readonly V2Message[]): {
-  tokens: number;
-  textTokens: number;
-  mediaCount: number;
-} {
-  let tokens = 0;
-  let textTokens = 0;
-  let mediaCount = 0;
-  const text = (value: string | undefined) => {
-    if (!value) return;
-    const count = countGptTokens(value);
-    tokens += count;
-    textTokens += count;
-  };
-  const projection = planV2MediaProjection(messages);
-  for (const message of messages) {
-    switch (message.type) {
-      case "user": {
-        text(message.text);
-        const covered = projection.get(message.id) ?? [];
-        for (const [index, file] of (message.files ?? []).entries()) {
-          const placeholder = covered.find(
-            image => image.index === index,
-          )?.placeholder;
-          if (placeholder !== undefined) {
-            text(placeholder);
-          } else if (
-            file.mime.startsWith("image/")
-            || file.mime === "application/pdf"
-          ) {
-            tokens += NATIVE_BATCH_MEDIA_TOKEN_CHARGE;
-            mediaCount += 1;
-          } else {
-            tokens += file.data.length;
-          }
-        }
-        break;
-      }
-      case "synthetic":
-      case "system":
-      case "skill":
-        text(message.text);
-        break;
-      case "shell":
-        text(message.command);
-        text(message.output?.output);
-        break;
-      case "compaction":
-        if (message.status === "completed") {
-          text(message.summary);
-          text(message.recent);
-        }
-        break;
-      case "assistant":
-        for (const item of message.content) {
-          if (item.type !== "tool") {
-            text(item.text);
-            continue;
-          }
-          const state = item.state;
-          text(
-            typeof state.input === "string"
-              ? state.input
-              : JSON.stringify(state.input),
-          );
-          if (state.status === "completed" || state.status === "error") {
-            for (const content of state.content ?? []) {
-              if (content.type === "text") text(content.text);
-              else tokens += NATIVE_BATCH_MEDIA_TOKEN_CHARGE;
-            }
-          }
-          if (state.status === "error") text(state.error.message);
-        }
-        break;
-      default:
-        break;
-    }
-  }
-  return { tokens, textTokens, mediaCount };
-}
 
 // Plans every target before any session is created: the summary model, its
 // budgets, the single target per request, the optional preceding turn within
@@ -270,18 +184,18 @@ function planBatches(
   model: V2SummarizerModel,
   globalIndexPrompt: string,
   nonceFactory: () => string,
-  reasoning: ReasoningReports | undefined,
-): Batch[] {
+  matchModel: boolean,
+): { batches: Batch[]; reports: StageReport[] } {
   const nonces = new Set<string>();
-  const matchModel = reasoning?.matchModel === true;
   const qualifies = v2Qualifies(model);
   const planOne = (
     turn: V2GenerationTurn,
     index: number,
     summarizer: V2SummarizerModel,
     nonce: string,
-  ): Batch => {
+  ): Fit<Batch> => {
     const budget = computeNativeBatchBudget(summarizer.info.limit);
+    if (budget.kind === "capacity") return budget;
     const destination = v2SummarizerRoute(summarizer);
     const estimate = estimateV2HistoryTokens(turn.span);
     const mediaManifest = v2MediaManifest(turn.span);
@@ -296,20 +210,19 @@ function planBatches(
         estimate.textTokens,
         estimate.mediaCount,
       ),
-      turn,
-      ...(mediaManifest ? { mediaManifest } : {}),
     };
-    const [batch] = planNativeGenerationBatches([candidate], budget, {
-      explicitRequestTokens: targets =>
-        estimateGenerationExplicitRequestTokens(targets, globalIndexPrompt),
+    const request = planNativeGenerationRequest(candidate, budget.value, {
+      explicitRequestTokens: target =>
+        estimateGenerationExplicitRequestTokens(target, globalIndexPrompt),
       responseProtocolTokens: estimateGenerationResponseProtocolTokens,
     });
+    if (request.kind === "capacity") return request;
     const previous =
       turn.previous
-      && batch!.estimatedInputTokens
+      && request.value.estimatedInputTokens
         + estimateV2HistoryTokens(turn.previous).tokens
         + readableReasoningHeaderTokens(turn.previous, destination)
-        <= budget.haloInputLimit
+        <= budget.value.haloInputLimit
         ? turn.previous
         : undefined;
     const target: GenerationTarget = {
@@ -318,10 +231,10 @@ function planBatches(
       expectedInlineImages: candidate.expectedInlineImages,
     };
     if (
-      estimateGenerationExplicitRequestTokens([target], globalIndexPrompt)
-        > batch!.estimatedExplicitRequestTokens
-      || estimateGenerationResponseProtocolTokens([target])
-        > estimateGenerationResponseProtocolTokens([candidate])
+      estimateGenerationExplicitRequestTokens(target, globalIndexPrompt)
+        > request.value.estimatedExplicitRequestTokens
+      || estimateGenerationResponseProtocolTokens(target)
+        > estimateGenerationResponseProtocolTokens(candidate)
     ) {
       throw new V2GenerationError(
         "Compaction generation request exceeded its planned size.",
@@ -341,18 +254,22 @@ function planBatches(
       marker,
       ...turn.span.slice(firstUser),
     ];
-    const planned = {
-      candidate,
+    const images = v2UnprojectedImages(history);
+    assertImagesReachModel(images, summarizer);
+    if (mediaManifest && !imagesWithinHostLimit(images)) {
+      return refuse(V2_IMAGE_LIMIT_EXCEEDED);
+    }
+    return fits({
+      ...(mediaManifest ? { mediaManifest } : {}),
       history,
       nonce,
       target,
-      prompt: buildGenerationPrompt([target], globalIndexPrompt),
+      prompt: buildGenerationPrompt(target, globalIndexPrompt),
       summarizer,
-    };
-    assertImagesReachModel(planned, summarizer);
-    return planned;
+    });
   };
-  return turns.map((turn, index) => {
+  const reports: StageReport[] = [];
+  const batches = turns.map((turn, index) => {
     // One nonce per target, absent from every history its request may send,
     // shared by the matched model's fit check and the request that runs.
     const nonce = selectGenerationNonce(
@@ -363,39 +280,26 @@ function planBatches(
     // The target's own reasoning decides the match, never the halo's; the
     // image check covers the turn that may join it.
     const match = matchCandidate(v2ReasoningUnits(turn.span), qualifies);
-    let choice: StageChoice = chooseStage(
-      match,
-      v2Configured(model),
-      candidate =>
+    const { choice, matched } = settleMatch(
+      chooseStage(match, v2Configured(model), candidate =>
         v2MatchPreflight(
           model,
           candidate,
           v2HistoryShowsImages([...(turn.previous ?? []), ...turn.span]),
         ),
+      ),
+      matchModel,
+      (candidate, variant) =>
+        planOne(turn, index, matchedV2Model(model, candidate, variant), nonce),
     );
-    let batch: Batch | undefined;
-    if (choice.kind === "match") {
-      try {
-        const matched = planOne(
-          turn,
-          index,
-          matchedV2Model(model, choice.model, choice.variant),
-          nonce,
-        );
-        if (matchModel) batch = matched;
-      } catch (error) {
-        if (!hasPluginMessage(error)) throw error;
-        choice = { kind: "fallback", reason: "capacity" };
-      }
-    }
-    batch ??= planOne(turn, index, model, nonce);
+    const batch = matched ?? requireFit(planOne(turn, index, model, nonce));
     // OpenCode 2 replay cost is never estimated, so the request's own
     // protected units are reported as left out of its input estimate.
     const requestModel = {
       providerID: batch.summarizer.ref.providerID,
       modelID: batch.summarizer.ref.id,
     };
-    reasoning?.reports.push(
+    reports.push(
       stageReport({
         stage: "turn",
         candidate: match,
@@ -408,6 +312,7 @@ function planBatches(
     );
     return batch;
   });
+  return { batches, reports };
 }
 
 // Generates one validated summary per target turn, in order. Every request
@@ -425,80 +330,48 @@ export async function generateV2Summaries(
   options: {
     controlTimeoutMs: number;
     nonceFactory?: () => string;
-    reasoning?: ReasoningReports;
+    matchModel?: boolean;
   },
-): Promise<V2GeneratedSummary[]> {
-  if (turns.length === 0) return [];
-  const batches = planBatches(
+): Promise<{ summaries: V2GeneratedSummary[]; reports: StageReport[] }> {
+  if (turns.length === 0) return { summaries: [], reports: [] };
+  const { batches, reports } = planBatches(
     turns,
     model,
     globalIndexPrompt,
     options.nonceFactory ?? createGenerationNonce,
-    options.reasoning,
+    options.matchModel === true,
   );
-  const results: V2GeneratedSummary[] = [];
-  const failures: Array<{ index: number; error: V2GenerationError }> = [];
-  let nextIndex = 0;
-  const worker = async () => {
-    while (failures.length === 0 && nextIndex < batches.length) {
-      const index = nextIndex++;
-      try {
-        results[index] = await runBatch(
-          host,
-          owned,
-          source,
-          batches[index]!.summarizer.ref,
-          batches[index]!,
-          options.controlTimeoutMs,
-        );
-      } catch (error) {
-        failures.push({
-          index,
-          error:
-            error instanceof V2GenerationError
-              ? error
-              : new V2GenerationError(
-                  "Compaction generation model request failed.",
-                ),
-        });
-      }
-    }
-  };
-  await Promise.all(
-    Array.from(
-      { length: Math.min(NATIVE_BATCH_MAX_CONCURRENCY, batches.length) },
-      worker,
-    ),
+  const outcome = await runGenerationBatches(batches, (batch, stop) =>
+    runBatch(host, owned, source, batch, options.controlTimeoutMs, stop),
   );
-  if (failures.length > 0) {
-    failures.sort((a, b) => a.index - b.index);
-    if (failures.length === 1) throw failures[0]!.error;
-    const errors = failures.map(failure => failure.error);
-    const reasons = [...new Set(errors.map(error => error.reason))].slice(
-      0,
-      MAX_REASONS,
-    );
-    const sessions = undeletedSessionIDs(errors);
-    throw new V2GenerationError(
-      `Compaction generation failed for ${failures.length} turns: ${reasons.join(" ")}${
-        sessions.length === 0
-          ? ""
-          : ` Temporary session${sessions.length === 1 ? "" : "s"} ${sessions.join(", ")} could not be deleted.`
-      }`,
-      undefined,
-      sessions,
-    );
+  if (outcome.kind === "succeeded") {
+    return { summaries: outcome.results, reports };
   }
-  return results;
+  // `runBatch` reports every failure, its cleanup's included, as one
+  // V2GenerationError.
+  const errors = outcome.failures.map(error => {
+    if (!(error instanceof V2GenerationError)) throw error;
+    return error;
+  });
+  if (errors.length === 1) throw errors[0];
+  throw new V2GenerationError(
+    `Compaction generation failed for ${errors.length} turns: ${distinctReasons(errors).join(" ")}`,
+    unremovedSessions(errors),
+  );
 }
 
+// One owned session: imported, prompted once, checked and removed. `stop` is
+// called as soon as a failure is observed, before the removal, so no further
+// batch starts while this one cleans up. A failed removal fails the batch and
+// names the session; a session the host no longer finds is named as not found
+// only beside another failure.
 async function runBatch(
   host: V2Host,
   owned: OwnedSessions,
   source: V2Source,
-  model: ModelRef,
   batch: Batch,
   controlTimeoutMs: number,
+  stop: () => void,
 ): Promise<V2GeneratedSummary> {
   const control = async <T>(
     failure: string,
@@ -517,7 +390,7 @@ async function runBatch(
     id: sessionID,
     title: "Magic Compact generation",
     agent: MAGIC_COMPACT_SUMMARIZER_AGENT,
-    model,
+    model: batch.summarizer.ref,
     permissions: GENERATION_PERMISSIONS,
     metadata: {},
     time: { created: now, updated: now },
@@ -551,8 +424,8 @@ async function runBatch(
       control("Compaction generation history verification failed.", request);
     if (
       !isDeepStrictEqual(
-        json(await readV2History(host, sessionID, read)),
-        json(history),
+        jsonForm(await readV2History(host, sessionID, read)),
+        jsonForm(history),
       )
     ) {
       throw new V2GenerationError(
@@ -580,14 +453,17 @@ async function runBatch(
       error instanceof V2GenerationError
         ? error
         : new V2GenerationError("Compaction generation model request failed.");
+    stop();
   }
-  if ((await removeOwnedSession(host, owned, sessionID)) === "unknown") {
+  const unremoved = await removeOwnedSession(host, owned, sessionID);
+  if (
+    unremoved?.removal === "failed"
+    || (unremoved !== undefined && failure !== undefined)
+  ) {
+    stop();
     failure = new V2GenerationError(
-      failure
-        ? `${failure.message} Its temporary session ${sessionID} could not be deleted.`
-        : `Compaction generation session deletion failed; temporary session ${sessionID} could not be deleted.`,
       failure?.reason ?? "Compaction generation session deletion failed.",
-      [sessionID],
+      [unremoved],
     );
   }
   if (failure) throw failure;
@@ -614,7 +490,12 @@ function acceptResponse(
   ) {
     throw new V2GenerationError(OVERFLOW);
   }
-  if (!isDeepStrictEqual(json(after.slice(0, history.length)), json(history))) {
+  if (
+    !isDeepStrictEqual(
+      jsonForm(after.slice(0, history.length)),
+      jsonForm(history),
+    )
+  ) {
     throw new V2GenerationError(
       "Compaction generation history verification failed.",
     );
@@ -663,16 +544,14 @@ function acceptResponse(
     ) {
       throw validationFailure("missing structured output");
     }
-    const [parsed] = parseGenerationResponse(
+    const parsed = parseGenerationResponse(
       call.state.input,
-      [batch.target],
+      batch.target,
       batch.nonce,
     );
     return {
-      text: frameSummary(parsed!),
-      ...(batch.candidate.mediaManifest
-        ? { mediaManifest: batch.candidate.mediaManifest }
-        : {}),
+      text: frameSummary(parsed),
+      ...(batch.mediaManifest ? { mediaManifest: batch.mediaManifest } : {}),
     };
   } catch (error) {
     if (error instanceof GenerationResponseValidationError) {
@@ -682,8 +561,4 @@ function acceptResponse(
     }
     throw error;
   }
-}
-
-function json(value: unknown): unknown {
-  return JSON.parse(JSON.stringify(value));
 }

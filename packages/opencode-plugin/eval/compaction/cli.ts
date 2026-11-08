@@ -1,8 +1,13 @@
 // Magic Compact model eval. See docs/CompactionEvaluation.md.
 import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { checkCompactionPlans, CorpusError, loadCorpus } from "./corpus";
-import { GRADES_FORMAT, validateGrades } from "./grade";
+import {
+  checkCompactionPlans,
+  CorpusError,
+  isRunnablePlan,
+  loadCorpus,
+} from "./corpus";
+import { GRADES_FORMAT, gradedAttempts, validateGrades } from "./grade";
 import {
   EvalError,
   loopbackServerUrl,
@@ -109,15 +114,7 @@ export async function main(argv: string[]): Promise<number> {
       allowOnly(flags, []);
       const corpus = loadCorpus();
       const plans = await checkCompactionPlans(corpus);
-      const ok = plans.every(
-        p =>
-          p.v1.targets === 1
-          && p.v2.targets === 1
-          && p.v1.preserved === 1
-          && p.v2.preserved === 1
-          && p.v1.candidates === 0
-          && p.v2.candidates === 0,
-      );
+      const ok = plans.every(isRunnablePlan);
       console.log(
         JSON.stringify(
           {
@@ -182,19 +179,7 @@ export async function main(argv: string[]): Promise<number> {
             corpusSha256: run.corpus.sha256,
             rubricSha256: run.corpus.rubricSha256,
           },
-          attempts
-            .filter(
-              a =>
-                a.status === "delivered"
-                && a.capsule !== null
-                && a.outputSha256 !== null,
-            )
-            .map(a => ({
-              attemptId: a.attemptId,
-              caseId: a.caseId,
-              outputSha256: a.outputSha256!,
-              capsule: a.capsule!,
-            })),
+          gradedAttempts(attempts),
           corpus.cases,
         );
         if (grades.grader.kind !== "manual")
@@ -246,12 +231,7 @@ export async function main(argv: string[]): Promise<number> {
         auth: serverAuth(),
         assertHostVersion: flags.values.get("--assert-host-version") ?? null,
       });
-      return summary.stillOwned.length
-        + summary.unknownOutcomes.length
-        + summary.unresolvedIntents.length
-        || summary.disposal.some(d => !d.scratchRemoved)
-        ? 1
-        : 0;
+      return summary.complete ? 0 : 1;
     }
     default:
       throw new EvalError(`Unknown command ${command}.\n\n${USAGE}`);

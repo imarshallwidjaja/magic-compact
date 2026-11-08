@@ -3,6 +3,13 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { sha256, type Corpus, type CorpusCase, type ModelRef } from "./corpus";
+import { WITNESS } from "./wrapper/core";
+
+// The agent each driver configures at the judge location, and the run
+// checks resolves to exactly the requested judge model.
+export const JUDGE_AGENT = "arkive-eval-judge";
+// How the wrapper's witness agent or command describes itself.
+export const WITNESS_PREFIX = `${WITNESS} `;
 
 // Versions whose loader, wrapper and lifecycle route were qualified in
 // containers. Any other version fails closed unless the operator names that

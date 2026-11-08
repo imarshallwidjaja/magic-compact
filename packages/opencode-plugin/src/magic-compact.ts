@@ -2,8 +2,8 @@ import type { V2Client } from "./api";
 import { COMPACT_NOOP } from "./commands";
 import {
   generateCompactionSummaries,
+  summarizerCatalogLoader,
   type GeneratedSummary,
-  type SummaryReasoningOptions,
 } from "./compact/compact";
 import { estimateReplay, indexReplay } from "./compact/reasoning";
 import {
@@ -12,11 +12,12 @@ import {
   replayFeedback,
   type ReplayEstimate,
 } from "./policy/reasoning";
-import { getCompactionCount } from "./compact/session";
+import { getCompactionCount } from "./policy/lineage";
 import {
   nativeModelVisibleMessages,
   planCompaction,
   type CompactionPlan,
+  type CompactionTarget,
   type MessageWithParts,
   type Turn,
 } from "./compact/plan";
@@ -24,10 +25,8 @@ import { createPruneProjection, type PruneProjection } from "./compact/prune";
 import {
   appendedNoticeMessage,
   applySuccessorEdits,
-  assertSourceUnchanged,
   createSuccessor,
   readSourceAtRest,
-  withExclusiveSource,
   type Successor,
   type SuccessorEdit,
 } from "./compact/successor";
@@ -37,24 +36,20 @@ import {
   statsMessage,
   type PreservedTurns,
 } from "./stats/constants";
-import { countModelFacingContentTokens } from "./stats/tokenize";
-import {
-  BOUNDARY_METADATA,
-  POST_COMPACTION_NOTICE,
-  boundaryPartID,
-  summaryEnvelopeTextPart,
-  turnHasPersistedSummary,
-} from "./compact/constants";
+import { countModelFacingContentTokens } from "./compact/accounting";
+import { BOUNDARY_METADATA, POST_COMPACTION_NOTICE } from "./policy/protocol";
+import { boundaryPartID, summaryEnvelopeTextPart } from "./compact/capsule";
 import {
   COMPACT_INSUFFICIENT_SAVINGS,
   hasUsefulSavings,
+  withExclusiveSource,
 } from "./policy/successor";
 import {
-  CONTROL_OPERATION_TIMEOUT_MS,
   createToastFeedback,
   failureToast,
   IN_PROGRESS_TOAST_DURATION_MS,
-} from "./util";
+} from "./toast-v1";
+import { CONTROL_OPERATION_TIMEOUT_MS } from "./util";
 import {
   decideRetention,
   findRetentionCandidates,
@@ -64,23 +59,26 @@ import {
   type RetentionPolicy,
 } from "./retention/retention";
 import { PluginMessageError } from "./policy/feedback";
+import { assertStatsUsable } from "./storage/stats";
 
-export {
-  COMPACT_ARGUMENTS_ERROR,
-  COMPACT_BACKEND_ERROR,
-  COMPACT_NOOP,
-  COMPACT_THRESHOLD_ERROR,
-  compactSuccess,
-  parseMagicCompactArguments,
-} from "./commands";
-export { COMPACT_INSUFFICIENT_SAVINGS };
 const COMMAND = "Magic Compact";
 
 type CompactionSelection = {
   turns: Turn[];
-  summaries: Exclude<GeneratedSummary, null>[];
+  summaries: GeneratedSummary[];
   pruning: PruneProjection;
 };
+
+// What a command reports: a no-op, or the verified successor. `reasoningLine`
+// appears only when there is something to say about summary models.
+type CompactionOutcome = {
+  preserved: PreservedTurns;
+  retentionLine: string;
+  reasoningLine: string | undefined;
+} & (
+  | { kind: "noop" }
+  | { kind: "compacted"; successor: Successor; summarizedTurns: number }
+);
 
 export type MagicCompactExecutionOptions = {
   // Heuristic skips only the retention step; turn summaries are generated
@@ -112,224 +110,235 @@ export async function executeMagicCompact(
     variant: "info",
     duration: IN_PROGRESS_TOAST_DURATION_MS,
   });
-  let successor: Successor;
-  let summarizedTurnCount: number;
-  let preserved: PreservedTurns;
-  let retentionLine: string;
-  let reasoningLine: string | undefined;
-
+  let outcome: CompactionOutcome;
   try {
-    const outcome = await withExclusiveSource(COMMAND, sessionID, async () => {
-      const source = await readSourceAtRest(
-        v2,
-        COMMAND,
-        sessionID,
-        controlTimeoutMs,
-      );
-      const plan = planCompaction(source.messages, keepTurns);
-      preserved = {
-        requested: keepTurns,
-        preserved: plan.preservedTurnCount,
-      };
-      if (plan.summarizedTurns.length === 0) {
-        retentionLine = retentionFeedback(
-          retentionWithoutCandidates(options.retention),
+    outcome = await withExclusiveSource(
+      COMMAND,
+      sessionID,
+      async (): Promise<CompactionOutcome> => {
+        const source = await readSourceAtRest(
+          v2,
+          COMMAND,
+          sessionID,
+          controlTimeoutMs,
         );
-        return null;
-      }
+        const plan = planCompaction(source.messages, keepTurns);
+        const preserved = {
+          requested: keepTurns,
+          preserved: plan.preservedTurnCount,
+        };
+        // Turns that already hold a summary need no request, so a command
+        // with no other turn is a no-op that reads no saved totals, catalog
+        // or model.
+        if (plan.targets.length === 0) {
+          return {
+            kind: "noop",
+            preserved,
+            retentionLine: retentionFeedback(
+              retentionWithoutCandidates(options.retention),
+            ),
+            reasoningLine: undefined,
+          };
+        }
+        await assertStatsUsable(sessionID);
 
-      const before = await countModelFacingContentTokens(source.messages);
-      const reasoning: SummaryReasoningOptions = {
-        matchModel: options.matchModel === true,
-        reports: [],
-      };
-      // Opaque summary-bearing turns are never pruned, so they hold no
-      // candidates. Retention runs before per-turn generation.
-      const retention =
-        options.retention.mode === "task-aware"
-          ? await decideRetention(
-              v2,
-              source.session,
-              source.messages,
-              await findRetentionCandidates(
+        const before = await countModelFacingContentTokens(source.messages);
+        const matchModel = options.matchModel === true;
+        // Resolved on first need and shared by the retention summary and
+        // every turn request.
+        const catalog = summarizerCatalogLoader(v2, source.session);
+        // Opaque summary-bearing turns are never pruned, so they hold no
+        // candidates. Retention runs before per-turn generation.
+        const retention =
+          options.retention.mode === "task-aware"
+            ? await decideRetention(
+                v2,
+                source.session,
                 source.messages,
-                plan.summarizedTurns.filter(
-                  turn => !turnHasPersistedSummary(turn),
+                await findRetentionCandidates(
+                  source.messages,
+                  plan.targets.map(target => target.turn),
                 ),
-              ),
-              options.retention,
-              { controlTimeoutMs, reasoning },
+                options.retention,
+                { controlTimeoutMs, matchModel, catalog },
+              )
+            : { plan: HEURISTIC_RETENTION, reports: [] };
+        const retentionLine = retentionFeedback(
+          retention.plan,
+          source.messages,
+        );
+        const generation = await generateCompactionSummaries(
+          v2,
+          source.session,
+          plan,
+          { controlTimeoutMs, matchModel, catalog },
+        );
+        const reasoningLine = reasoningFeedback(
+          [...retention.reports, ...generation.reports],
+          matchModel,
+        );
+        // Profitability and the savings gate measure what the continuing
+        // model is sent: visible content plus the estimated replay cost of
+        // protected reasoning that can be attributed. Unattributed reasoning
+        // adds nothing and is reported as not counted. Both sides of every
+        // comparison use the source's one attribution, so only the selected
+        // turns' own reasoning, which compaction removes whole, can change a
+        // result.
+        const sourceReplay = indexReplay(
+          nativeModelVisibleMessages(source.messages),
+        );
+        const replayOf = (turns: Turn[]) =>
+          sourceReplay.estimate(
+            generation.replay,
+            new Set(
+              turns.flatMap(turn => turnMessages(turn).map(m => m.info.id)),
+            ),
+          );
+        const selection = await selectProfitableTurns(
+          plan.targets,
+          generation.summaries,
+          sessionID,
+          retention.plan.keep,
+          replayOf,
+        );
+        if (selection.turns.length === 0) {
+          throw new PluginMessageError(COMPACT_INSUFFICIENT_SAVINGS);
+        }
+
+        const compacted = applySuccessorEdits(
+          source.messages,
+          compactionEdits(source, plan, selection),
+        );
+        const after = await countModelFacingContentTokens(compacted);
+        const sourceEstimate = sourceReplay.estimate(generation.replay);
+        const removedReplay = replayOf(selection.turns);
+        const eligibleTokens = continuationTokens(
+          (
+            await countModelFacingContentTokens(
+              selection.turns.flatMap(turn => turn.assistants),
             )
-          : HEURISTIC_RETENTION;
-      retentionLine = retentionFeedback(retention, source.messages);
-      const summaries = await generateCompactionSummaries(
-        v2,
-        source.session,
-        plan,
-        { controlTimeoutMs, reasoning },
-      );
-      reasoningLine = reasoningFeedback(
-        reasoning.reports,
-        reasoning.matchModel,
-      );
-      // Profitability and the savings gate measure what the continuing model
-      // is sent: visible content plus the estimated replay cost of protected
-      // reasoning that can be attributed. Unattributed reasoning adds nothing
-      // and is reported as not counted. Both sides of every comparison use
-      // the source's one attribution, so only the selected turns' own
-      // reasoning, which compaction removes whole, can change a result.
-      const sourceReplay = indexReplay(
-        nativeModelVisibleMessages(source.messages),
-      );
-      const replayOf = (turns: Turn[]) =>
-        sourceReplay.estimate(
-          reasoning.replay,
-          new Set(
-            turns.flatMap(turn => turnMessages(turn).map(m => m.info.id)),
-          ),
+          ).tokens,
+          removedReplay,
         );
-      const selection = await selectProfitableTurns(
-        plan,
-        summaries,
-        sessionID,
-        retention.keep,
-        replayOf,
-      );
-      if (selection.turns.length === 0) {
-        if (summaries.every(summary => summary === null)) return null;
-        throw new PluginMessageError(COMPACT_INSUFFICIENT_SAVINGS);
-      }
-
-      const compacted = applySuccessorEdits(
-        source.messages,
-        compactionEdits(source, plan, selection),
-      );
-      const after = await countModelFacingContentTokens(compacted);
-      const sourceEstimate = sourceReplay.estimate(reasoning.replay);
-      const removedReplay = replayOf(selection.turns);
-      const eligibleTokens = continuationTokens(
-        (
-          await countModelFacingContentTokens(
-            selection.turns.flatMap(turn => turn.assistants),
+        if (
+          !hasUsefulSavings(
+            before.tokens
+              - after.tokens
+              - removedReplay.visibleTokens
+              + removedReplay.tokens,
+            eligibleTokens,
           )
-        ).tokens,
-        removedReplay,
-      );
-      if (
-        !hasUsefulSavings(
-          before.tokens
-            - after.tokens
-            - removedReplay.visibleTokens
-            + removedReplay.tokens,
-          eligibleTokens,
-        )
-      ) {
-        throw new PluginMessageError(COMPACT_INSUFFICIENT_SAVINGS);
-      }
-      if (after.projectedMediaTokens < before.projectedMediaTokens) {
-        throw new Error(
-          "Magic Compact media projection unexpectedly decreased.",
-        );
-      }
+        ) {
+          throw new PluginMessageError(COMPACT_INSUFFICIENT_SAVINGS);
+        }
+        if (after.projectedMediaTokens < before.projectedMediaTokens) {
+          throw new Error(
+            "Magic Compact media projection unexpectedly decreased.",
+          );
+        }
 
-      const compactionCount = getCompactionCount(source.session) + 1;
-      const replayLine = replayFeedback(sourceEstimate, removedReplay);
-      // The ignored notice is excluded from canonical counts, so it does not
-      // change the `after` it reports.
-      const history = applySuccessorEdits(compacted, [
-        {
-          type: "append-message",
-          message: appendedNoticeMessage(source, "stats", [
-            {
-              type: "text",
-              text: statsMessage(
-                compactionCount,
-                before,
-                after,
-                selection.turns.length,
-                preserved,
-                retentionLine,
-                [
-                  ...(reasoningLine === undefined
-                    ? []
-                    : [`Reasoning | ${reasoningLine}`]),
-                  ...(replayLine === undefined
-                    ? []
-                    : [`Reasoning replay (estimate) | ${replayLine}`]),
-                ],
-              ),
-              ignored: true,
-              metadata: STATS_METADATA,
-            },
-          ]),
-        },
-      ]);
-      const created = await createSuccessor(v2, {
-        command: COMMAND,
-        source,
-        history,
-        operation: "compact",
-        compactionCount,
-        omissions: selection.pruning.mutations.flatMap(mutation =>
-          mutation.type === "update-part" ? mutation.omissions : [],
-        ),
-        tokensPruned:
-          before.tokens
-          + before.projectedMediaTokens
-          - (after.tokens + after.projectedMediaTokens),
-        mediaTokensProjected: after.projectedMediaTokens,
-        recheckSource: async () =>
-          assertSourceUnchanged(
-            COMMAND,
-            source,
-            await readSourceAtRest(v2, COMMAND, sessionID, controlTimeoutMs),
+        const compactionCount = getCompactionCount(source.session) + 1;
+        const replayLine = replayFeedback(sourceEstimate, removedReplay);
+        // The ignored notice is excluded from canonical counts, so it does
+        // not change the `after` it reports.
+        const history = applySuccessorEdits(compacted, [
+          {
+            type: "append-message",
+            message: appendedNoticeMessage(source, "stats", [
+              {
+                type: "text",
+                text: statsMessage(
+                  compactionCount,
+                  before,
+                  after,
+                  selection.turns.length,
+                  preserved,
+                  retentionLine,
+                  [
+                    ...(reasoningLine === undefined
+                      ? []
+                      : [`Reasoning | ${reasoningLine}`]),
+                    ...(replayLine === undefined
+                      ? []
+                      : [`Reasoning replay (estimate) | ${replayLine}`]),
+                  ],
+                ),
+                ignored: true,
+                metadata: STATS_METADATA,
+              },
+            ]),
+          },
+        ]);
+        const created = await createSuccessor(v2, {
+          command: COMMAND,
+          source,
+          history,
+          operation: "compact",
+          compactionCount,
+          omissions: selection.pruning.mutations.flatMap(mutation =>
+            mutation.type === "update-part" ? mutation.omissions : [],
           ),
-        controlTimeoutMs,
-      });
-      const actual = await countModelFacingContentTokens(created.messages);
-      // The persisted successor, under its new IDs, must estimate exactly as
-      // the projection did.
-      const replay = (messages: MessageWithParts[]) =>
-        estimateReplay(nativeModelVisibleMessages(messages), reasoning.replay);
-      const afterReplay = replay(compacted);
-      const actualReplay = replay(created.messages);
-      if (
-        actual.tokens !== after.tokens
-        || actual.projectedMediaTokens !== after.projectedMediaTokens
-        || actualReplay.tokens !== afterReplay.tokens
-        || actualReplay.visibleTokens !== afterReplay.visibleTokens
-        || actualReplay.units !== afterReplay.units
-        || actualReplay.unknown !== afterReplay.unknown
-      ) {
-        throw new PluginMessageError(
-          `Compaction token projection mismatch in successor session ${created.session.id}.`,
-        );
-      }
-      summarizedTurnCount = selection.turns.length;
-      return created;
-    });
-    if (outcome === null) {
-      await toastFeedback.showTerminal({
-        title: COMMAND,
-        message: `${noopFeedback(preserved!)} ${retentionLine!}${reasoningLine === undefined ? "" : ` ${reasoningLine}`}`,
-        variant: "info",
-        duration: 5000,
-      });
-      return null;
-    }
-    successor = outcome;
+          tokensPruned:
+            before.tokens
+            + before.projectedMediaTokens
+            - (after.tokens + after.projectedMediaTokens),
+          mediaTokensProjected: after.projectedMediaTokens,
+          controlTimeoutMs,
+        });
+        const actual = await countModelFacingContentTokens(created.messages);
+        // The persisted successor, under its new IDs, must estimate exactly as
+        // the projection did.
+        const replay = (messages: MessageWithParts[]) =>
+          estimateReplay(
+            nativeModelVisibleMessages(messages),
+            generation.replay,
+          );
+        const afterReplay = replay(compacted);
+        const actualReplay = replay(created.messages);
+        if (
+          actual.tokens !== after.tokens
+          || actual.projectedMediaTokens !== after.projectedMediaTokens
+          || actualReplay.tokens !== afterReplay.tokens
+          || actualReplay.visibleTokens !== afterReplay.visibleTokens
+          || actualReplay.units !== afterReplay.units
+          || actualReplay.unknown !== afterReplay.unknown
+        ) {
+          throw new PluginMessageError(
+            `Compaction token projection mismatch in successor session ${created.session.id}.`,
+          );
+        }
+        return {
+          kind: "compacted",
+          successor: created,
+          summarizedTurns: selection.turns.length,
+          preserved,
+          retentionLine,
+          reasoningLine,
+        };
+      },
+    );
   } catch (error) {
     await toastFeedback.showTerminal(failureToast(COMMAND, error));
     throw error;
   }
 
+  const lines = `${outcome.retentionLine}${outcome.reasoningLine === undefined ? "" : ` ${outcome.reasoningLine}`}`;
+  if (outcome.kind === "noop") {
+    await toastFeedback.showTerminal({
+      title: COMMAND,
+      message: `${noopFeedback(outcome.preserved)} ${lines}`,
+      variant: "info",
+      duration: 5000,
+    });
+    return null;
+  }
   await toastFeedback.showTerminal({
     title: COMMAND,
-    message: `Compacted ${summarizedTurnCount!} request turn(s) into successor session ${successor.session.id}. ${preservedTurnsFeedback(preserved!)} ${retentionLine!}${reasoningLine === undefined ? "" : ` ${reasoningLine}`}`,
+    message: `Compacted ${outcome.summarizedTurns} request turn(s) into successor session ${outcome.successor.session.id}. ${preservedTurnsFeedback(outcome.preserved)} ${lines}`,
     variant: "info",
     duration: 5000,
   });
-  return successor;
+  return outcome.successor;
 }
 
 // Nothing preserved means N did not shape the outcome, so the message stays
@@ -410,21 +419,20 @@ function compactionEdits(
 // reasoning part of a summarized turn, so the projected turn replays none.
 // Reasoning whose cost cannot be attributed counts only by its visible text.
 async function selectProfitableTurns(
-  plan: CompactionPlan,
+  targets: CompactionTarget[],
   summaries: GeneratedSummary[],
   sessionID: string,
   keep: ReadonlySet<string>,
   replayOf: (turns: Turn[]) => ReplayEstimate,
 ): Promise<CompactionSelection> {
   const selectedTurns: Turn[] = [];
-  const selectedSummaries: Exclude<GeneratedSummary, null>[] = [];
+  const selectedSummaries: GeneratedSummary[] = [];
   const projectedTurns: Turn[] = [];
   const mutations: PruneProjection["mutations"] = [];
-  for (const [index, turn] of plan.summarizedTurns.entries()) {
+  for (const [index, { turn }] of targets.entries()) {
     const summary = summaries[index];
     if (summary === undefined)
       throw new Error("Missing summary for assistant turn.");
-    if (summary === null) continue;
     const candidates = [injectProjectedSummary(turn, summary, sessionID)];
     const pruning = await createPruneProjection(candidates, sessionID, keep);
     const projectedTurn = pruning.turns[0]!;
@@ -459,7 +467,7 @@ function turnMessages(turn: Turn): MessageWithParts[] {
 
 function injectProjectedSummary(
   turn: Turn,
-  summary: Exclude<GeneratedSummary, null>,
+  summary: GeneratedSummary,
   sessionID: string,
 ): Turn {
   const projected = structuredClone(turn);

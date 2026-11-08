@@ -34,6 +34,21 @@ export type DatasetSplit = (typeof DATASET_SPLITS)[number];
 // and its environment override, so stored results keep their meaning.
 export const DECISION_EVALUATION_THRESHOLD = 0.8;
 
+// Why a run on this split cannot use this reference threshold, or undefined
+// when it can. Planning, result loading and report overrides all apply it.
+export function thresholdRefusal(
+  split: DatasetSplit,
+  threshold: number,
+): string | undefined {
+  if (!Number.isFinite(threshold) || threshold <= 0 || threshold > 1) {
+    return "must be above 0 and at most 1";
+  }
+  if (split === "heldout" && threshold !== DECISION_EVALUATION_THRESHOLD) {
+    return `must be the frozen threshold ${DECISION_EVALUATION_THRESHOLD} for a held-out dataset`;
+  }
+  return undefined;
+}
+
 // IDs double as OpenAI question names, so they stay short and plain.
 const identifier = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/);
 
@@ -169,10 +184,17 @@ export function datasetSha256(dataset: DecisionDataset): string {
   return sha256(canonicalJson(dataset));
 }
 
-// The singleton request the production classifier sends for this case.
+// The canonical singleton request the production classifier builds for this
+// case. It carries no backend's body limit: a provider's limit applies to the
+// wire body that provider is sent (see `planCase` in runner.ts).
 export function buildCaseRequest(item: EvalCase): RetentionRequest {
   try {
-    const requests = buildRetentionRequests(item.context, [item.candidate], 1);
+    const requests = buildRetentionRequests(
+      item.context,
+      [item.candidate],
+      1,
+      null,
+    );
     return requests[0]!;
   } catch (error) {
     if (error instanceof RetentionClassificationError) {

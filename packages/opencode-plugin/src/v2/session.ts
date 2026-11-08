@@ -6,13 +6,30 @@ import type {
 } from "@opencode/client";
 import { randomBytes } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { PluginMessageError } from "../policy/feedback";
 import {
+  successorLineage,
+  successorMetadata,
+  successorTitle,
+  type SuccessorLineage,
+} from "../policy/lineage";
+import {
+  abandonedDeliveryJob,
+  settleDeliveries,
+  type DeliveryRecord,
+  type RecoveryRecord,
+} from "../policy/recovery";
+import {
+  deleteCandidateStorage,
   SourceChangedError,
   SourceNotAtRestError,
   successorFailure,
   SuccessorVerificationError,
   undeliveredBackgroundRefusal,
   unfinishedHistoryRefusal,
+  type CandidateDisposal,
+  type CandidateKeptBy,
+  type SourceLifecycle,
   type SuccessorCommand,
   type SuccessorStage,
   type UnfinishedHistoryRecord,
@@ -20,14 +37,11 @@ import {
 import {
   commitPlannedOmission,
   copyCache,
-  deleteCache,
   type PlannedOmission,
 } from "../storage/omission";
-import { deleteStats, readStats, writeStats } from "../storage/stats";
-import { attemptWithinDeadline, isRecord } from "../util";
+import { writeSuccessorStats } from "../storage/stats";
+import { attemptWithinDeadline, isRecord, jsonForm } from "../util";
 import type { V2Host } from "./host";
-import { PluginMessageError } from "../policy/feedback";
-import { abandonedDeliveryJob, type RecoveryRecord } from "../policy/recovery";
 
 export type V2Message = SessionMessageInfo;
 
@@ -46,17 +60,25 @@ export function v2StorageKey(sessionID: string): string {
 
 const PAGE_LIMIT = 200;
 
+// A host request that failed or missed the control deadline. Its fixed text
+// is the at-rest read refusal; the host's error is dropped, because it may
+// carry bodies or paths.
+class SourceReadError extends PluginMessageError {
+  constructor(command: SuccessorCommand) {
+    super(
+      `${command} could not read the session state it needs to check that the session is at rest. The session was left unchanged.`,
+    );
+    this.name = "SourceReadError";
+  }
+}
+
 async function within<T>(
   command: SuccessorCommand,
   controlTimeoutMs: number,
   request: (signal: AbortSignal) => Promise<T>,
 ): Promise<T> {
   const outcome = await attemptWithinDeadline(request, controlTimeoutMs);
-  if (outcome.kind !== "success") {
-    throw new PluginMessageError(
-      `${command} could not read the session state it needs to check that the session is at rest. The session was left unchanged.`,
-    );
-  }
+  if (outcome.kind !== "success") throw new SourceReadError(command);
   return outcome.value;
 }
 
@@ -97,7 +119,7 @@ export async function readV2History(
     message =>
       message.type !== "assistant" || message.time.completed !== undefined,
   );
-  if (!isDeepStrictEqual(json(exported.messages), json(exportable))) {
+  if (!isDeepStrictEqual(jsonForm(exported.messages), jsonForm(exportable))) {
     throw new Error("Session history pages did not match its export.");
   }
   return messages;
@@ -124,6 +146,19 @@ async function listChildren(
   return children;
 }
 
+// A source as `readV2SourceAtRest` or `readV2RecoverableSource` read it, with
+// the recheck that reads it again the same way and throws
+// `SourceChangedError` on drift. The successor runs the recheck just before
+// its ready update.
+export type CheckedV2Source = V2Source & {
+  readonly recheck: () => Promise<void>;
+};
+
+// An unfinished record or undelivered background launch in a subagent
+// session's own history. Recovery never writes or copies a subagent session,
+// so it names the record and leaves it as it is.
+export type V2SubagentRecord = { sessionID: string; messageID: string };
+
 // Reads the complete source and refuses every state OpenCode 2.0.28 can show
 // for work that is still in flight or waiting to be delivered.
 export async function readV2SourceAtRest(
@@ -131,28 +166,59 @@ export async function readV2SourceAtRest(
   command: SuccessorCommand,
   sessionID: string,
   controlTimeoutMs: number,
-): Promise<V2Source> {
+): Promise<CheckedV2Source> {
   return (
-    await inspectV2Source(host, command, sessionID, controlTimeoutMs, false)
+    await readV2Source(host, command, sessionID, controlTimeoutMs, "at-rest")
   ).source;
 }
-
-// An unfinished record or undelivered background launch in a subagent
-// session's own history. Recovery never writes or copies a subagent session,
-// so it names the record and leaves it as it is.
-export type V2SubagentRecord = { sessionID: string; messageID: string };
 
 // The source as `/magic-recover` reads it: every live check of
 // `readV2SourceAtRest` still refuses, including running background jobs, but
 // unfinished stored records and undelivered background results are left for
-// the caller, because running the command declared their work abandoned.
-export async function readV2RecoverableSource(
+// the caller, because running the command declared their work abandoned. Its
+// recheck also compares the subagent records.
+export function readV2RecoverableSource(
   host: V2Host,
   command: SuccessorCommand,
   sessionID: string,
   controlTimeoutMs: number,
-): Promise<{ source: V2Source; subagentRecords: V2SubagentRecord[] }> {
-  return inspectV2Source(host, command, sessionID, controlTimeoutMs, true);
+): Promise<{ source: CheckedV2Source; subagentRecords: V2SubagentRecord[] }> {
+  return readV2Source(host, command, sessionID, controlTimeoutMs, "recovery");
+}
+
+async function readV2Source(
+  host: V2Host,
+  command: SuccessorCommand,
+  sessionID: string,
+  controlTimeoutMs: number,
+  lifecycle: SourceLifecycle,
+): Promise<{ source: CheckedV2Source; subagentRecords: V2SubagentRecord[] }> {
+  const read = () =>
+    inspectV2Source(host, command, sessionID, controlTimeoutMs, lifecycle);
+  // What the recheck compares: the continuation state and the complete
+  // history, whose completion times OpenCode 2 stores, plus for recovery the
+  // subagent records it lists.
+  const snapshot = (inspection: Awaited<ReturnType<typeof read>>) =>
+    jsonForm({
+      continuation: continuationState(inspection.source),
+      messages: inspection.source.messages,
+      ...(lifecycle === "recovery"
+        ? { subagentRecords: inspection.subagentRecords }
+        : {}),
+    });
+  const inspection = await read();
+  const initial = snapshot(inspection);
+  return {
+    source: {
+      ...inspection.source,
+      recheck: async () => {
+        if (!isDeepStrictEqual(snapshot(await read()), initial)) {
+          throw new SourceChangedError(command);
+        }
+      },
+    },
+    subagentRecords: inspection.subagentRecords,
+  };
 }
 
 async function inspectV2Source(
@@ -160,7 +226,7 @@ async function inspectV2Source(
   command: SuccessorCommand,
   sessionID: string,
   controlTimeoutMs: number,
-  abandonedHistory: boolean,
+  lifecycle: SourceLifecycle,
 ): Promise<{ source: V2Source; subagentRecords: V2SubagentRecord[] }> {
   const read = <T>(request: (signal: AbortSignal) => Promise<T>) =>
     within(command, controlTimeoutMs, request);
@@ -206,32 +272,14 @@ async function inspectV2Source(
       );
     }
     // Not active, so what remains is history the host never finished.
-    const unfinished = history.flatMap(unfinishedRecord);
     const background = backgroundJobs(history);
     jobs.push(...background.jobs);
-    if (!abandonedHistory) {
-      if (unfinished.length > 0) {
-        throw unfinishedHistoryRefusal(
-          command,
-          unfinished,
-          child ? id : undefined,
-        );
-      }
-      const [first] = background.undelivered;
-      if (first !== undefined) {
-        throw first.jobID === undefined
-          ? notAtRest(
-              "a background command or subagent cannot be matched to its result",
-            )
-          : undeliveredBackgroundRefusal(
-              command,
-              "a background command or subagent has not delivered its result yet",
-            );
-      }
+    if (lifecycle === "at-rest") {
+      assertV2HistoryFinished(command, history, child ? id : undefined);
     } else if (child) {
       subagentRecords.push(
         ...[
-          ...unfinished.map(record => record.messageID),
+          ...history.flatMap(unfinishedRecord).map(record => record.messageID),
           ...background.undelivered.map(launch => launch.messageID),
         ].map(messageID => ({ sessionID: id, messageID })),
       );
@@ -305,11 +353,40 @@ async function readHistoryOrRefuse(
   try {
     return await readV2History(host, sessionID, read);
   } catch (error) {
-    // The host's own error is dropped: it may carry bodies or paths.
-    throw error instanceof Error && error.message.startsWith(command)
+    // A failed read keeps its own refusal. Any other failure means the pages
+    // and export disagreed or were malformed; the host's own error is
+    // dropped, because it may carry bodies or paths.
+    throw error instanceof SourceReadError
       ? error
       : new PluginMessageError(
           `${command} could not read a complete session history. The session was left unchanged.`,
+        );
+  }
+}
+
+// Refuses a history that holds an unfinished record or a background launch
+// still owed its result. `subagentSessionID` names the subagent session whose
+// history it is, when it is not the source itself. The at-rest read applies
+// it to every session in the tree; recovery applies it to its own result.
+export function assertV2HistoryFinished(
+  command: SuccessorCommand,
+  messages: V2Message[],
+  subagentSessionID?: string,
+): void {
+  const unfinished = messages.flatMap(unfinishedRecord);
+  if (unfinished.length > 0) {
+    throw unfinishedHistoryRefusal(command, unfinished, subagentSessionID);
+  }
+  const [first] = backgroundJobs(messages).undelivered;
+  if (first !== undefined) {
+    throw first.jobID === undefined
+      ? new SourceNotAtRestError(
+          command,
+          "a background command or subagent cannot be matched to its result",
+        )
+      : undeliveredBackgroundRefusal(
+          command,
+          "a background command or subagent has not delivered its result yet",
         );
   }
 }
@@ -372,11 +449,7 @@ type BackgroundJob = { tool: "shell" | "subagent"; id: string };
 // foreground call the user detached afterwards (OpenCode 2.0.28 gives both the
 // same running result and leaves the original input unchanged). Until the
 // notification is stored, a successor would lose the result, so every such
-// call must be matched by a notification for its job, one per call: in stored
-// order a notification settles the oldest launch of its job that is still
-// open, and one with no open launch settles nothing, so a job started twice
-// owes two. A call that `/magic-recover` recorded as never delivered is
-// abandoned, owes none, and settles only itself.
+// call must be matched by a notification for its job (`settleDeliveries`).
 // Returns the jobs that owe no notification, which the caller checks have
 // stopped (a cancellation notice is written when the cancel is accepted), and
 // every launch still owed one; a launch without a job ID can never be linked.
@@ -406,63 +479,60 @@ function notifiedJob(message: V2Message): string | undefined {
   return undefined;
 }
 
-export function backgroundJobs(messages: V2Message[]): {
-  jobs: BackgroundJob[];
-  undelivered: V2BackgroundLaunch[];
-} {
-  const launches: V2BackgroundLaunch[] = [];
-  const open = new Map<string, V2BackgroundLaunch[]>();
-  const settled = new Set<V2BackgroundLaunch>();
-  for (const message of messages) {
-    const notified = notifiedJob(message);
-    if (notified !== undefined) {
-      const launch = open.get(notified)?.shift();
-      if (launch !== undefined) settled.add(launch);
-      continue;
-    }
-    if (message.type !== "assistant") continue;
-    for (const [index, item] of message.content.entries()) {
+function backgroundRecords(
+  message: V2Message,
+): DeliveryRecord<V2BackgroundLaunch>[] {
+  const notified = notifiedJob(message);
+  if (notified !== undefined) return [{ type: "delivery", job: notified }];
+  if (message.type !== "assistant") return [];
+  return message.content.flatMap(
+    (item, index): DeliveryRecord<V2BackgroundLaunch>[] => {
       if (
         item.type !== "tool"
         || item.state.status !== "completed"
         || (item.name !== "shell" && item.name !== "subagent")
       ) {
-        continue;
+        return [];
       }
       const metadata = item.state.metadata ?? {};
       if (
         item.state.input["background"] !== true
         && metadata["status"] !== "running"
       ) {
-        continue;
+        return [];
       }
       const tool = item.name;
       const id =
         item.name === "shell" ? metadata["shellID"] : metadata["sessionID"];
       const jobID = typeof id === "string" ? id : undefined;
-      const launch: V2BackgroundLaunch = {
-        messageID: message.id,
-        index,
-        tool,
-        jobID,
-      };
-      launches.push(launch);
-      if (jobID === undefined) continue;
-      if (abandonedDeliveryJob(metadata) === jobID) {
-        settled.add(launch);
-      } else {
-        const key = `${tool}:${jobID}`;
-        open.set(key, [...(open.get(key) ?? []), launch]);
-      }
-    }
-  }
+      const job = (value: string | undefined) =>
+        value === undefined ? undefined : `${tool}:${value}`;
+      return [
+        {
+          type: "launch",
+          launch: { messageID: message.id, index, tool, jobID },
+          job: job(jobID),
+          mark: job(abandonedDeliveryJob(metadata)),
+        },
+      ];
+    },
+  );
+}
+
+export function backgroundJobs(messages: V2Message[]): {
+  jobs: BackgroundJob[];
+  undelivered: V2BackgroundLaunch[];
+} {
+  const launches = settleDeliveries(messages.flatMap(backgroundRecords));
   return {
-    jobs: launches.flatMap(launch =>
-      settled.has(launch) && launch.jobID !== undefined
+    jobs: launches.flatMap(({ launch, settled }) =>
+      settled && launch.jobID !== undefined
         ? [{ tool: launch.tool, id: launch.jobID }]
         : [],
     ),
-    undelivered: launches.filter(launch => !settled.has(launch)),
+    undelivered: launches.flatMap(({ launch, settled }) =>
+      settled ? [] : [launch],
+    ),
   };
 }
 
@@ -471,7 +541,7 @@ export function backgroundJobs(messages: V2Message[]): {
 // continue the conversation the user left.
 function continuationState(source: V2Source): unknown {
   const { session } = source;
-  return json({
+  return {
     title: session.title,
     agent: session.agent,
     model: session.model,
@@ -481,20 +551,7 @@ function continuationState(source: V2Source): unknown {
     subpath: session.subpath,
     projectID: session.projectID,
     instructions: source.instructions,
-  });
-}
-
-export function assertV2SourceUnchanged(
-  command: SuccessorCommand,
-  initial: V2Source,
-  current: V2Source,
-): void {
-  if (
-    !isDeepStrictEqual(continuationState(current), continuationState(initial))
-    || !isDeepStrictEqual(json(current.messages), json(initial.messages))
-  ) {
-    throw new SourceChangedError(command);
-  }
+  };
 }
 
 // Host-generated instruction-change notices describe deltas against the
@@ -508,34 +565,19 @@ export function isInstructionNotice(message: V2Message): boolean {
   );
 }
 
-// Successor lineage stored on the new session. `ready` turns true only after
-// the history, instructions, caches and stats are verified and the source was
-// rechecked. `outcome` is the command's result for clients that did not run it.
-// `recovery` lists every source record a recovery closed or left alone.
-export type V2SuccessorMetadata = {
-  compactionCount: number;
-  successorOf: string;
-  operation: "compact" | "trim" | "recover";
-  createdAt: number;
-  ready: boolean;
-  outcome: string;
-  recovery?: RecoveryRecord[];
-};
-
 export type V2SuccessorRequest = {
   command: SuccessorCommand;
-  source: V2Source;
+  // Its recheck runs after the candidate is complete.
+  source: CheckedV2Source;
   // The edited history, still under source message IDs.
   messages: V2Message[];
-  operation: V2SuccessorMetadata["operation"];
+  operation: SuccessorLineage["operation"];
   compactionCount: number;
   outcome: string;
   recovery?: RecoveryRecord[];
   omissions: PlannedOmission[];
   tokensPruned: number;
   mediaTokensProjected: number;
-  // Rechecks the source after the candidate is complete; throws on drift.
-  recheckSource: () => Promise<void>;
   controlTimeoutMs: number;
 };
 
@@ -587,7 +629,7 @@ export function withFreshMessageIDs(
 // entry, unarchived. A field another writer changed makes the candidate
 // foreign.
 function candidateHeader(session: SessionInfo): unknown {
-  return json({
+  return jsonForm({
     parentID: session.parentID,
     fork: session.fork,
     revert: session.revert,
@@ -604,7 +646,7 @@ function candidateHeader(session: SessionInfo): unknown {
 }
 
 function sortedEntries(entries: readonly InstructionEntryInfo[]): unknown {
-  return json([...entries].sort((a, b) => a.key.localeCompare(b.key)));
+  return jsonForm([...entries].sort((a, b) => a.key.localeCompare(b.key)));
 }
 
 // Creates a new root session holding the edited history, copies the current
@@ -620,32 +662,29 @@ export async function createV2Successor(
   const read = <T>(operation: (signal: AbortSignal) => Promise<T>) =>
     within(command, request.controlTimeoutMs, operation);
   const createdAt = Date.now();
-  const lineage = (ready: boolean): V2SuccessorMetadata => ({
+  const lineage = {
     compactionCount: request.compactionCount,
     successorOf: sourceID,
     operation: request.operation,
     createdAt,
-    ready,
     outcome: request.outcome,
     ...(request.recovery === undefined ? {} : { recovery: request.recovery }),
-  });
+  };
   const successorID = mintV2ID("ses_", createdAt, 1, true);
   const expected = withFreshMessageIDs(
     request.messages.filter(message => !isInstructionNotice(message)),
   );
   const metadata = (ready: boolean) =>
-    json({
-      ...source.session.metadata,
-      magicCompact: lineage(ready),
-    }) as Record<string, JsonValue>;
-  const title = (ready: boolean) =>
-    source.session.title === undefined || ready
-      ? source.session.title
-      : `${source.session.title} (preparing)`;
+    jsonForm(
+      successorMetadata(
+        source.session.metadata,
+        successorLineage(lineage, ready),
+      ),
+    ) as Record<string, JsonValue>;
+  const title = (ready: boolean) => successorTitle(source.session.title, ready);
   const info = {
     ...structuredClone(source.session),
     id: successorID,
-    // Marks a candidate that is not ready yet in session lists.
     ...(source.session.title === undefined ? {} : { title: title(false) }),
     metadata: metadata(false),
     time: { created: createdAt, updated: createdAt },
@@ -671,11 +710,10 @@ export async function createV2Successor(
     controlTimeoutMs: request.controlTimeoutMs,
   };
 
-  let importAttempted = false;
   let readyAttempted = false;
+  let storageAttempted = false;
   let stage: SuccessorStage = "import";
   try {
-    importAttempted = true;
     await host.session.import({
       info: info as never,
       messages: expected as never,
@@ -697,6 +735,7 @@ export async function createV2Successor(
     await verifySuccessor(host, read, owned, true);
 
     stage = "cache";
+    storageAttempted = true;
     const sourceKey = v2StorageKey(sourceID);
     const successorKey = v2StorageKey(successorID);
     await copyCache(sourceKey, successorKey);
@@ -704,24 +743,19 @@ export async function createV2Successor(
       await commitPlannedOmission(successorKey, omission);
     }
     stage = "stats";
-    const previous = await readStats(sourceKey);
-    await writeStats(successorKey, {
-      version: 1,
-      sourceSessionId: sourceID,
-      rootSessionId: previous?.rootSessionId ?? sourceID,
-      totalTokensPruned:
-        (previous?.totalTokensPruned ?? 0) + request.tokensPruned,
-      cachedTokensSaved: previous?.cachedTokensSaved ?? 0,
+    await writeSuccessorStats({
+      sourceKey,
+      successorKey,
+      sourceSessionID: sourceID,
+      tokensPruned: request.tokensPruned,
       mediaTokensProjected: request.mediaTokensProjected,
-      cachedMediaTokensSaved: previous?.cachedMediaTokensSaved ?? 0,
-      // Imported responses are already counted; only new ones add savings.
-      processedAssistantMessageIds: expected
+      assistantMessageIDs: expected
         .filter(message => message.type === "assistant")
         .map(message => message.id),
     });
 
     stage = "recheck";
-    await request.recheckSource();
+    await source.recheck();
     // The snapshot just before the write, not a lock: the ready update
     // replaces the title and metadata, and the candidate's instructions are
     // part of the conversation it continues.
@@ -749,16 +783,15 @@ export async function createV2Successor(
     );
     return { session, messages: expected };
   } catch (error) {
-    const discarded =
-      importAttempted
-      && !readyAttempted
-      && (await discardOwnedCandidate(host, read, owned));
+    // Once the ready update was sent the host may have applied it, so the
+    // candidate may already be the user's successor: keep it and name it.
+    const disposal: CandidateDisposal = readyAttempted
+      ? { outcome: "ready-attempted" }
+      : await discardOwnedCandidate(host, read, owned, storageAttempted);
     throw successorFailure(command, error, {
       stage,
       sourceID,
-      candidateID: successorID,
-      discarded,
-      readyAttempted,
+      candidate: { id: successorID, disposal },
     });
   }
 }
@@ -791,7 +824,7 @@ async function verifySuccessor(
   } catch {
     throw new SuccessorVerificationError("history read failed");
   }
-  if (!isDeepStrictEqual(json(messages), json(candidate.planned))) {
+  if (!isDeepStrictEqual(jsonForm(messages), jsonForm(candidate.planned))) {
     throw new SuccessorVerificationError(
       "imported history did not match the plan",
     );
@@ -830,14 +863,21 @@ async function verifySuccessor(
 // queued message, permission request or form, only source instruction entries
 // it could have put, and the planned history or none. The import is a single
 // request, so its history is either the plan or empty; anything else means
-// another writer touched it. Anything unreadable keeps the candidate.
+// another writer touched it. Anything unreadable, and a removal the host does
+// not confirm, keeps the candidate. A candidate the host reports missing, as
+// after a failed import, is absent: the import may still be applied later, so
+// nothing saved under its ID is removed.
 async function discardOwnedCandidate(
   host: V2Host,
   read: <T>(request: (signal: AbortSignal) => Promise<T>) => Promise<T>,
   candidate: OwnedCandidate,
-): Promise<boolean> {
+  storageAttempted: boolean,
+): Promise<CandidateDisposal> {
   const { candidateID } = candidate;
-  // A failed import may have created nothing.
+  const kept = (keptBy: CandidateKeptBy): CandidateDisposal => ({
+    outcome: "kept",
+    keptBy,
+  });
   const lookup = await attemptWithinDeadline(
     signal => host.session.get({ sessionID: candidateID }, { signal }),
     candidate.controlTimeoutMs,
@@ -847,18 +887,19 @@ async function discardOwnedCandidate(
     && isRecord(lookup.error)
     && lookup.error["_tag"] === "SessionNotFoundError"
   ) {
-    return true;
+    return { outcome: "absent", storageAttempted };
   }
-  if (lookup.kind !== "success") return false;
+  if (lookup.kind !== "success") return kept("read");
+  let removing = false;
   try {
     if (!isDeepStrictEqual(candidateHeader(lookup.value), candidate.header))
-      return false;
+      return kept("record");
     const current = await readV2History(host, candidateID, read);
     if (
       current.length > 0
-      && !isDeepStrictEqual(json(current), json(candidate.planned))
+      && !isDeepStrictEqual(jsonForm(current), jsonForm(candidate.planned))
     ) {
-      return false;
+      return kept("history");
     }
     const entries = await read(signal =>
       host.session.instructions.entry.list(
@@ -866,17 +907,18 @@ async function discardOwnedCandidate(
         { signal },
       ),
     );
-    const known = json(candidate.instructions) as InstructionEntryInfo[];
+    const known = jsonForm(candidate.instructions) as InstructionEntryInfo[];
     if (
-      !(json(entries) as InstructionEntryInfo[]).every(entry =>
+      !(jsonForm(entries) as InstructionEntryInfo[]).every(entry =>
         known.some(item => isDeepStrictEqual(item, entry)),
       )
     ) {
-      return false;
+      return kept("instructions");
     }
-    if ((await listChildren(host, candidateID, read)).length > 0) return false;
+    if ((await listChildren(host, candidateID, read)).length > 0)
+      return kept("children");
     const active = await read(signal => host.session.active({ signal }));
-    if (active[candidateID] !== undefined) return false;
+    if (active[candidateID] !== undefined) return kept("activity");
     const [inbox, permissions, forms] = await Promise.all([
       read(signal =>
         host.session.inbox.list({ sessionID: candidateID }, { signal }),
@@ -888,19 +930,15 @@ async function discardOwnedCandidate(
         host.session.form.list({ sessionID: candidateID }, { signal }),
       ),
     ]);
-    if (inbox.length + permissions.length + forms.length > 0) return false;
-    // Directly awaited: abandoning a removal could leave a session behind.
+    if (inbox.length + permissions.length + forms.length > 0)
+      return kept("pending");
+    // Directly awaited: abandoning a removal could leave a session behind,
+    // and a removal the host rejected may still apply, so it is never
+    // retried.
+    removing = true;
     await host.session.remove({ sessionID: candidateID });
   } catch {
-    return false;
+    return kept(removing ? "delete" : "read");
   }
-  await deleteCache(v2StorageKey(candidateID)).catch(() => undefined);
-  await deleteStats(v2StorageKey(candidateID)).catch(() => undefined);
-  return true;
-}
-
-// Records cross the HTTP API as JSON; comparing their JSON form keeps absent
-// and undefined fields equal.
-function json(value: unknown): unknown {
-  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+  return deleteCandidateStorage(v2StorageKey(candidateID));
 }

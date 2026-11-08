@@ -1,5 +1,5 @@
 import type { Part, ToolPart } from "@opencode-ai/sdk/v2";
-import { isPersistedSummaryPart } from "./constants";
+import { isPersistedSummaryPart } from "./capsule";
 import type { MessageWithParts, Turn } from "./plan";
 import { planOmission, type PlannedOmission } from "../storage/omission";
 import { isRecord } from "../util";
@@ -185,7 +185,6 @@ export async function trimWouldChangeContent(part: ToolPart): Promise<boolean> {
   return call !== null && (await toolTrimChangesContent(call));
 }
 
-// V1 tool names for the shared rule categories.
 const V1_TOOL_CATEGORIES: Readonly<Record<string, ToolRuleCategory>> = {
   write: "write",
   edit: "edit",

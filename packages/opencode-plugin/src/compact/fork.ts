@@ -2,9 +2,8 @@ import type { Message, Part, Session } from "@opencode-ai/sdk/v2";
 import { randomBytes, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { V2Client } from "../api";
-import { markPluginMessage, type LeavesSessions } from "../policy/feedback";
-import { ContentFreeError } from "../policy/successor";
-import { attemptWithinDeadline, CONTROL_OPERATION_TIMEOUT_MS } from "../util";
+import { ContentFreeError } from "../policy/feedback";
+import { attemptWithinDeadline } from "../util";
 import { snapshotSourceMessages, type MessageWithParts } from "./plan";
 
 // Fixed, content-free causes shown to operators; never raw host bodies.
@@ -23,7 +22,7 @@ const FORK_FAILURE_DETAIL = {
 export type ForkFailureReason = keyof typeof FORK_FAILURE_DETAIL;
 export type ForkFailureDetail = (typeof FORK_FAILURE_DETAIL)[ForkFailureReason];
 
-export class ForkHistoryError extends ContentFreeError {
+export class ForkHistoryError extends ContentFreeError<ForkFailureDetail> {
   constructor(readonly reason: ForkFailureReason) {
     const detail = FORK_FAILURE_DETAIL[reason];
     super(
@@ -34,45 +33,34 @@ export class ForkHistoryError extends ContentFreeError {
   }
 }
 
-// Already sanitized; callers must retain the owned ID needed for cleanup. The
-// fork ID is `undeletedSessionIDs`, not a reason, so an aggregate of several
-// failed forks names every one however many reasons it explains.
-export class ForkCleanupError extends AggregateError implements LeavesSessions {
-  readonly undeletedSessionIDs: readonly string[];
-
-  constructor(sourceID: string, forkID: string, reason: ForkFailureReason) {
-    const failure = new ForkHistoryError(reason);
-    super(
-      [failure],
-      `Magic Compact chronological fork initialization and cleanup failed (${failure.detail}). Source session ${sourceID} was left unchanged; delete partial fork ${forkID} manually.`,
-    );
-    this.name = "ForkCleanupError";
-    this.undeletedSessionIDs = [forkID];
-    markPluginMessage(this);
-  }
-}
-
 type ReplayEvents = NonNullable<
   NonNullable<Parameters<V2Client["sync"]["replay"]>[0]>["events"]
 >;
+
+// A native fork the host created, cut before the first planned message. It is
+// not yet known to be empty or usable: `populate` checks that it holds no
+// message, writes the planned history once and verifies it and the live
+// source. The caller registers the fork as soon as it has the ID and owns its
+// deletion; nothing here deletes it.
+export type ForkCut = {
+  readonly id: string;
+  // Failures are ForkHistoryError.
+  populate(controlTimeoutMs: number): Promise<void>;
+};
 
 // OpenCode 1.18.30 mints a native fork's message and part IDs one record at a
 // time from the host clock and reads parts back in ID order, so a clock that
 // steps backwards while the fork is copied reverses history. Messages also sort
 // by a row creation time taken from the copied JSON. The host's copy therefore
 // never populates a fork: the native fork is cut before the first planned
-// message, so it holds only the session, and the planned history is written
-// once through host replay with IDs minted here from a single clock reading.
-export async function forkSession(
+// message, and `populate` writes the planned history once through host replay
+// with IDs minted here from a single clock reading.
+export async function createForkCut(
   v2: V2Client,
   source: Session,
   messages: MessageWithParts[],
-  controlTimeoutMs = CONTROL_OPERATION_TIMEOUT_MS,
-): Promise<Session> {
-  const route = {
-    directory: source.directory,
-    ...(source.workspaceID ? { workspace: source.workspaceID } : {}),
-  };
+): Promise<ForkCut> {
+  const route = sessionRoute(source);
   // Source identity and references are validated before the host is touched.
   const sourceSnapshot = classified("source-invalid", () =>
     snapshotSourceMessages(messages),
@@ -91,24 +79,31 @@ export async function forkSession(
   );
   if (!fork.id || fork.id === source.id)
     throw new ForkHistoryError("fork-invalid");
+  const id = fork.id;
 
-  try {
-    const load = (sessionID = fork.id) =>
+  const populate = async (controlTimeoutMs: number) => {
+    const load = (sessionID = id) =>
       loadHistory(v2, sessionID, route, controlTimeoutMs);
     if ((await load()).length !== 0)
       throw new ForkHistoryError("cut-not-empty");
     if (messages.length > 0) {
-      const expected = plan(fork.id);
+      const expected = plan(id);
       // Like fork creation, replay is awaited directly: timing out could lose
       // ownership of a still-writing server operation during cleanup.
-      await replayHistory(v2, fork.id, expected, route);
+      try {
+        await replayHistory(v2, id, expected, route);
+      } catch (error) {
+        throw error instanceof ForkHistoryError
+          ? error
+          : new ForkHistoryError("replay-failed");
+      }
       if (!isDeepStrictEqual(await load(), expected))
         throw new ForkHistoryError("replay-mismatch");
     }
     // The fork holds planned records, not the live source. Recheck
-    // correspondence before it becomes a generation or summary input; timing churn is
-    // normalized separately from the exact persisted chronology/content check
-    // above.
+    // correspondence before it becomes a generation or summary input; timing
+    // churn is normalized separately from the exact persisted
+    // chronology/content check above.
     const live = await load(source.id);
     if (
       !classified("source-drift", () =>
@@ -117,21 +112,8 @@ export async function forkSession(
     ) {
       throw new ForkHistoryError("source-drift");
     }
-    return fork;
-  } catch (error) {
-    // Only the replay request is unclassified here; reads, comparisons and
-    // source validation throw ForkHistoryError themselves.
-    const failure =
-      error instanceof ForkHistoryError
-        ? error
-        : new ForkHistoryError("replay-failed");
-    try {
-      unwrap(await v2.session.delete({ sessionID: fork.id, ...route }));
-    } catch {
-      throw new ForkCleanupError(source.id, fork.id, failure.reason);
-    }
-    throw failure;
-  }
+  };
+  return { id, populate };
 }
 
 // Comparison helpers read host-supplied records; unexpected shapes are the
@@ -147,6 +129,14 @@ function classified<T>(reason: ForkFailureReason, test: () => T): T {
 }
 
 export type HistoryRoute = { directory: string; workspace?: string };
+
+// The directory and workspace every request about this session is routed to.
+export function sessionRoute(session: Session): HistoryRoute {
+  return {
+    directory: session.directory,
+    ...(session.workspaceID ? { workspace: session.workspaceID } : {}),
+  };
+}
 
 // Reads are idempotent, so a timed-out or rejected request gets exactly one
 // more attempt with a fresh deadline. A response that arrives is final:

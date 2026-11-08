@@ -8,21 +8,23 @@ import type { PermissionRuleset, Session } from "@opencode-ai/sdk/v2";
 import { randomBytes } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { V2Client } from "../api";
+import { estimateNativeHistoryTokens } from "../compact/batch";
 import {
   computeNativeBatchBudget,
-  estimateNativeHistoryTokens,
+  fits,
   NATIVE_BATCH_FIXED_RESERVE_TOKENS,
-} from "../compact/batch";
+  refuse,
+  type Fit,
+} from "../policy/budget";
 import {
   assertConfiguredModelSupportsImages,
   assertForkRecordIdentity,
   historyMayExposeImages,
   isQualifiedDeepSeekModel,
-  resolveSummarizerCatalog,
   stageReport,
   type CompactionSettings,
+  type LoadSummarizerCatalog,
   type SummarizerCatalog,
-  type SummaryReasoningOptions,
 } from "../compact/compact";
 import {
   indexReplay,
@@ -33,14 +35,10 @@ import {
   chooseStage,
   matchCandidate,
   sameModel,
-  type StageChoice,
+  settleMatch,
   type StageReport,
 } from "../policy/reasoning";
-import {
-  hasPluginMessage,
-  markPluginMessage,
-  PluginMessageError,
-} from "../policy/feedback";
+import { hasPluginMessage, PluginMessageError } from "../policy/feedback";
 import { isContextOverflow, safeStatus } from "../policy/generation";
 import {
   assertForkMessageShape,
@@ -49,24 +47,35 @@ import {
   type MessageWithParts,
 } from "../compact/plan";
 import {
-  ForkCleanupError,
+  createForkCut,
   ForkHistoryError,
-  forkSession,
+  sessionRoute,
+  type ForkCut,
 } from "../compact/fork";
+import { registerOwnedFork, releaseOwnedFork } from "../compact/owned";
 import {
   MAGIC_COMPACT_SUMMARIZER_AGENT,
   SESSION_SUMMARY_PROMPT,
   SESSION_SUMMARY_RESPONSE_SCHEMA,
   SESSION_SUMMARY_TOOL_PROMPT,
-} from "../compact/constants";
+} from "../policy/protocol";
 import { countGptTokens } from "../stats/tokenize";
-import { attemptWithinDeadline, CONTROL_OPERATION_TIMEOUT_MS } from "../util";
 import {
+  attemptWithinDeadline,
+  CONTROL_OPERATION_TIMEOUT_MS,
+  isNonArrayRecord,
+} from "../util";
+import {
+  caughtSummaryStage,
+  failedSummaryStages,
+  SESSION_SUMMARY_TOO_LARGE,
   SessionSummaryError,
+  sessionSummaryStageFailure,
   structuredSessionSummary,
+  type SessionSummary,
   type SessionSummaryStage,
+  type SessionSummaryStageFailure,
 } from "../policy/retention";
-import { RETENTION_FAILURE_GUIDANCE } from "./classifier";
 
 export { SESSION_SUMMARY_PROMPT };
 
@@ -100,33 +109,13 @@ const ID_RANDOM_ALPHABET =
   "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const ID_ORDER_WAIT_ATTEMPTS = 50;
 
-// Summary forks that are still owned by a running command, and whether
-// OpenCode tried to compact one natively.
-const ownedSummaryForks = new Map<string, { nativeCompaction: boolean }>();
-
-export function isOwnedSessionSummaryFork(sessionID: string): boolean {
-  return ownedSummaryForks.has(sessionID);
-}
-
-// Called from the plugin's `experimental.session.compacting` hook. OpenCode
-// 1.18.30 runs that hook at the start of every native compaction, whether
-// triggered before a step, by a finished step's token count, or by a
-// provider overflow, and before its summary request, replay, or
-// auto-continue. Throwing ends the fork's prompt loop there, so an owned
-// fork never sends another model request; the command then reports that the
-// session is too large.
-export function rejectNativeCompactionOfSummaryFork(sessionID: string): void {
-  const owned = ownedSummaryForks.get(sessionID);
-  if (!owned) return;
-  owned.nativeCompaction = true;
-  throw new SessionSummaryError("budget");
-}
-
 export { SessionSummaryError, type SessionSummaryStage };
 
 export type SessionSummaryOptions = {
+  // The command's summarizer catalog, shared with its turn requests.
+  catalog: LoadSummarizerCatalog;
+  matchModel?: boolean;
   controlTimeoutMs?: number;
-  reasoning?: SummaryReasoningOptions;
 };
 
 // How the summary request is made: as plain text, or on the DeepSeek route
@@ -142,8 +131,8 @@ export async function generateSessionSummary(
   v2: V2Client,
   session: Session,
   messages: MessageWithParts[],
-  options: SessionSummaryOptions = {},
-): Promise<string> {
+  options: SessionSummaryOptions,
+): Promise<SessionSummary> {
   const controlTimeoutMs =
     options.controlTimeoutMs ?? CONTROL_OPERATION_TIMEOUT_MS;
   const sourceSnapshot = snapshotSourceMessages(messages);
@@ -153,7 +142,7 @@ export async function generateSessionSummary(
   try {
     visible = nativeModelVisibleMessages(messages);
   } catch {
-    throw new SessionSummaryError("history");
+    throw sessionSummaryStageFailure("history");
   }
   const requiresImages = historyMayExposeImages(visible);
   // One attribution of the history for every candidate request's estimate.
@@ -161,7 +150,7 @@ export async function generateSessionSummary(
   let request: SummaryRequest;
   let report: StageReport;
   try {
-    const catalog = await resolveSummarizerCatalog(v2, session, requiresImages);
+    const catalog = await options.catalog(requiresImages);
     const configured = catalog.configured;
     // Matching unlocks only the current model's own protected reasoning;
     // reasoning from other models in the history stays unreadable.
@@ -176,15 +165,6 @@ export async function generateSessionSummary(
         }),
     );
     const match = matchCandidate(units, catalog.qualifies);
-    let choice: StageChoice = chooseStage(match, configured, model => {
-      const descriptor = catalog.describe(model);
-      return {
-        variants: new Set(descriptor?.variants ?? []),
-        optionsConflict: catalog.summarizerOptions,
-        imagesBlocked:
-          requiresImages && descriptor?.capabilities?.input?.image !== true,
-      };
-    });
     const summaryRequest = (settings: CompactionSettings): SummaryRequest => {
       const structured =
         isQualifiedDeepSeekModel(settings.model, settings.descriptor)
@@ -201,100 +181,93 @@ export async function generateSessionSummary(
           : SESSION_SUMMARY_PROMPT,
       };
     };
-    const fits = (candidate: SummaryRequest) => {
-      try {
-        return (
-          summaryRequestTokens(candidate, visible, replay, catalog)
-          <= computeNativeBatchBudget(candidate.settings.descriptor.limit)
-            .hardSingleTurnInput
-        );
-      } catch (error) {
-        if (hasPluginMessage(error)) return false;
-        throw error;
-      }
+    const fit = (candidate: SummaryRequest): Fit<SummaryRequest> => {
+      const budget = computeNativeBatchBudget(
+        candidate.settings.descriptor.limit,
+      );
+      if (budget.kind === "capacity") return budget;
+      return summaryRequestTokens(candidate, visible, replay, catalog)
+        > budget.value.hardSingleTurnInput
+        ? refuse(SESSION_SUMMARY_TOO_LARGE)
+        : fits(candidate);
     };
-    let selected = summaryRequest(configured);
-    if (choice.kind === "match") {
-      const matched = summaryRequest({
-        model: choice.model,
-        ...(choice.variant === undefined ? {} : { variant: choice.variant }),
-        descriptor: catalog.describe(choice.model)!,
-      });
-      if (!fits(matched)) {
-        choice = { kind: "fallback", reason: "capacity" };
-      } else if (options.reasoning?.matchModel) {
-        selected = matched;
-      }
-    }
-    request = selected;
+    const settled = settleMatch(
+      chooseStage(match, configured, model => {
+        const descriptor = catalog.describe(model);
+        return {
+          variants: new Set(descriptor?.variants ?? []),
+          optionsConflict: catalog.summarizerOptions,
+          imagesBlocked:
+            requiresImages && descriptor?.capabilities?.input?.image !== true,
+        };
+      }),
+      options.matchModel === true,
+      (model, variant) =>
+        fit(
+          summaryRequest({
+            model,
+            ...(variant === undefined ? {} : { variant }),
+            descriptor: catalog.describe(model)!,
+          }),
+        ),
+    );
+    request = settled.matched ?? summaryRequest(configured);
     if (requiresImages) assertConfiguredModelSupportsImages(request.settings);
     const budget = computeNativeBatchBudget(request.settings.descriptor.limit);
+    if (budget.kind === "capacity")
+      throw new PluginMessageError(budget.message);
     // Fail before any fork when the request cannot fit. The compacting hook
     // still stops native compaction if the estimate is exceeded anyway.
     if (
       summaryRequestTokens(request, visible, replay, catalog)
-      > budget.hardSingleTurnInput
+      > budget.value.hardSingleTurnInput
     ) {
-      throw new SessionSummaryError("budget");
+      throw sessionSummaryStageFailure("budget");
     }
     report = stageReport({
       stage: "session",
       candidate: match,
-      choice,
+      choice: settled.choice,
       settings: request.settings,
       history: visible,
       catalog,
       replay,
     });
   } catch (error) {
-    if (error instanceof SessionSummaryError) throw error;
-    // Only this plugin's own configuration messages, which are fixed text
-    // without session content, are repeated.
+    // Only this plugin's own messages, which are fixed text without session
+    // content, are repeated.
+    if (hasPluginMessage(error)) throw error;
     throw new PluginMessageError(
-      `${hasPluginMessage(error) ? error.message : "Magic Compact could not resolve its summarizer agent."} ${RETENTION_FAILURE_GUIDANCE}`,
-      { cause: error },
+      "Magic Compact could not resolve its summarizer agent.",
     );
   }
-  options.reasoning?.reports.push(report);
   const settings = request.settings;
 
-  const route = {
-    directory: session.directory,
-    ...(session.workspaceID ? { workspace: session.workspaceID } : {}),
-  };
-  let fork: Session;
+  const route = sessionRoute(session);
+  let fork: ForkCut;
   try {
-    fork = await forkSession(v2, session, messages, controlTimeoutMs);
+    fork = await createForkCut(v2, session, messages);
   } catch (error) {
-    if (error instanceof ForkCleanupError) {
-      throw markPluginMessage(
-        new AggregateError(
-          [error, new SessionSummaryError("history")],
-          `${error.message} ${RETENTION_FAILURE_GUIDANCE}`,
-          { cause: error },
-        ),
-      );
-    }
-    throw new SessionSummaryError(
-      error instanceof ForkHistoryError ? "history" : "fork",
-      safeStatus(error),
-      false,
-      error instanceof ForkHistoryError ? error.detail : undefined,
-    );
+    throw forkFailure(error);
   }
-  const owned = { nativeCompaction: false };
-  ownedSummaryForks.set(fork.id, owned);
+  // Registered before its first request and released only after a confirmed
+  // deletion.
+  const owned = registerOwnedFork(fork.id);
+  const forkID = fork.id;
 
-  let failure: SessionSummaryError | undefined;
+  const failures: SessionSummaryStageFailure[] = [];
   let prompted = false;
   let summary: string | undefined;
   try {
+    await fork.populate(controlTimeoutMs).catch((error: unknown) => {
+      throw forkFailure(error);
+    });
     const permission = await attemptWithinDeadline(
       signal =>
         v2.session
           .update(
             {
-              sessionID: fork.id,
+              sessionID: forkID,
               ...route,
               permission: request.structured
                 ? STRUCTURED_SUMMARY_FORK_PERMISSION
@@ -309,17 +282,12 @@ export async function generateSessionSummary(
       throw stageFailure("permission", permission);
     }
 
-    const history = await loadForkMessages(
-      v2,
-      fork.id,
-      route,
-      controlTimeoutMs,
-    );
+    const history = await loadForkMessages(v2, forkID, route, controlTimeoutMs);
     try {
       assertForkMessageShape(history, { sourceSnapshot });
-      assertForkRecordIdentity(history, fork.id);
+      assertForkRecordIdentity(history, forkID);
     } catch {
-      throw new SessionSummaryError("history");
+      throw sessionSummaryStageFailure("history");
     }
     const messageID = await nextPromptMessageID(history);
 
@@ -328,7 +296,7 @@ export async function generateSessionSummary(
     try {
       response = unwrapResponse(
         await v2.session.prompt({
-          sessionID: fork.id,
+          sessionID: forkID,
           ...route,
           messageID,
           agent: SUMMARY_AGENT,
@@ -339,14 +307,20 @@ export async function generateSessionSummary(
         }),
       );
     } catch (error) {
-      if (owned.nativeCompaction) throw new SessionSummaryError("budget");
+      if (owned.nativeCompactionBlocked) {
+        throw sessionSummaryStageFailure("budget");
+      }
       throw providerFailure(error);
     }
-    if (owned.nativeCompaction) throw new SessionSummaryError("budget");
+    if (owned.nativeCompactionBlocked) {
+      throw sessionSummaryStageFailure("budget");
+    }
     // OpenCode reports provider failures, including a context overflow when
     // auto-compaction is off, as an error on a 200 response.
-    const responseInfo = isObject(response) ? response["info"] : undefined;
-    const responseError = isObject(responseInfo)
+    const responseInfo = isNonArrayRecord(response)
+      ? response["info"]
+      : undefined;
+    const responseError = isNonArrayRecord(responseInfo)
       ? responseInfo["error"]
       : undefined;
     if (responseError !== undefined && responseError !== null) {
@@ -356,59 +330,56 @@ export async function generateSessionSummary(
     const final = request.structured
       ? await loadStructuredForkMessages(
           v2,
-          fork.id,
+          forkID,
           route,
           controlTimeoutMs,
           history.length + 2,
         )
-      : await loadForkMessages(v2, fork.id, route, controlTimeoutMs);
+      : await loadForkMessages(v2, forkID, route, controlTimeoutMs);
     // A native checkpoint in the fork means OpenCode found the request too
     // large, even when the compacting hook did not run.
     if (final.slice(history.length).some(isNativeCompactionArtifact)) {
-      throw new SessionSummaryError("budget");
+      throw sessionSummaryStageFailure("budget");
     }
     summary = acceptedSummary(
       response,
       final,
       history,
       messageID,
-      fork.id,
+      forkID,
       request,
     );
   } catch (error) {
-    failure =
-      error instanceof SessionSummaryError
-        ? error
-        : new SessionSummaryError("validation");
+    failures.push(caughtSummaryStage(error));
   }
 
-  const cleanupFailures: SessionSummaryError[] = [];
-  if (failure && prompted) {
+  // Only a prompt can leave the fork running.
+  if (failures.length > 0 && prompted) {
     try {
-      unwrapResponse(await v2.session.abort({ sessionID: fork.id, ...route }));
+      unwrapResponse(await v2.session.abort({ sessionID: forkID, ...route }));
     } catch (error) {
-      cleanupFailures.push(new SessionSummaryError("abort", safeStatus(error)));
+      failures.push({
+        kind: "stage",
+        stage: "abort",
+        status: safeStatus(error),
+      });
     }
   }
   try {
-    unwrapResponse(await v2.session.delete({ sessionID: fork.id, ...route }));
-    ownedSummaryForks.delete(fork.id);
+    unwrapResponse(await v2.session.delete({ sessionID: forkID, ...route }));
+    releaseOwnedFork(owned);
   } catch (error) {
-    cleanupFailures.push(new SessionSummaryError("delete", safeStatus(error)));
+    failures.push({
+      kind: "stage",
+      stage: "delete",
+      status: safeStatus(error),
+      temporary: "fork",
+      session: { id: forkID, removal: "failed" },
+    });
   }
-
-  const failures = [...(failure ? [failure] : []), ...cleanupFailures];
-  if (failures.length === 1) throw failures[0];
-  if (failures.length > 1) {
-    throw markPluginMessage(
-      new AggregateError(
-        failures,
-        `Task-aware retention session summary and fork cleanup failed (${failures.map(item => item.stage).join(", ")}). ${RETENTION_FAILURE_GUIDANCE}`,
-        { cause: failures[0] },
-      ),
-    );
-  }
-  return summary!;
+  const failure = failedSummaryStages(failures, "fork");
+  if (failure) throw failure;
+  return { text: summary!, report };
 }
 
 // The model-visible input of a summary request: the fixed host reserve, the
@@ -454,7 +425,7 @@ function acceptedSummary(
   forkID: string,
   request: SummaryRequest,
 ): string {
-  const invalid = () => new SessionSummaryError("validation");
+  const invalid = () => sessionSummaryStageFailure("validation");
   if (messages.length !== history.length + 2) throw invalid();
   const prefix = messages.slice(0, history.length);
   try {
@@ -493,10 +464,12 @@ function acceptedSummary(
   }
 
   const reply = messages[history.length + 1]!;
-  const responseInfo = isObject(response) ? response["info"] : undefined;
+  const responseInfo = isNonArrayRecord(response)
+    ? response["info"]
+    : undefined;
   if (
     reply.info.role !== "assistant"
-    || !isObject(responseInfo)
+    || !isNonArrayRecord(responseInfo)
     || responseInfo["id"] !== reply.info.id
     || reply.info.parentID !== messageID
     || reply.info.agent !== SUMMARY_AGENT
@@ -609,7 +582,7 @@ async function loadStructuredForkMessages(
     const cursor = outcome.value.cursor;
     if (!cursor) return pages.flat();
     if (cursors.has(cursor) || pages.length >= maxPages) {
-      throw new SessionSummaryError("history");
+      throw sessionSummaryStageFailure("history");
     }
     cursors.add(cursor);
     before = cursor;
@@ -623,23 +596,32 @@ function isNativeCompactionArtifact(message: MessageWithParts): boolean {
   );
 }
 
-function providerFailure(error: unknown): SessionSummaryError {
-  const status = safeStatus(error);
-  return new SessionSummaryError(
-    "provider",
-    status,
-    isContextOverflow(error, status),
+// A fork that could not be created, or populated as planned.
+function forkFailure(error: unknown): SessionSummaryError {
+  return sessionSummaryStageFailure(
+    error instanceof ForkHistoryError ? "history" : "fork",
+    {
+      status: safeStatus(error),
+      ...(error instanceof ForkHistoryError ? { detail: error.detail } : {}),
+    },
   );
 }
 
+function providerFailure(error: unknown): SessionSummaryError {
+  const status = safeStatus(error);
+  return sessionSummaryStageFailure("provider", {
+    status,
+    overflow: isContextOverflow(error, status),
+  });
+}
+
 function stageFailure(
-  stage: SessionSummaryStage,
+  stage: Exclude<SessionSummaryStage, "delete">,
   outcome: { kind: "timed-out" } | { kind: "failed"; error: unknown },
 ): SessionSummaryError {
-  return new SessionSummaryError(
-    stage,
-    outcome.kind === "failed" ? safeStatus(outcome.error) : undefined,
-  );
+  return sessionSummaryStageFailure(stage, {
+    status: outcome.kind === "failed" ? safeStatus(outcome.error) : undefined,
+  });
 }
 
 // An explicit OpenCode message ID pins the prompt's identity, so a native
@@ -678,8 +660,4 @@ function idTimeValue(): bigint {
 function unwrapResponse<T, E>(response: { data?: T; error?: E }): T {
   if ("error" in response && response.error) throw response.error;
   return response.data as T;
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

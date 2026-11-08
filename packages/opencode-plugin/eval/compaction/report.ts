@@ -2,27 +2,22 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadCorpus, type Corpus } from "./corpus";
-import { score, validateGrades, type GradesFile, type Scores } from "./grade";
+import {
+  disposition,
+  gradedAttempts,
+  score,
+  validateGrades,
+  type GradesFile,
+  type Scores,
+} from "./grade";
+import {
+  recordsRun,
+  residue,
+  unresolvedOwnership,
+  type Residue,
+  type UnresolvedOwnership,
+} from "./ledger";
 import { readRun, type AttemptRecord } from "./run";
-
-// How the frozen rubric treats an attempt. A settled attempt that delivered
-// no valid summary scores 0 and is not usable; an attempt whose outcome is
-// unknown, or that never reached the model, is not scored at all; a delivered
-// summary without an accepted grade stays ungraded and is never counted as 0.
-type Disposition = "delivered" | "zero" | "unscored";
-
-const ZERO_STATUSES = new Set([
-  "failed",
-  "noop",
-  "delivered-invalid",
-  // The model does not accept the case's image: a capability refusal.
-  "preflight-skipped",
-]);
-
-export function disposition(attempt: AttemptRecord): Disposition {
-  if (attempt.status === "delivered") return "delivered";
-  return ZERO_STATUSES.has(attempt.status) ? "zero" : "unscored";
-}
 
 export type CaseScore = {
   caseId: string;
@@ -67,7 +62,20 @@ export type RunSummary = {
   mechanicalPass: number;
   zeroScored: number;
   unscored: number;
+  // The sessions the run still owns now, from its ledger; attempt records
+  // keep the cleanup results of their own time. Empty also for a run without
+  // a ledger, whose `residue` is null.
   cleanupRetained: string[];
+  // What the run still owns now, from its ledger; null when the run has no
+  // ledger, because what it owns is then unknown, not none.
+  residue: Residue | null;
+  // Whether `residue` is everything the run owns: false when the ledger is
+  // missing or was started after the run (`recordsRun`), whose residue lists
+  // only what that ledger recorded.
+  ownershipKnown: boolean;
+  // Scratch roots the latest disposal kept, which are not counted as owned;
+  // null when the run has no ledger.
+  unresolvedOwnership: UnresolvedOwnership[] | null;
   medianCommandMs: number | null;
   usage: {
     requests: number;
@@ -134,7 +142,7 @@ export function summarizeRun(
   dir: string,
   corpus: Corpus = loadCorpus(),
 ): RunSummary {
-  const { run, preflight, results, attempts } = readRun(dir, corpus);
+  const { run, preflight, results, attempts, ledger } = readRun(dir, corpus);
   const statuses: Record<string, number> = {};
   const failures: Record<string, number> = {};
   for (const attempt of attempts) {
@@ -156,14 +164,8 @@ export function summarizeRun(
     usage.reasoning += attempt.usage.reasoning;
     usage.cost += attempt.usage.cost;
   }
-  const graded = attempts
-    .filter(a => disposition(a) === "delivered")
-    .map(a => ({
-      attemptId: a.attemptId,
-      caseId: a.caseId,
-      outputSha256: a.outputSha256!,
-      capsule: a.capsule!,
-    }));
+  const graded = gradedAttempts(attempts);
+  const left = ledger ? residue(ledger) : null;
   const cases = run.requested.cases;
   const gradesDir = join(dir, "grades");
   const graders: GraderSummary[] = [];
@@ -238,9 +240,10 @@ export function summarizeRun(
     mechanicalPass: graded.length,
     zeroScored,
     unscored: attempts.filter(a => disposition(a) === "unscored").length,
-    cleanupRetained: attempts.flatMap(a =>
-      a.cleanup.filter(c => c.action === "retained").map(c => c.id),
-    ),
+    cleanupRetained: left?.sessions.map(s => s.id) ?? [],
+    residue: left,
+    ownershipKnown: ledger !== null && recordsRun(ledger, run.runNonce),
+    unresolvedOwnership: ledger ? unresolvedOwnership(ledger) : null,
     medianCommandMs: ms.length ? ms[Math.floor(ms.length / 2)]! : null,
     usage,
     semantic:
@@ -288,9 +291,39 @@ export function formatReport(summaries: RunSummary[]): string {
     out.push(
       `- Cost and speed (not part of any score): median command ${s.medianCommandMs ?? "n/a"} ms; observed summarizer requests ${s.usage.requests}, input ${s.usage.input}, output ${s.usage.output}, reasoning ${s.usage.reasoning} tokens, cost ${s.usage.cost.toFixed(4)}.`,
     );
-    if (s.cleanupRetained.length)
+    const left = s.residue;
+    if (!left)
       out.push(
-        `- Retained sessions (not deleted, see ledger): ${s.cleanupRetained.join(", ")}`,
+        "- Ownership unknown: the run has no ledger, so the sessions, storage and scratch roots it may still own cannot be listed.",
+      );
+    else if (!s.ownershipKnown)
+      out.push(
+        "- Ownership incomplete: the ledger does not begin with this run's run-start, so it was started after the run lost its own and lists only what was recorded since; the run may own more.",
+      );
+    if (left?.sessions.length)
+      out.push(
+        `- Sessions the run still owns (removal not settled; run \`cleanup\`, see ledger): ${left.sessions.map(r => (r.reason ? `${r.id} (${r.reason})` : r.id)).join(", ")}`,
+      );
+    if (left?.storage.length)
+      out.push(
+        `- Removed or vanished successors whose storage removal is not confirmed: ${left.storage.map(r => (r.paths ? `${r.id} (cache ${r.paths.cache}, stats ${r.paths.stats})` : `${r.id} (location not recorded)`)).join(", ")}`,
+      );
+    if (left?.unresolvedIntents.length)
+      out.push(
+        `- Session creations neither confirmed nor ruled out: ${left.unresolvedIntents.length}`,
+      );
+    if (left?.unknownOutcomes.length)
+      out.push(
+        `- Attempts with an unknown outcome: ${left.unknownOutcomes.join(", ")}`,
+      );
+    if (s.unresolvedOwnership?.length)
+      out.push(
+        `- Unresolved ownership (scratch roots the last disposal kept, with its reason; not counted as owned; review by hand or run \`cleanup\`): ${s.unresolvedOwnership
+          .map(
+            u =>
+              `${u.directory} (${u.reason ?? "no reason recorded"}${u.sessions?.length ? `; sessions ${u.sessions.join(", ")}` : ""})`,
+          )
+          .join(", ")}`,
       );
     out.push(
       `- Semantic: ${s.semantic}${s.semantic === "UNGRADED" ? " (no accepted grades; mechanical results alone say nothing about summary quality)" : ""}`,

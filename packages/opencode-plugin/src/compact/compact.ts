@@ -11,27 +11,25 @@ import {
   CONTROL_OPERATION_TIMEOUT_MS,
   isRecord,
 } from "../util";
-import {
-  MAGIC_COMPACT_SUMMARIZER_AGENT,
-  boundaryPartID,
-  summaryEnvelopePartID,
-  turnHasPersistedSummary,
-} from "./constants";
+import { MAGIC_COMPACT_SUMMARIZER_AGENT } from "../policy/protocol";
+import { boundaryPartID, summaryEnvelopePartID } from "./capsule";
+import { estimateNativeTurnCost, toolAttachmentsModelVisible } from "./batch";
 import {
   computeNativeBatchBudget,
-  estimateNativeTurnCost,
-  NATIVE_BATCH_MAX_CONCURRENCY,
+  fits,
   NATIVE_BATCH_PLANNING_NONCE,
-  planNativeGenerationBatches,
-  toolAttachmentsModelVisible,
-  type NativeBatchProtocol,
+  outputCapacityMessage,
+  planNativeGenerationRequest,
+  refuse,
+  requireFit,
+  type Fit,
   type NativeBatchBudget,
-  type NativeGenerationBatch,
-} from "./batch";
+  type NativeGenerationRequest,
+  type NativeRequestProtocol,
+} from "../policy/budget";
 import { createMediaManifest, type MediaManifest } from "./media";
 import {
   buildGenerationPrompt,
-  capCodePoints,
   containsString,
   createGenerationNonce,
   diagnosticCategories,
@@ -43,8 +41,6 @@ import {
   GenerationMarkerNonceCollisionError,
   GenerationResponseValidationError,
   generationTurnMarker,
-  type GenerationTurnResult,
-  GLOBAL_ANCHOR_CHARACTER_LIMIT,
   globalTurnIndexPrompt,
   isContextOverflow,
   isOutputTruncation,
@@ -52,26 +48,37 @@ import {
   safeStatus,
   selectGenerationNonce,
   validationCategoryText,
-  validationFailure,
+  type GenerationTarget,
+  type GenerationTurnResult,
 } from "../policy/generation";
 import {
   distinctReasons,
-  hasPluginMessage,
   markPluginMessage,
   PluginMessageError,
-  undeletedSessionIDs,
+  unremovedSessions,
+  unremovedSessionsText,
+  type LeavesSessions,
+  type UnremovedSession,
 } from "../policy/feedback";
-import { ForkCleanupError, ForkHistoryError, forkSession } from "./fork";
+import { runGenerationBatches } from "../policy/generation-pool";
+import {
+  createForkCut,
+  ForkHistoryError,
+  sessionRoute,
+  type ForkCut,
+  type HistoryRoute,
+} from "./fork";
+import { registerOwnedFork, releaseOwnedFork, type OwnedFork } from "./owned";
 import {
   chooseStage,
   matchCandidate,
   reasoningContextMode,
+  settleMatch,
   stageReport as sharedStageReport,
   verifiedReasoning,
   type MatchCandidate,
   type ModelIdentity,
   type Qualifies,
-  type ReasoningReports,
   type ReasoningRoute,
   type StageChoice,
   type StageReport,
@@ -84,7 +91,6 @@ import {
 } from "./reasoning";
 import {
   assertForkMessageShape,
-  buildTurns,
   snapshotSourceMessages,
   type CompactionPlan,
   type MessageWithParts,
@@ -117,25 +123,30 @@ export type CompactionSettings = {
   };
 };
 
-type GenerationCandidate = {
-  planIndex: number;
+// One target as planning estimates it, under the conservative planning
+// marker; the request that runs names it under its real marker.
+type GenerationCandidate = GenerationTarget & {
+  // Position in the plan's targets.
+  index: number;
   sourceTurnIndex: number;
-  ordinal: number;
-  marker: string;
-  expectedInlineImages: number;
   inputTokens: number;
   outputTokens: number;
   mediaManifest?: MediaManifest;
 };
 
-type GenerationBatchPlan = NativeGenerationBatch<GenerationCandidate> & {
+type RetainedRequest = NativeGenerationRequest<GenerationCandidate> & {
   retainedMessageIndexes: number[];
-  targetUserMessageIndexes: number[];
+  targetUserMessageIndex: number;
 };
 
-type GenerationBatch = GenerationBatchPlan & {
+type GenerationBatch = {
+  target: GenerationTarget;
   generationNonce: string;
   prompt: string;
+  // Source message positions the request keeps: the target turn and at most
+  // the one complete preceding turn.
+  retainedMessageIndexes: number[];
+  targetUserMessageIndex: number;
   // The summary model this request runs on: the configured summarizer, or
   // under `--match-model` the model that wrote the target's reasoning.
   settings: CompactionSettings;
@@ -155,23 +166,26 @@ type ForkMessageIdentity = {
   }>;
 };
 
-type SummaryGenerationOptions = {
+export type GenerationOptions = {
+  // The command's summarizer catalog, shared with its retention summary.
+  catalog: LoadSummarizerCatalog;
+  matchModel?: boolean;
   controlTimeoutMs?: number;
   nonceFactory?: () => string;
-  reasoning?: SummaryReasoningOptions;
 };
 
-// `--match-model`, and the list each summary request's reasoning report is
-// added to for the command's feedback.
-export type SummaryReasoningOptions = ReasoningReports & {
-  // Set by per-turn generation once it has read the model list: the model
-  // the successor continues with and its reasoning context.
-  replay?: ReplayContext | undefined;
+export type GeneratedSummary = {
+  text: string;
+  mediaManifest?: MediaManifest;
 };
 
-type GenerationRoute = {
-  directory: string;
-  workspace?: string;
+export type GenerationResult = {
+  // One framed summary per plan target, in target order.
+  summaries: GeneratedSummary[];
+  // Each turn request's reasoning report, in target order.
+  reports: StageReport[];
+  // The model the successor continues with and its reasoning context.
+  replay: ReplayContext | undefined;
 };
 
 type GenerationStage =
@@ -184,21 +198,6 @@ type GenerationStage =
   | "validation"
   | "abort"
   | "delete";
-
-export type GeneratedSummary = {
-  text: string;
-  mediaManifest?: MediaManifest;
-} | null;
-
-// Generation forks still owned by a running command. Native compaction of one
-// would send an extra model request and replace its retained history, so the
-// plugin's compacting hook ends the fork's prompt loop as a context overflow,
-// which reports trim-first guidance.
-const ownedGenerationForks = new Set<string>();
-
-export function isOwnedGenerationFork(sessionID: string): boolean {
-  return ownedGenerationForks.has(sessionID);
-}
 
 // A summary request carries the protected reasoning of earlier turns only
 // when OpenAI Responses runs it with every turn's reasoning context. The
@@ -229,73 +228,48 @@ export function requestAllTurnsReasoning(
   options["reasoningContext"] = "all_turns";
 }
 
-export function rejectNativeCompactionOfGenerationFork(
-  sessionID: string,
-): void {
-  if (!ownedGenerationForks.has(sessionID)) return;
-  const error = new Error(
-    "Magic Compact owns this generation session; native compaction is blocked.",
-  );
-  error.name = "ContextOverflowError";
-  throw error;
-}
-
 export async function generateCompactionSummaries(
   v2: V2Client,
   session: Session,
   plan: CompactionPlan,
-  options: SummaryGenerationOptions = {},
-): Promise<GeneratedSummary[]> {
+  options: GenerationOptions,
+): Promise<GenerationResult> {
   const controlTimeoutMs =
     options.controlTimeoutMs ?? CONTROL_OPERATION_TIMEOUT_MS;
   if (!Number.isFinite(controlTimeoutMs) || controlTimeoutMs <= 0) {
     throw new Error("Compaction generation control deadline must be positive.");
   }
+  // Nothing to summarize needs no catalog.
+  if (plan.targets.length === 0) {
+    return { summaries: [], reports: [], replay: undefined };
+  }
 
   assertGeneratedPartIDsAvailable(plan);
   const globalTurnIndexPrompt = buildGlobalTurnIndexPrompt(plan);
-  const generated: GeneratedSummary[] = plan.summarizedTurns.map(() => null);
-  const candidates = plan.summarizedTurns.flatMap((turn, planIndex) => {
-    if (turnHasPersistedSummary(turn)) return [];
-    const mediaManifest = createMediaManifest(turn);
-    const cost = estimateNativeTurnCost(turn);
-    return [
-      {
-        planIndex,
-        sourceTurnIndex: plan.sourceTurnStartIndex + planIndex,
-        ordinal: 0,
-        marker: "",
+  const candidates = plan.targets.map(
+    ({ turn, sourceTurnIndex }, index): GenerationCandidate => {
+      const mediaManifest = createMediaManifest(turn);
+      return {
+        index,
+        sourceTurnIndex,
+        ordinal: index + 1,
+        marker: generationTurnMarker(NATIVE_BATCH_PLANNING_NONCE, index + 1),
         expectedInlineImages: mediaManifest?.images.length ?? 0,
-        ...cost,
+        ...estimateNativeTurnCost(turn),
         ...(mediaManifest ? { mediaManifest } : {}),
-      },
-    ];
-  });
-  candidates.forEach((candidate, index) => {
-    candidate.ordinal = index + 1;
-    candidate.marker = generationTurnMarker(
-      NATIVE_BATCH_PLANNING_NONCE,
-      candidate.ordinal,
-    );
-  });
-  if (candidates.length === 0) return generated;
+      };
+    },
+  );
 
-  const catalog = await resolveSummarizerCatalog(
-    v2,
-    session,
-    historyMayExposeImages(plan.sourceSnapshot),
+  const catalog = await options.catalog(
+    historyMayExposeImages(plan.sourceMessages),
   );
   const configured = catalog.configured;
-  if (options.reasoning) options.reasoning.replay = catalog.replayContext();
-  const protocol: NativeBatchProtocol<GenerationCandidate> = {
-    explicitRequestTokens: batchCandidates =>
-      estimateGenerationExplicitRequestTokens(
-        batchCandidates,
-        globalTurnIndexPrompt,
-      ),
+  const protocol: NativeRequestProtocol<GenerationCandidate> = {
+    explicitRequestTokens: candidate =>
+      estimateGenerationExplicitRequestTokens(candidate, globalTurnIndexPrompt),
     responseProtocolTokens: estimateGenerationResponseProtocolTokens,
   };
-  const generationNonces = new Set<string>();
   // One attribution of the source for every request's replay estimate.
   const replayIndex = indexReplay(plan.sourceMessages);
   // A request's input with each attributable protected unit its model is sent
@@ -304,8 +278,9 @@ export async function generateCompactionSummaries(
     candidate: GenerationCandidate,
     settings: CompactionSettings,
     nonce: string,
-  ): GenerationBatch => {
+  ): Fit<GenerationBatch> => {
     const budget = computeNativeBatchBudget(settings.descriptor.limit);
+    if (budget.kind === "capacity") return budget;
     const replayDelta = (turn: Turn) => {
       const estimate = replayIndex.estimate(
         catalog.requestContext(settings.model),
@@ -313,87 +288,78 @@ export async function generateCompactionSummaries(
       );
       return estimate.tokens - estimate.visibleTokens;
     };
-    const target = plan.summarizedTurns[candidate.planIndex]!;
-    const [batch] = planNativeGenerationBatches(
-      [
-        {
-          ...candidate,
-          inputTokens: candidate.inputTokens + replayDelta(target),
-        },
-      ],
-      budget,
+    const target = plan.targets[candidate.index]!.turn;
+    const request = planNativeGenerationRequest(
+      {
+        ...candidate,
+        inputTokens: candidate.inputTokens + replayDelta(target),
+      },
+      budget.value,
       protocol,
     );
-    return {
-      ...finalizeGenerationBatch(
-        createGenerationBatch(batch!, plan, budget, replayDelta),
-        budget,
-        globalTurnIndexPrompt,
-        nonce,
-      ),
-      settings,
-    };
+    if (request.kind === "capacity") return request;
+    const batch = finalizeGenerationBatch(
+      retainPrecedingTurn(request.value, plan, budget.value, replayDelta),
+      budget.value,
+      globalTurnIndexPrompt,
+      nonce,
+    );
+    if (batch.kind === "capacity") return batch;
+    return fits({ ...batch.value, settings });
   };
-  const sourceTurns = buildTurns(plan.sourceSnapshot as MessageWithParts[]);
-  const matchModel = options.reasoning?.matchModel === true;
+  const generationNonces = new Set<string>();
+  const reports: StageReport[] = [];
   const batches = candidates.map(candidate => {
-    const turn = plan.summarizedTurns[candidate.planIndex]!;
+    const turn = plan.targets[candidate.index]!.turn;
     // One nonce per target, shared by the matched model's fit check and the
     // request that runs, so a plan that is not used claims none.
     const nonce = selectGenerationNonce(
-      [plan.sourceSnapshot],
+      [plan.sourceMessages],
       options.nonceFactory ?? createGenerationNonce,
       generationNonces,
     );
     // The target's own reasoning decides the match, never the halo's. The
     // image check covers the turn that may join it as context.
+    const preceding = plan.sourceTurns[candidate.sourceTurnIndex - 1];
     const exposesImages = historyMayExposeImages([
-      ...(sourceTurns[candidate.sourceTurnIndex - 1]
-        ? turnMessages(sourceTurns[candidate.sourceTurnIndex - 1]!)
-        : []),
+      ...(preceding ? turnMessages(preceding) : []),
       ...turnMessages(turn),
     ]);
     const match = matchCandidate(
       reasoningUnits(turn.assistants),
       catalog.qualifies,
     );
-    let choice = chooseStage(match, configured, model => {
-      const descriptor = catalog.describe(model);
-      return {
-        variants: new Set(descriptor?.variants ?? []),
-        optionsConflict: catalog.summarizerOptions,
-        imagesBlocked:
-          exposesImages && descriptor?.capabilities?.input?.image !== true,
-      };
-    });
-    let batch: GenerationBatch | undefined;
-    if (choice.kind === "match") {
-      try {
-        const matched = planBatch(
+    const { choice, matched } = settleMatch(
+      chooseStage(match, configured, model => {
+        const descriptor = catalog.describe(model);
+        return {
+          variants: new Set(descriptor?.variants ?? []),
+          optionsConflict: catalog.summarizerOptions,
+          imagesBlocked:
+            exposesImages && descriptor?.capabilities?.input?.image !== true,
+        };
+      }),
+      options.matchModel === true,
+      (model, variant) =>
+        planBatch(
           candidate,
           {
-            model: choice.model,
-            ...(choice.variant === undefined
-              ? {}
-              : { variant: choice.variant }),
-            descriptor: catalog.describe(choice.model)!,
+            model,
+            ...(variant === undefined ? {} : { variant }),
+            descriptor: catalog.describe(model)!,
           },
           nonce,
-        );
-        if (matchModel) batch = matched;
-      } catch (error) {
-        if (!hasPluginMessage(error)) throw error;
-        choice = { kind: "fallback", reason: "capacity" };
-      }
-    }
-    batch ??= planBatch(candidate, configured, nonce);
+        ),
+    );
+    const batch =
+      matched ?? requireFit(planBatch(candidate, configured, nonce));
     const retained = batch.retainedMessageIndexes.map(
-      index => plan.sourceSnapshot[index] as MessageWithParts,
+      index => plan.sourceMessages[index]!,
     );
     if (historyMayExposeImages(retained)) {
       assertConfiguredModelSupportsImages(batch.settings);
     }
-    options.reasoning?.reports.push(
+    reports.push(
       stageReport({
         stage: "turn",
         candidate: match,
@@ -406,181 +372,159 @@ export async function generateCompactionSummaries(
     );
     return batch;
   });
-  const sourceOutcome = await attemptWithinDeadline(
-    signal =>
-      v2.session
-        .messages(
-          {
-            sessionID: session.id,
-            directory: session.directory,
-            ...(session.workspaceID ? { workspace: session.workspaceID } : {}),
-          },
-          { signal },
-        )
-        .then(unwrapLifecycleResponse),
-    controlTimeoutMs,
+  const sourceMessages = await control(controlTimeoutMs, "history", signal =>
+    v2.session.messages(
+      { sessionID: session.id, ...sessionRoute(session) },
+      { signal },
+    ),
   );
-  if (sourceOutcome.kind !== "success") {
-    throw lifecycleFailure(
-      session.id,
-      "history",
-      sourceOutcome.kind === "timed-out" ? "timeout" : "rejection",
-      sourceOutcome.kind === "failed" ? sourceOutcome.error : undefined,
-    );
-  }
   if (
     !isDeepStrictEqual(
-      snapshotSourceMessages(sourceOutcome.value),
+      snapshotSourceMessages(sourceMessages),
       plan.sourceSnapshot,
     )
   ) {
-    throw lifecycleFailure(session.id, "history", "rejection");
+    throw lifecycleFailure("history", "rejection");
   }
-  const results = await requestCompactionGenerationBatches(
-    v2,
-    session,
-    batches,
-    plan,
-    sourceOutcome.value,
-    controlTimeoutMs,
+  const outcome = await runGenerationBatches(batches, (batch, stop) =>
+    requestCompactionGeneration(
+      v2,
+      session,
+      batch,
+      plan,
+      sourceMessages,
+      controlTimeoutMs,
+      stop,
+    ),
   );
-  for (const [index, candidate] of candidates.entries()) {
-    const result = results[index]!;
-    generated[candidate.planIndex] = {
-      text: frameSummary(result),
+  if (outcome.kind === "failed") {
+    const [first, ...others] = outcome.failures;
+    if (others.length === 0) throw first;
+    throw ownedAggregate(
+      outcome.failures,
+      "Multiple compaction generation batches failed.",
+    );
+  }
+  return {
+    summaries: candidates.map((candidate, index) => ({
+      text: frameSummary(outcome.results[index]!),
       ...(candidate.mediaManifest
         ? { mediaManifest: candidate.mediaManifest }
         : {}),
-    };
-  }
-  return generated;
+    })),
+    reports,
+    replay: catalog.replayContext(),
+  };
 }
 
-// `replayDelta` is what a turn's protected reasoning adds to the request
-// model's input beyond its visible text, which the halo choice counts too.
-function createGenerationBatch(
-  batch: NativeGenerationBatch<GenerationCandidate>,
+// Keeps the complete preceding non-checkpoint turn as context while the
+// request stays within the halo limit. `replayDelta` is what a turn's
+// protected reasoning adds to the request model's input beyond its visible
+// text, which the halo choice counts too.
+function retainPrecedingTurn(
+  request: NativeGenerationRequest<GenerationCandidate>,
   plan: CompactionPlan,
   budget: NativeBatchBudget,
   replayDelta: (turn: Turn) => number,
-): GenerationBatchPlan {
-  const sourceMessages = plan.sourceSnapshot as MessageWithParts[];
-  const sourceTurns = buildTurns(sourceMessages);
-  const retainedTurnIndexes = new Set(
-    batch.candidates.map(candidate => candidate.sourceTurnIndex),
-  );
-  const firstTurnIndex = batch.candidates[0]!.sourceTurnIndex;
-  if (
-    [...retainedTurnIndexes].some(turnIndex =>
-      turnHasNativeCheckpointArtifact(sourceTurns[turnIndex]),
-    )
-  ) {
+): RetainedRequest {
+  const { sourceTurns, sourceMessages } = plan;
+  const turnIndex = request.candidate.sourceTurnIndex;
+  const targetTurn = sourceTurns[turnIndex];
+  if (!targetTurn) {
+    throw new Error(
+      "Compaction generation target turn is missing from source order.",
+    );
+  }
+  if (turnHasNativeCheckpointArtifact(targetTurn)) {
     throw new Error(
       "Compaction generation cannot safely isolate a native checkpoint target.",
     );
   }
-  let retainedInput = batch.estimatedInputTokens;
-  let inputLimit = batch.inputLimit;
-  const precedingTurn = sourceTurns[firstTurnIndex - 1];
-  if (
-    precedingTurn
-    && !retainedTurnIndexes.has(firstTurnIndex - 1)
-    && !turnHasNativeCheckpointArtifact(precedingTurn)
-  ) {
+  const retainedTurns = [targetTurn];
+  let estimatedInputTokens = request.estimatedInputTokens;
+  let inputLimit = request.inputLimit;
+  const precedingTurn = sourceTurns[turnIndex - 1];
+  if (precedingTurn && !turnHasNativeCheckpointArtifact(precedingTurn)) {
     const precedingCost =
       estimateNativeTurnCost(precedingTurn).inputTokens
       + replayDelta(precedingTurn);
-    if (retainedInput + precedingCost <= budget.haloInputLimit) {
-      retainedInput += precedingCost;
+    if (estimatedInputTokens + precedingCost <= budget.haloInputLimit) {
+      estimatedInputTokens += precedingCost;
       inputLimit = budget.haloInputLimit;
-      retainedTurnIndexes.add(firstTurnIndex - 1);
+      retainedTurns.push(precedingTurn);
     }
   }
 
-  const retainedMessages = new Set(
-    [...retainedTurnIndexes].flatMap(turnIndex => {
-      const turn = sourceTurns[turnIndex];
-      if (!turn) {
-        throw new Error(
-          "Compaction generation target turn is missing from source order.",
-        );
-      }
-      return [...turn.user, ...turn.assistants];
-    }),
-  );
-  const retainedMessageIndexes = sourceMessages.flatMap((message, index) =>
-    retainedMessages.has(message) ? [index] : [],
-  );
-  const targetUserMessageIndexes = batch.candidates.map(candidate => {
-    const message = sourceTurns[candidate.sourceTurnIndex]?.user[0];
-    const index = message ? sourceMessages.indexOf(message) : -1;
-    if (index < 0) {
-      throw new Error(
-        "Compaction generation target message is missing from source order.",
-      );
-    }
-    return index;
-  });
+  const retainedMessages = new Set(retainedTurns.flatMap(turnMessages));
+  const targetUserMessageIndex = targetTurn.user[0]
+    ? sourceMessages.indexOf(targetTurn.user[0])
+    : -1;
+  if (targetUserMessageIndex < 0) {
+    throw new Error(
+      "Compaction generation target message is missing from source order.",
+    );
+  }
   return {
-    ...batch,
-    estimatedInputTokens: retainedInput,
+    ...request,
+    estimatedInputTokens,
     inputLimit,
-    retainedMessageIndexes,
-    targetUserMessageIndexes,
+    retainedMessageIndexes: sourceMessages.flatMap((message, index) =>
+      retainedMessages.has(message) ? [index] : [],
+    ),
+    targetUserMessageIndex,
   };
 }
 
+// Renders the request under its real nonce and checks it against the
+// conservative estimate and the model's limits. A real request larger than
+// its estimate is a protocol defect, not a capacity outcome.
 function finalizeGenerationBatch(
-  batch: GenerationBatchPlan,
+  request: RetainedRequest,
   budget: NativeBatchBudget,
   globalTurnIndexPrompt: string,
   generationNonce: string,
-): Omit<GenerationBatch, "settings"> {
-  const candidates = batch.candidates.map(candidate => ({
-    ...candidate,
+): Fit<Omit<GenerationBatch, "settings">> {
+  const { candidate } = request;
+  const target: GenerationTarget = {
+    ordinal: candidate.ordinal,
     marker: generationTurnMarker(generationNonce, candidate.ordinal),
-  }));
-  const prompt = buildGenerationPrompt(candidates, globalTurnIndexPrompt);
-  const exactExplicitRequestTokens = estimateGenerationExplicitRequestTokens(
-    candidates,
-    globalTurnIndexPrompt,
-  );
+    expectedInlineImages: candidate.expectedInlineImages,
+  };
   const exactInputTokens =
-    batch.estimatedInputTokens
-    - batch.estimatedExplicitRequestTokens
-    + exactExplicitRequestTokens;
+    request.estimatedInputTokens
+    - request.estimatedExplicitRequestTokens
+    + estimateGenerationExplicitRequestTokens(target, globalTurnIndexPrompt);
   const exactOutputTokens =
-    candidates.reduce(
-      (total, candidate) => total + Math.ceil(candidate.outputTokens),
-      0,
-    ) + estimateGenerationResponseProtocolTokens(candidates);
-  if (exactInputTokens > batch.estimatedInputTokens) {
+    Math.ceil(candidate.outputTokens)
+    + estimateGenerationResponseProtocolTokens(target);
+  if (exactInputTokens > request.estimatedInputTokens) {
     throw new Error(
       "Magic Compact exact generation request exceeds its conservative pre-fork token estimate.",
     );
   }
+  if (exactOutputTokens > request.estimatedOutputTokens) {
+    throw new Error(
+      "Magic Compact exact generation response exceeds its conservative pre-fork token estimate.",
+    );
+  }
   if (
-    exactInputTokens > batch.inputLimit
+    exactInputTokens > request.inputLimit
     || exactInputTokens > budget.usableInput
   ) {
-    throw new PluginMessageError(
+    return refuse(
       "Magic Compact exact generation request cannot fit the configured model input. Run /magic-trim first and retry.",
     );
   }
-  if (
-    exactOutputTokens > batch.estimatedOutputTokens
-    || exactOutputTokens > budget.outputTarget
-  ) {
-    throw new PluginMessageError(
-      `A single compaction turn cannot fit the configured ${budget.outputTarget}-token output target. Configure a compaction model with more output capacity.`,
-    );
+  if (exactOutputTokens > budget.outputTarget) {
+    return refuse(outputCapacityMessage(budget));
   }
-  return {
-    ...batch,
-    candidates,
+  return fits({
+    target,
     generationNonce,
-    prompt,
-  };
+    prompt: buildGenerationPrompt(target, globalTurnIndexPrompt),
+    retainedMessageIndexes: request.retainedMessageIndexes,
+    targetUserMessageIndex: request.targetUserMessageIndex,
+  });
 }
 
 function turnMessages(turn: Turn): MessageWithParts[] {
@@ -622,102 +566,12 @@ function turnHasNativeCheckpointArtifact(turn: Turn | undefined): boolean {
   );
 }
 
-async function requestCompactionGenerationBatches(
-  v2: V2Client,
-  sourceSession: Session,
-  batches: GenerationBatch[],
-  plan: CompactionPlan,
-  sourceMessages: MessageWithParts[],
-  controlTimeoutMs: number,
-): Promise<GenerationTurnResult[]> {
-  const results: Array<GenerationTurnResult[] | undefined> = Array.from({
-    length: batches.length,
-  });
-  const failures: Array<Error | undefined> = Array.from({
-    length: batches.length,
-  });
-  let nextBatchIndex = 0;
-  let stopAdmission = false;
-  const worker = async () => {
-    while (!stopAdmission) {
-      const batchIndex = nextBatchIndex;
-      nextBatchIndex += 1;
-      const batch = batches[batchIndex];
-      if (!batch) return;
-      try {
-        const batchResults = await requestCompactionGeneration(
-          v2,
-          sourceSession,
-          batch,
-          plan,
-          sourceMessages,
-          controlTimeoutMs,
-          () => {
-            stopAdmission = true;
-          },
-        );
-        if (batchResults.length !== batch.candidates.length) {
-          throw validationFailure("turn count mismatch", {
-            expected: batch.candidates.length,
-            received: batchResults.length,
-          });
-        }
-        results[batchIndex] = batchResults;
-      } catch (error) {
-        failures[batchIndex] = sanitizeGenerationFailure(
-          sourceSession.id,
-          error,
-        );
-        stopAdmission = true;
-      }
-    }
-  };
-  await Promise.all(
-    Array.from(
-      { length: Math.min(NATIVE_BATCH_MAX_CONCURRENCY, batches.length) },
-      worker,
-    ),
-  );
-  const orderedFailures = failures.filter(
-    (failure): failure is Error => failure !== undefined,
-  );
-  if (orderedFailures.length === 1) throw orderedFailures[0];
-  if (orderedFailures.length > 1) {
-    throw ownedAggregate(
-      orderedFailures,
-      "Multiple compaction generation batches failed.",
-    );
-  }
-
-  const candidates = batches.flatMap(batch => batch.candidates);
-  const orderedResults = results.flatMap(batchResults => batchResults ?? []);
-  if (orderedResults.length !== candidates.length) {
-    throw lifecycleFailure(
-      sourceSession.id,
-      "validation",
-      "rejection",
-      validationFailure("turn count mismatch", {
-        expected: candidates.length,
-        received: orderedResults.length,
-      }),
-    );
-  }
-  if (
-    candidates.some(
-      (candidate, index) =>
-        candidate.ordinal !== index + 1 || !orderedResults[index],
-    )
-  ) {
-    throw lifecycleFailure(
-      sourceSession.id,
-      "validation",
-      "rejection",
-      validationFailure("invalid envelope"),
-    );
-  }
-  return orderedResults;
-}
-
+// One generation batch: its fork is created and registered at once, then
+// populated, isolated to the request's retained turns, prompted once and
+// deleted. `stop` is called as soon as a failure is observed, before the fork
+// is aborted or deleted, so no further batch starts while this one cleans up.
+// A fork whose deletion failed stays registered, so its guards stay in place,
+// and its failure names it.
 async function requestCompactionGeneration(
   v2: V2Client,
   sourceSession: Session,
@@ -725,295 +579,200 @@ async function requestCompactionGeneration(
   plan: CompactionPlan,
   sourceMessages: MessageWithParts[],
   controlTimeoutMs: number,
-  onFailureObserved: () => void,
-): Promise<GenerationTurnResult[]> {
-  const candidates = batch.candidates;
-  const route: GenerationRoute = {
-    directory: sourceSession.directory,
-    ...(sourceSession.workspaceID
-      ? { workspace: sourceSession.workspaceID }
-      : {}),
-  };
-  let fork: Session;
+  stop: () => void,
+): Promise<GenerationTurnResult> {
+  const route = sessionRoute(sourceSession);
+  let fork: ForkCut;
   try {
-    fork = await forkSession(
-      v2,
-      sourceSession,
-      sourceMessages,
-      controlTimeoutMs,
-    );
+    fork = await createForkCut(v2, sourceSession, sourceMessages);
   } catch (error) {
-    onFailureObserved();
-    if (error instanceof ForkCleanupError) throw error;
-    throw lifecycleFailure(
-      sourceSession.id,
-      error instanceof ForkHistoryError ? "history" : "fork",
-      error instanceof ForkHistoryError && error.reason === "read-timeout"
-        ? "timeout"
-        : "rejection",
-      error,
-    );
+    stop();
+    throw forkFailure(error);
   }
 
-  ownedGenerationForks.add(fork.id);
-  let operationError: Error | undefined;
-  const recordOperationError = (error: Error): void => {
-    operationError = error;
-    onFailureObserved();
-  };
-  let results: GenerationTurnResult[] | undefined;
-  const generationNonce = batch.generationNonce;
-  let retainedIdentity: ForkMessageIdentity[] | undefined;
-  const permissionOutcome = await attemptWithinDeadline(
-    signal =>
-      v2.session
-        .update(
-          {
-            sessionID: fork.id,
-            ...route,
-            permission: GENERATION_PERMISSION,
-          },
-          { signal },
-        )
-        .then(unwrapLifecycleResponse),
-    controlTimeoutMs,
-  );
-  if (permissionOutcome.kind !== "success") {
-    recordOperationError(
-      lifecycleFailure(
-        sourceSession.id,
-        "permission",
-        permissionOutcome.kind === "timed-out" ? "timeout" : "rejection",
-        permissionOutcome.kind === "failed"
-          ? permissionOutcome.error
-          : undefined,
-      ),
-    );
-  }
-
-  if (!operationError) {
-    const messagesOutcome = await attemptWithinDeadline(
-      signal =>
-        v2.session
-          .messages({ sessionID: fork.id, ...route }, { signal })
-          .then(unwrapLifecycleResponse),
+  const owned = registerOwnedFork(fork.id);
+  const failures: unknown[] = [];
+  let prompted = false;
+  let result: GenerationTurnResult | undefined;
+  try {
+    await fork.populate(controlTimeoutMs).catch((error: unknown) => {
+      throw forkFailure(error);
+    });
+    await isolateGenerationFork(
+      v2,
+      fork.id,
+      route,
+      batch,
+      plan,
       controlTimeoutMs,
     );
-    if (messagesOutcome.kind !== "success") {
-      recordOperationError(
-        lifecycleFailure(
-          sourceSession.id,
-          "history",
-          messagesOutcome.kind === "timed-out" ? "timeout" : "rejection",
-          messagesOutcome.kind === "failed" ? messagesOutcome.error : undefined,
-        ),
-      );
-    } else {
-      try {
-        assertForkMessageShape(messagesOutcome.value, plan);
-        assertForkRecordIdentity(messagesOutcome.value, fork.id);
-        retainedIdentity = batch.retainedMessageIndexes.map(index =>
-          forkMessageIdentity(messagesOutcome.value[index]!),
-        );
-      } catch (error) {
-        recordOperationError(
-          lifecycleFailure(sourceSession.id, "history", "rejection", error),
-        );
-      }
-
-      if (!operationError) {
-        const retained = new Set(batch.retainedMessageIndexes);
-        for (const [index, message] of messagesOutcome.value.entries()) {
-          if (retained.has(index)) continue;
-          const isolationOutcome = await attemptWithinDeadline(
-            signal =>
-              v2.session
-                .deleteMessage(
-                  {
-                    sessionID: fork.id,
-                    messageID: message.info.id,
-                    ...route,
-                  },
-                  { signal },
-                )
-                .then(unwrapLifecycleResponse),
-            controlTimeoutMs,
-          );
-          if (isolationOutcome.kind === "success") continue;
-          recordOperationError(
-            lifecycleFailure(
-              sourceSession.id,
-              "isolation",
-              isolationOutcome.kind === "timed-out" ? "timeout" : "rejection",
-              isolationOutcome.kind === "failed"
-                ? isolationOutcome.error
-                : undefined,
-            ),
-          );
-          break;
-        }
-      }
-
-      if (!operationError) {
-        const retainedOutcome = await attemptWithinDeadline(
-          signal =>
-            v2.session
-              .messages({ sessionID: fork.id, ...route }, { signal })
-              .then(unwrapLifecycleResponse),
-          controlTimeoutMs,
-        );
-        if (retainedOutcome.kind !== "success") {
-          recordOperationError(
-            lifecycleFailure(
-              sourceSession.id,
-              "history",
-              retainedOutcome.kind === "timed-out" ? "timeout" : "rejection",
-              retainedOutcome.kind === "failed"
-                ? retainedOutcome.error
-                : undefined,
-            ),
-          );
-        } else {
-          try {
-            if (!retainedIdentity) {
-              throw new Error(
-                "Compaction generation fork history shape mismatch.",
-              );
-            }
-            assertRetainedForkMessageShape(
-              retainedOutcome.value,
-              plan,
-              batch.retainedMessageIndexes,
-            );
-            assertForkRecordIdentity(retainedOutcome.value, fork.id);
-            assertRetainedForkIdentity(retainedOutcome.value, retainedIdentity);
-            if (containsString(retainedOutcome.value, generationNonce)) {
-              throw new GenerationMarkerNonceCollisionError();
-            }
-            const markerTargets = generationMarkerTargets(
-              retainedOutcome.value,
-              fork.id,
-              batch,
-            );
-            for (const target of markerTargets) {
-              const markerOutcome = await attemptWithinDeadline(
-                signal =>
-                  v2.part
-                    .update(
-                      {
-                        sessionID: fork.id,
-                        messageID: target.message.info.id,
-                        partID: target.part.id,
-                        ...route,
-                        part: target.part,
-                      },
-                      { signal },
-                    )
-                    .then(unwrapLifecycleResponse),
-                controlTimeoutMs,
-              );
-              if (markerOutcome.kind === "success") continue;
-              recordOperationError(
-                lifecycleFailure(
-                  sourceSession.id,
-                  "marker",
-                  markerOutcome.kind === "timed-out" ? "timeout" : "rejection",
-                  markerOutcome.kind === "failed"
-                    ? markerOutcome.error
-                    : undefined,
-                ),
-              );
-              break;
-            }
-          } catch (error) {
-            recordOperationError(
-              lifecycleFailure(sourceSession.id, "history", "rejection", error),
-            );
-          }
-        }
-      }
-    }
+    prompted = true;
+    result = await promptGenerationFork(v2, owned, route, batch);
+  } catch (error) {
+    failures.push(error);
+    stop();
   }
-
-  if (!operationError) {
-    let stage: Extract<GenerationStage, "provider" | "validation"> = "provider";
+  // Only a prompt can leave the fork running.
+  if (prompted && failures.length > 0) {
     try {
-      const body = unwrapLifecycleResponse(
-        await v2.session.prompt({
-          sessionID: fork.id,
-          ...route,
-          agent: MAGIC_COMPACT_SUMMARIZER_AGENT,
-          model: batch.settings.model,
-          ...(batch.settings.variant
-            ? { variant: batch.settings.variant }
-            : {}),
-          format: GENERATION_FORMAT,
-          parts: [
-            {
-              type: "text",
-              text: batch.prompt,
-            },
-          ],
-        }),
-      );
-      const responseInfo =
-        isRecord(body) && isRecord(body["info"]) ? body["info"] : undefined;
-      const structuredOutput = responseInfo?.["structured"];
-      if (responseInfo) {
-        const responseError = responseInfo["error"];
-        const outputTruncated = isOutputTruncation(responseInfo["finish"]);
-        const structuredOutputFailure = isStructuredOutputError(responseError);
-        if (responseError && !(outputTruncated && structuredOutputFailure)) {
-          throw responseError;
-        }
-        if (outputTruncated && structuredOutput === undefined) {
-          throw { name: "MessageOutputLengthError" };
-        }
-      }
-      stage = "validation";
-      results = parseGenerationResponse(
-        structuredOutput,
-        candidates,
-        generationNonce,
+      unwrapLifecycleResponse(
+        await v2.session.abort({ sessionID: fork.id, ...route }),
       );
     } catch (error) {
-      recordOperationError(
-        lifecycleFailure(sourceSession.id, stage, "rejection", error),
-      );
-      try {
-        unwrapLifecycleResponse(
-          await v2.session.abort({ sessionID: fork.id, ...route }),
-        );
-      } catch (abortError) {
-        operationError = combineLifecycleErrors(
-          operationError!,
-          lifecycleFailure(sourceSession.id, "abort", "rejection", abortError),
-        );
-      }
+      failures.push(lifecycleFailure("abort", "rejection", error));
     }
   }
-
-  let deleteError: Error | undefined;
   try {
     unwrapLifecycleResponse(
       await v2.session.delete({ sessionID: fork.id, ...route }),
     );
-    ownedGenerationForks.delete(fork.id);
+    releaseOwnedFork(owned);
   } catch (error) {
-    deleteError = lifecycleFailure(
-      sourceSession.id,
-      "delete",
-      "rejection",
-      error,
+    failures.push(
+      new GenerationLifecycleError(
+        "delete",
+        safeStatus(error),
+        lifecycleMessage("delete", "rejection"),
+        [{ id: fork.id, removal: "failed" }],
+      ),
     );
-    onFailureObserved();
+    stop();
   }
-  if (operationError && deleteError) {
-    throw combineLifecycleErrors(operationError, deleteError);
+  const [first, ...others] = failures;
+  if (others.length > 0) {
+    throw ownedAggregate(
+      failures,
+      "Compaction generation and fork cleanup both failed.",
+    );
   }
-  if (operationError) throw operationError;
-  if (deleteError) throw deleteError;
-  return results!;
+  if (first !== undefined) throw first;
+  return result!;
+}
+
+// Leaves the fork holding exactly the request's retained turns, checked
+// record for record against the plan, with the target marker inserted.
+async function isolateGenerationFork(
+  v2: V2Client,
+  forkID: string,
+  route: HistoryRoute,
+  batch: GenerationBatch,
+  plan: CompactionPlan,
+  controlTimeoutMs: number,
+): Promise<void> {
+  await control(controlTimeoutMs, "permission", signal =>
+    v2.session.update(
+      { sessionID: forkID, ...route, permission: GENERATION_PERMISSION },
+      { signal },
+    ),
+  );
+  const forked = await control(controlTimeoutMs, "history", signal =>
+    v2.session.messages({ sessionID: forkID, ...route }, { signal }),
+  );
+  const retainedIdentity = checkedHistory(() => {
+    assertForkMessageShape(forked, plan);
+    assertForkRecordIdentity(forked, forkID);
+    return batch.retainedMessageIndexes.map(index =>
+      forkMessageIdentity(forked[index]!),
+    );
+  });
+  const retainedIndexes = new Set(batch.retainedMessageIndexes);
+  for (const [index, message] of forked.entries()) {
+    if (retainedIndexes.has(index)) continue;
+    await control(controlTimeoutMs, "isolation", signal =>
+      v2.session.deleteMessage(
+        { sessionID: forkID, messageID: message.info.id, ...route },
+        { signal },
+      ),
+    );
+  }
+  const retained = await control(controlTimeoutMs, "history", signal =>
+    v2.session.messages({ sessionID: forkID, ...route }, { signal }),
+  );
+  const marker = checkedHistory(() => {
+    assertRetainedForkMessageShape(
+      retained,
+      plan,
+      batch.retainedMessageIndexes,
+    );
+    assertForkRecordIdentity(retained, forkID);
+    assertRetainedForkIdentity(retained, retainedIdentity);
+    if (containsString(retained, batch.generationNonce)) {
+      throw new GenerationMarkerNonceCollisionError();
+    }
+    return generationMarkerTarget(retained, forkID, batch);
+  });
+  await control(controlTimeoutMs, "marker", signal =>
+    v2.part.update(
+      {
+        sessionID: forkID,
+        messageID: marker.message.info.id,
+        partID: marker.part.id,
+        ...route,
+        part: marker.part,
+      },
+      { signal },
+    ),
+  );
+}
+
+// The one model request, awaited without a local deadline, and its untrusted
+// structured response. A native compaction the hook blocked means the request
+// outgrew the model, whatever error the host then returns for the prompt.
+async function promptGenerationFork(
+  v2: V2Client,
+  fork: OwnedFork,
+  route: HistoryRoute,
+  batch: GenerationBatch,
+): Promise<GenerationTurnResult> {
+  let body: unknown;
+  try {
+    body = unwrapLifecycleResponse(
+      await v2.session.prompt({
+        sessionID: fork.id,
+        ...route,
+        agent: MAGIC_COMPACT_SUMMARIZER_AGENT,
+        model: batch.settings.model,
+        ...(batch.settings.variant ? { variant: batch.settings.variant } : {}),
+        format: GENERATION_FORMAT,
+        parts: [{ type: "text", text: batch.prompt }],
+      }),
+    );
+  } catch (error) {
+    if (fork.nativeCompactionBlocked) throw overflowFailure();
+    throw lifecycleFailure("provider", "rejection", error);
+  }
+  if (fork.nativeCompactionBlocked) throw overflowFailure();
+  const responseInfo =
+    isRecord(body) && isRecord(body["info"]) ? body["info"] : undefined;
+  const structuredOutput = responseInfo?.["structured"];
+  if (responseInfo) {
+    const responseError = responseInfo["error"];
+    const outputTruncated = isOutputTruncation(responseInfo["finish"]);
+    // A response cut at its output limit still counts when its structured
+    // output was captured.
+    if (
+      responseError
+      && !(outputTruncated && isStructuredOutputError(responseError))
+    ) {
+      throw lifecycleFailure("provider", "rejection", responseError);
+    }
+    if (outputTruncated && structuredOutput === undefined) {
+      throw new GenerationLifecycleError(
+        "provider",
+        undefined,
+        GENERATION_OUTPUT_LIMIT,
+      );
+    }
+  }
+  try {
+    return parseGenerationResponse(
+      structuredOutput,
+      batch.target,
+      batch.generationNonce,
+    );
+  } catch (error) {
+    throw lifecycleFailure("validation", "rejection", error);
+  }
 }
 
 function assertRetainedForkMessageShape(
@@ -1126,47 +885,28 @@ export function assertForkRecordIdentity(
   }
 }
 
-function generationMarkerTargets(
+function generationMarkerTarget(
   messages: MessageWithParts[],
   forkSessionID: string,
   batch: GenerationBatch,
-): Array<{ message: MessageWithParts; part: TextPart }> {
-  const targets = batch.candidates.map((candidate, index) => {
-    const message = retainedForkMessage(
-      messages,
-      batch,
-      batch.targetUserMessageIndexes[index]!,
-    );
-    return {
-      message,
-      part: generationMarkerPart(
-        forkSessionID,
-        message.info.id,
-        candidate.marker,
-        candidate.ordinal,
-      ),
-    };
-  });
-  for (const target of targets) {
-    if (target.message.parts.some(part => part.id === target.part.id)) {
-      throw new Error("Compaction generation fork marker collision.");
-    }
-  }
-  return targets;
-}
-
-function retainedForkMessage(
-  messages: MessageWithParts[],
-  batch: GenerationBatch,
-  sourceMessageIndex: number,
-): MessageWithParts {
-  const retainedIndex =
-    batch.retainedMessageIndexes.indexOf(sourceMessageIndex);
+): { message: MessageWithParts; part: TextPart } {
+  const retainedIndex = batch.retainedMessageIndexes.indexOf(
+    batch.targetUserMessageIndex,
+  );
   const message = messages[retainedIndex];
   if (retainedIndex < 0 || !message || message.info.role !== "user") {
     throw new Error("Compaction generation fork history shape mismatch.");
   }
-  return message;
+  const part = generationMarkerPart(
+    forkSessionID,
+    message.info.id,
+    batch.target.marker,
+    batch.target.ordinal,
+  );
+  if (message.parts.some(existing => existing.id === part.id)) {
+    throw new Error("Compaction generation fork marker collision.");
+  }
+  return { message, part };
 }
 
 function generationMarkerPart(
@@ -1193,12 +933,12 @@ function generationMarkerPart(
 
 export const SUMMARIZER_MODEL_REQUIRED = `Magic Compact requires an explicit model on its ${MAGIC_COMPACT_SUMMARIZER_AGENT} agent. Set agent["${MAGIC_COMPACT_SUMMARIZER_AGENT}"].model (and optionally variant) in your OpenCode config.`;
 
-// The configured summarizer plus the live model list, read once per summary
-// stage. `describe` gives another listed model's descriptor for
-// `--match-model`, `qualifies` says whether a model's protected reasoning
-// behavior is verified, `requestContext` is the reasoning context a summary
-// request on a model uses, and `replayContext` names the model the successor
-// continues with and the reasoning context its requests use.
+// The configured summarizer plus the live model list. `describe` gives another
+// listed model's descriptor for `--match-model`, `qualifies` says whether a
+// model's protected reasoning behavior is verified, `requestContext` is the
+// reasoning context a summary request on a model uses, and `replayContext`
+// names the model the successor continues with and the reasoning context its
+// requests use.
 export type SummarizerCatalog = {
   configured: CompactionSettings;
   // The summarizer agent carries operator options written for its own model.
@@ -1209,21 +949,47 @@ export type SummarizerCatalog = {
   replayContext: () => ReplayContext | undefined;
 };
 
-export async function resolveSummarizerCatalog(
+// One command's summarizer catalog. The agent list and the model list are
+// each read at most once, when a summary request first needs them, so the
+// retention summary and every turn request share one resolution and a
+// command that makes no summary request reads neither. `requiresImages` only
+// chooses the failure text for its caller.
+export type LoadSummarizerCatalog = (
+  requiresImages: boolean,
+) => Promise<SummarizerCatalog>;
+
+export function summarizerCatalogLoader(
   v2: V2Client,
   sourceSession: Session,
-  requiresImages: boolean,
-): Promise<SummarizerCatalog> {
+): LoadSummarizerCatalog {
+  let agents: Promise<SummarizerAgents> | undefined;
+  let providers: Promise<unknown[] | undefined> | undefined;
+  return async requiresImages => {
+    const read = await (agents ??= readSummarizerAgents(v2, sourceSession));
+    const listed = await (providers ??= readProviders(v2, sourceSession));
+    if (listed === undefined) {
+      throw new PluginMessageError(
+        requiresImages
+          ? "Magic Compact could not verify an image-capable configured compaction model."
+          : "Magic Compact could not resolve the configured compaction model descriptor.",
+      );
+    }
+    return summarizerCatalog(sourceSession, read, listed, requiresImages);
+  };
+}
+
+type SummarizerAgents = {
+  agents: Agent[];
+  summarizer: Agent & { model: ModelIdentity };
+};
+
+async function readSummarizerAgents(
+  v2: V2Client,
+  sourceSession: Session,
+): Promise<SummarizerAgents> {
   let agents: Agent[];
   try {
-    agents = unwrap(
-      await v2.app.agents({
-        directory: sourceSession.directory,
-        ...(sourceSession.workspaceID
-          ? { workspace: sourceSession.workspaceID }
-          : {}),
-      }),
-    );
+    agents = unwrap(await v2.app.agents(sessionRoute(sourceSession)));
   } catch {
     throw new PluginMessageError(
       `Magic Compact could not resolve the ${MAGIC_COMPACT_SUMMARIZER_AGENT} agent.`,
@@ -1239,32 +1005,35 @@ export async function resolveSummarizerCatalog(
   }
   // No fallback: the source session's model and OpenCode's native compaction
   // agent are never used in its place.
-  if (
-    !summarizer.model
-    || !summarizer.model.providerID.trim()
-    || !summarizer.model.modelID.trim()
-  ) {
+  const model = summarizer.model;
+  if (!model || !model.providerID.trim() || !model.modelID.trim()) {
     throw new PluginMessageError(SUMMARIZER_MODEL_REQUIRED);
   }
+  return { agents, summarizer: { ...summarizer, model } };
+}
+
+// The listed providers, or undefined when the list could not be read.
+async function readProviders(
+  v2: V2Client,
+  sourceSession: Session,
+): Promise<unknown[] | undefined> {
   let catalog: ReturnType<typeof unwrap>;
   try {
-    catalog = unwrap(
-      await v2.provider.list({
-        directory: sourceSession.directory,
-        ...(sourceSession.workspaceID
-          ? { workspace: sourceSession.workspaceID }
-          : {}),
-      }),
-    );
+    catalog = unwrap(await v2.provider.list(sessionRoute(sourceSession)));
   } catch {
-    throw new PluginMessageError(
-      requiresImages
-        ? "Magic Compact could not verify an image-capable configured compaction model."
-        : "Magic Compact could not resolve the configured compaction model descriptor.",
-    );
+    return undefined;
   }
-  const providers =
-    isRecord(catalog) && Array.isArray(catalog["all"]) ? catalog["all"] : [];
+  return isRecord(catalog) && Array.isArray(catalog["all"])
+    ? catalog["all"]
+    : [];
+}
+
+function summarizerCatalog(
+  sourceSession: Session,
+  { agents, summarizer }: SummarizerAgents,
+  providers: unknown[],
+  requiresImages: boolean,
+): SummarizerCatalog {
   const providerRecord = (providerID: string) =>
     providers.find(value => isRecord(value) && value["id"] === providerID) as
       Record<string, unknown> | undefined;
@@ -1447,42 +1216,37 @@ export function historyMayExposeImages(sourceSnapshot: unknown): boolean {
   });
 }
 
+// A turn is anchored by its first ordinary (non-synthetic, non-ignored) text
+// part across its user messages, even when that text is empty.
 function buildGlobalTurnIndexPrompt(plan: CompactionPlan): string {
-  const sourceTurns = buildTurns(
-    plan.sourceSnapshot as unknown as MessageWithParts[],
+  return globalTurnIndexPrompt(
+    plan.sourceTurns
+      .slice(
+        plan.effectiveSourceTurnStartIndex,
+        plan.effectiveSourceTurnEndIndex,
+      )
+      .map((turn, index) => ({
+        sourceOrdinal: plan.effectiveSourceTurnStartIndex + index + 1,
+        userText:
+          turn.user
+            .flatMap(message => message.parts)
+            .find(
+              (part): part is TextPart =>
+                part.type === "text"
+                && part.synthetic !== true
+                && part.ignored !== true,
+            )?.text ?? "",
+      })),
   );
-  const globalTurnIndex = sourceTurns
-    .slice(plan.effectiveSourceTurnStartIndex, plan.effectiveSourceTurnEndIndex)
-    .map((turn, index) => ({
-      sourceOrdinal: plan.effectiveSourceTurnStartIndex + index + 1,
-      anchor: capCodePoints(
-        firstOrdinaryUserLine(turn),
-        GLOBAL_ANCHOR_CHARACTER_LIMIT,
-      ),
-    }));
-  return globalTurnIndexPrompt(globalTurnIndex);
 }
 
-function firstOrdinaryUserLine(turn: Turn): string {
-  const text = turn.user
-    .flatMap(message => message.parts)
-    .find(
-      (part): part is TextPart =>
-        part.type === "text"
-        && part.synthetic !== true
-        && part.ignored !== true,
-    )?.text;
-  return (text ?? "").split(/\r\n|\r|\n/u, 1)[0] ?? "";
-}
-
+// Successor edits apply to the whole source, so a generated summary or
+// boundary part ID must not already be taken anywhere in it.
 function assertGeneratedPartIDsAvailable(plan: CompactionPlan): void {
   const partIDs = new Set(
-    [...plan.summarizedTurns, ...(plan.nextTurn ? [plan.nextTurn] : [])]
-      .flatMap(turn => [...turn.user, ...turn.assistants])
-      .flatMap(message => message.parts.map(part => part.id)),
+    plan.sourceMessages.flatMap(message => message.parts.map(part => part.id)),
   );
-  for (const turn of plan.summarizedTurns) {
-    if (turnHasPersistedSummary(turn)) continue;
+  for (const { turn } of plan.targets) {
     const assistant = turn.assistants[0];
     if (!assistant) throw new Error("Turn missing assistant message.");
     if (partIDs.has(summaryEnvelopePartID(assistant.info.id))) {
@@ -1501,24 +1265,85 @@ function assertGeneratedPartIDsAvailable(plan: CompactionPlan): void {
 
 type LifecycleFailureKind = "timeout" | "rejection";
 
-class GenerationLifecycleError extends PluginMessageError {
-  readonly status: number | undefined;
+const GENERATION_OVERFLOW =
+  "The complete forked session exceeded the configured compaction model context. Run /magic-trim first, then retry /magic-compact.";
+const GENERATION_OUTPUT_LIMIT =
+  "The compaction model reached its output limit while summarizing a single turn. Configure a compaction model with more output capacity.";
 
+// A generation failure with fixed text, its stage and the classified HTTP
+// status; never a host or provider body. A failed deletion also names the
+// fork it left.
+class GenerationLifecycleError
+  extends PluginMessageError
+  implements LeavesSessions
+{
   constructor(
-    readonly sourceSessionID: string,
     readonly stage: GenerationStage,
-    readonly kind: LifecycleFailureKind,
-    status: number | undefined,
-    message: string,
+    readonly status: number | undefined,
+    readonly reason: string,
+    readonly unremovedSessions: readonly UnremovedSession[] = [],
   ) {
-    super(message);
+    super(
+      unremovedSessions.length === 0
+        ? reason
+        : `${reason} ${unremovedSessionsText(unremovedSessions, "Fork")}`,
+    );
     this.name = "GenerationLifecycleError";
-    this.status = status;
+  }
+}
+
+// A fork that could not be created, or populated as planned.
+function forkFailure(error: unknown): GenerationLifecycleError {
+  return error instanceof ForkHistoryError
+    ? lifecycleFailure(
+        "history",
+        error.reason === "read-timeout" ? "timeout" : "rejection",
+        error,
+      )
+    : lifecycleFailure("fork", "rejection", error);
+}
+
+function overflowFailure(): GenerationLifecycleError {
+  return new GenerationLifecycleError(
+    "provider",
+    undefined,
+    GENERATION_OVERFLOW,
+  );
+}
+
+// One control request under the deadline. A timeout or rejection is this
+// stage's failure.
+async function control<T>(
+  controlTimeoutMs: number,
+  stage: Extract<
+    GenerationStage,
+    "permission" | "history" | "isolation" | "marker"
+  >,
+  request: (signal: AbortSignal) => Promise<{ data?: T; error?: unknown }>,
+): Promise<T> {
+  const outcome = await attemptWithinDeadline(
+    signal => request(signal).then(unwrapLifecycleResponse),
+    controlTimeoutMs,
+  );
+  if (outcome.kind === "success") return outcome.value;
+  throw lifecycleFailure(
+    stage,
+    outcome.kind === "timed-out" ? "timeout" : "rejection",
+    outcome.kind === "failed" ? outcome.error : undefined,
+  );
+}
+
+// A check of fork history the host returned; any failure is a history
+// failure.
+function checkedHistory<T>(check: () => T): T {
+  try {
+    return check();
+  } catch (error) {
+    throw lifecycleFailure("history", "rejection", error);
   }
 }
 
 function lifecycleFailure(
-  sourceSessionID: string,
   stage: GenerationStage,
   kind: LifecycleFailureKind,
   error?: unknown,
@@ -1526,60 +1351,26 @@ function lifecycleFailure(
   const status = safeStatus(error);
   if (error instanceof ForkHistoryError) {
     return new GenerationLifecycleError(
-      sourceSessionID,
       stage,
-      kind,
       status,
       `Compaction generation fork history verification ${kind === "timeout" ? "timed out" : "failed"} (${error.detail}).`,
     );
   }
-  const overflow = stage === "provider" && isContextOverflow(error, status);
-  const truncated = stage === "provider" && isOutputTruncation(error);
-  const missingStructuredOutput =
-    stage === "provider" && isStructuredOutputError(error);
+  const provider = stage === "provider";
   const message =
     error instanceof GenerationMarkerNonceCollisionError
       ? error.message
       : stage === "validation"
           && error instanceof GenerationResponseValidationError
         ? `Compaction generation response validation failed: ${validationCategoryText(error)}.`
-        : overflow
-          ? "The complete forked session exceeded the configured compaction model context. Run /magic-trim first, then retry /magic-compact."
-          : truncated
-            ? "The compaction model reached its output limit while summarizing a single turn. Configure a compaction model with more output capacity."
-            : missingStructuredOutput
+        : provider && isContextOverflow(error, status)
+          ? GENERATION_OVERFLOW
+          : provider && isOutputTruncation(error)
+            ? GENERATION_OUTPUT_LIMIT
+            : provider && isStructuredOutputError(error)
               ? "The compaction model finished without submitting its StructuredOutput response."
               : lifecycleMessage(stage, kind);
-  return new GenerationLifecycleError(
-    sourceSessionID,
-    stage,
-    kind,
-    status,
-    message,
-  );
-}
-
-function sanitizeGenerationFailure(
-  sourceSessionID: string,
-  error: unknown,
-): Error {
-  if (
-    error instanceof GenerationLifecycleError
-    || error instanceof ForkCleanupError
-  )
-    return error;
-  if (error instanceof AggregateError) {
-    const errors = error.errors.map(item =>
-      sanitizeGenerationFailure(sourceSessionID, item),
-    );
-    if (errors.length > 0) {
-      return ownedAggregate(
-        errors,
-        "Compaction generation batch and fork cleanup failed.",
-      );
-    }
-  }
-  return lifecycleFailure(sourceSessionID, "validation", "rejection", error);
+  return new GenerationLifecycleError(stage, status, message);
 }
 
 function lifecycleMessage(
@@ -1631,29 +1422,20 @@ function unwrapLifecycleResponse<T, E>(response: { data?: T; error?: E }): T {
   return response.data as T;
 }
 
-function combineLifecycleErrors(primary: Error, secondary: Error): Error {
-  return ownedAggregate(
-    [primary, secondary],
-    "Compaction generation and fork cleanup both failed.",
-  );
-}
-
 // An aggregate of this plugin's already sanitized generation failures. Its
 // message adds their distinct reasons, so a person sees why the batches
 // failed (for example, to run /magic-trim first) and not only that several
-// did, and then every partial fork that could not be deleted, which the
-// reason cap never drops. The failures stay in `errors`, unchanged and in
-// batch order.
-function ownedAggregate(errors: Error[], summary: string): AggregateError {
-  const forks = undeletedSessionIDs(errors);
+// did, and then every fork that could not be deleted, which the reason cap
+// never drops. The failures stay in `errors`, unchanged and in batch order.
+function ownedAggregate(
+  errors: readonly unknown[],
+  summary: string,
+): AggregateError {
+  const forks = unremovedSessions(errors);
   const message = [
     summary,
     ...distinctReasons(errors),
-    ...(forks.length === 0
-      ? []
-      : [
-          `Delete partial fork${forks.length === 1 ? "" : "s"} ${forks.join(", ")} manually.`,
-        ]),
+    ...(forks.length === 0 ? [] : [unremovedSessionsText(forks, "Fork")]),
   ].join(" ");
   return markPluginMessage(
     new AggregateError(errors, message, { cause: errors[0] }),

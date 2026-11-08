@@ -1,8 +1,7 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { createHash, randomBytes } from "node:crypto";
+import { rm } from "node:fs/promises";
 import { z } from "zod";
-import { pluginStorageDirectory } from "./store";
+import { pluginStorageDirectory, replaceJSONFile } from "./store";
 
 const LegacyOmissionEntrySchema = z.object({ content: z.string() }).strict();
 const OmissionEntrySchema = z
@@ -58,24 +57,6 @@ export function omissionReadDiagnostic(
 }
 
 const mutationQueues = new Map<string, Promise<void>>();
-
-export async function allocateOmission(
-  sessionID: string,
-  entry: OmissionEntry,
-  tokenFactory: () => string = createToken,
-): Promise<string> {
-  return withSessionMutation(sessionID, async () => {
-    const cache = (await readCacheFile(sessionID)) ?? createEmptyCache();
-    for (let attempt = 0; attempt < 128; attempt++) {
-      const contentID = formatContentID(sessionID, tokenFactory());
-      if (cache.entries[contentID]) continue;
-      cache.entries[contentID] = createEntry(contentID, entry.content);
-      await writeCacheFile(sessionID, cache);
-      return contentID;
-    }
-    throw new Error("Unable to allocate a unique omission Content ID.");
-  });
-}
 
 export function planOmission(
   sessionID: string,
@@ -142,28 +123,6 @@ export async function readOmittedContent(
   return null;
 }
 
-export async function readCache(
-  sessionID: string,
-): Promise<OmissionCache | null> {
-  return readCacheFile(sessionID);
-}
-
-export async function writeCache(
-  sessionID: string,
-  cache: OmissionCache,
-): Promise<void> {
-  const parsed = OmissionCacheSchema.safeParse(cache);
-  if (!parsed.success) {
-    throw new Error(`Invalid omission cache for session ${sessionID}.`, {
-      cause: parsed.error,
-    });
-  }
-  await withSessionMutation(sessionID, async () => {
-    await readCacheFile(sessionID);
-    await writeCacheFile(sessionID, parsed.data);
-  });
-}
-
 export function cachePath(sessionID: string): string {
   return `${pluginStorageDirectory()}/${sessionID}.json`;
 }
@@ -208,18 +167,7 @@ async function writeCacheFile(
   cache: OmissionCache,
 ): Promise<void> {
   assertCacheIntegrity(cache);
-  const filePath = cachePath(sessionID);
-  await mkdir(dirname(filePath), { recursive: true });
-  const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    await writeFile(temporaryPath, `${JSON.stringify(cache, null, 2)}\n`);
-    await rename(temporaryPath, filePath);
-  } catch (error) {
-    await Bun.file(temporaryPath)
-      .delete()
-      .catch(() => undefined);
-    throw error;
-  }
+  await replaceJSONFile(cachePath(sessionID), cache);
 }
 
 async function withSessionMutation<T>(

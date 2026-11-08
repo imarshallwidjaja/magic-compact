@@ -1,8 +1,15 @@
 // Successor lifecycle pieces shared by both hosts.
-import type { ForkFailureDetail } from "../compact/fork";
-import { PluginMessageError } from "./feedback";
+import { deleteCache } from "../storage/omission";
+import { deleteStats, InvalidStatsError } from "../storage/stats";
+import { ContentFreeError, PluginMessageError } from "./feedback";
 
 export type SuccessorCommand = "Magic Compact" | "Magic Trim" | "Magic Recover";
+
+// How a command reads its source. `at-rest` refuses unfinished stored records
+// and undelivered background results; `recovery`, for `/magic-recover` only,
+// returns them for the caller to close. Both keep every live check, and the
+// recheck before the ready update reads the source the same way.
+export type SourceLifecycle = "at-rest" | "recovery";
 
 export const COMPACT_INSUFFICIENT_SAVINGS =
   "Magic Compact projected no useful canonical active-content savings; the source session was left unchanged.";
@@ -90,7 +97,7 @@ export function boundedLabel(value: string, limit: number): string {
   return label.length > limit ? `${label.slice(0, limit - 3)}...` : label;
 }
 
-const plural = (count: number, noun: string) =>
+export const plural = (count: number, noun: string) =>
   `${count} ${noun}${count === 1 ? "" : "s"}`;
 
 // Refusal for a stored history that holds records which never finished. The
@@ -161,16 +168,16 @@ export function undeliveredBackgroundRefusal(
   );
 }
 
+// States only the drift; `successorFailure` adds what became of the candidate.
 export class SourceChangedError extends PluginMessageError {
   constructor(command: SuccessorCommand) {
     super(
-      `The session changed while ${command} was preparing its successor, so no successor was kept. The session was left unchanged; retry when it is at rest.`,
+      `The session changed while ${command} was preparing its successor. The session was left unchanged; retry when it is at rest.`,
     );
     this.name = "SourceChangedError";
   }
 }
 
-// The fixed ways a successor candidate can fail verification.
 export type SuccessorVerificationDetail =
   | "history read failed"
   | "imported history did not match the plan"
@@ -178,19 +185,7 @@ export type SuccessorVerificationDetail =
   | "instructions did not match the source"
   | "candidate was changed by another writer";
 
-// An error this plugin raised whose `detail` is one of its own fixed category
-// texts, never host content. Only the subclasses below construct it, each from
-// a closed set.
-export abstract class ContentFreeError extends PluginMessageError {
-  protected constructor(
-    message: string,
-    readonly detail: SuccessorVerificationDetail | ForkFailureDetail,
-  ) {
-    super(message);
-  }
-}
-
-export class SuccessorVerificationError extends ContentFreeError {
+export class SuccessorVerificationError extends ContentFreeError<SuccessorVerificationDetail> {
   constructor(detail: SuccessorVerificationDetail) {
     super(detail, detail);
     this.name = "SuccessorVerificationError";
@@ -208,17 +203,61 @@ export type SuccessorStage =
   | "recheck"
   | "ready";
 
+// The check that kept a candidate: a read that failed or timed out, its
+// session record, its history, its instruction entries, a child session,
+// activity, a pending request, or a deletion the host did not confirm.
+export type CandidateKeptBy =
+  | "read"
+  | "record"
+  | "history"
+  | "instructions"
+  | "children"
+  | "activity"
+  | "pending"
+  | "delete";
+
+// What became of a candidate after a failure, named by what this run
+// observed. Only `deleted` and `deleted-with-residue` follow a deletion this
+// run confirmed. `absent` means the host reported no such session, which does
+// not prove deletion: a request the host rejected may still be applied, so
+// nothing saved under the candidate's ID is removed; `storageAttempted` says
+// whether this run had started writing its omission cache or stats, not that
+// any file exists. `kept` follows any doubt that the candidate holds only what
+// this run wrote. `ready-attempted` means the ready update was sent, so the
+// host may already have applied it.
+export type CandidateDisposal =
+  | { outcome: "deleted" }
+  | { outcome: "deleted-with-residue"; residue: Array<"cache" | "stats"> }
+  | { outcome: "absent"; storageAttempted: boolean }
+  | { outcome: "kept"; keptBy: CandidateKeptBy }
+  | { outcome: "ready-attempted" };
+
+// Removes the omission cache and stats saved under a deleted candidate's
+// storage key, and reports what could not be removed instead of hiding it.
+export async function deleteCandidateStorage(
+  storageKey: string,
+): Promise<CandidateDisposal> {
+  const residue: Array<"cache" | "stats"> = [];
+  await deleteCache(storageKey).catch(() => residue.push("cache"));
+  await deleteStats(storageKey).catch(() => residue.push("stats"));
+  return residue.length === 0
+    ? { outcome: "deleted" }
+    : { outcome: "deleted-with-residue", residue };
+}
+
 // What manual recovery needs and nothing else: the stage, a fixed category,
-// an HTTP status or known system error code when the failure carried one, and
-// the IDs of the source and of a candidate that was kept. Host bodies, paths,
-// prompts and raw error objects never enter it.
+// an HTTP status or known system error code when the failure carried one, the
+// IDs of the source and of a candidate that was not deleted, and what became
+// of the candidate. Host bodies, paths, prompts and raw error objects never
+// enter it.
 export type SuccessorFailureDetails = {
   stage: SuccessorStage;
-  detail?: ContentFreeError["detail"];
+  detail?: string;
   status?: number;
   code?: string;
   sourceID: string;
   candidateID?: string;
+  cleanup?: CandidateDisposal;
 };
 
 export class SuccessorFailure extends Error {
@@ -284,44 +323,50 @@ export function classifyFailure(
 }
 
 // The terminal failure for a candidate that could not be completed. It names
-// the candidate when it was kept and carries only classified details; the
-// original error is never attached.
+// the candidate unless this run confirmed its deletion, says what became of
+// it, and carries only classified details; the original error is never
+// attached. Without `candidate` no candidate ID is known: none was created, or
+// a create request the host rejected returned none, so a session it may still
+// have created cannot be named.
 export function successorFailure(
   command: SuccessorCommand,
   error: unknown,
   context: {
     stage: SuccessorStage;
     sourceID: string;
-    candidateID?: string;
-    // The candidate was deleted, or no candidate existed.
-    discarded?: boolean;
-    // The ready update was sent, so the host may already have applied it.
-    readyAttempted?: boolean;
+    candidate?: { id: string; disposal: CandidateDisposal };
   },
 ): SuccessorFailure {
   const classified = classifyFailure(error);
-  const { stage, sourceID, candidateID, discarded, readyAttempted } = context;
+  const { stage, sourceID, candidate } = context;
+  const named =
+    candidate !== undefined && candidate.disposal.outcome !== "deleted"
+      ? candidate
+      : undefined;
   const details: SuccessorFailureDetails = {
     stage,
     sourceID,
     ...classified,
-    ...(candidateID !== undefined && !discarded ? { candidateID } : {}),
+    ...(named === undefined ? {} : { candidateID: named.id }),
+    ...(candidate === undefined ? {} : { cleanup: candidate.disposal }),
   };
-  if (readyAttempted && candidateID !== undefined) {
+  if (named?.disposal.outcome === "ready-attempted") {
     return new SuccessorFailure(
-      successorNotReadyMessage(command, candidateID),
+      successorNotReadyMessage(command, named.id),
       details,
     );
   }
-  // Only this plugin's own refusals carry their message through; their text is
-  // fixed. A host error's name or message is never trusted. A refusal's record
-  // line goes after the kept-candidate text: the candidate and what to do
-  // about it come first, because the failure toast cuts the end of long text.
+  // Only this plugin's own refusals and the invalid-stats diagnostic carry
+  // their message through; their text is fixed. A host error's name or
+  // message is never trusted. A refusal's record line goes after the
+  // kept-candidate text: the candidate and what to do about it come first,
+  // because the failure toast cuts the end of long text.
   const refusal = error instanceof SourceNotAtRestError ? error : undefined;
   const failure =
     refusal !== undefined
       ? refusal.statement
       : error instanceof SourceChangedError
+          || error instanceof InvalidStatsError
         ? error.message
         : classified.detail !== undefined
           ? `${command} could not verify its successor session (${classified.detail}). The original session was left unchanged.`
@@ -331,13 +376,34 @@ export function successorFailure(
               ? `${command} could not build a valid successor history. The original session was left unchanged.`
               : `${command} could not finish preparing its successor session. The original session was left unchanged.`;
   const text =
-    candidateID !== undefined && !discarded
-      ? `${failure} Successor candidate ${candidateID} was kept because it could not be confirmed as unmodified; this run did not mark it ready, so inspect it or delete it manually.`
-      : failure;
+    named === undefined
+      ? failure
+      : `${failure} ${candidateText(named.id, named.disposal)}`;
   return new SuccessorFailure(
     refusal?.record === undefined ? text : `${text}\n${refusal.record}`,
     details,
   );
+}
+
+// A candidate that was not deleted is described by what this run saw. A kept
+// candidate's text says only that this run did not mark it ready, because
+// another writer may have.
+function candidateText(id: string, disposal: CandidateDisposal): string {
+  switch (disposal.outcome) {
+    case "kept":
+      return disposal.keptBy === "delete"
+        ? `Successor candidate ${id} was kept because its deletion could not be confirmed; this run did not mark it ready, so inspect it or delete it manually.`
+        : `Successor candidate ${id} was kept because it could not be confirmed as unmodified; this run did not mark it ready, so inspect it or delete it manually.`;
+    case "absent":
+      return `Successor candidate ${id} was not found when this run checked it, which does not prove that it was removed; check for it before continuing.${disposal.storageAttempted ? " Any omission cache or stats this run saved for it were left in place." : ""}`;
+    case "deleted-with-residue":
+      return `Successor candidate ${id} was deleted, but its ${disposal.residue.map(item => (item === "cache" ? "omission cache" : "stats")).join(" and ")} could not be removed; delete the files named after ${id} in Magic Compact's storage directory.`;
+    case "deleted":
+    case "ready-attempted":
+      throw new Error(
+        "A deleted or ready candidate has no kept-candidate text.",
+      );
+  }
 }
 
 export function successorNotReadyMessage(

@@ -9,6 +9,7 @@
 // The evaluation harness (`eval/decisions/providers.ts`) imports the wire
 // serializers and answer readers from here; nothing here imports evaluation
 // code.
+import { isNonArrayRecord } from "../util";
 import type { RetentionRequest } from "./classifier";
 
 export const RETENTION_BACKEND_IDS = ["jev", "openai-decisions"] as const;
@@ -156,10 +157,6 @@ export function openAIDecisionsBody(
   });
 }
 
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function validProbability(value: unknown): value is number {
   return typeof value === "number" && value >= 0 && value <= 1;
 }
@@ -175,7 +172,7 @@ function answeredBy(
   payload: unknown,
   model: string,
 ): Record<string, unknown> | AnswerFailure {
-  if (!isObject(payload) || typeof payload["model"] !== "string") {
+  if (!isNonArrayRecord(payload) || typeof payload["model"] !== "string") {
     return "invalid-response";
   }
   return payload["model"] === model ? payload : "model-mismatch";
@@ -194,7 +191,7 @@ export function parseJevAnswers(
   if (typeof body === "string") return { ok: false, reason: body };
   const answers = body["answers"];
   if (
-    !isObject(answers)
+    !isNonArrayRecord(answers)
     || Object.keys(answers).length !== names.length
     || !names.every(name => Object.hasOwn(answers, name))
   ) {
@@ -204,7 +201,7 @@ export function parseJevAnswers(
   for (const name of names) {
     const answer = answers[name];
     if (
-      !isObject(answer)
+      !isNonArrayRecord(answer)
       || answer["type"] !== "noul"
       || !validProbability(answer["noul"])
     ) {
@@ -228,7 +225,7 @@ export function parseOpenAIDecisionAnswers(
   const answers = body["answers"];
   if (!Array.isArray(answers) || answers.length !== 1) return invalid;
   const answer: unknown = answers[0];
-  if (!isObject(answer) || answer["name"] !== name) return invalid;
+  if (!isNonArrayRecord(answer) || answer["name"] !== name) return invalid;
   if (answer["type"] === "refusal") return { ok: false, reason: "refusal" };
   if (
     answer["type"] !== "predicate"
@@ -242,7 +239,7 @@ export function parseOpenAIDecisionAnswers(
 function parseObject(text: string): Record<string, unknown> | undefined {
   try {
     const parsed: unknown = JSON.parse(text);
-    return isObject(parsed) ? parsed : undefined;
+    return isNonArrayRecord(parsed) ? parsed : undefined;
   } catch {
     return undefined;
   }
@@ -253,7 +250,9 @@ function parseObject(text: string): Record<string, unknown> | undefined {
 // not count.
 function isJevTokenLimitBody(text: string): boolean {
   const detail = parseObject(text)?.["detail"];
-  return isObject(detail) && detail["error_type"] === "max_tokens_exceeded";
+  return (
+    isNonArrayRecord(detail) && detail["error_type"] === "max_tokens_exceeded"
+  );
 }
 
 // Exactly the root `error` object OpenAI returned for an over-limit input:
@@ -263,7 +262,7 @@ function isJevTokenLimitBody(text: string): boolean {
 function isOpenAITokenLimitBody(text: string): boolean {
   const error = parseObject(text)?.["error"];
   return (
-    isObject(error)
+    isNonArrayRecord(error)
     && error["message"] === OPENAI_TOKEN_LIMIT_MESSAGE
     && error["type"] === "invalid_request_error"
     && Object.hasOwn(error, "param")

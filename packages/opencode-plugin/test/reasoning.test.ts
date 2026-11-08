@@ -230,7 +230,7 @@ describe("verified reasoning routes and models", () => {
       verifiedReasoning(
         v2ReasoningRoute(SOL, { modelID: "gpt-6.1-sol", package: package_ }),
       ),
-    ).toBeDefined();
+    ).toEqual({ defaultContext: "all_turns" });
     // The model list gives the fast entry its own `id` and the base `modelID`.
     expect(
       verifiedReasoning(
@@ -860,15 +860,25 @@ describe("OpenCode 2 readable reasoning", () => {
         { providerID: "openai", id: "gpt-6.1-sol" },
       ),
     ];
-    const header = countGptTokens(`${READABLE_REASONING_HEADER}\n`) + 1;
-    expect(readableReasoningHeaderTokens(history, responses(SOL))).toBe(header);
-    // An older model on the same serializer still needs the projection.
-    expect(
-      readableReasoningHeaderTokens(
-        history,
-        responses({ providerID: "openai", modelID: "gpt-5.5" }),
-      ),
-    ).toBe(2 * header);
+    // What projecting an item adds to the request, tokenized as sent; the
+    // charge covers it with at most one boundary token to spare.
+    const growth = (text: string) =>
+      countGptTokens(`${READABLE_REASONING_HEADER}\n${text}`)
+      - countGptTokens(text);
+    // SOL replays its own protected item; only the other model's is shown.
+    const own = readableReasoningHeaderTokens(history, responses(SOL));
+    expect(own).toBeGreaterThanOrEqual(growth("plain one"));
+    expect(own).toBeLessThanOrEqual(growth("plain one") + 1);
+    // An older model on the same serializer still needs the projection, for
+    // both items, each charged the same.
+    const older = readableReasoningHeaderTokens(
+      history,
+      responses({ providerID: "openai", modelID: "gpt-5.5" }),
+    );
+    expect(older).toBe(2 * own);
+    expect(older).toBeGreaterThanOrEqual(
+      growth("plain one") + growth("sol summary"),
+    );
     expect(
       readableReasoningHeaderTokens(history, {
         ...responses({ providerID: "deepseek", modelID: "deepseek-flash" }),

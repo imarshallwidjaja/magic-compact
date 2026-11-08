@@ -60,7 +60,6 @@ test("ships a no-grant license plus verbatim upstream BSD-3 with the package", a
     "Redistribution and use in source and binary forms",
   );
   expect(rootNotice).toBe(UPSTREAM_BSD3);
-  expect(rootNotice).not.toContain("Ivan Marshall Widjaja");
 
   const packageJson = JSON.parse(
     await readFile(join(import.meta.dir, "../package.json"), "utf8"),

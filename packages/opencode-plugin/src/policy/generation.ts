@@ -1,14 +1,13 @@
 import { randomBytes } from "node:crypto";
-import { GENERATION_PROTOCOL } from "../compact/constants";
+import { GENERATION_PROTOCOL } from "./protocol";
 import { countGptTokens } from "../stats/tokenize";
-import { isRecord } from "../util";
+import { hasExactKeys, isPlainRecord } from "../util";
 import { PluginMessageError } from "./feedback";
 
 // Host-neutral per-turn generation protocol: the response schema, prompt and
 // markers, the nonce, strict response validation, summary framing, and the
 // provider-error classification both hosts apply to their native failures.
 
-// One target turn of a generation request.
 export type GenerationTarget = {
   ordinal: number;
   marker: string;
@@ -53,7 +52,7 @@ export const GENERATION_RESPONSE_SCHEMA = {
   additionalProperties: false,
 };
 
-export const GLOBAL_ANCHOR_CHARACTER_LIMIT = 160;
+const GLOBAL_ANCHOR_CHARACTER_LIMIT = 160;
 const GENERATION_NONCE_ATTEMPTS = 8;
 const GENERATION_NONCE_PATTERN = /^[A-Za-z0-9_-]{22}$/u;
 
@@ -116,7 +115,16 @@ export function containsString(value: unknown, needle: string): boolean {
 }
 
 export function buildGenerationPrompt(
-  candidates: GenerationTarget[],
+  target: GenerationTarget,
+  globalTurnIndexPrompt: string,
+): string {
+  return renderGenerationPrompt([target], globalTurnIndexPrompt);
+}
+
+// The prompt with no target is never sent: it measures the fixed instructions
+// and global index every request repeats.
+function renderGenerationPrompt(
+  targets: GenerationTarget[],
   globalTurnIndexPrompt: string,
 ): string {
   return [
@@ -126,62 +134,75 @@ export function buildGenerationPrompt(
     globalTurnIndexPrompt,
     "Use the ephemeral markers only as ordering guides. Echo each exact marker token and target ordinal; marker echo is allowed. Never include the active generation nonce or marker token in summaries or visual descriptions; useful source identifiers may remain when you include them.",
     JSON.stringify({
-      turns: candidates.map(candidate => ({
-        ordinal: candidate.ordinal,
-        marker: candidate.marker,
-        expectedInlineImages: candidate.expectedInlineImages,
+      turns: targets.map(target => ({
+        ordinal: target.ordinal,
+        marker: target.marker,
+        expectedInlineImages: target.expectedInlineImages,
       })),
     }),
   ].join("\n");
 }
 
+// `null` estimates the request without its target.
 export function estimateGenerationExplicitRequestTokens(
-  candidates: GenerationTarget[],
+  target: GenerationTarget | null,
   globalTurnIndexPrompt: string,
 ): number {
   return (
     countGptTokens(JSON.stringify(GENERATION_RESPONSE_SCHEMA))
-    + countGptTokens(buildGenerationPrompt(candidates, globalTurnIndexPrompt))
-    + candidates.reduce(
-      (total, candidate) => total + countGptTokens(candidate.marker),
-      0,
+    + countGptTokens(
+      renderGenerationPrompt(target ? [target] : [], globalTurnIndexPrompt),
     )
+    + (target ? countGptTokens(target.marker) : 0)
   );
 }
 
 export function estimateGenerationResponseProtocolTokens(
-  candidates: GenerationTarget[],
+  target: GenerationTarget,
 ): number {
   return countGptTokens(
     JSON.stringify({
-      turns: candidates.map(candidate => ({
-        ordinal: candidate.ordinal,
-        marker: candidate.marker,
-        summary: "",
-        visualDescriptions: Array.from(
-          { length: candidate.expectedInlineImages },
-          (_, index) => ({ ordinal: index + 1, description: "" }),
-        ),
-      })),
+      turns: [
+        {
+          ordinal: target.ordinal,
+          marker: target.marker,
+          summary: "",
+          visualDescriptions: Array.from(
+            { length: target.expectedInlineImages },
+            (_, index) => ({ ordinal: index + 1, description: "" }),
+          ),
+        },
+      ],
     }),
   );
 }
 
 // The orientation-only map every request of one compaction repeats verbatim.
+// Each host chooses the user text that anchors a complete turn; the anchor is
+// its first line, capped at 160 characters.
 export function globalTurnIndexPrompt(
-  globalTurnIndex: Array<{ sourceOrdinal: number; anchor: string }>,
+  turns: Array<{ sourceOrdinal: number; userText: string }>,
 ): string {
+  const globalTurnIndex = turns.map(turn => ({
+    sourceOrdinal: turn.sourceOrdinal,
+    anchor: capCodePoints(
+      turn.userText.split(/\r\n|\r|\n/u, 1)[0] ?? "",
+      GLOBAL_ANCHOR_CHARACTER_LIMIT,
+    ),
+  }));
   return [
     "The globalTurnIndex is an orientation-only user-anchor map. Its sourceOrdinal values are immutable source-history positions, not target ordinals, and it does not supply distant assistant or tool detail. Each entry contains only its sourceOrdinal and bounded user anchor:",
     JSON.stringify({ globalTurnIndex }),
   ].join("\n");
 }
 
+// The response is untrusted: its single result must echo the target's exact
+// ordinal and marker.
 export function parseGenerationResponse(
   parsed: unknown,
-  candidates: GenerationTarget[],
+  target: GenerationTarget,
   nonce: string,
-): GenerationTurnResult[] {
+): GenerationTurnResult {
   if (parsed === undefined)
     throw validationFailure("missing structured output");
   if (
@@ -191,79 +212,77 @@ export function parseGenerationResponse(
   ) {
     throw validationFailure("invalid envelope");
   }
-  if (parsed["turns"].length !== candidates.length) {
+  if (parsed["turns"].length !== 1) {
     throw validationFailure("turn count mismatch", {
-      expected: candidates.length,
+      expected: 1,
       received: parsed["turns"].length,
     });
   }
 
-  return parsed["turns"].map((value, index) => {
-    const candidate = candidates[index]!;
-    if (
-      !isPlainRecord(value)
-      || !hasExactKeys(value, [
-        "marker",
-        "ordinal",
-        "summary",
-        "visualDescriptions",
-      ])
-      || !Array.isArray(value["visualDescriptions"])
-    ) {
-      throw validationFailure("invalid turn shape or identity", {
-        field: "shape",
-        ordinal: candidate.ordinal,
-      });
-    }
-    const identityField =
-      value["ordinal"] !== candidate.ordinal
-        ? "ordinal"
-        : value["marker"] !== candidate.marker
-          ? "marker"
-          : undefined;
-    if (identityField) {
-      throw validationFailure("invalid turn shape or identity", {
-        field: identityField,
-        ordinal: candidate.ordinal,
-      });
-    }
-    if (typeof value["summary"] !== "string" || !value["summary"].trim()) {
-      throw validationFailure("invalid summary");
-    }
-    const expectedImages = candidate.expectedInlineImages;
-    if (value["visualDescriptions"].length !== expectedImages) {
-      throw validationFailure("invalid visual coverage");
-    }
-    const summary = value["summary"].trim();
-    if (summary.includes(nonce)) {
-      throw validationFailure("nonce leakage");
-    }
-    const visualDescriptions = value["visualDescriptions"].map(
-      (description, imageIndex) => {
-        if (
-          !isPlainRecord(description)
-          || !hasExactKeys(description, ["description", "ordinal"])
-          || description["ordinal"] !== imageIndex + 1
-          || typeof description["description"] !== "string"
-          || !description["description"].trim()
-        ) {
-          throw validationFailure("invalid visual coverage");
-        }
-        const text = description["description"].trim();
-        if (text.includes(nonce)) {
-          throw validationFailure("nonce leakage");
-        }
-        return {
-          ordinal: imageIndex + 1,
-          description: text,
-        };
-      },
-    );
-    return {
-      summary,
-      visualDescriptions,
-    };
-  });
+  const value: unknown = parsed["turns"][0];
+  if (
+    !isPlainRecord(value)
+    || !hasExactKeys(value, [
+      "marker",
+      "ordinal",
+      "summary",
+      "visualDescriptions",
+    ])
+    || !Array.isArray(value["visualDescriptions"])
+  ) {
+    throw validationFailure("invalid turn shape or identity", {
+      field: "shape",
+      ordinal: target.ordinal,
+    });
+  }
+  const identityField =
+    value["ordinal"] !== target.ordinal
+      ? "ordinal"
+      : value["marker"] !== target.marker
+        ? "marker"
+        : undefined;
+  if (identityField) {
+    throw validationFailure("invalid turn shape or identity", {
+      field: identityField,
+      ordinal: target.ordinal,
+    });
+  }
+  if (typeof value["summary"] !== "string" || !value["summary"].trim()) {
+    throw validationFailure("invalid summary");
+  }
+  const expectedImages = target.expectedInlineImages;
+  if (value["visualDescriptions"].length !== expectedImages) {
+    throw validationFailure("invalid visual coverage");
+  }
+  const summary = value["summary"].trim();
+  if (summary.includes(nonce)) {
+    throw validationFailure("nonce leakage");
+  }
+  const visualDescriptions = value["visualDescriptions"].map(
+    (description, imageIndex) => {
+      if (
+        !isPlainRecord(description)
+        || !hasExactKeys(description, ["description", "ordinal"])
+        || description["ordinal"] !== imageIndex + 1
+        || typeof description["description"] !== "string"
+        || !description["description"].trim()
+      ) {
+        throw validationFailure("invalid visual coverage");
+      }
+      const text = description["description"].trim();
+      if (text.includes(nonce)) {
+        throw validationFailure("nonce leakage");
+      }
+      return {
+        ordinal: imageIndex + 1,
+        description: text,
+      };
+    },
+  );
+  return {
+    summary,
+    visualDescriptions,
+  };
 }
 
 export function frameSummary(result: GenerationTurnResult): string {
@@ -278,7 +297,7 @@ export function frameSummary(result: GenerationTurnResult): string {
   ].join("\n");
 }
 
-export function capCodePoints(value: string, characterLimit: number): string {
+function capCodePoints(value: string, characterLimit: number): string {
   return Array.from(value).slice(0, characterLimit).join("");
 }
 
@@ -325,26 +344,6 @@ export function validationCategoryText(
     return `${error.category} (${error.detail.field} at target ordinal ${error.detail.ordinal})`;
   }
   return error.category;
-}
-
-export function hasExactKeys(
-  value: Record<string, unknown>,
-  expected: string[],
-): boolean {
-  const keys = Object.keys(value).sort();
-  const sortedExpected = [...expected].sort();
-  return (
-    keys.length === sortedExpected.length
-    && keys.every((key, index) => key === sortedExpected[index])
-  );
-}
-
-export function isPlainRecord(
-  value: unknown,
-): value is Record<string, unknown> {
-  if (!isRecord(value) || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
 }
 
 export class GenerationMarkerNonceCollisionError extends PluginMessageError {

@@ -10,92 +10,161 @@ import type {
 } from "@opencode-ai/sdk/v2";
 import { isDeepStrictEqual } from "node:util";
 import type { V2Client } from "../api";
-import { abandonedDeliveryJob, type RecoveryRecord } from "../policy/recovery";
+import { PluginMessageError } from "../policy/feedback";
 import {
-  commitPlannedOmission,
-  copyCache,
-  deleteCache,
-  type PlannedOmission,
-} from "../storage/omission";
+  successorLineage,
+  successorMetadata,
+  successorTitle,
+  type SuccessorLineage,
+} from "../policy/lineage";
 import {
-  deleteStats,
-  readStats,
-  writeStats,
-  type ConversationStats,
-} from "../storage/stats";
-import { attemptWithinDeadline, isRecord } from "../util";
+  abandonedDeliveryJob,
+  settleDeliveries,
+  type DeliveryRecord,
+  type RecoveryRecord,
+} from "../policy/recovery";
 import {
-  ForkHistoryError,
-  loadHistory,
-  planHistory,
-  replayHistory,
-  type HistoryRoute,
-} from "./fork";
-import { snapshotSourceMessages, type MessageWithParts } from "./plan";
-import {
+  deleteCandidateStorage,
   SourceChangedError,
   SourceNotAtRestError,
   successorFailure,
   SuccessorVerificationError,
   undeliveredBackgroundRefusal,
   unfinishedHistoryRefusal,
+  type CandidateDisposal,
+  type CandidateKeptBy,
+  type SourceLifecycle,
   type SuccessorCommand,
   type SuccessorStage,
   type UnfinishedHistoryRecord,
 } from "../policy/successor";
-import { PluginMessageError } from "../policy/feedback";
-
-export {
-  SourceChangedError,
-  SourceNotAtRestError,
-  SuccessorFailure,
-  withExclusiveSource,
-  type SuccessorCommand,
-} from "../policy/successor";
-
-// Successor lineage stored on the new session. `ready` turns true only after
-// the history, caches and stats are verified and the source was rechecked.
-// `recovery` lists every source record a recovery closed or left alone.
-export type SuccessorMetadata = {
-  compactionCount: number;
-  successorOf: string;
-  operation: "compact" | "trim" | "recover";
-  createdAt: number;
-  ready: boolean;
-  recovery?: RecoveryRecord[];
-};
-
-export function sessionRoute(session: Session): HistoryRoute {
-  return {
-    directory: session.directory,
-    ...(session.workspaceID ? { workspace: session.workspaceID } : {}),
-  };
-}
+import {
+  commitPlannedOmission,
+  copyCache,
+  type PlannedOmission,
+} from "../storage/omission";
+import { writeSuccessorStats } from "../storage/stats";
+import { attemptWithinDeadline, isRecord, jsonForm } from "../util";
+import {
+  ForkHistoryError,
+  loadHistory,
+  planHistory,
+  replayHistory,
+  sessionRoute,
+  type HistoryRoute,
+} from "./fork";
+import { snapshotSourceMessages, type MessageWithParts } from "./plan";
 
 export type SourceState = {
   session: Session;
   messages: MessageWithParts[];
 };
 
+// A source as `readSourceAtRest` or `readRecoverableSource` read it, with the
+// recheck that reads it again the same way and throws `SourceChangedError` on
+// drift. The successor runs the recheck just before its ready update.
+export type CheckedSource = SourceState & {
+  readonly recheck: () => Promise<void>;
+};
+
+// A host response that carried an error or no data. Only its HTTP status is
+// kept, so a failure's details can name it; the body and error are dropped,
+// and `classifyFailure` accepts only a status from 100 to 599.
+class HostResponseError extends Error {
+  constructor(
+    message: string,
+    readonly status: number | undefined,
+  ) {
+    super(message);
+    this.name = "HostResponseError";
+  }
+}
+
+type HostResponse<T> = {
+  data?: T;
+  error?: unknown;
+  response?: { status?: number };
+};
+
+function responseData<T>(message: string, response: HostResponse<T>): T {
+  if (response.error || response.data === undefined || response.data === null) {
+    throw new HostResponseError(message, response.response?.status);
+  }
+  return response.data;
+}
+
+function readWithin<T>(
+  request: (signal: AbortSignal) => Promise<HostResponse<T>>,
+  controlTimeoutMs: number,
+) {
+  return attemptWithinDeadline(
+    signal =>
+      request(signal).then(response =>
+        responseData("host read failed", response),
+      ),
+    controlTimeoutMs,
+  );
+}
+
 // Reads the complete source and refuses every state OpenCode 1.18.30 can show
 // for work that is still in flight. A status this version does not define is
 // treated as active.
-export async function readSourceAtRest(
+export function readSourceAtRest(
   v2: V2Client,
   command: SuccessorCommand,
   sessionID: string,
   controlTimeoutMs: number,
-): Promise<SourceState> {
-  const source = await readRecoverableSource(
-    v2,
-    command,
-    sessionID,
-    controlTimeoutMs,
-  );
-  // After the live checks, so work that is actually running is reported as
-  // running; what remains is history the host never finished.
-  assertHistoryFinished(command, source.messages);
-  return source;
+): Promise<CheckedSource> {
+  return readSource(v2, command, sessionID, controlTimeoutMs, "at-rest");
+}
+
+// The source as `/magic-recover` reads it: every live check of
+// `readSourceAtRest` still refuses, but unfinished stored records and
+// undelivered background results are returned for the caller to close,
+// because running the command declared their work abandoned.
+export function readRecoverableSource(
+  v2: V2Client,
+  command: SuccessorCommand,
+  sessionID: string,
+  controlTimeoutMs: number,
+): Promise<CheckedSource> {
+  return readSource(v2, command, sessionID, controlTimeoutMs, "recovery");
+}
+
+async function readSource(
+  v2: V2Client,
+  command: SuccessorCommand,
+  sessionID: string,
+  controlTimeoutMs: number,
+  lifecycle: SourceLifecycle,
+): Promise<CheckedSource> {
+  const read = async () => {
+    const state = await readLiveSource(
+      v2,
+      command,
+      sessionID,
+      controlTimeoutMs,
+    );
+    // After the live checks, so work that is actually running is reported as
+    // running; what remains is history the host never finished.
+    if (lifecycle === "at-rest") assertHistoryFinished(command, state.messages);
+    return state;
+  };
+  const state = await read();
+  const initial = captureSnapshot(state, lifecycle);
+  return {
+    ...state,
+    recheck: async () => {
+      const current = captureSnapshot(await read(), lifecycle);
+      if (
+        initial === UNCOMPARABLE
+        || current === UNCOMPARABLE
+        || !isDeepStrictEqual(current, initial)
+      ) {
+        throw new SourceChangedError(command);
+      }
+    },
+  };
 }
 
 // Refuses a history that holds an unfinished record or a background launch
@@ -122,28 +191,19 @@ export function assertHistoryFinished(
   }
 }
 
-// The source as `/magic-recover` reads it: every live check of
-// `readSourceAtRest` still refuses, but unfinished stored records and
-// undelivered background results are returned for the caller to close,
-// because running the command declared their work abandoned.
-export async function readRecoverableSource(
+// The live checks both lifecycles share: a root session, no pending revert or
+// native compaction, an idle subagent tree, and no pending permission request
+// or question in it.
+async function readLiveSource(
   v2: V2Client,
   command: SuccessorCommand,
   sessionID: string,
   controlTimeoutMs: number,
 ): Promise<SourceState> {
   const read = async <T>(
-    request: (signal: AbortSignal) => Promise<{ data?: T; error?: unknown }>,
+    request: (signal: AbortSignal) => Promise<HostResponse<T>>,
   ): Promise<T> => {
-    const outcome = await attemptWithinDeadline(
-      signal =>
-        request(signal).then(response => {
-          if (response.error || response.data === undefined)
-            throw new Error("host read failed");
-          return response.data;
-        }),
-      controlTimeoutMs,
-    );
+    const outcome = await readWithin(request, controlTimeoutMs);
     if (outcome.kind !== "success") {
       throw new PluginMessageError(
         `${command} could not read the session state it needs to check that the session is at rest. The session was left unchanged.`,
@@ -225,13 +285,12 @@ export async function readRecoverableSource(
 // `<task id="CHILD" state="completed">` or `state="error"`. That covers a call
 // made with `background: true` and a foreground call promoted to the
 // background. Until that message is stored a successor would lose the result,
-// so every started job needs its own later delivery. A message to a job that
-// is still running (`Background task updated`) starts nothing new. A cancelled
-// job is never delivered and the host lists no jobs publicly, so it stays
-// undelivered. A launch `/magic-recover` recorded as never delivered is
-// abandoned and owes no delivery. Returns every launch still owed a delivery
-// in stored order; deliveries settle the oldest open launch of their child
-// first. A launch without a child session ID can never be matched.
+// so every started job needs its own later delivery (`settleDeliveries`). A
+// message to a job that is still running (`Background task updated`) starts
+// nothing new. A cancelled job is never delivered and the host lists no jobs
+// publicly, so it stays undelivered until `/magic-recover` marks its launch.
+// Returns every launch still owed a delivery in stored order. A launch without
+// a child session ID can never be matched.
 export type UndeliveredBackgroundTask = {
   messageID: string;
   part: ToolPart;
@@ -241,50 +300,57 @@ export type UndeliveredBackgroundTask = {
 export function undeliveredBackgroundTasks(
   messages: MessageWithParts[],
 ): UndeliveredBackgroundTask[] {
-  const launches: UndeliveredBackgroundTask[] = [];
-  const open = new Map<string, UndeliveredBackgroundTask[]>();
-  const delivered = new Set<UndeliveredBackgroundTask>();
-  for (const message of messages) {
-    for (const part of message.parts) {
+  return settleDeliveries(messages.flatMap(backgroundRecords)).flatMap(
+    ({ launch, settled }) => (settled ? [] : [launch]),
+  );
+}
+
+function backgroundRecords(
+  message: MessageWithParts,
+): DeliveryRecord<UndeliveredBackgroundTask>[] {
+  return message.parts.flatMap(
+    (part): DeliveryRecord<UndeliveredBackgroundTask>[] => {
       if (part.type === "tool") {
         if (
           part.tool !== "task"
           || part.state.status !== "completed"
           || part.state.metadata?.["background"] !== true
         ) {
-          continue;
+          return [];
         }
         const sessionId = part.state.metadata["sessionId"];
         const childID = typeof sessionId === "string" ? sessionId : undefined;
         if (
           childID !== undefined
-          && (part.state.output.startsWith(
+          && part.state.output.startsWith(
             `<task id="${childID}" state="running">\n<summary>Background task updated</summary>`,
           )
-            || abandonedDeliveryJob(part.state.metadata) === childID)
         ) {
-          continue;
+          return [];
         }
-        const launch = { messageID: message.info.id, part, childID };
-        launches.push(launch);
-        if (childID !== undefined)
-          open.set(childID, [...(open.get(childID) ?? []), launch]);
-      } else if (
-        part.type === "text"
-        && part.synthetic === true
-        && message.info.role === "user"
-      ) {
-        const childID =
-          /^<task id="([^"]+)" state="(?:completed|error)">\n/u.exec(
-            part.text,
-          )?.[1];
-        const settled =
-          childID === undefined ? undefined : open.get(childID)?.shift();
-        if (settled !== undefined) delivered.add(settled);
+        return [
+          {
+            type: "launch",
+            launch: { messageID: message.info.id, part, childID },
+            job: childID,
+            mark: abandonedDeliveryJob(part.state.metadata),
+          },
+        ];
       }
-    }
-  }
-  return launches.filter(launch => !delivered.has(launch));
+      if (
+        part.type !== "text"
+        || part.synthetic !== true
+        || message.info.role !== "user"
+      ) {
+        return [];
+      }
+      const childID =
+        /^<task id="([^"]+)" state="(?:completed|error)">\n/u.exec(
+          part.text,
+        )?.[1];
+      return childID === undefined ? [] : [{ type: "delivery", job: childID }];
+    },
+  );
 }
 
 // The host's own test of an unfinished record: an assistant message with
@@ -334,7 +400,7 @@ function unfinishedRecord(
 // to the normalized history, means the successor would not continue the
 // conversation the user left.
 function continuationState(session: Session): unknown {
-  return {
+  return structuredClone({
     directory: session.directory,
     workspaceID: session.workspaceID,
     title: session.title,
@@ -342,56 +408,43 @@ function continuationState(session: Session): unknown {
     model: session.model,
     permission: session.permission,
     metadata: session.metadata,
-  };
+  });
 }
 
-export function assertSourceUnchanged(
-  command: SuccessorCommand,
-  initial: SourceState,
-  current: SourceState,
-): void {
-  let same: boolean;
+const UNCOMPARABLE = Symbol("uncomparable source");
+
+// What the recheck compares: the continuation state and the history with
+// timing, token and cost churn normalized away. Recovery also compares the
+// lifecycle that normalization drops with the other timing fields: whether
+// each assistant message and each timed part has finished. Recovery closes
+// records by exactly that state, so a record the host finished meanwhile must
+// stop it rather than be closed. A tool call's status stays in the normalized
+// history. Records whose shape cannot be compared never match.
+function captureSnapshot(
+  state: SourceState,
+  lifecycle: SourceLifecycle,
+): unknown {
   try {
-    same =
-      isDeepStrictEqual(
-        continuationState(current.session),
-        continuationState(initial.session),
-      )
-      && isDeepStrictEqual(
-        snapshotSourceMessages(current.messages),
-        snapshotSourceMessages(initial.messages),
-      );
+    return {
+      continuation: continuationState(state.session),
+      history: snapshotSourceMessages(state.messages),
+      ...(lifecycle === "recovery"
+        ? {
+            finished: state.messages.map(message => ({
+              completed:
+                message.info.role === "assistant"
+                && message.info.time.completed !== undefined,
+              parts: message.parts.map(part =>
+                "time" in part && isRecord(part.time)
+                  ? (part.time as { end?: unknown }).end !== undefined
+                  : null,
+              ),
+            })),
+          }
+        : {}),
+    };
   } catch {
-    same = false;
-  }
-  if (!same) throw new SourceChangedError(command);
-}
-
-// `assertSourceUnchanged` plus the lifecycle the drift snapshot normalizes
-// away with the other timing fields: whether each assistant message and each
-// timed part has finished. Recovery closes records by exactly that state, so
-// a record the host finished meanwhile must stop it rather than be closed.
-export function assertRecoverySourceUnchanged(
-  command: SuccessorCommand,
-  initial: SourceState,
-  current: SourceState,
-): void {
-  assertSourceUnchanged(command, initial, current);
-  const lifecycle = (messages: MessageWithParts[]) =>
-    messages.map(message => ({
-      completed:
-        message.info.role === "assistant"
-        && message.info.time.completed !== undefined,
-      parts: message.parts.map(part =>
-        "time" in part && isRecord(part.time)
-          ? (part.time as { end?: unknown }).end !== undefined
-          : null,
-      ),
-    }));
-  if (
-    !isDeepStrictEqual(lifecycle(current.messages), lifecycle(initial.messages))
-  ) {
-    throw new SourceChangedError(command);
+    return UNCOMPARABLE;
   }
 }
 
@@ -486,15 +539,9 @@ export function appendedNoticeMessage(
   };
 }
 
-// Records cross the HTTP API as JSON; comparing their JSON form keeps absent
-// and undefined fields equal.
-function json(value: unknown): unknown {
-  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
-}
-
 // Every session field another writer could change without touching history.
 function actualHeader(session: Session): unknown {
-  return json({
+  return jsonForm({
     parentID: session.parentID,
     projectID: session.projectID,
     directory: session.directory,
@@ -528,7 +575,7 @@ function expectedHeader(
     parentID: undefined,
     projectID: created.projectID,
     path: created.path,
-    title: ready ? source.title : `${source.title} (preparing)`,
+    title: successorTitle(source.title, ready),
     metadata,
     share: created.share,
     revert: undefined,
@@ -547,16 +594,15 @@ function headerMatches(
 
 export type SuccessorRequest = {
   command: SuccessorCommand;
-  source: SourceState;
+  // Its recheck runs after the candidate is complete.
+  source: CheckedSource;
   history: MessageWithParts[];
-  operation: SuccessorMetadata["operation"];
+  operation: SuccessorLineage["operation"];
   compactionCount: number;
   omissions: PlannedOmission[];
   tokensPruned: number;
   mediaTokensProjected: number;
   recovery?: RecoveryRecord[];
-  // Rechecks the source after the candidate is complete; throws on drift.
-  recheckSource: () => Promise<void>;
   controlTimeoutMs: number;
 };
 
@@ -582,18 +628,18 @@ export async function createSuccessor(
   } catch (error) {
     throw successorFailure(command, error, { stage: "plan", sourceID });
   }
-  const metadata: SuccessorMetadata = {
+  const lineage = {
     compactionCount: request.compactionCount,
     successorOf: sourceID,
     operation: request.operation,
     createdAt: Date.now(),
-    ready: false,
     ...(request.recovery === undefined ? {} : { recovery: request.recovery }),
   };
-  const sessionMetadata = (ready: boolean) => ({
-    ...source.session.metadata,
-    magicCompact: { ...metadata, ready },
-  });
+  const sessionMetadata = (ready: boolean) =>
+    successorMetadata(
+      source.session.metadata,
+      successorLineage(lineage, ready),
+    );
   let created: Session | undefined;
   try {
     const response = await v2.session.create({
@@ -601,8 +647,7 @@ export async function createSuccessor(
       ...(source.session.workspaceID
         ? { workspaceID: source.session.workspaceID }
         : {}),
-      // Marks a candidate that is not ready yet in session lists.
-      title: `${source.session.title} (preparing)`,
+      title: successorTitle(source.session.title, false),
       ...(source.session.agent ? { agent: source.session.agent } : {}),
       ...(source.session.model ? { model: source.session.model } : {}),
       ...(source.session.permission
@@ -610,10 +655,10 @@ export async function createSuccessor(
         : {}),
       metadata: sessionMetadata(false),
     });
-    created = response.data;
-    if (response.error || !created)
-      throw hostRefusal("create failed", response);
+    created = responseData("create failed", response);
   } catch (error) {
+    // A rejected create returned no ID, so a session the host may still have
+    // created cannot be named.
     throw successorFailure(command, error, { stage: "create", sourceID });
   }
   const successor = created;
@@ -625,6 +670,7 @@ export async function createSuccessor(
   );
   let expected: MessageWithParts[] = [];
   let readyAttempted = false;
+  let storageAttempted = false;
   let stage: SuccessorStage = "verify";
   try {
     if (
@@ -659,48 +705,57 @@ export async function createSuccessor(
       throw new ForkHistoryError("replay-mismatch");
 
     stage = "cache";
+    storageAttempted = true;
     await copyCache(sourceID, successor.id);
     for (const omission of request.omissions) {
       await commitPlannedOmission(successor.id, omission);
     }
     stage = "stats";
-    await writeStats(
-      successor.id,
-      await successorStats(source, request, expected),
-    );
+    await writeSuccessorStats({
+      sourceKey: sourceID,
+      successorKey: successor.id,
+      sourceSessionID: sourceID,
+      tokensPruned: request.tokensPruned,
+      mediaTokensProjected: request.mediaTokensProjected,
+      assistantMessageIDs: expected
+        .filter(message => message.info.role === "assistant")
+        .map(message => message.info.id),
+    });
 
     stage = "recheck";
-    await request.recheckSource();
+    await source.recheck();
     stage = "verify";
     if (!isDeepStrictEqual(await load(), expected))
       throw new ForkHistoryError("replay-mismatch");
     // A snapshot just before the write, not a lock: the ready update replaces
     // the title and metadata, so a header another writer changed must stop it.
-    const current = await readCandidate(
-      v2,
-      successor.id,
-      route,
+    const current = await readWithin(
+      signal =>
+        v2.session.get({ sessionID: successor.id, ...route }, { signal }),
       request.controlTimeoutMs,
     );
-    if (!headerMatches(current, preparing)) {
+    if (
+      current.kind !== "success"
+      || !headerMatches(current.value, preparing)
+    ) {
       throw new SuccessorVerificationError(
         "candidate was changed by another writer",
       );
     }
     stage = "ready";
     readyAttempted = true;
-    const ready = await v2.session.update({
-      sessionID: successor.id,
-      ...route,
-      title: source.session.title,
-      metadata: sessionMetadata(true),
-    });
-    if (ready.error || !ready.data) {
-      throw hostRefusal("ready update failed", ready);
-    }
+    const ready = responseData(
+      "ready update failed",
+      await v2.session.update({
+        sessionID: successor.id,
+        ...route,
+        title: source.session.title,
+        metadata: sessionMetadata(true),
+      }),
+    );
     if (
       !headerMatches(
-        ready.data,
+        ready,
         expectedHeader(source.session, successor, sessionMetadata(true), true),
       )
     ) {
@@ -708,58 +763,29 @@ export async function createSuccessor(
         "imported session did not match the source",
       );
     }
-    return { session: ready.data, messages: expected };
+    return { session: ready, messages: expected };
   } catch (error) {
+    if (!successor.id) {
+      throw successorFailure(command, error, { stage, sourceID });
+    }
     // Once the ready update was sent the host may have applied it, so the
     // candidate may already be the user's successor: keep it and name it.
-    const discarded =
-      !readyAttempted
-      && (await discardOwnedCandidate(v2, {
-        candidateID: successor.id,
-        route,
-        planned: expected,
-        header: preparing,
-        controlTimeoutMs: request.controlTimeoutMs,
-      }));
+    const disposal: CandidateDisposal = readyAttempted
+      ? { outcome: "ready-attempted" }
+      : await discardOwnedCandidate(v2, {
+          candidateID: successor.id,
+          route,
+          planned: expected,
+          header: preparing,
+          storageAttempted,
+          controlTimeoutMs: request.controlTimeoutMs,
+        });
     throw successorFailure(command, error, {
       stage,
       sourceID,
-      candidateID: successor.id,
-      discarded,
-      readyAttempted,
+      candidate: { id: successor.id, disposal },
     });
   }
-}
-
-// A failed host call's error: fixed text, and the HTTP status the response
-// carried so that the failure's details can name it. The response body and
-// error are never attached; `classifyFailure` accepts only a status from 100
-// to 599.
-function hostRefusal(
-  message: string,
-  response: { response?: { status?: number } },
-): Error {
-  return Object.assign(new Error(message), {
-    status: response.response?.status,
-  });
-}
-
-async function readCandidate(
-  v2: V2Client,
-  sessionID: string,
-  route: HistoryRoute,
-  controlTimeoutMs: number,
-): Promise<Session | undefined> {
-  const outcome = await attemptWithinDeadline(
-    signal =>
-      v2.session.get({ sessionID, ...route }, { signal }).then(response => {
-        if (response.error || response.data === undefined)
-          throw new Error("candidate read failed");
-        return response.data;
-      }),
-    controlTimeoutMs,
-  );
-  return outcome.kind === "success" ? outcome.value : undefined;
 }
 
 // A history message this command could have written: the planned record, or
@@ -787,7 +813,9 @@ function ownedMessage(
 // command wrote: the header it created, no child session, no activity or
 // pending request, and a prefix of the planned history, so a partly applied
 // replay still qualifies while any record, field or work another writer added
-// does not. Anything unreadable is kept and reported.
+// does not. Anything unreadable, and a deletion the host does not confirm,
+// keeps the candidate. A candidate the host reports missing is absent, which
+// proves nothing about its deletion, so its local storage stays.
 async function discardOwnedCandidate(
   v2: V2Client,
   candidate: {
@@ -795,33 +823,39 @@ async function discardOwnedCandidate(
     route: HistoryRoute;
     planned: MessageWithParts[];
     header: unknown;
+    storageAttempted: boolean;
     controlTimeoutMs: number;
   },
-): Promise<boolean> {
+): Promise<CandidateDisposal> {
   const { candidateID, route, planned, controlTimeoutMs } = candidate;
+  const kept = (keptBy: CandidateKeptBy): CandidateDisposal => ({
+    outcome: "kept",
+    keptBy,
+  });
   const read = async <T>(
-    request: (signal: AbortSignal) => Promise<{ data?: T; error?: unknown }>,
+    request: (signal: AbortSignal) => Promise<HostResponse<T>>,
   ): Promise<T | undefined> => {
-    const outcome = await attemptWithinDeadline(
-      signal =>
-        request(signal).then(response => {
-          if (response.error || response.data === undefined)
-            throw new Error("read failed");
-          return response.data;
-        }),
-      controlTimeoutMs,
-    );
+    const outcome = await readWithin(request, controlTimeoutMs);
     return outcome.kind === "success" ? outcome.value : undefined;
   };
-  const session = await read(signal =>
-    v2.session.get({ sessionID: candidateID, ...route }, { signal }),
+  const lookup = await readWithin(
+    signal => v2.session.get({ sessionID: candidateID, ...route }, { signal }),
+    controlTimeoutMs,
   );
-  if (!headerMatches(session, candidate.header)) return false;
+  if (
+    lookup.kind === "failed"
+    && lookup.error instanceof HostResponseError
+    && lookup.error.status === 404
+  ) {
+    return { outcome: "absent", storageAttempted: candidate.storageAttempted };
+  }
+  if (lookup.kind !== "success") return kept("read");
+  if (!headerMatches(lookup.value, candidate.header)) return kept("record");
   let history: MessageWithParts[];
   try {
     history = await loadHistory(v2, candidateID, route, controlTimeoutMs);
   } catch {
-    return false;
+    return kept("read");
   }
   if (
     history.length > planned.length
@@ -829,7 +863,7 @@ async function discardOwnedCandidate(
       ownedMessage(message, planned[index]!, index),
     )
   ) {
-    return false;
+    return kept("history");
   }
   const children = await read(signal =>
     v2.session.children({ sessionID: candidateID, ...route }, { signal }),
@@ -841,51 +875,35 @@ async function discardOwnedCandidate(
   const questions = await read(signal => v2.question.list(route, { signal }));
   if (
     children === undefined
-    || children.length > 0
     || statuses === undefined
-    || (statuses[candidateID] !== undefined
-      && (statuses[candidateID] as { type?: unknown }).type !== "idle")
     || permissions === undefined
-    || permissions.some(item => item.sessionID === candidateID)
     || questions === undefined
+  ) {
+    return kept("read");
+  }
+  if (children.length > 0) return kept("children");
+  if (
+    statuses[candidateID] !== undefined
+    && (statuses[candidateID] as { type?: unknown }).type !== "idle"
+  ) {
+    return kept("activity");
+  }
+  if (
+    permissions.some(item => item.sessionID === candidateID)
     || questions.some(item => item.sessionID === candidateID)
   ) {
-    return false;
+    return kept("pending");
   }
+  // Directly awaited: a deletion the host rejected may still apply, so it is
+  // never retried and the candidate is reported as kept.
   try {
     const deleted = await v2.session.delete({
       sessionID: candidateID,
       ...route,
     });
-    if (deleted.error) return false;
+    if (deleted.error) return kept("delete");
   } catch {
-    return false;
+    return kept("delete");
   }
-  await deleteCache(candidateID).catch(() => undefined);
-  await deleteStats(candidateID).catch(() => undefined);
-  return true;
-}
-
-// Working-conversation stats carry the source totals forward. Every imported
-// assistant message is already counted, so replayed history never adds a
-// cached-savings increment; only new responses in the successor do.
-async function successorStats(
-  source: SourceState,
-  request: SuccessorRequest,
-  successorMessages: MessageWithParts[],
-): Promise<ConversationStats> {
-  const previous = await readStats(source.session.id);
-  return {
-    version: 1,
-    sourceSessionId: source.session.id,
-    rootSessionId: previous?.rootSessionId ?? source.session.id,
-    totalTokensPruned:
-      (previous?.totalTokensPruned ?? 0) + request.tokensPruned,
-    cachedTokensSaved: previous?.cachedTokensSaved ?? 0,
-    mediaTokensProjected: request.mediaTokensProjected,
-    cachedMediaTokensSaved: previous?.cachedMediaTokensSaved ?? 0,
-    processedAssistantMessageIds: successorMessages
-      .filter(message => message.info.role === "assistant")
-      .map(message => message.info.id),
-  };
+  return deleteCandidateStorage(candidateID);
 }

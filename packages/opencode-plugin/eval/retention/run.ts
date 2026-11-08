@@ -23,7 +23,14 @@
 //                comparable to them or to production.
 //   latest-only  sends no summary, to measure summary dependence.
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmdirSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import {
   buildRetentionRequests,
@@ -53,8 +60,10 @@ type Label = {
 type Labels = {
   snapshots: Array<{ snapshotID: string; split: string; labels: Label[] }>;
 };
-type Order = "chronological" | "reversed";
-type ContextMode = "generated" | "proxy" | "latest-only";
+const ORDERS = ["chronological", "reversed"] as const;
+type Order = (typeof ORDERS)[number];
+const CONTEXT_MODES = ["generated", "proxy", "latest-only"] as const;
+type ContextMode = (typeof CONTEXT_MODES)[number];
 type RunRecord = {
   name: string;
   split: string;
@@ -75,7 +84,6 @@ type RunRecord = {
 };
 
 const RUNS_DIR = join(SCRATCH_DIR, "runs");
-const SUMMARIES_DIR = join(SCRATCH_DIR, "summaries");
 const labels = JSON.parse(
   readFileSync(new URL("./labels.json", import.meta.url), "utf8"),
 ) as Labels;
@@ -103,17 +111,93 @@ const VARIANTS: Record<
   },
 };
 
-function loadDataset(): EvalSnapshot[] {
+function loadDataset(scratch = SCRATCH_DIR): EvalSnapshot[] {
   return JSON.parse(
-    readFileSync(join(SCRATCH_DIR, "dataset.json"), "utf8"),
+    readFileSync(join(scratch, "dataset.json"), "utf8"),
   ) as EvalSnapshot[];
 }
 
-function sessionSummary(snapshot: EvalSnapshot, context: ContextMode): string {
+function sessionSummary(
+  snapshot: EvalSnapshot,
+  context: ContextMode,
+  scratch: string,
+): string {
   if (context === "latest-only") return "";
   if (context === "proxy") return snapshot.provisionalSummaries.join("\n\n");
-  if (context !== "generated") throw new Error(`Unknown context ${context}.`);
-  return readFileSync(join(SUMMARIES_DIR, `${snapshot.snapshotID}.md`), "utf8");
+  return readFileSync(
+    join(scratch, "summaries", `${snapshot.snapshotID}.md`),
+    "utf8",
+  );
+}
+
+// The output of a paid run, claimed before its first paid request. After
+// each paid snapshot, everything scored so far is written in the output's
+// own format to `<output>.partial/snapshot-<k>-of-<n>.json`, in a directory
+// this run creates and no other run reuses, so an interruption keeps each
+// completed snapshot. Nothing resumes or retries from a checkpoint, and a
+// new run needs a new output. The output is written once, never over an
+// existing file, after every snapshot, and the checkpoints are then removed.
+function paidOutput(output: string) {
+  const partial = `${output}.partial`;
+  if (existsSync(output) || existsSync(partial)) {
+    throw new Error("Output or its checkpoint directory already exists.");
+  }
+  const checkpoints: string[] = [];
+  return {
+    open: () => mkdirSync(partial),
+    checkpoint(index: number, total: number, text: string) {
+      const checkpoint = join(
+        partial,
+        `snapshot-${index + 1}-of-${total}.json`,
+      );
+      writeFileSync(checkpoint, text, { flag: "wx" });
+      checkpoints.push(checkpoint);
+    },
+    finish(text: string) {
+      writeFileSync(output, text, { flag: "wx" });
+      for (const checkpoint of checkpoints) unlinkSync(checkpoint);
+      rmdirSync(partial);
+    },
+  };
+}
+
+// `run <name> <split> [batch] [order] [variant] [context]`, checked before
+// any key is read or request sent. `variant` is checked by `run`.
+export function parseHistoricalRunArguments(args: string[]) {
+  const [
+    name,
+    split,
+    batch = "1",
+    order = "chronological",
+    variant = "shipped",
+    context = "generated",
+  ] = args;
+  if (!name || !split) {
+    throw new Error(
+      "usage: run.ts run <name> <split> [batch] [order] [variant] [context]",
+    );
+  }
+  // The classifier's own batch rule, checked here before the key is read.
+  const batchSize = Number(batch);
+  if (!Number.isInteger(batchSize) || batchSize < 1) {
+    throw new Error("batch must be a positive integer.");
+  }
+  const parsedOrder = ORDERS.find(value => value === order);
+  if (!parsedOrder) {
+    throw new Error(`order must be one of: ${ORDERS.join(", ")}.`);
+  }
+  const parsedContext = CONTEXT_MODES.find(value => value === context);
+  if (!parsedContext) {
+    throw new Error(`context must be one of: ${CONTEXT_MODES.join(", ")}.`);
+  }
+  return {
+    name,
+    split,
+    batchSize,
+    order: parsedOrder,
+    variant,
+    context: parsedContext,
+  };
 }
 
 function toCandidates(snapshot: EvalSnapshot): RetentionCandidate[] {
@@ -127,15 +211,28 @@ function toCandidates(snapshot: EvalSnapshot): RetentionCandidate[] {
   }));
 }
 
-async function run(
+export type PaidDeps = {
+  // The command line passes TYPESAFE_API_KEY.
+  apiKey: string | undefined;
+  fetch: RetentionFetch;
+};
+
+// Each snapshot is one paid classifier invocation, checkpointed as
+// `paidOutput` describes; the record is written to `runs/<name>.json` under
+// the scratch directory.
+export async function run(
   name: string,
   split: string,
   batchSize: number,
   order: Order,
   variant: string,
   context: ContextMode,
+  deps: PaidDeps & { scratch?: string },
 ): Promise<void> {
-  const apiKey = process.env["TYPESAFE_API_KEY"];
+  const scratch = deps.scratch ?? SCRATCH_DIR;
+  const runs = join(scratch, "runs");
+  const output = paidOutput(join(runs, `${name}.json`));
+  const { apiKey } = deps;
   if (!apiKey) throw new Error("TYPESAFE_API_KEY is not set.");
   const mutate = VARIANTS[variant];
   if (!mutate) throw new Error(`Unknown variant ${variant}.`);
@@ -151,8 +248,10 @@ async function run(
     scores: {},
     invocations: [],
   };
-  const snapshots = loadDataset().filter(s => s.split === split);
-  for (const snapshot of snapshots) {
+  const snapshots = loadDataset(scratch).filter(s => s.split === split);
+  mkdirSync(runs, { recursive: true });
+  output.open();
+  for (const [index, snapshot] of snapshots.entries()) {
     const candidates = toCandidates(snapshot);
     if (order === "reversed") candidates.reverse();
     const requestLatencyMs: number[] = [];
@@ -162,7 +261,7 @@ async function run(
       };
       for (const question of Object.values(body.questions)) mutate(question);
       const started = performance.now();
-      const response = await fetch(url, {
+      const response = await deps.fetch(url, {
         ...init,
         body: JSON.stringify(body),
       });
@@ -178,7 +277,7 @@ async function run(
     const result = await classifyRetention(
       {
         latestUserRequest: snapshot.latestUserRequest,
-        sessionSummary: sessionSummary(snapshot, context),
+        sessionSummary: sessionSummary(snapshot, context, scratch),
       },
       candidates,
       { apiKey, batchSize, fetch: timedFetch },
@@ -196,12 +295,9 @@ async function run(
     console.log(
       `${snapshot.snapshotID}\t${result.requests} requests\t${result.inputTokens} input tokens\t${record.invocations.at(-1)!.latencyMs} ms`,
     );
+    output.checkpoint(index, snapshots.length, JSON.stringify(record, null, 1));
   }
-  mkdirSync(RUNS_DIR, { recursive: true });
-  writeFileSync(
-    join(RUNS_DIR, `${name}.json`),
-    JSON.stringify(record, null, 1),
-  );
+  output.finish(JSON.stringify(record, null, 1));
 }
 
 type Row = Label & { key: string; snapshotID: string; tokens: number };
@@ -424,52 +520,32 @@ export async function checkNative(
   );
 }
 
-async function scoreNative(
+// Each snapshot is one paid classifier invocation, checkpointed as
+// `paidOutput` describes.
+export async function scoreNative(
   input: NativeInput,
   split: string,
   order: string,
   output: string,
+  deps: PaidDeps & { frozen?: { snapshots: NativeSnapshot[] } },
 ): Promise<void> {
-  if (order !== "chronological" && order !== "reversed")
-    throw new Error("Invalid order.");
-  if (existsSync(output)) throw new Error("Output already exists.");
-  await checkNative(input);
-  const apiKey = process.env["TYPESAFE_API_KEY"];
+  if (!ORDERS.some(value => value === order)) throw new Error("Invalid order.");
+  const paid = paidOutput(output);
+  await checkNative(input, deps.frozen);
+  const { apiKey } = deps;
   if (!apiKey) throw new Error("TYPESAFE_API_KEY is not set.");
   let snapshots = input.snapshots.filter(s => s.split === split);
   if (!snapshots.length) throw new Error("Empty split.");
   if (order === "reversed") snapshots = [...snapshots].reverse();
   const scores: Record<string, number> = {};
-  const invocations = [];
-  for (const s of snapshots) {
-    const started = performance.now();
-    const requestMs: number[] = [];
-    const result = await classifyRetention(
-      s.context,
-      order === "reversed" ? [...s.candidates].reverse() : s.candidates,
-      {
-        apiKey,
-        keepThreshold: NATIVE_EVALUATION_KEEP_THRESHOLD,
-        fetch: async (url, init) => {
-          const t0 = performance.now();
-          const response = await fetch(url, init);
-          await response.clone().text();
-          requestMs.push(Math.round(performance.now() - t0));
-          return response;
-        },
-      },
-    );
-    for (const [id, d] of result.decisions) scores[id] = d.useful;
-    invocations.push({
-      snapshotID: s.snapshotID,
-      requests: result.requests,
-      inputTokens: result.inputTokens,
-      elapsedMs: Math.round(performance.now() - started),
-      requestMs,
-    });
-  }
-  writeFileSync(
-    output,
+  const invocations: Array<{
+    snapshotID: string;
+    requests: number;
+    inputTokens: number;
+    elapsedMs: number;
+    requestMs: number[];
+  }> = [];
+  const result = () =>
     JSON.stringify(
       {
         model: RETENTION_MODEL,
@@ -481,8 +557,37 @@ async function scoreNative(
       },
       null,
       2,
-    ),
-  );
+    );
+  paid.open();
+  for (const [index, s] of snapshots.entries()) {
+    const started = performance.now();
+    const requestMs: number[] = [];
+    const classified = await classifyRetention(
+      s.context,
+      order === "reversed" ? [...s.candidates].reverse() : s.candidates,
+      {
+        apiKey,
+        keepThreshold: NATIVE_EVALUATION_KEEP_THRESHOLD,
+        fetch: async (url, init) => {
+          const t0 = performance.now();
+          const response = await deps.fetch(url, init);
+          await response.clone().text();
+          requestMs.push(Math.round(performance.now() - t0));
+          return response;
+        },
+      },
+    );
+    for (const [id, d] of classified.decisions) scores[id] = d.useful;
+    invocations.push({
+      snapshotID: s.snapshotID,
+      requests: classified.requests,
+      inputTokens: classified.inputTokens,
+      elapsedMs: Math.round(performance.now() - started),
+      requestMs,
+    });
+    paid.checkpoint(index, snapshots.length, result());
+  }
+  paid.finish(result());
   console.log(
     `${Object.keys(scores).length} cases scored; results written to ${output}`,
   );
@@ -575,19 +680,27 @@ if (import.meta.main) {
   if (command === "check" || command === "score") {
     const input = JSON.parse(readFileSync(args[0]!, "utf8")) as NativeInput;
     if (command === "check") await checkNative(input);
-    else await scoreNative(input, args[1]!, args[2]!, args[3]!);
+    else {
+      const [, split, order, output] = args;
+      if (!split || !order || !output) {
+        throw new Error(
+          "usage: run.ts score <external-input.json> <split> <order> <output.json>",
+        );
+      }
+      await scoreNative(input, split, order, output, {
+        apiKey: process.env["TYPESAFE_API_KEY"],
+        fetch: (url, init) => fetch(url, init),
+      });
+    }
   } else if (command === "metrics") {
     nativeMetrics();
   } else if (command === "run") {
-    const [name, split, batch, order, variant, context] = args;
-    await run(
-      name!,
-      split!,
-      Number(batch ?? 1),
-      (order ?? "chronological") as Order,
-      variant ?? "shipped",
-      (context ?? "generated") as ContextMode,
-    );
+    const { name, split, batchSize, order, variant, context } =
+      parseHistoricalRunArguments(args);
+    await run(name, split, batchSize, order, variant, context, {
+      apiKey: process.env["TYPESAFE_API_KEY"],
+      fetch: (url, init) => fetch(url, init),
+    });
   } else if (command === "report") {
     report(args);
   } else {

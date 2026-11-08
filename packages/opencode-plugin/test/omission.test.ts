@@ -1,17 +1,17 @@
-import { beforeAll, afterAll, describe, expect, test } from "bun:test";
+import { beforeAll, afterAll, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import * as fs from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
   OmissionIntegrityError,
-  allocateOmission,
   cachePath,
+  commitPlannedOmission,
   copyCache,
   omissionReadDiagnostic,
-  readCache,
+  planOmission,
   readOmittedContent,
-  writeCache,
 } from "../src/storage/omission";
 
 let storageDirectory: string;
@@ -29,15 +29,16 @@ afterAll(async () => {
 });
 
 describe("OpenCode omission storage", () => {
-  test("allocates session-qualified random IDs with SHA-256 integrity metadata", async () => {
+  test("plans session-qualified random IDs and commits SHA-256 integrity metadata", async () => {
     const sessionID = "ses_1234567890abcdefghijkl";
     const content = "three bytes: \u20ac";
 
-    const contentID = await allocateOmission(sessionID, { content });
-    const cache = await readCache(sessionID);
+    const planned = planOmission(sessionID, { content });
+    await commitPlannedOmission(sessionID, planned);
+    const { contentID } = planned;
 
     expect(contentID).toMatch(/^abcdefghijkl:omitted-[A-Za-z0-9_-]{22}$/);
-    expect(cache).toEqual({
+    expect(await readRawCache(sessionID)).toEqual({
       version: 2,
       entries: {
         [contentID]: {
@@ -49,40 +50,26 @@ describe("OpenCode omission storage", () => {
     });
   });
 
-  test("retries a generated collision without overwriting existing bytes", async () => {
-    const sessionID = "ses_collision_retry";
-    const firstToken = "A".repeat(22);
-    const secondToken = "B".repeat(22);
-    await allocateOmission(sessionID, { content: "first" }, () => firstToken);
-    const tokens = [firstToken, secondToken];
+  test("refuses a duplicate planned Content ID without overwriting the committed entry", async () => {
+    const sessionID = "ses_collision_refusal";
+    const contentID = await commitContent(sessionID, "first", "A");
+    const original = await Bun.file(cachePath(sessionID)).text();
 
-    const secondID = await allocateOmission(
-      sessionID,
-      { content: "second" },
-      () => tokens.shift()!,
-    );
+    await expect(
+      commitPlannedOmission(sessionID, { contentID, content: "second" }),
+    ).rejects.toThrow("Planned omission Content ID collided before pruning.");
 
-    expect(secondID).toEndWith(secondToken);
-    expect(
-      await readOmittedContent(
-        sessionID,
-        `${sessionID.slice(-12)}:omitted-${firstToken}`,
-      ),
-    ).toBe("first");
-    expect(await readOmittedContent(sessionID, secondID)).toBe("second");
+    expect(await Bun.file(cachePath(sessionID)).text()).toBe(original);
+    expect(await readOmittedContent(sessionID, contentID)).toBe("first");
   });
 
   test("binds distinct lone-surrogate JavaScript strings without normalization", async () => {
     const sessionID = "ses_lone_surrogate_write";
     const d800 = "\ud800";
     const d801 = "\ud801";
-    const d800ID = await allocateOmission(sessionID, { content: d800 }, () =>
-      "A".repeat(22),
-    );
-    const d801ID = await allocateOmission(sessionID, { content: d801 }, () =>
-      "B".repeat(22),
-    );
-    const cache = (await readCache(sessionID))!;
+    const d800ID = await commitContent(sessionID, d800, "A");
+    const d801ID = await commitContent(sessionID, d801, "B");
+    const cache = await readRawCache(sessionID);
 
     expect(cache.entries[d800ID]!.sha256).toBe(contentSha256(d800ID, d800));
     expect(cache.entries[d801ID]!.sha256).toBe(contentSha256(d801ID, d801));
@@ -95,12 +82,8 @@ describe("OpenCode omission storage", () => {
 
   test("rejects U+D800 to U+D801 content substitution on read", async () => {
     const sessionID = "ses_lone_surrogate_read_corruption";
-    const contentID = await allocateOmission(
-      sessionID,
-      { content: "\ud800" },
-      () => "R".repeat(22),
-    );
-    const cache = (await readCache(sessionID))!;
+    const contentID = await commitContent(sessionID, "\ud800", "R");
+    const cache = await readRawCache(sessionID);
     cache.entries[contentID]!.content = "\ud801";
     await writeRawCache(sessionID, `${JSON.stringify(cache, null, 2)}\n`);
 
@@ -112,12 +95,8 @@ describe("OpenCode omission storage", () => {
   test("rejects U+D800 to U+D801 content substitution before copy", async () => {
     const source = "ses_lone_surrogate_copy_source";
     const target = "ses_lone_surrogate_copy_target";
-    const contentID = await allocateOmission(
-      source,
-      { content: "\ud800" },
-      () => "C".repeat(22),
-    );
-    const cache = (await readCache(source))!;
+    const contentID = await commitContent(source, "\ud800", "C");
+    const cache = await readRawCache(source);
     cache.entries[contentID]!.content = "\ud801";
     await writeRawCache(source, `${JSON.stringify(cache, null, 2)}\n`);
 
@@ -127,24 +106,15 @@ describe("OpenCode omission storage", () => {
     expect(await Bun.file(cachePath(target)).exists()).toBeFalse();
   });
 
-  test("binds complete entry records to their exact Content IDs across read, copy, and write", async () => {
+  test("binds complete entry records to their exact Content IDs across read, copy, and commit", async () => {
     const source = "ses_entry_swap_source";
     const copied = "ses_entry_swap_valid_copy";
     const copyTarget = "ses_entry_swap_copy_target";
-    const writeTarget = "ses_entry_swap_write_target";
-    const firstID = await allocateOmission(
-      source,
-      { content: "first content" },
-      () => "A".repeat(22),
-    );
-    const secondID = await allocateOmission(
-      source,
-      { content: "second content" },
-      () => "B".repeat(22),
-    );
-    const valid = (await readCache(source))!;
+    const firstID = await commitContent(source, "first content", "A");
+    const secondID = await commitContent(source, "second content", "B");
+    const valid = await readRawCache(source);
 
-    await writeCache(copied, structuredClone(valid));
+    await copyCache(source, copied);
     expect(await readOmittedContent(copied, firstID)).toBe("first content");
     expect(await readOmittedContent(copied, secondID)).toBe("second content");
 
@@ -163,42 +133,39 @@ describe("OpenCode omission storage", () => {
     );
     expect(await Bun.file(cachePath(copyTarget)).exists()).toBeFalse();
 
-    await allocateOmission(writeTarget, { content: "preserve target" }, () =>
-      "T".repeat(22),
-    );
-    const originalTarget = await Bun.file(cachePath(writeTarget)).text();
-    await expect(writeCache(writeTarget, swapped)).rejects.toBeInstanceOf(
-      OmissionIntegrityError,
-    );
-    expect(await Bun.file(cachePath(writeTarget)).text()).toBe(originalTarget);
+    const swappedBytes = await Bun.file(cachePath(source)).text();
+    await expect(
+      commitContent(source, "must not append", "T"),
+    ).rejects.toBeInstanceOf(OmissionIntegrityError);
+    expect(await Bun.file(cachePath(source)).text()).toBe(swappedBytes);
   });
 
-  test("serializes same-session allocations while leaving distinct sessions independent", async () => {
-    const token = (value: number) => value.toString().padStart(22, "0");
-    let index = 0;
-    const ids = await Promise.all(
-      Array.from({ length: 20 }, (_, value) =>
-        allocateOmission("ses_concurrent", { content: String(value) }, () =>
-          token(index++),
-        ),
-      ),
+  test("serializes concurrent same-session commits without losing an entry", async () => {
+    const sessionID = "ses_concurrent";
+    const planned = Array.from({ length: 20 }, (_, value) =>
+      planOmission(sessionID, { content: String(value) }),
     );
 
-    expect(new Set(ids).size).toBe(20);
-    expect(
-      Object.keys((await readCache("ses_concurrent"))!.entries),
-    ).toHaveLength(20);
+    await Promise.all(
+      planned.map(omission => commitPlannedOmission(sessionID, omission)),
+    );
+
+    const entries = (await readRawCache(sessionID)).entries;
+    expect(Object.keys(entries).sort()).toEqual(
+      planned.map(omission => omission.contentID).sort(),
+    );
+    for (const omission of planned) {
+      expect(await readOmittedContent(sessionID, omission.contentID)).toBe(
+        omission.content,
+      );
+    }
   });
 
   test("does not resolve an old ID to replacement bytes after cache loss", async () => {
     const sessionID = "ses_cache_loss";
-    const oldID = await allocateOmission(sessionID, { content: "old" }, () =>
-      "A".repeat(22),
-    );
+    const oldID = await commitContent(sessionID, "old", "A");
     await rm(cachePath(sessionID));
-    await allocateOmission(sessionID, { content: "replacement" }, () =>
-      "B".repeat(22),
-    );
+    await commitContent(sessionID, "replacement", "B");
 
     expect(await readOmittedContent(sessionID, oldID)).toBeNull();
   });
@@ -209,12 +176,12 @@ describe("OpenCode omission storage", () => {
     await writeRawCache(sessionID, malformed);
 
     await expect(
-      allocateOmission(sessionID, { content: "must not replace" }),
-    ).rejects.toThrow("Invalid omission cache");
+      commitContent(sessionID, "must not replace", "M"),
+    ).rejects.toThrow(`Invalid omission cache for session ${sessionID}.`);
     expect(await Bun.file(cachePath(sessionID)).text()).toBe(malformed);
   });
 
-  test("validates every v2 entry before allocating and leaves a corrupt cache unchanged", async () => {
+  test("validates every v2 entry before committing and leaves a corrupt cache unchanged", async () => {
     const sessionID = "ses_invalid_allocate";
     const contentID = qualifiedContentID(sessionID, "A");
     const corrupt = rawV2Cache({
@@ -225,7 +192,7 @@ describe("OpenCode omission storage", () => {
     await writeRawCache(sessionID, corrupt);
 
     await expect(
-      allocateOmission(sessionID, { content: "must not append" }),
+      commitContent(sessionID, "must not append", "N"),
     ).rejects.toBeInstanceOf(OmissionIntegrityError);
     expect(await Bun.file(cachePath(sessionID)).text()).toBe(corrupt);
   });
@@ -233,7 +200,7 @@ describe("OpenCode omission storage", () => {
   test("copies an absent source as an explicit empty v2 backup cache", async () => {
     await copyCache("ses_absent", "ses_empty_backup");
 
-    expect(await readCache("ses_empty_backup")).toEqual({
+    expect(await readRawCache("ses_empty_backup")).toEqual({
       version: 2,
       entries: {},
       legacy: { entries: {} },
@@ -246,7 +213,7 @@ describe("OpenCode omission storage", () => {
     await writeRawCache(target, malformed);
 
     await expect(copyCache("ses_absent_copy_source", target)).rejects.toThrow(
-      "Invalid omission cache",
+      `Invalid omission cache for session ${target}.`,
     );
     expect(await Bun.file(cachePath(target)).text()).toBe(malformed);
   });
@@ -261,9 +228,7 @@ describe("OpenCode omission storage", () => {
       }),
     });
     await writeRawCache(source, corruptSource);
-    await allocateOmission(target, { content: "original target" }, () =>
-      "T".repeat(22),
-    );
+    await commitContent(target, "original target", "T");
     const originalTarget = await Bun.file(cachePath(target)).text();
 
     await expect(copyCache(source, target)).rejects.toBeInstanceOf(
@@ -277,17 +242,14 @@ describe("OpenCode omission storage", () => {
     const source = "ses_mapping_source";
     const other = "ses_mapping_other";
     const temporary = "ses_mapping_temporary";
-    const contentID = await allocateOmission(
-      source,
-      { content: "source bytes" },
-      () => "S".repeat(22),
-    );
+    const contentID = await commitContent(source, "source bytes", "S");
 
+    expect(await readOmittedContent(source, contentID)).toBe("source bytes");
     expect(await readOmittedContent(other, contentID)).toBeNull();
     expect(await readOmittedContent(temporary, contentID)).toBeNull();
   });
 
-  test("preserves valid v1 bytes when migrating and copying but never reads them", async () => {
+  test("preserves valid v1 bytes when migrating on commit and copy", async () => {
     const source = "ses_legacy_migration_source";
     const target = "ses_legacy_migration_target";
     const legacyEntries = {
@@ -296,21 +258,11 @@ describe("OpenCode omission storage", () => {
     await writeLegacyCache(source, legacyEntries);
 
     await copyCache(source, target);
-    const newID = await allocateOmission(source, { content: "new" }, () =>
-      "N".repeat(22),
-    );
+    const newID = await commitContent(source, "new", "N");
 
-    expect((await readCache(source))!.legacy.entries).toEqual(legacyEntries);
-    expect((await readCache(target))!.legacy.entries).toEqual(legacyEntries);
-    expect(newID).toMatch(/:omitted-[A-Za-z0-9_-]{22}$/);
-    expect(newID).not.toBe("omitted-236");
-    for (const sessionID of [source, target]) {
-      await expect(
-        readOmittedContent(sessionID, "omitted-001"),
-      ).rejects.toThrow(
-        "Unverifiable legacy omission omitted-001 is unavailable",
-      );
-    }
+    expect((await readRawCache(source)).legacy.entries).toEqual(legacyEntries);
+    expect((await readRawCache(target)).legacy.entries).toEqual(legacyEntries);
+    expect(await readOmittedContent(source, newID)).toBe("new");
   });
 
   test("never returns collision-prone or missing bare legacy IDs", async () => {
@@ -349,30 +301,6 @@ describe("OpenCode omission storage", () => {
     ).rejects.toBeInstanceOf(OmissionIntegrityError);
   });
 
-  test("rejects an integrity-invalid supplied write and preserves the original file byte-for-byte", async () => {
-    const sessionID = "ses_invalid_write";
-    await allocateOmission(sessionID, { content: "original" }, () =>
-      "O".repeat(22),
-    );
-    const original = await Bun.file(cachePath(sessionID)).text();
-    const replacementID = qualifiedContentID(sessionID, "W");
-
-    await expect(
-      writeCache(sessionID, {
-        version: 2,
-        entries: {
-          [replacementID]: v2Entry(replacementID, "replacement", {
-            sha256: "0".repeat(64),
-          }),
-        },
-        legacy: { entries: {} },
-      }),
-    ).rejects.toBeInstanceOf(OmissionIntegrityError);
-
-    expect(await Bun.file(cachePath(sessionID)).text()).toBe(original);
-    expect(await readOmittedContent(sessionID, replacementID)).toBeNull();
-  });
-
   test("rejects the obsolete v2 byteLength field instead of migrating an unshipped schema", async () => {
     const sessionID = "ses_obsolete_byte_length";
     const contentID = qualifiedContentID(sessionID, "B");
@@ -388,8 +316,8 @@ describe("OpenCode omission storage", () => {
       }),
     );
 
-    await expect(readCache(sessionID)).rejects.toThrow(
-      "Invalid omission cache",
+    await expect(readOmittedContent(sessionID, contentID)).rejects.toThrow(
+      `Invalid omission cache for session ${sessionID}.`,
     );
   });
 
@@ -400,8 +328,11 @@ describe("OpenCode omission storage", () => {
     });
     await writeRawCache(sessionID, invalid);
 
-    await expect(readCache(sessionID)).rejects.toThrow(
-      "Invalid omission cache",
+    await expect(
+      readOmittedContent(sessionID, qualifiedContentID(sessionID, "Q")),
+    ).rejects.toThrow(`Invalid omission cache for session ${sessionID}.`);
+    await expect(commitContent(sessionID, "new", "Q")).rejects.toThrow(
+      `Invalid omission cache for session ${sessionID}.`,
     );
     expect(await Bun.file(cachePath(sessionID)).text()).toBe(invalid);
   });
@@ -414,7 +345,9 @@ describe("OpenCode omission storage", () => {
           "legacy content has no cryptographic binding",
         ),
       ),
-    ).toContain("integrity verification failed");
+    ).toBe(
+      "Omitted content unavailable for Content ID omitted-001: integrity verification failed. legacy content has no cryptographic binding",
+    );
     const unsafeDetail = `/home/ivan/.local/share/session-secret.json`;
     const diagnostic = omissionReadDiagnostic(
       "qualified:omitted-id",
@@ -427,33 +360,74 @@ describe("OpenCode omission storage", () => {
     expect(diagnostic).not.toContain("EACCES");
   });
 
-  test("uses atomic replacement without leaving temporary cache files", async () => {
-    const sessionID = "ses_atomic";
-    await allocateOmission(sessionID, { content: "atomic" });
-    const names = await readdir(dirname(cachePath(sessionID)));
+  test("never opens cache permissions and a failed replacement keeps the old file", async () => {
+    const sessionID = "ses_cache_mode";
+    const path = cachePath(sessionID);
+    const mode = async () => (await stat(path)).mode & 0o777;
+    await mkdir(dirname(path), { recursive: true });
+    // A umask that strips owner read must not leave the first write unreadable.
+    const umask = process.umask(0o400);
+    try {
+      const firstID = await commitContent(sessionID, "first", "F");
+      expect(await mode()).toBe(0o600);
+      expect(await readOmittedContent(sessionID, firstID)).toBe("first");
+      await chmod(path, 0o640);
+      await commitContent(sessionID, "second", "S");
+      expect(await mode()).toBe(0o640);
 
+      const before = await Bun.file(path).text();
+      const renames = spyOn(fs, "rename").mockRejectedValue(
+        Object.assign(new Error("EIO: rename failed"), { code: "EIO" }),
+      );
+      try {
+        await expect(commitContent(sessionID, "third", "T")).rejects.toThrow(
+          "EIO",
+        );
+      } finally {
+        renames.mockRestore();
+      }
+      expect(await Bun.file(path).text()).toBe(before);
+      expect(await mode()).toBe(0o640);
+      expect(await readOmittedContent(sessionID, firstID)).toBe("first");
+    } finally {
+      process.umask(umask);
+    }
+    const names = await readdir(dirname(path));
     expect(names.filter(name => name.includes(`${sessionID}.json.`))).toEqual(
       [],
     );
   });
 
-  test("preserves exact IDs and bytes through repeated backup copies and later allocations", async () => {
-    const sourceID = await allocateOmission(
-      "ses_repeat_source",
-      { content: "original" },
-      () => "R".repeat(22),
-    );
+  test("preserves exact IDs and bytes through repeated copies and later commits", async () => {
+    const sourceID = await commitContent("ses_repeat_source", "original", "R");
     await copyCache("ses_repeat_source", "ses_repeat_backup_1");
     await copyCache("ses_repeat_backup_1", "ses_repeat_backup_2");
-    await allocateOmission("ses_repeat_source", { content: "later" }, () =>
-      "L".repeat(22),
-    );
+    await commitContent("ses_repeat_source", "later", "L");
 
     expect(await readOmittedContent("ses_repeat_backup_2", sourceID)).toBe(
       "original",
     );
   });
 });
+
+// Commits through the production write path with a fixed token, so a test
+// can name the Content ID before it exists.
+async function commitContent(
+  sessionID: string,
+  content: string,
+  token: string,
+): Promise<string> {
+  const contentID = qualifiedContentID(sessionID, token);
+  await commitPlannedOmission(sessionID, { contentID, content });
+  return contentID;
+}
+
+async function readRawCache(sessionID: string) {
+  return JSON.parse(await Bun.file(cachePath(sessionID)).text()) as {
+    entries: Record<string, { content: string; sha256: string }>;
+    legacy: { entries: Record<string, { content: string }> };
+  };
+}
 
 async function writeRawCache(
   sessionID: string,
