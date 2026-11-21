@@ -119,7 +119,7 @@ On OpenCode 2, list the package under `plugins` and define the summarizer agent 
 
 The plugin turns that agent into a hidden subagent with its own prompt and a deny-all permission rule, and keeps your model and variant. Without the agent or its model, compaction and task-aware retention fail with setup guidance.
 
-`/magic-compact`, `/magic-trim`, and `/magic-recover` need this server's HTTP API, because OpenCode 2 gives plugins no session transfer or history APIs. The plugin uses OpenCode's registered background service, which the OpenCode 2 TUI and `opencode run` use by default (`opencode serve --service` starts it headless). A private server (`opencode run --standalone`) is not supported. To use a standalone `opencode serve` listener instead, pass its URL as the `serverUrl` option and export `OPENCODE_SERVER_PASSWORD` (and `OPENCODE_SERVER_USERNAME` when it is not `opencode`) in the server environment:
+`/magic-compact`, `/magic-trim`, and `/magic-recover` need this server's HTTP API, because OpenCode 2 gives plugins no session transfer or history APIs. The plugin uses OpenCode's registered background service, which the OpenCode 2 TUI and `opencode run` use by default (`opencode serve --service` starts it headless). It reads the service's registration file (`$XDG_STATE_HOME/opencode/service.json`, or `~/.local/state/opencode/service.json`) for the URL and password, so no extra variables are needed. That is the file OpenCode 2.0.28 writes on its `latest`, `dev`, `beta` and `next` channels; builds from any other channel, such as a local source build, write a differently named file, which the plugin does not read. A private server (`opencode run --standalone`) is not supported. To use a standalone `opencode serve` listener instead, pass its URL as the `serverUrl` option and export `OPENCODE_SERVER_PASSWORD` (and `OPENCODE_SERVER_USERNAME` when it is not `opencode`) in the server environment. A configured `serverUrl` is the only endpoint the plugin tries; it must be an `http` or `https` URL with no user name, password, query or fragment in it (a base path is fine):
 
 ```jsonc
 {
@@ -132,7 +132,9 @@ The plugin turns that agent into a hidden subagent with its own prompt and a den
 }
 ```
 
-Before any read or write, the plugin requires the endpoint to report its own process ID and the same source session as the plugin context, and refuses otherwise. It never guesses a port or starts a service.
+Before any read or write, the plugin requires the endpoint to report its own process ID and the same source session as the plugin context, and refuses otherwise. A registration that names another process is never contacted. The refusal names its reason: no configuration, an invalid `serverUrl` or registration, another process's service, an unreachable endpoint, refused credentials, the wrong server or session, a timeout, or an unloaded plugin. It never guesses a port, starts a service or follows a redirect.
+
+These checks guard against a misconfigured or stale endpoint; they do not authenticate the server. The plugin trusts a configured `serverUrl` as yours, and the process ID check runs after the credentials are sent. If another process took over the URL, it would receive them.
 
 What differs on OpenCode 2:
 

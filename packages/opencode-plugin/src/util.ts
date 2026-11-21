@@ -48,6 +48,25 @@ type DeadlineAttempt<T> =
   | { kind: "timed-out" }
   | { kind: "failed"; error: unknown };
 
+// Starts `start` only while `signal` is live and settles as soon as it aborts,
+// with the abort reason, even when the operation ignores its signal. The
+// operation's later result or rejection is dropped.
+export function abortable<T>(
+  signal: AbortSignal,
+  start: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    signal.throwIfAborted();
+    const operation = start(signal);
+    const stop = () => reject(signal.reason);
+    signal.addEventListener("abort", stop, { once: true });
+    if (signal.aborted) stop();
+    void operation
+      .then(resolve, reject)
+      .then(() => signal.removeEventListener("abort", stop));
+  });
+}
+
 export async function attemptWithinDeadline<T>(
   attempt: (signal: AbortSignal) => Promise<T>,
   deadlineMs: number,

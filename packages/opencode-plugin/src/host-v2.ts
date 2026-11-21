@@ -30,6 +30,7 @@ import { statsSummaryMessage } from "./stats/constants";
 import { omissionReadDiagnostic, readOmittedContent } from "./storage/omission";
 import { readStats } from "./storage/stats";
 import {
+  abortable,
   attemptWithinDeadline,
   CONTROL_OPERATION_TIMEOUT_MS,
   isRecord,
@@ -37,7 +38,7 @@ import {
 import { executeV2Compact } from "./v2/compact";
 import { GENERATION_RESPONSE_SCHEMA } from "./policy/generation";
 import { V2_RESPONSE_TOOL } from "./v2/generation";
-import { connectV2Host, type V2Host } from "./v2/host";
+import { connectV2Host } from "./v2/host";
 import {
   projectV2RequestMessages,
   requestCarriesMediaManifest,
@@ -55,6 +56,9 @@ type Context = Plugin.Context;
 
 const MEDIA_HISTORY_REQUIRED =
   "Magic Compact could not read this session's complete history over the OpenCode server's HTTP API, which it needs to project summarized images in a request that replays history from before the session's latest compaction. The request was not sent.";
+
+const MEDIA_READ_STOPPED =
+  "Magic Compact could not project summarized images in this request because the plugin was unloaded. The request was not sent.";
 
 const RESPONSE_TOOL_REJECTED =
   "Magic Compact's response tool is only available in its own per-turn generation requests.";
@@ -88,11 +92,17 @@ export async function setup(
   owned = new OwnedSessions(),
 ): Promise<() => void> {
   const controlTimeoutMs = CONTROL_OPERATION_TIMEOUT_MS;
-  const connect = (sessionID: string) =>
-    connectV2Host(sessionID, id => ctx.session.get({ sessionID: id }), {
-      serverUrl: ctx.options["serverUrl"],
-      controlTimeoutMs,
-    });
+  const connect = (sessionID: string, signal?: AbortSignal) =>
+    connectV2Host(
+      sessionID,
+      (id, readSignal) =>
+        ctx.session.get({ sessionID: id }, { signal: readSignal }),
+      {
+        serverUrl: ctx.options["serverUrl"],
+        controlTimeoutMs,
+        ...(signal ? { signal } : {}),
+      },
+    );
 
   // The operator configures the summarizer's model and variant; the plugin
   // owns only its role, prompt and tool access.
@@ -267,20 +277,47 @@ export async function setup(
     });
   });
 
-  // The complete history of a session, read over this server's own HTTP API.
-  // The verified connection is kept for later reads and dropped on failure.
-  let historyHost: Promise<V2Host> | undefined;
-  const completeHistory = async (sessionID: string): Promise<V2Message[]> => {
+  // The plugin's activation, ended by the cleanup `setup` returns. Media reads
+  // are read-only work it owns: none starts after it ends, and the open one
+  // settles at once, even a read that ignores its signal, with its later
+  // result dropped. Commands already running are not tied to it.
+  const activation = new AbortController();
+  const mediaRead = async <T>(
+    read: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> => {
     try {
-      historyHost ??= connect(sessionID);
-      const host = await historyHost;
+      return await abortable(activation.signal, read);
+    } catch (error) {
+      throw activation.signal.aborted ? new Error(MEDIA_READ_STOPPED) : error;
+    }
+  };
+  // The activation can end after a read settles and before its caller
+  // resumes, so the caller checks again before it uses the result.
+  const assertActive = () => {
+    if (activation.signal.aborted) throw new Error(MEDIA_READ_STOPPED);
+  };
+
+  // The complete history of a session, read over this server's own HTTP API
+  // on a connection qualified for that session by this read. No page or
+  // export starts once `signal` aborts.
+  const completeHistory = async (
+    sessionID: string,
+    signal: AbortSignal,
+  ): Promise<V2Message[]> => {
+    try {
+      const host = await connect(sessionID, signal);
+      // A read that ignores its signal still settles, and its deadline timer
+      // clears, as soon as `signal` aborts.
       return await readV2History(host, sessionID, async request => {
-        const outcome = await attemptWithinDeadline(request, controlTimeoutMs);
+        signal.throwIfAborted();
+        const outcome = await attemptWithinDeadline(
+          deadline => abortable(AbortSignal.any([deadline, signal]), request),
+          controlTimeoutMs,
+        );
         if (outcome.kind !== "success") throw new Error("history read failed");
         return outcome.value;
       });
     } catch {
-      historyHost = undefined;
       throw new Error(MEDIA_HISTORY_REQUIRED);
     }
   };
@@ -309,13 +346,17 @@ export async function setup(
       // only the in-memory registry marks it as one that may replay a
       // retained copy of a summarized message.
       if (!owned.has(event.sessionID)) {
-        const session = await ctx.session.get({ sessionID: event.sessionID });
+        const session = await mediaRead(signal =>
+          ctx.session.get({ sessionID: event.sessionID }, { signal }),
+        );
+        assertActive();
         if (!isRecord(session.metadata?.["magicCompact"])) return;
       }
     }
-    const context: V2Message[] = await ctx.session.context({
-      sessionID: event.sessionID,
-    });
+    const context: V2Message[] = await mediaRead(signal =>
+      ctx.session.context({ sessionID: event.sessionID }, { signal }),
+    );
+    assertActive();
     const known = new Set(context.map(message => message.id));
     if (imageIDs.every(id => known.has(id))) {
       // A capsule in the context is in the request too.
@@ -323,10 +364,11 @@ export async function setup(
       event.messages = projectV2RequestMessages(event.messages, context);
       return;
     }
-    event.messages = projectV2RequestMessages(
-      event.messages,
-      await completeHistory(event.sessionID),
+    const history = await mediaRead(signal =>
+      completeHistory(event.sessionID, signal),
     );
+    assertActive();
+    event.messages = projectV2RequestMessages(event.messages, history);
   };
 
   // The response tool is advertised only to the agent loop of a per-turn
@@ -370,9 +412,10 @@ export async function setup(
     await projectMedia(event);
   });
 
-  const events = new AbortController();
   void (async () => {
-    for await (const event of ctx.event.subscribe({ signal: events.signal })) {
+    for await (const event of ctx.event.subscribe({
+      signal: activation.signal,
+    })) {
       if (event.type !== "session.step.ended") continue;
       // Invalid stats are left alone by `recordCompletionEvent`. Any other
       // failure loses only this increment, and the subscription keeps
@@ -383,5 +426,5 @@ export async function setup(
       ).catch(() => undefined);
     }
   })().catch(() => undefined);
-  return () => events.abort();
+  return () => activation.abort();
 }

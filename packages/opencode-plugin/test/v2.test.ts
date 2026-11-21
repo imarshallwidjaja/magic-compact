@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
+import { closeSync, constants, lstatSync, openSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -11,6 +12,7 @@ import {
   commandFailureMessage,
   parseMagicCompactArguments,
   parseMagicTrimArguments,
+  RECOVER_NOOP,
   STATS_ARGUMENTS_ERROR,
   TRIM_ARGUMENTS_ERROR,
   TRIM_THRESHOLD_ERROR,
@@ -102,16 +104,25 @@ import {
   type FakeV2State,
 } from "./v2-host";
 
+// Plugin storage and the service registration both live in scratch
+// directories, so no test reads or contacts a real OpenCode service.
 const originalDataHome = process.env.XDG_DATA_HOME;
+const originalStateHome = process.env.XDG_STATE_HOME;
 let storageDirectory: string;
+let stateDirectory: string;
 beforeEach(async () => {
   storageDirectory = await mkdtemp(join(tmpdir(), "magic-compact-v2-test-"));
+  stateDirectory = await mkdtemp(join(tmpdir(), "magic-compact-v2-state-"));
   process.env.XDG_DATA_HOME = storageDirectory;
+  process.env.XDG_STATE_HOME = stateDirectory;
 });
 afterEach(async () => {
   if (originalDataHome === undefined) delete process.env.XDG_DATA_HOME;
   else process.env.XDG_DATA_HOME = originalDataHome;
+  if (originalStateHome === undefined) delete process.env.XDG_STATE_HOME;
+  else process.env.XDG_STATE_HOME = originalStateHome;
   await rm(storageDirectory, { recursive: true, force: true });
+  await rm(stateDirectory, { recursive: true, force: true });
 });
 
 const words = (tag: string, count: number) =>
@@ -877,6 +888,83 @@ describe("OpenCode 2 source at rest", () => {
   });
 });
 
+// A disposable loopback HTTP server that records each request's path and
+// Authorization header. `hold` keeps a request open until its client aborts
+// it, and records that abort; a promised response answers when it settles.
+// `waitFor` resolves once a recorded request or abort makes `ready` true.
+type Seen = { path: string; authorization: string | null };
+function loopback(
+  respond: (
+    url: URL,
+    request: Request,
+  ) => Response | Promise<Response> | "hold",
+): {
+  url: string;
+  seen: Seen[];
+  aborted: string[];
+  waitFor: (ready: () => boolean) => Promise<void>;
+  stop: () => Promise<void>;
+} {
+  const seen: Seen[] = [];
+  const aborted: string[] = [];
+  let recorded = Promise.withResolvers<void>();
+  const record = () => {
+    recorded.resolve();
+    recorded = Promise.withResolvers<void>();
+  };
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    fetch: request => {
+      const url = new URL(request.url);
+      seen.push({
+        path: url.pathname,
+        authorization: request.headers.get("authorization"),
+      });
+      record();
+      const response = respond(url, request);
+      if (response !== "hold") return response;
+      return new Promise<Response>(resolve => {
+        request.signal.addEventListener("abort", () => {
+          aborted.push(url.pathname);
+          record();
+          resolve(new Response("aborted", { status: 499 }));
+        });
+      });
+    },
+  });
+  return {
+    url: `http://127.0.0.1:${server.port}`,
+    seen,
+    aborted,
+    waitFor: async ready => {
+      while (!ready()) await recorded.promise;
+    },
+    stop: () => server.stop(true),
+  };
+}
+
+// Every microtask queued so far has run.
+const settleMicrotasks = () =>
+  new Promise<void>(resolve => setImmediate(resolve));
+
+const serverInfo = (pid: number, version = "2.0.28") =>
+  Response.json({ version, pid, urls: [], paths: { tmp: "/tmp" } });
+
+const basic = (username: string, password: string) =>
+  `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`;
+
+// Writes OpenCode 2.0.28's stable-channel service registration under the
+// suite's scratch XDG_STATE_HOME.
+async function register(record: unknown) {
+  const file = join(stateDirectory, "opencode", "service.json");
+  await mkdir(dirname(file), { recursive: true });
+  await Bun.write(
+    file,
+    typeof record === "string" ? record : JSON.stringify(record),
+  );
+}
+
 describe("OpenCode 2 endpoint qualification", () => {
   const session = {
     id: "ses_src",
@@ -884,60 +972,576 @@ describe("OpenCode 2 endpoint qualification", () => {
     time: { created: 1 },
     location: LOCATION,
   };
-  const fetchFor = (pid: number, remote = session) =>
-    (async (input: Request | string | URL) => {
-      const url = new URL(input instanceof Request ? input.url : String(input));
-      if (url.pathname === "/api/info")
-        return Response.json({
-          version: "2.0.28",
-          pid,
-          urls: [],
-          paths: { tmp: "/tmp" },
-        });
+  const PASSWORD = "synthetic-registration-password";
+  // A server of process 7 that requires the registration's Basic auth.
+  const managed = (remote: unknown = session, pid = 7) =>
+    loopback((url, request) => {
+      if (request.headers.get("authorization") !== basic("opencode", PASSWORD))
+        return new Response("no", { status: 401 });
+      if (url.pathname === "/api/info") return serverInfo(pid);
       return Response.json({ data: remote });
-    }) as typeof fetch;
+    });
+  const env = () => ({ XDG_STATE_HOME: stateDirectory });
+  const refusal = async (
+    connecting: Promise<unknown>,
+    detail: string,
+    hidden: string[] = [],
+  ) => {
+    const error = (await connecting.then(
+      () => {
+        throw new Error("Expected a refusal.");
+      },
+      (reason: unknown) => reason,
+    )) as Error & { detail?: string };
+    expect(error.detail).toBe(detail);
+    expect(error.message).toStartWith(V2_ENDPOINT_REQUIRED);
+    // No credential, URL or file system path reaches the person.
+    for (const text of [PASSWORD, stateDirectory, "127.0.0.1", ...hidden])
+      expect(error.message).not.toContain(text);
+    return error;
+  };
 
-  test("accepts only an endpoint that reports this PID and the same source", async () => {
-    const options = {
-      serverUrl: "http://127.0.0.1:9",
-      env: {},
-      pid: 7,
-      controlTimeoutMs: 1_000,
-    };
-    await expect(
-      connectV2Host("ses_src", async () => session, {
-        ...options,
-        fetch: fetchFor(7),
-      }),
-    ).resolves.toBeDefined();
-    await expect(
-      connectV2Host("ses_src", async () => session, {
-        ...options,
-        fetch: fetchFor(8),
-      }),
-    ).rejects.toThrow(V2_ENDPOINT_REQUIRED);
-    await expect(
-      connectV2Host(
+  test("a registered service of this process qualifies with its own credentials and no manual variables", async () => {
+    const server = managed();
+    try {
+      await register({
+        id: "svc",
+        version: "2.0.28",
+        url: server.url,
+        pid: 7,
+        password: PASSWORD,
+      });
+      let reads = 0;
+      const host = await connectV2Host(
         "ses_src",
-        async () => ({ ...session, projectID: "other" }),
-        { ...options, fetch: fetchFor(7) },
-      ),
-    ).rejects.toThrow(V2_ENDPOINT_REQUIRED);
-    await expect(
-      connectV2Host("ses_src", async () => session, {
-        ...options,
-        serverUrl: 4101,
-      }),
-    ).rejects.toThrow(V2_ENDPOINT_REQUIRED);
+        async () => {
+          reads++;
+          return session;
+        },
+        { env: env(), pid: 7, controlTimeoutMs: 1_000 },
+      );
+      // One identity read, no separate discovery probe.
+      expect(server.seen.map(seen => seen.path)).toEqual([
+        "/api/info",
+        "/api/session/ses_src",
+      ]);
+      expect(reads).toBe(1);
+      expect(
+        server.seen.every(
+          seen => seen.authorization === basic("opencode", PASSWORD),
+        ),
+      ).toBe(true);
+      // Later requests keep the same credentials.
+      expect((await host.server.info()).pid).toBe(7);
+      expect(server.seen.at(-1)!.authorization).toBe(
+        basic("opencode", PASSWORD),
+      );
+    } finally {
+      await server.stop();
+    }
   });
 
-  test("never guesses an endpoint when no service is registered", async () => {
-    await expect(
-      connectV2Host("ses_src", async () => session, {
-        discover: async () => undefined,
+  test("without XDG_STATE_HOME the registration is read under the home directory", async () => {
+    const server = managed();
+    try {
+      const file = join(
+        stateDirectory,
+        ".local",
+        "state",
+        "opencode",
+        "service.json",
+      );
+      await mkdir(dirname(file), { recursive: true });
+      await Bun.write(
+        file,
+        JSON.stringify({ url: server.url, pid: 7, password: PASSWORD }),
+      );
+      await connectV2Host("ses_src", async () => session, {
+        env: { XDG_STATE_HOME: "", HOME: stateDirectory },
+        pid: 7,
         controlTimeoutMs: 1_000,
-      }),
-    ).rejects.toThrow(V2_ENDPOINT_REQUIRED);
+      });
+      expect(server.seen).toHaveLength(2);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test("a missing, malformed or foreign registration sends no request", async () => {
+    const server = managed();
+    let reads = 0;
+    const connect = () =>
+      connectV2Host(
+        "ses_src",
+        async () => {
+          reads++;
+          return session;
+        },
+        { env: env(), pid: 7, controlTimeoutMs: 1_000 },
+      );
+    try {
+      await refusal(connect(), "not-configured");
+      const valid = {
+        id: "svc",
+        version: "2.0.28",
+        url: server.url,
+        pid: 7,
+        password: PASSWORD,
+      };
+      for (const record of [
+        "{not json",
+        "[]",
+        { ...valid, pid: "7" },
+        { ...valid, pid: 7.5 },
+        { ...valid, url: 1 },
+        { ...valid, url: "not a url" },
+        { ...valid, url: server.url.replace("http:", "ftp:") },
+        { ...valid, url: server.url.replace("//", `//opencode:${PASSWORD}@`) },
+        { ...valid, version: 2 },
+        { ...valid, password: 1 },
+        { ...valid, id: {} },
+      ]) {
+        await register(record);
+        await refusal(connect(), "invalid-registration");
+      }
+      // A live service of another process is never sent this server's
+      // requests or the registration's credentials.
+      await register({ ...valid, pid: 8 });
+      await refusal(connect(), "foreign-service");
+      expect(server.seen).toEqual([]);
+      expect(reads).toBe(0);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test("the server must report the registered PID and version", async () => {
+    const registration = (url: string) => ({
+      id: "svc",
+      version: "2.0.28",
+      url,
+      pid: 7,
+      password: PASSWORD,
+    });
+    const other = managed(session, 8);
+    const older = loopback(url =>
+      url.pathname === "/api/info"
+        ? serverInfo(7, "2.0.27")
+        : Response.json({ data: session }),
+    );
+    try {
+      for (const server of [other, older]) {
+        await register(registration(server.url));
+        await refusal(
+          connectV2Host("ses_src", async () => session, {
+            env: env(),
+            pid: 7,
+            controlTimeoutMs: 1_000,
+          }),
+          "wrong-server",
+        );
+        expect(server.seen.map(seen => seen.path)).toEqual(["/api/info"]);
+      }
+      // Without a recorded version, any version string qualifies.
+      await register({ ...registration(older.url), version: undefined });
+      await connectV2Host("ses_src", async () => session, {
+        env: env(),
+        pid: 7,
+        controlTimeoutMs: 1_000,
+      });
+    } finally {
+      await other.stop();
+      await older.stop();
+    }
+  });
+
+  test("a malformed server identity is refused before the session is read", async () => {
+    for (const info of [
+      null,
+      [],
+      { pid: "7", version: "2.0.28" },
+      { pid: 7 },
+      { pid: 7, version: 2 },
+    ]) {
+      const server = loopback(url =>
+        url.pathname === "/api/info"
+          ? Response.json(info)
+          : Response.json({ data: session }),
+      );
+      try {
+        // A record without a version still needs a version string.
+        await register({ url: server.url, pid: 7 });
+        await refusal(
+          connectV2Host("ses_src", async () => session, {
+            env: env(),
+            pid: 7,
+            controlTimeoutMs: 1_000,
+          }),
+          "wrong-server",
+        );
+        expect(server.seen.map(seen => seen.path)).toEqual(["/api/info"]);
+      } finally {
+        await server.stop();
+      }
+    }
+  });
+
+  test("an explicit serverUrl is the only endpoint, whether it succeeds or fails", async () => {
+    // A ready registration of this very process is never consulted.
+    const registered = managed();
+    const explicit = loopback((url, request) => {
+      if (
+        request.headers.get("authorization")
+        !== basic("operator", "explicit-pw")
+      )
+        return new Response("no", { status: 401 });
+      if (url.pathname === "/api/info") return serverInfo(7);
+      return Response.json({ data: session });
+    });
+    const failing = loopback(() => new Response("down", { status: 500 }));
+    try {
+      await register({ url: registered.url, pid: 7, password: PASSWORD });
+      const connect = (serverUrl: unknown, password = "explicit-pw") =>
+        connectV2Host("ses_src", async () => session, {
+          serverUrl,
+          env: {
+            ...env(),
+            OPENCODE_SERVER_USERNAME: "operator",
+            OPENCODE_SERVER_PASSWORD: password,
+          },
+          pid: 7,
+          controlTimeoutMs: 1_000,
+        });
+      await connect(` ${explicit.url}/ `);
+      expect(explicit.seen).toHaveLength(2);
+      await refusal(connect(explicit.url, "wrong-pw"), "auth-refused", [
+        "wrong-pw",
+      ]);
+      await refusal(connect(failing.url), "wrong-server", ["explicit-pw"]);
+      const authority = explicit.url.slice("http://".length);
+      for (const invalid of [
+        4101,
+        "",
+        "127.0.0.1:4096",
+        "ftp://127.0.0.1:4096",
+        `http://operator:explicit-pw@${authority}`,
+        `http://@${authority}`,
+        `${explicit.url}/?token=1`,
+        `${explicit.url}/?`,
+        `${explicit.url}/#here`,
+      ])
+        await refusal(connect(invalid), "invalid-server-url", ["explicit-pw"]);
+      expect(failing.seen).toHaveLength(1);
+      expect(explicit.seen).toHaveLength(3);
+      expect(registered.seen).toEqual([]);
+    } finally {
+      await registered.stop();
+      await explicit.stop();
+      await failing.stop();
+    }
+  });
+
+  test("an endpoint under a base path is called under that path", async () => {
+    const server = loopback(url => {
+      if (url.pathname === "/opencode/api/info") return serverInfo(7);
+      if (url.pathname === "/opencode/api/session/ses_src")
+        return Response.json({ data: session });
+      return new Response("no", { status: 404 });
+    });
+    try {
+      await connectV2Host("ses_src", async () => session, {
+        serverUrl: `${server.url}/opencode/`,
+        env: env(),
+        pid: 7,
+        controlTimeoutMs: 1_000,
+      });
+      expect(server.seen.map(seen => seen.path)).toEqual([
+        "/opencode/api/info",
+        "/opencode/api/session/ses_src",
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test("every successor command connects through the registration, and only there", async () => {
+    const server = managed();
+    const commands = new Map<string, (input: unknown) => Promise<void>>();
+    const editor = { add: () => undefined, update: () => undefined };
+    const cleanup = await setup({
+      options: {},
+      agent: { transform: async (fn: (e: unknown) => void) => fn(editor) },
+      command: {
+        transform: async (fn: (e: unknown) => void) =>
+          fn({
+            add: (command: {
+              name: string;
+              execute: (input: unknown) => Promise<void>;
+            }) => commands.set(command.name, command.execute),
+          }),
+      },
+      tool: { transform: async (fn: (e: unknown) => void) => fn(editor) },
+      session: { hook: async () => undefined, get: async () => session },
+      event: { subscribe: async function* () {} },
+    } as never);
+    try {
+      await register({
+        url: server.url,
+        pid: process.pid + 1,
+        password: PASSWORD,
+      });
+      for (const name of ["magic-compact", "magic-trim", "magic-recover"]) {
+        const error = await commands.get(name)!({
+          sessionID: "ses_src",
+          prompt: { text: name === "magic-recover" ? "" : "--heuristic" },
+        }).catch((reason: Error) => reason);
+        expect((error as Error).message).toBe(
+          `${V2_ENDPOINT_REQUIRED}\nReason: The registered OpenCode service belongs to another OpenCode process.`,
+        );
+      }
+      expect(server.seen).toEqual([]);
+    } finally {
+      cleanup();
+      await server.stop();
+    }
+  });
+
+  test("a redirect is never followed", async () => {
+    const witness = managed();
+    const redirecting = loopback(url =>
+      Response.redirect(`${witness.url}${url.pathname}`, 307),
+    );
+    try {
+      await register({ url: redirecting.url, pid: 7, password: PASSWORD });
+      await refusal(
+        connectV2Host("ses_src", async () => session, {
+          env: env(),
+          pid: 7,
+          controlTimeoutMs: 1_000,
+        }),
+        "wrong-server",
+      );
+      expect(redirecting.seen.map(seen => seen.path)).toEqual(["/api/info"]);
+      expect(witness.seen).toEqual([]);
+    } finally {
+      await witness.stop();
+      await redirecting.stop();
+    }
+  });
+
+  test("a qualified connection never follows a later redirect", async () => {
+    const witness = managed();
+    const server = loopback((url, request) => {
+      if (request.headers.get("authorization") !== basic("opencode", PASSWORD))
+        return new Response("no", { status: 401 });
+      if (url.pathname === "/api/info") return serverInfo(7);
+      if (url.pathname === "/api/session/ses_src")
+        return Response.json({ data: session });
+      return Response.redirect(`${witness.url}${url.pathname}`, 307);
+    });
+    try {
+      await register({ url: server.url, pid: 7, password: PASSWORD });
+      const host = await connectV2Host("ses_src", async () => session, {
+        env: env(),
+        pid: 7,
+        controlTimeoutMs: 1_000,
+      });
+      await expect(
+        host.session.export({ sessionID: "ses_src", sanitize: false }),
+      ).rejects.toThrow();
+      expect(server.seen.map(seen => seen.path)).toEqual([
+        "/api/info",
+        "/api/session/ses_src",
+        "/api/experimental/session/ses_src/export",
+      ]);
+      expect(witness.seen).toEqual([]);
+    } finally {
+      await witness.stop();
+      await server.stop();
+    }
+  });
+
+  test("the endpoint must return the same well-formed source session", async () => {
+    const failed = async () => {
+      throw new Error("in-process read failed");
+    };
+    // The in-process read comes first: when it fails or has no well-formed
+    // identity of the source, the session is never requested.
+    const cases: Array<[unknown, () => Promise<unknown>, boolean]> = [
+      [{ ...session, projectID: "other" }, async () => session, true],
+      [{ ...session, id: "ses_other" }, async () => session, true],
+      [session, async () => ({ ...session, id: "ses_other" }), false],
+      [session, async () => ({ ...session, location: undefined }), false],
+      [session, async () => ({ ...session, time: { created: "1" } }), false],
+      [{ ...session, location: undefined }, async () => session, true],
+      [session, failed, false],
+    ];
+    for (const [remote, readLocal, requestsSession] of cases) {
+      const server = managed(remote);
+      try {
+        await register({ url: server.url, pid: 7, password: PASSWORD });
+        await refusal(
+          connectV2Host("ses_src", readLocal, {
+            env: env(),
+            pid: 7,
+            controlTimeoutMs: 1_000,
+          }),
+          "wrong-session",
+          ["in-process read failed"],
+        );
+        expect(server.seen.map(seen => seen.path)).toEqual([
+          "/api/info",
+          ...(requestsSession ? ["/api/session/ses_src"] : []),
+        ]);
+      } finally {
+        await server.stop();
+      }
+    }
+    const missing = loopback((url, request) => {
+      if (request.headers.get("authorization") !== basic("opencode", PASSWORD))
+        return new Response("no", { status: 401 });
+      if (url.pathname === "/api/info") return serverInfo(7);
+      return Response.json(
+        { _tag: "SessionNotFound", message: "ses_src not found" },
+        { status: 404 },
+      );
+    });
+    try {
+      await register({ url: missing.url, pid: 7, password: PASSWORD });
+      await refusal(
+        connectV2Host("ses_src", async () => session, {
+          env: env(),
+          pid: 7,
+          controlTimeoutMs: 1_000,
+        }),
+        "wrong-session",
+        ["not found"],
+      );
+    } finally {
+      await missing.stop();
+    }
+  });
+
+  test("an unreachable, slow or cancelled check is reported as such and sends nothing more", async () => {
+    const closed = loopback(() => serverInfo(7));
+    await closed.stop();
+    await register({ url: closed.url, pid: 7, password: PASSWORD });
+    const connect = (
+      signal?: AbortSignal,
+      read = async () => session,
+      controlTimeoutMs = 100,
+    ) =>
+      connectV2Host("ses_src", read, {
+        env: env(),
+        pid: 7,
+        controlTimeoutMs,
+        ...(signal ? { signal } : {}),
+      });
+    await refusal(connect(), "unreachable");
+
+    const holding = loopback(url =>
+      url.pathname === "/api/info" ? "hold" : Response.json({ data: session }),
+    );
+    try {
+      await register({ url: holding.url, pid: 7, password: PASSWORD });
+      await refusal(connect(), "timed-out");
+      await holding.waitFor(() => holding.aborted.length === 1);
+      expect(holding.aborted).toEqual(["/api/info"]);
+
+      // Cancelled while the server identity read is open.
+      const activation = new AbortController();
+      const cancelled = connect(activation.signal, undefined, 60_000);
+      await holding.waitFor(() => holding.seen.length === 2);
+      activation.abort();
+      await refusal(cancelled, "cancelled");
+      await holding.waitFor(() => holding.aborted.length === 2);
+
+      // Already cancelled: no request at all.
+      const seen = holding.seen.length;
+      await refusal(connect(activation.signal), "cancelled");
+      expect(holding.seen).toHaveLength(seen);
+    } finally {
+      await holding.stop();
+    }
+
+    // The in-process read comes before the session request. One that ignores
+    // its signal is still open when the check settles as cancelled, and its
+    // late result starts no request.
+    const server = managed();
+    try {
+      await register({ url: server.url, pid: 7, password: PASSWORD });
+      const activation = new AbortController();
+      const entered = Promise.withResolvers<void>();
+      const held = Promise.withResolvers<unknown>();
+      // No deadline settles it first.
+      const late = connect(
+        activation.signal,
+        () => {
+          entered.resolve();
+          return held.promise;
+        },
+        60_000,
+      );
+      await entered.promise;
+      // Long enough for a session request started with the read to arrive.
+      await Bun.sleep(100);
+      expect(server.seen.map(seen => seen.path)).toEqual(["/api/info"]);
+      activation.abort();
+      await refusal(late, "cancelled");
+      held.resolve(session);
+      await settleMicrotasks();
+      await Bun.sleep(100);
+      expect(server.seen.map(seen => seen.path)).toEqual(["/api/info"]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test("a registration read that does not finish is bounded by the deadline and the caller's signal", async () => {
+    // A FIFO holds the read open, past its abort, until a writer opens it.
+    const file = join(stateDirectory, "opencode", "service.json");
+    await mkdir(dirname(file), { recursive: true });
+    await rm(file, { force: true });
+    expect(Bun.spawnSync(["mkfifo", file]).exitCode).toBe(0);
+    // Lets any held read finish. Opening is refused (ENXIO) when no read is
+    // left, and only a FIFO is opened.
+    const releaseReads = () => {
+      if (!lstatSync(file, { throwIfNoEntry: false })?.isFIFO()) return;
+      try {
+        closeSync(openSync(file, constants.O_WRONLY | constants.O_NONBLOCK));
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ENXIO" && code !== "ENOENT") throw error;
+      }
+    };
+    let reads = 0;
+    const connect = (controlTimeoutMs: number, signal?: AbortSignal) =>
+      connectV2Host(
+        "ses_src",
+        async () => {
+          reads++;
+          return session;
+        },
+        {
+          env: env(),
+          pid: 7,
+          controlTimeoutMs,
+          ...(signal ? { signal } : {}),
+        },
+      );
+    try {
+      await refusal(connect(100), "timed-out");
+      const activation = new AbortController();
+      const cancelled = connect(60_000, activation.signal);
+      // The read has started once the queued microtasks have run.
+      await settleMicrotasks();
+      activation.abort();
+      await refusal(cancelled, "cancelled");
+      expect(reads).toBe(0);
+    } finally {
+      releaseReads();
+      await rm(file, { force: true });
+    }
   });
 });
 
@@ -3630,7 +4234,10 @@ describe("OpenCode 2 media projection", () => {
         if (url.pathname.endsWith("/export")) {
           return Response.json({ data: { messages: history.records } });
         }
-        return Response.json({ data: session });
+        // Each session read returns the session it names.
+        return Response.json({
+          data: { ...session, id: url.pathname.split("/").at(-1) },
+        });
       },
     });
     try {
@@ -3653,7 +4260,10 @@ describe("OpenCode 2 media projection", () => {
               hooks.set(name, callback);
             },
             context: async () => structuredClone(history.context),
-            get: async () => session,
+            get: async ({ sessionID }: { sessionID: string }) => ({
+              ...session,
+              id: sessionID,
+            }),
           },
           event: { subscribe: async function* () {} },
         } as never,
@@ -3680,8 +4290,8 @@ describe("OpenCode 2 media projection", () => {
       ]);
       expect(compatible).not.toContain(history.older);
       expect(compatible.match(/Historical inline image 1/gu)).toHaveLength(3);
-      // The verified connection is reused.
-      expect(reads.filter(path => path === "/api/info")).toHaveLength(1);
+      // Each complete-history read qualifies the endpoint again.
+      expect(reads.filter(path => path === "/api/info")).toHaveLength(2);
 
       // On that route a request may hold no capsule at all: the checkpoint
       // replays the retained copy, and later turns carry no manifest. In a
@@ -3769,6 +4379,282 @@ describe("OpenCode 2 media projection", () => {
       expect(reads).toHaveLength(count);
     } finally {
       await server.stop(true);
+    }
+  });
+
+  // The plugin over a loopback server holding `checkpointHistory`, with the
+  // cleanup `setup` returns and a record of in-process reads. `holdContext`
+  // keeps the in-process context read open until released, ignoring its
+  // signal like a read that does not honour it, and reports when it starts.
+  const mediaPlugin = async (
+    respond: (url: URL) => Response | Promise<Response> | "hold" | undefined,
+  ) => {
+    const history = checkpointHistory();
+    const server = loopback(url => {
+      const held = respond(url);
+      if (held !== undefined) return held;
+      if (url.pathname.endsWith("/message"))
+        return Response.json({ data: history.records, cursor: { next: null } });
+      if (url.pathname.endsWith("/export"))
+        return Response.json({ data: { messages: history.records } });
+      return Response.json({
+        data: lineageSession(url.pathname.split("/").at(-1)!),
+      });
+    });
+    const hooks = new Map<string, (event: never) => Promise<void>>();
+    const commands = new Map<string, (input: unknown) => Promise<void>>();
+    const inProcess: string[] = [];
+    let contextGate: Promise<void> | undefined;
+    let contextEntered: (() => void) | undefined;
+    let afterContext: (() => void) | undefined;
+    const editor = { add: () => undefined, update: () => undefined };
+    const cleanup = await setup({
+      options: { serverUrl: server.url },
+      agent: { transform: async (fn: (e: unknown) => void) => fn(editor) },
+      command: {
+        transform: async (fn: (e: unknown) => void) =>
+          fn({
+            add: (command: {
+              name: string;
+              execute: (input: unknown) => Promise<void>;
+            }) => commands.set(command.name, command.execute),
+          }),
+      },
+      tool: { transform: async (fn: (e: unknown) => void) => fn(editor) },
+      session: {
+        hook: async (
+          name: string,
+          callback: (event: never) => Promise<void>,
+        ) => {
+          hooks.set(name, callback);
+        },
+        context: ({ sessionID }: { sessionID: string }) => {
+          inProcess.push(`context ${sessionID}`);
+          contextEntered?.();
+          if (afterContext) {
+            // Runs `after` once the read has settled, before its caller
+            // resumes: the caller's await takes more than one job.
+            const read = Promise.resolve(structuredClone(history.context));
+            const after = afterContext;
+            queueMicrotask(() => void read.then(after));
+            return read;
+          }
+          return (contextGate ?? Promise.resolve()).then(() =>
+            structuredClone(history.context),
+          );
+        },
+        get: async ({ sessionID }: { sessionID: string }) => {
+          inProcess.push(`get ${sessionID}`);
+          return lineageSession(sessionID);
+        },
+      },
+      event: { subscribe: async function* () {} },
+    } as never);
+    const run = (name: string, sessionID: string, messages: unknown[]) => {
+      const event = { sessionID, tools: {}, messages };
+      const before = JSON.stringify(messages);
+      const settled = hooks.get(name)!(event as never).then(
+        () => undefined,
+        (error: Error) => error.message,
+      );
+      return {
+        event,
+        unchanged: () => JSON.stringify(event.messages) === before,
+        settled,
+      };
+    };
+    return {
+      history,
+      server,
+      cleanup,
+      commands,
+      inProcess,
+      run,
+      holdContext: () => {
+        const gate = Promise.withResolvers<void>();
+        const entered = Promise.withResolvers<void>();
+        contextGate = gate.promise;
+        contextEntered = entered.resolve;
+        return { release: gate.resolve, entered: entered.promise };
+      },
+      cleanupAfterContextRead: () => {
+        afterContext = cleanup;
+      },
+    };
+  };
+  const lineageSession = (id: string) => ({
+    id,
+    projectID: "p",
+    time: { created: 1 },
+    location: LOCATION,
+    metadata: { magicCompact: {} },
+  });
+
+  test("each complete-history read qualifies the endpoint for its own session", async () => {
+    const plugin = await mediaPlugin(url =>
+      url.pathname === "/api/info" ? serverInfo(process.pid) : undefined,
+    );
+    try {
+      for (const sessionID of ["ses_a", "ses_b", "ses_a"]) {
+        const { event, settled } = plugin.run(
+          "context",
+          sessionID,
+          plugin.history.incompatible,
+        );
+        expect(await settled).toBeUndefined();
+        expect(JSON.stringify(event.messages)).not.toContain(
+          plugin.history.older,
+        );
+      }
+      const paths = plugin.server.seen.map(seen => seen.path);
+      expect(paths.filter(path => path === "/api/info")).toHaveLength(3);
+      expect(
+        paths.filter(path => /^\/api\/session\/[^/]+$/u.test(path)),
+      ).toEqual([
+        "/api/session/ses_a",
+        "/api/session/ses_b",
+        "/api/session/ses_a",
+      ]);
+      expect(plugin.inProcess.filter(read => read.startsWith("get"))).toEqual([
+        "get ses_a",
+        "get ses_b",
+        "get ses_a",
+      ]);
+    } finally {
+      plugin.cleanup();
+      await plugin.server.stop();
+    }
+  });
+
+  test.each(["/api/info", "/message"])(
+    "cleanup while %s is open aborts it and leaves the request unprojected",
+    async held => {
+      const plugin = await mediaPlugin(url =>
+        url.pathname.endsWith(held)
+          ? "hold"
+          : url.pathname === "/api/info"
+            ? serverInfo(process.pid)
+            : undefined,
+      );
+      try {
+        const pending = plugin.run(
+          "generate",
+          "ses_a",
+          plugin.history.incompatible,
+        );
+        await plugin.server.waitFor(() =>
+          plugin.server.seen.some(seen => seen.path.endsWith(held)),
+        );
+        plugin.cleanup();
+        expect(await pending.settled).toContain("the plugin was unloaded");
+        expect(pending.unchanged()).toBe(true);
+        await plugin.server.waitFor(() => plugin.server.aborted.length === 1);
+        await settleMicrotasks();
+        // Nothing follows the aborted read.
+        expect(plugin.server.seen.at(-1)!.path).toEndWith(held);
+      } finally {
+        await plugin.server.stop();
+      }
+    },
+  );
+
+  test("after cleanup a late in-process read projects nothing and no new media read starts", async () => {
+    const plugin = await mediaPlugin(url =>
+      url.pathname === "/api/info" ? serverInfo(process.pid) : undefined,
+    );
+    try {
+      const { release, entered } = plugin.holdContext();
+      const late = plugin.run("context", "ses_a", plugin.history.incompatible);
+      await entered;
+      plugin.cleanup();
+      // The hook settles while the in-process read is still held.
+      expect(await late.settled).toContain("the plugin was unloaded");
+      release();
+      await settleMicrotasks();
+      expect(late.unchanged()).toBe(true);
+
+      const reads = plugin.inProcess.length;
+      const refused = plugin.run("title", "ses_a", plugin.history.incompatible);
+      expect(await refused.settled).toContain("the plugin was unloaded");
+      expect(refused.unchanged()).toBe(true);
+      expect(plugin.inProcess).toHaveLength(reads);
+      expect(plugin.server.seen).toEqual([]);
+      // A request that needs no read is still left as it is.
+      const plain = plugin.run(
+        "context",
+        "ses_a",
+        requestMessages(plainTurn(4)),
+      );
+      expect(await plain.settled).toBeUndefined();
+      expect(plain.unchanged()).toBe(true);
+    } finally {
+      await plugin.server.stop();
+    }
+  });
+
+  test("cleanup between a read settling and its use projects nothing", async () => {
+    const plugin = await mediaPlugin(() => undefined);
+    try {
+      plugin.cleanupAfterContextRead();
+      const covered = plugin.run(
+        "context",
+        "ses_a",
+        requestMessages(plugin.history.context),
+      );
+      expect(await covered.settled).toContain("the plugin was unloaded");
+      expect(covered.unchanged()).toBe(true);
+      expect(plugin.server.seen).toEqual([]);
+    } finally {
+      await plugin.server.stop();
+    }
+  });
+
+  test("cleanup leaves a running successor command's requests to finish with its own result", async () => {
+    // The command's first history page is held until after cleanup.
+    const page = Promise.withResolvers<void>();
+    let pages = 0;
+    // The rest of the at-rest read finds nothing running or waiting.
+    const idle: Record<string, unknown> = {
+      "/api/session": { data: [], cursor: { next: null } },
+      "/api/session/active": { data: {} },
+      "/api/session/ses_a/inbox": { data: [] },
+      "/api/session/ses_a/permission": { data: [] },
+      "/api/session/ses_a/form": { data: [] },
+      "/api/shell": { data: [] },
+      "/api/experimental/session/ses_a/instructions/entries": { data: [] },
+    };
+    const plugin = await mediaPlugin(url => {
+      if (url.pathname === "/api/info") return serverInfo(process.pid);
+      if (url.pathname in idle) return Response.json(idle[url.pathname]);
+      if (url.pathname.endsWith("/message") && pages++ === 0)
+        return page.promise.then(() =>
+          Response.json({
+            data: plugin.history.records,
+            cursor: { next: null },
+          }),
+        );
+      return undefined;
+    });
+    try {
+      const recovering = plugin.commands.get("magic-recover")!({
+        sessionID: "ses_a",
+        prompt: { text: "" },
+      }).catch((reason: Error) => reason.message);
+      await plugin.server.waitFor(() => pages === 1);
+      plugin.cleanup();
+      page.resolve();
+      expect(await recovering).toBe(RECOVER_NOOP);
+      expect(plugin.server.aborted).toEqual([]);
+      const paths = plugin.server.seen.map(seen => seen.path);
+      const held = paths.findIndex(path => path.endsWith("/message"));
+      // Qualified before the held page, and reading to the end after it.
+      expect(paths.slice(0, 2)).toEqual(["/api/info", "/api/session/ses_a"]);
+      expect(paths.slice(held + 1)).toEqual([
+        "/api/experimental/session/ses_a/export",
+        ...Object.keys(idle),
+      ]);
+    } finally {
+      await plugin.server.stop();
     }
   });
 
